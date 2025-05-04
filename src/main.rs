@@ -40,8 +40,6 @@ fn main() {
             }
             Ok(n) => {
                 let current_time = std::time::SystemTime::now();
-                println!("Received {} bytes: {:?}", n, &buf[..n]);
-                println!("Message: {}", String::from_utf8_lossy(&buf[..n]));
                 let header = parse_header(buf);
                 match header {
                     Ok(ref header) => println!("Parsed header: {:?}", header),
