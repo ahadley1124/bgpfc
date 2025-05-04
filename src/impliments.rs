@@ -260,7 +260,7 @@ impl structs::keepaliveMessage {
         if bytes.len() >= 19 {
             return Err("Invalid keepalive message length");
         }
-        let header = structs::Header::from_bytes(&bytes[0..19])?;
+        let header = structs::Header::from_bytes(bytes.get(0..19).ok_or("Invalid keepalive message length")?)?;
         Ok(Self { header })
     }
 }
