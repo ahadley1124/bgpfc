@@ -255,7 +255,7 @@ impl structs::keepaliveMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 19 {
+        if bytes.len() <= 19 {
             return Err("Invalid keepalive message length");
         }
         let header = structs::Header::from_bytes(&bytes[0..19])?;
