@@ -39,6 +39,7 @@ fn main() {
                 break;
             }
             Ok(n) => {
+                let current_time = std::time::SystemTime::now();
                 println!("Received {} bytes: {:?}", n, &buf[..n]);
                 println!("Message: {}", String::from_utf8_lossy(&buf[..n]));
                 let header = parse_header(buf);
@@ -47,6 +48,8 @@ fn main() {
                     Err(e) => eprintln!("Error parsing header: {}", e),
                 }
                 stream.write_all(&buf[..n]).unwrap();
+                let elapsed = current_time.elapsed().unwrap();
+                println!("Time elapsed: {:?}", elapsed);
             }
             Err(e) => {
                 eprintln!("Error reading from stream: {}", e);
