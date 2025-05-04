@@ -1,6 +1,6 @@
 pub struct Header {
     pub marker: [u8; 16],
-    pub length: [u8; 2],
+    pub length: u16,
     pub message_type: u8,
 }
 
