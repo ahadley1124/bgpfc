@@ -15,7 +15,10 @@ impl structs::Header {
         if bytes.len() < 19 {
             return Err("Invalid header length");
         }
-        let marker = bytes[0..15].try_into().map_err(|_| "Invalid marker length")?;
+        println!("First 16 bytes: {:?}", &bytes[0..16]);
+        println!("Next 2 bytes: {:?}", &bytes[16..18]);
+        println!("Last byte: {:?}", bytes[18]);
+        let marker = bytes[0..16].try_into().map_err(|_| "Invalid marker length")?;
         let length = u16::from_be_bytes([bytes[16], bytes[17]]);
         let message_type = bytes[18];
         Ok(Self {
