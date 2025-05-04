@@ -15,7 +15,7 @@ fn my_open_message() -> structs::openMessage {
     let version = 4;
     let my_asn = 65500;
     let hold_time = 300;
-    let bgp_id = "10.0.1.136".parse().unwrap();
+    let bgp_id: u32 = u32::from_be_bytes([10, 0, 1, 136]);
     let opt_param_len = 0;
     let opt_params = Vec::new();
     structs::openMessage::new(header, version, my_asn, hold_time, bgp_id, opt_param_len, opt_params)
