@@ -76,7 +76,7 @@ fn main() {
                     }
                     3 => {
                         println!("Received keepalive message");
-                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[n..]);
+                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[19..n]);
                         match keepalive_message {
                             Ok(keepalive_message) => {
                                 println!("Received keepalive message: {:?}", keepalive_message);
