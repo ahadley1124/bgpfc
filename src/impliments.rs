@@ -257,7 +257,7 @@ impl structs::keepaliveMessage {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         // the rfc says that the keepalive message is 19 bytes long, but multiple different implementations have different lengths
         // so we will just check if the length is at least 19 bytes
-        if bytes.len() >= 19 {
+        if bytes.len() > 18 {
             return Err("Invalid keepalive message length");
         }
         let header = structs::Header::from_bytes(bytes.get(0..19).ok_or("Invalid keepalive message length")?)?;
