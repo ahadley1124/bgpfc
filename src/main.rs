@@ -78,7 +78,7 @@ fn main() {
                         println!("Received keepalive message");
                         println!("Full buffer: {:?}", buf);
                         println!("Buffer length: {}", n);
-                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[19..n]);
+                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[0..n]);
                         match keepalive_message {
                             Ok(keepalive_message) => {
                                 println!("Received keepalive message: {:?}", keepalive_message);
