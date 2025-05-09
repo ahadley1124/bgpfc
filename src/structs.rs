@@ -4,6 +4,11 @@ pub struct Header {
     pub message_type: u8,
 }
 
+pub struct BGPMessage {
+    pub header: Header,
+    pub message: Option<(openMessage, updateMessage, keepaliveMessage, notificationMessage)>,
+}
+
 pub struct openMessage {
     pub header: Header,
     pub version: u8,
@@ -25,6 +30,7 @@ pub struct updateMessage {
 
 pub struct keepaliveMessage {
     pub header: Header,
+    pub extra: Vec<u8>,
 }
 
 pub struct notificationMessage {

@@ -158,7 +158,7 @@ impl structs::updateMessage {
         let header = structs::Header::from_bytes(&bytes[0..19])?;
         let withdrawn_routes_len = u16::from_be_bytes([bytes[19], bytes[20]]);
         let withdrawn_routes = bytes[21..(21 + withdrawn_routes_len as usize)].to_vec();
-        let total_path_attr_len = u16::from_be_bytes([bytes[(21 + withdrawn_routes_len as usize)], bytes[(22 + withdrawn_routes_len as usize)]]);
+        let total_path_attr_len = u16::from_be_bytes([bytes[21 + withdrawn_routes_len as usize], bytes[22 + withdrawn_routes_len as usize]]);
         let path_attributes = bytes[(23 + withdrawn_routes_len as usize)..(23 + withdrawn_routes_len as usize + total_path_attr_len as usize)].to_vec();
         let nlri = bytes[(23 + withdrawn_routes_len as usize + total_path_attr_len as usize)..].to_vec();
         Ok(Self {
@@ -243,7 +243,10 @@ impl structs::keepaliveMessage {
         // calculate the length and update the header
         let length = 19;
         header.length = length as u16; // update the header length
-        Self { header }
+        Self {
+            header,
+            extra: Vec::new(),
+        }
     }
 
     pub fn length(&self) -> usize {
