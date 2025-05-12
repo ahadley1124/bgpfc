@@ -211,7 +211,7 @@ impl structs::notificationMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 19 {
+        if bytes.len() >= 21 {
             return Err("Invalid notification message length");
         }
         let header = structs::Header::from_bytes(&bytes[0..19])?;

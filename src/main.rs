@@ -30,7 +30,6 @@ fn main() {
     println!("Accepted connection from {}", stream.peer_addr().unwrap());
     let open_message = my_open_message();
     let open_message_bytes = open_message.to_bytes();
-    println!("Sending open message: {:?}", open_message_bytes);
     let mut buf: [u8; 1024] = [0; 1024];
     loop {
         match stream.read(&mut buf) {
@@ -42,8 +41,8 @@ fn main() {
                 let header = parse_header(buf);
                 // if the header is ok, unwrap it, else print the error
                 match header {
-                    Ok(ref header) => {
-                        println!("Received header: {:?}", header);
+                    Ok(_) => {
+                        continue;
                     }
                     Err(e) => {
                         eprintln!("Error parsing header: {}", e);
