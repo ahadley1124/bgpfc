@@ -74,6 +74,18 @@ fn main() {
                             }
                         }
                     }
+                    3 => {
+                        println!("Received notification message");
+                        let notification_message = structs::notificationMessage::from_bytes(&buf[19..n]);
+                        match notification_message {
+                            Ok(notification_message) => {
+                                println!("Received notification message: {:?}", notification_message);
+                            }
+                            Err(e) => {
+                                eprintln!("Error parsing notification message: {}", e);
+                            }
+                        }
+                    }
                     4 => {
                         println!("Received keepalive message");
                         println!("Full buffer: {:?}", buf);
@@ -85,18 +97,6 @@ fn main() {
                             }
                             Err(e) => {
                                 eprintln!("Error parsing keepalive message: {}", e);
-                            }
-                        }
-                    }
-                    3 => {
-                        println!("Received notification message");
-                        let notification_message = structs::notificationMessage::from_bytes(&buf[19..n]);
-                        match notification_message {
-                            Ok(notification_message) => {
-                                println!("Received notification message: {:?}", notification_message);
-                            }
-                            Err(e) => {
-                                eprintln!("Error parsing notification message: {}", e);
                             }
                         }
                     }
