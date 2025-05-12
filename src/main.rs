@@ -29,6 +29,8 @@ fn main() {
     let listener = connection::bind_socket(addr).unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
 
+    let header = structs::Header::new([0; 16], 0, 1);
+
     //upon accepting a new connection, move it to a new thread
     loop {
         let (mut stream, _) = listener.accept().unwrap();
@@ -55,11 +57,20 @@ fn main() {
                                             &buf[19..n]
                                         );
                                         match open_message {
-                                            Ok(open_message) =>
+                                            Ok(open_message) => {
                                                 println!(
                                                     "Received open message: {:?}",
                                                     open_message
-                                                ),
+                                                );
+                                                // Send keepalive after successful open message parse
+                                                let keepalive = structs::keepaliveMessage::new(header);
+                                                let keepalive_bytes = keepalive.to_bytes();
+                                                if let Err(e) = stream.write_all(&keepalive_bytes) {
+                                                    eprintln!("Failed to send keepalive: {}", e);
+                                                } else {
+                                                    println!("Sent keepalive message");
+                                                }
+                                            }
                                             Err(e) =>
                                                 eprintln!("Error parsing open message: {}", e),
                                         }
