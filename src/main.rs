@@ -168,6 +168,18 @@ fn main() {
     }
 }
 
+#[test]
+fn test_parse_header() {
+    let mut input: [u8; 1024] = [0; 1024];
+    input[..16].copy_from_slice(&[255; 16]);
+    let result = parse_header(input);
+    assert!(result.is_ok());
+    let header = result.unwrap();
+    assert_eq!(header.marker, [255; 16]);
+    assert_eq!(header.length, 0);
+    assert_eq!(header.message_type, 0);
+}
+
 //fn main() {
 //    let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
 //    let listener = connection::bind_socket(addr).unwrap();
