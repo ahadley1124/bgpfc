@@ -74,7 +74,7 @@ fn main() {
                             }
                         }
                     }
-                    3 => {
+                    4 => {
                         println!("Received keepalive message");
                         println!("Full buffer: {:?}", buf);
                         println!("Buffer length: {}", n);
@@ -88,7 +88,7 @@ fn main() {
                             }
                         }
                     }
-                    4 => {
+                    3 => {
                         println!("Received notification message");
                         let notification_message = structs::notificationMessage::from_bytes(&buf[19..n]);
                         match notification_message {
