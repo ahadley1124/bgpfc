@@ -119,9 +119,12 @@ fn main() {
                                     Err(e) => eprintln!("Error parsing keepalive message: {}", e),
                                 }
                             }
-                            _ => #[cfg(debug_assertions)]
-                                println!("Unknown message type: {}", header.message_type),
-                        }
+                            _ => {
+                                #[cfg(debug_assertions)]
+                                {
+                                    println!("Unknown message type: {}", header.message_type);
+                                }
+                            }                        }
                     }
                     Err(e) => {
                         eprintln!("Error reading from stream: {}", e);
