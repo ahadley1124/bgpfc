@@ -30,6 +30,7 @@ fn main() {
     println!("Accepted connection from {}", stream.peer_addr().unwrap());
     let open_message = my_open_message();
     let open_message_bytes = open_message.to_bytes();
+    stream.write_all(&open_message_bytes).unwrap();
     let mut buf: [u8; 1024] = [0; 1024];
     loop {
         match stream.read(&mut buf) {
