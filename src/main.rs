@@ -2,6 +2,7 @@
 
 use std::net::SocketAddrV4;
 use std::io::{ Read, Write };
+use std::thread;
 
 mod connection;
 mod structs;
@@ -23,97 +24,134 @@ fn my_open_message() -> structs::openMessage {
     structs::openMessage::new(header, version, my_asn, hold_time, bgp_id, opt_param_len, opt_params)
 }
 
-fn main() {
+fn main () {
     let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
     let listener = connection::bind_socket(addr).unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
-    // only listen for connections and print all the data received
-    let (mut stream, _) = listener.accept().unwrap();
-    println!("Accepted connection from {}", stream.peer_addr().unwrap());
-    let open_message = my_open_message();
-    let open_message_bytes = open_message.to_bytes();
-    stream.write_all(&open_message_bytes).unwrap();
-    let mut buf: [u8; 1024] = [0; 1024];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => {
-                break;
-            }
-            Ok(n) => {
-                let current_time = std::time::SystemTime::now();
-                let header = parse_header(buf);
-                // if the header is ok, unwrap it, else print the error
-                match header {
-                    Ok(_) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("Error parsing header: {}", e);
+    thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    println!("Accepted connection from {}", stream.peer_addr().unwrap());
+                    let open_message = my_open_message();
+                    let open_message_bytes = open_message.to_bytes();
+                    stream.write_all(&open_message_bytes).unwrap();
+                    let mut buf: [u8; 1024] = [0; 1024];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let header = parse_header(buf);
+                                match header {
+                                    Ok(_) => continue,
+                                    Err(e) => eprintln!("Error parsing header: {}", e),
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error reading from stream: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
-                match header.clone().unwrap().message_type {
-                    1 => {
-                        println!("Received open message");
-                        let open_message = structs::openMessage::from_bytes(&buf[19..n]);
-                        match open_message {
-                            Ok(open_message) => {
-                                println!("Received open message: {:?}", open_message);
-                            }
-                            Err(e) => {
-                                eprintln!("Error parsing open message: {}", e);
-                            }
-                        }
-                    }
-                    2 => {
-                        println!("Received update message");
-                        let update_message = structs::updateMessage::from_bytes(&buf[19..n]);
-                        match update_message {
-                            Ok(update_message) => {
-                                println!("Received update message: {:?}", update_message);
-                            }
-                            Err(e) => {
-                                eprintln!("Error parsing update message: {}", e);
-                            }
-                        }
-                    }
-                    3 => {
-                        println!("Received notification message");
-                        let notification_message = structs::notificationMessage::from_bytes(&buf[19..n]);
-                        match notification_message {
-                            Ok(notification_message) => {
-                                println!("Received notification message: {:?}", notification_message);
-                            }
-                            Err(e) => {
-                                eprintln!("Error parsing notification message: {}", e);
-                            }
-                        }
-                    }
-                    4 => {
-                        println!("Received keepalive message");
-                        println!("Full buffer: {:?}", buf);
-                        println!("Buffer length: {}", n);
-                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[0..n]);
-                        match keepalive_message {
-                            Ok(keepalive_message) => {
-                                println!("Received keepalive message: {:?}", keepalive_message);
-                            }
-                            Err(e) => {
-                                eprintln!("Error parsing keepalive message: {}", e);
-                            }
-                        }
-                    }
-                    _ => {
-                        println!("Unknown message type: {}", header.clone().unwrap().message_type);
-                    }
-                    
-                }
-                let elapsed = current_time.elapsed().unwrap();
-                println!("Time elapsed: {:?}", elapsed);
-            }
-            Err(e) => {
-                eprintln!("Error reading from stream: {}", e);
-                break;
+                Err(e) => eprintln!("Error accepting connection: {}", e),
             }
         }
-    }
+    }).join().unwrap();
+    println!("Server stopped");
 }
+
+//fn main() {
+//    let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
+//    let listener = connection::bind_socket(addr).unwrap();
+//    println!("Listening on {}", listener.local_addr().unwrap());
+//    // only listen for connections and print all the data received
+//    let (mut stream, _) = listener.accept().unwrap();
+//    println!("Accepted connection from {}", stream.peer_addr().unwrap());
+//    let open_message = my_open_message();
+//    let open_message_bytes = open_message.to_bytes();
+//    stream.write_all(&open_message_bytes).unwrap();
+//    let mut buf: [u8; 1024] = [0; 1024];
+//    loop {
+//        match stream.read(&mut buf) {
+//            Ok(0) => {
+//                break;
+//            }
+//            Ok(n) => {
+//                let current_time = std::time::SystemTime::now();
+//                let header = parse_header(buf);
+//                // if the header is ok, unwrap it, else print the error
+//                match header {
+//                    Ok(_) => {
+//                        continue;
+//                    }
+//                    Err(e) => {
+//                        eprintln!("Error parsing header: {}", e);
+//                    }
+//                }
+//                match header.clone().unwrap().message_type {
+//                    1 => {
+//                        println!("Received open message");
+//                        let open_message = structs::openMessage::from_bytes(&buf[19..n]);
+//                        match open_message {
+//                            Ok(open_message) => {
+//                                println!("Received open message: {:?}", open_message);
+//                            }
+//                            Err(e) => {
+//                                eprintln!("Error parsing open message: {}", e);
+//                            }
+//                        }
+//                    }
+//                    2 => {
+//                        println!("Received update message");
+//                        let update_message = structs::updateMessage::from_bytes(&buf[19..n]);
+//                        match update_message {
+//                            Ok(update_message) => {
+//                                println!("Received update message: {:?}", update_message);
+//                            }
+//                            Err(e) => {
+//                                eprintln!("Error parsing update message: {}", e);
+//                            }
+//                        }
+//                    }
+//                    3 => {
+//                        println!("Received notification message");
+//                        let notification_message = structs::notificationMessage::from_bytes(&buf[19..n]);
+//                        match notification_message {
+//                            Ok(notification_message) => {
+//                                println!("Received notification message: {:?}", notification_message);
+//                            }
+//                            Err(e) => {
+//                                eprintln!("Error parsing notification message: {}", e);
+//                            }
+//                        }
+//                    }
+//                    4 => {
+//                        println!("Received keepalive message");
+//                        println!("Full buffer: {:?}", buf);
+//                        println!("Buffer length: {}", n);
+//                        let keepalive_message = structs::keepaliveMessage::from_bytes(&buf[0..n]);
+//                        match keepalive_message {
+//                            Ok(keepalive_message) => {
+//                                println!("Received keepalive message: {:?}", keepalive_message);
+//                            }
+//                            Err(e) => {
+//                                eprintln!("Error parsing keepalive message: {}", e);
+//                            }
+//                        }
+//                    }
+//                    _ => {
+//                        println!("Unknown message type: {}", header.clone().unwrap().message_type);
+//                    }
+//
+//                }
+//                let elapsed = current_time.elapsed().unwrap();
+//                println!("Time elapsed: {:?}", elapsed);
+//            }
+//            Err(e) => {
+//                eprintln!("Error reading from stream: {}", e);
+//                break;
+//            }
+//        }
+//    }
+//}
