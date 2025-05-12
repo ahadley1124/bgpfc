@@ -76,19 +76,20 @@ impl structs::openMessage {
         19 + 1 + 2 + 2 + 4 + 1 + self.opt_param_len as usize
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.header.to_bytes();
-        bytes.push(self.version);
-        bytes.extend_from_slice(&self.my_asn.to_be_bytes());
-        bytes.extend_from_slice(&self.hold_time.to_be_bytes());
-        bytes.extend_from_slice(&self.bgp_id.to_be_bytes());
-        bytes.push(self.opt_param_len);
-        bytes.extend_from_slice(&self.opt_params);
+    pub fn to_bytes(&self) -> [u8; 1024] {
+        let mut bytes: [u8; 1024] = [0; 1024];
+        bytes[0..19].copy_from_slice(&self.header.to_bytes());
+        bytes[19] = self.version;
+        bytes[20..22].copy_from_slice(&self.my_asn.to_be_bytes());
+        bytes[22..24].copy_from_slice(&self.hold_time.to_be_bytes());
+        bytes[24..28].copy_from_slice(&self.bgp_id.to_be_bytes());
+        bytes[28] = self.opt_param_len;
+        bytes[29..(29 + self.opt_param_len as usize)].copy_from_slice(&self.opt_params);
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 19 {
+        if bytes.len() < 29 {
             return Err("Invalid open message length");
         }
         let header = structs::Header::from_bytes(&bytes[0..19])?;
