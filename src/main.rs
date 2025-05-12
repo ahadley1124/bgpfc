@@ -1,3 +1,5 @@
+#![allow(nonstandard_style)]
+
 use std::net::SocketAddrV4;
 use std::io::{ Read, Write };
 
