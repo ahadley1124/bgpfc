@@ -24,25 +24,56 @@ fn my_open_message() -> structs::openMessage {
     structs::openMessage::new(header, version, my_asn, hold_time, bgp_id, opt_param_len, opt_params)
 }
 
+fn init_peer(stream: &mut std::net::TcpStream) -> Result<&mut std::net::TcpStream, &'static str> {
+    println!("Accepted connection from {}", stream.peer_addr().unwrap());
+    let open_message = my_open_message();
+    let open_message_bytes = open_message.to_bytes();
+    #[cfg(debug_assertions)]
+    println!("Sending open message: {:?}", open_message);
+    if let Err(e) = stream.write_all(&open_message_bytes) {
+        eprintln!("Failed to send open message: {}", e);
+        return Err("Failed to send open message");
+    } else {
+        #[cfg(debug_assertions)]
+        println!("Sent open message");
+    }
+    #[cfg(debug_assertions)]
+    println!("Sent open message: {:?}", open_message);
+    // Send keepalive message after sending open message
+    let keepalive = structs::keepaliveMessage::new(open_message.header);
+    let keepalive_bytes = keepalive.to_bytes();
+    if let Err(e) = stream.write_all(&keepalive_bytes) {
+        eprintln!("Failed to send keepalive: {}", e);
+        return Err("Failed to send keepalive");
+    } else {
+        #[cfg(debug_assertions)]
+        println!("Sent keepalive message");
+    }
+    stream.flush().unwrap();
+    Ok(stream)
+}
+
 fn main() {
     let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
     let listener = connection::bind_socket(addr).unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
-
-    let header = structs::Header::new([0; 16], 0, 1);
-
     //upon accepting a new connection, move it to a new thread
     loop {
         let (mut stream, _) = listener.accept().unwrap();
         println!("Accepted connection from {}", stream.peer_addr().unwrap());
-        let open_message = my_open_message();
-        let open_message_bytes = open_message.to_bytes();
-        stream.write_all(&open_message_bytes).unwrap();
-
+        // Initialize peer
+        if let Err(e) = init_peer(&mut stream) {
+            eprintln!("Error initializing peer: {}", e);
+            continue;
+        }
+        // Spawn a new thread to handle the connection
+        #[cfg(debug_assertions)]
+        println!("Spawning new thread to handle connection");
+        let mut stream_clone = stream.try_clone().unwrap();
         thread::spawn(move || {
             let mut buf: [u8; 1024] = [0; 1024];
             loop {
-                match stream.read(&mut buf) {
+                match stream_clone.read(&mut buf) {
                     Ok(0) => {
                         break;
                     } // Connection closed
@@ -124,7 +155,8 @@ fn main() {
                                 {
                                     println!("Unknown message type: {}", header.message_type);
                                 }
-                            }                        }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error reading from stream: {}", e);
