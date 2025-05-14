@@ -14,7 +14,7 @@ fn parse_header(input: [u8; 1024]) -> Result<structs::Header, &'static str> {
 }
 
 fn my_open_message() -> structs::openMessage {
-    let header = structs::Header::new([0; 16], 0, 1);
+    let header = structs::Header::new([255; 16], 0, 1);
     let version = 4;
     let my_asn = 65500;
     let hold_time = 300;
@@ -78,6 +78,7 @@ fn main() {
                         break;
                     } // Connection closed
                     Ok(n) => {
+                        println!("Full Buffer: {:?}", buf);
                         let header = match parse_header(buf) {
                             Ok(header) => {
                                 println!("Received header: {:?}", header);
@@ -178,6 +179,18 @@ fn test_parse_header() {
     assert_eq!(header.marker, [255; 16]);
     assert_eq!(header.length, 0);
     assert_eq!(header.message_type, 0);
+}
+
+#[test]
+fn test_my_open_message() {
+    let open_message = my_open_message();
+    assert_eq!(open_message.header.marker, [255; 16]);
+    assert_eq!(open_message.version, 4);
+    assert_eq!(open_message.my_asn, 65500);
+    assert_eq!(open_message.hold_time, 300);
+    assert_eq!(open_message.bgp_id, u32::from_be_bytes([10, 0, 1, 136]));
+    assert_eq!(open_message.opt_param_len, 0);
+    assert_eq!(open_message.opt_params.len(), 0);
 }
 
 //fn main() {
