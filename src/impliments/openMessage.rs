@@ -40,7 +40,8 @@ impl structs::openMessage {
         }
         let header = structs::Header::from_bytes(&bytes[0..19])?;
         let version = bytes[19];
-        let my_asn = u16::from_be_bytes([bytes[20], bytes[21]]);
+        let asn_bytes = [bytes[20], bytes[21]];
+        let my_asn = u16::from_be_bytes(asn_bytes);
         let hold_time = u16::from_be_bytes([bytes[22], bytes[23]]);
         let bgp_id = u32::from_be_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let opt_param_len = bytes[28];
