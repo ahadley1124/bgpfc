@@ -3,7 +3,6 @@
 use std::net::{SocketAddrV4, TcpStream};
 use std::io::{ Read, Write };
 use std::thread;
-use std::collections::HashMap;
 
 mod connection;
 mod structs;
@@ -99,4 +98,20 @@ fn main() {
     }
     // The following code is unreachable because of the infinite loop above.
     // If you want to support graceful shutdown, refactor the loop to break on some condition.
+}
+
+#[test]
+fn test_open_message() {
+    let mut open_message: [u8; 1024] = [0; 1024];
+    // add the byets [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x29, 0x01, 0x04, 0xc0, 0xa8, 0x01, 0x01, 0x00, 0xb4, 0x02, 0x06, 0x02, 0x06, 0x46, 0x01, 0x00, 0x01, 0x02, 0x02, 0x80]
+    open_message[0..16].copy_from_slice(&[0xff; 16]);
+    open_message[16..19].copy_from_slice(&[0x00, 0x29, 0x01]);
+    open_message[19..23].copy_from_slice(&[0x04, 0xc0, 0xa8, 0x01]);
+    open_message[23..27].copy_from_slice(&[0x01, 0x00, 0xb4, 0x02]);
+    open_message[27..31].copy_from_slice(&[0x06, 0x02, 0x06, 0x46]);
+    open_message[31..35].copy_from_slice(&[0x01, 0x00, 0x01, 0x02]);
+    open_message[35..39].copy_from_slice(&[0x02, 0x80, 0x00, 0x00]);
+    println!("open_message: {:?}", open_message);
+    let parsed_open_message = structs::openMessage::from_bytes(&open_message).unwrap();
+    assert_eq!(open_message, parsed_open_message.to_bytes());
 }
