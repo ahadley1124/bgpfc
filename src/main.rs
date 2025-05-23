@@ -118,3 +118,22 @@ fn test_open_message() {
     println!("Parsed open message: {:?}", parsed_open_message);
     assert_eq!(open_message, parsed_open_message.to_bytes());
 }
+
+#[test]
+fn test_update_message() {
+    let update_message: [u8; 41] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x29, 0x02, 0x00, 0x00, 0x00, 0x0e, 0x40,
+        0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03,
+        0x04, 0x0a, 0x00, 0x00, 0x01, 0x18, 0x17, 0xbe,
+        0xd8,
+    ];
+    println!("update_message: {:?}", update_message);
+    println!("update_message length: {}", update_message.len());
+    let parsed_header = structs::Header::from_bytes(&update_message[0..19]).unwrap();
+    println!("Parsed header: {:?}", parsed_header);
+    let parsed_update_message = structs::updateMessage::from_bytes(&update_message[..]).unwrap();
+    println!("Parsed update message: {:?}", parsed_update_message);
+    assert_eq!(update_message.as_ref(), parsed_update_message.to_bytes().as_slice());
+}
