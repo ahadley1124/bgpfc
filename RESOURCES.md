@@ -1,6 +1,6 @@
 # Resources
 
-## Below are RFC's and other links that are relevant to the BGP specification.
+## Below are RFC's and other links that are relevant to the BGP specification
 
 - [RFC 2796 - BGP Route Reflection - An Alternative to Full Mesh IBGP](https://datatracker.ietf.org/doc/html/rfc2796)
 - [RFC 4271 - A Border Gateway Protocol 4 (BGP-4)](https://datatracker.ietf.org/doc/html/rfc4271)
