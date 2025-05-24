@@ -1,3 +1,6 @@
+use std::net::IpAddr;
+use serde::{Serialize, Deserialize};
+
 pub struct Header {
     pub marker: [u8; 16],
     pub length: u16,
@@ -38,4 +41,24 @@ pub struct notificationMessage {
     pub error_code: u8,
     pub error_subcode: u8,
     pub data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Configuration {
+    pub my_asn: u16,
+    pub hold_time: u16,
+    pub bgp_id: IpAddr,
+    pub networks: Vec<Networks>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Networks {
+    pub prefix: IpAddr,
+    pub mask: u8,
+    pub next_hop: IpAddr,
+    pub as_path: Vec<u16>,
+    pub internal: bool,
+    pub local_pref: u32,
 }

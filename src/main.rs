@@ -7,6 +7,7 @@ use std::thread;
 mod connection;
 mod structs;
 mod impliments;
+mod setup;
 
 fn parse_header(input: [u8; 1024]) -> Result<structs::Header, &'static str> {
     let header = structs::Header::from_bytes(&input[0..19])?;
@@ -54,6 +55,15 @@ fn init_peer(stream: &mut std::net::TcpStream) -> Result<&mut std::net::TcpStrea
 }
 
 fn main() {
+    // Load configuration
+    let config = setup::json::main();
+    let config = match config {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to load configuration: {}", e);
+            return;
+        }
+    };
     let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
     let listener = connection::bind_socket(addr).unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
