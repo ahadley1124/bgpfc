@@ -57,6 +57,9 @@ pub fn parse_config(config: &serde_json::Value) -> Result<structs::Configuration
             as_path,
             internal,
             local_pref,
+            rpki_valid: Some(true), // Default value, can be modified later
+            rpki_partial_valid: None, // Default value, can be modified later
+            rpki_invalid: None, // Default value, can be modified later
         });
     }
 

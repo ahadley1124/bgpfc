@@ -61,4 +61,44 @@ pub struct Networks {
     pub as_path: Vec<u16>,
     pub internal: bool,
     pub local_pref: u32,
+    pub rpki_valid: Option<bool>,
+    pub rpki_partial_valid: Option<bool>,
+    pub rpki_invalid: Option<bool>,
+}
+
+pub struct RPKI_PDU {
+    pub version: u8,
+    pub PDU_type: u8,
+    pub serial_number: u32,
+    pub session_id: u32,
+    pub length: u32,
+    pub flags: u8,
+    pub prefix_length: u8,
+    pub max_length: u8,
+    pub prefix: IpAddr,
+    pub asn: u32,
+    zero: u8,
+}
+
+pub struct RPKI_Serial_Notify {
+    pub version: u8,
+    pub PDU_type: u8,
+    pub session_id: u32,
+    pub length: u32,
+    pub serial_number: u32,
+}
+
+pub struct RPKI_Serial_Query {
+    pub version: u8,
+    pub PDU_type: u8,
+    pub session_id: u32,
+    pub length: u32,
+    pub serial_number: u32,
+}
+
+pub struct RPKI_Reset_Query {
+    pub version: u8,
+    pub PDU_type: u8,
+    pub reserved: u16,
+    pub length: u32,
 }
