@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 
 use crate::structs::{self, Configuration};
+use std::collections::HashMap;
 
 static CONFIG_FILE: &str = "config.json";
 static DEFAULT_CONFIG: &str = r#"
@@ -45,8 +46,11 @@ pub fn parse_config(config: &serde_json::Value) -> Result<structs::Configuration
             .ok_or("Invalid as_path")?
             .iter()
             .filter_map(|x| x.as_u64())
-            .map(|x| x as u16)
-            .collect::<Vec<u16>>();
+            .map(|x| x as u8)
+            .fold(HashMap::new(), |mut acc, asn| {
+            *acc.entry(asn).or_insert(0) += 1;
+            acc
+            });
         let internal = network["internal"].as_bool().unwrap_or(false);
         let local_pref = network["local_pref"].as_u64().unwrap_or(100) as u32;
 

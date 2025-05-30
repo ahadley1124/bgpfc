@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 
 pub struct Header {
     pub marker: [u8; 16],
@@ -58,7 +59,7 @@ pub struct Networks {
     pub prefix: IpAddr,
     pub mask: u8,
     pub next_hop: IpAddr,
-    pub as_path: Vec<u16>,
+    pub as_path: HashMap<u8, u32>,
     pub internal: bool,
     pub local_pref: u32,
     pub rpki_valid: Option<bool>,
