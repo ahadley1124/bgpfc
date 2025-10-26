@@ -7,6 +7,7 @@ use std::thread;
 mod connection;
 mod structs;
 mod impliments;
+mod setup;
 
 fn parse_header(input: [u8; 1024]) -> Result<structs::Header, &'static str> {
     let header = structs::Header::from_bytes(&input[0..19])?;
@@ -54,6 +55,15 @@ fn init_peer(stream: &mut std::net::TcpStream) -> Result<&mut std::net::TcpStrea
 }
 
 fn main() {
+    // Load configuration
+    let config = setup::json::main();
+    match config {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to load configuration: {}", e);
+            return;
+        }
+    };
     let addr = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 179);
     let listener = connection::bind_socket(addr).unwrap();
     println!("Listening on {}", listener.local_addr().unwrap());
@@ -117,4 +127,39 @@ fn test_open_message() {
     let parsed_open_message = structs::openMessage::from_bytes(&open_message[..29]).unwrap();
     println!("Parsed open message: {:?}", parsed_open_message);
     assert_eq!(open_message, parsed_open_message.to_bytes());
+}
+
+#[test]
+fn test_update_message() {
+    let update_message: [u8; 41] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x29, 0x02, 0x00, 0x00, 0x00, 0x0e, 0x40,
+        0x01, 0x01, 0x00, 0x40, 0x02, 0x00, 0x40, 0x03,
+        0x04, 0x0a, 0x00, 0x00, 0x01, 0x18, 0x17, 0xbe,
+        0xd8,
+    ];
+    println!("update_message: {:?}", update_message);
+    println!("update_message length: {}", update_message.len());
+    let parsed_header = structs::Header::from_bytes(&update_message[0..19]).unwrap();
+    println!("Parsed header: {:?}", parsed_header);
+    let parsed_update_message = structs::updateMessage::from_bytes(&update_message[..]).unwrap();
+    println!("Parsed update message: {:?}", parsed_update_message);
+    assert_eq!(update_message.as_ref(), parsed_update_message.to_bytes().as_slice());
+}
+
+#[test]
+fn test_keepalive_message() {
+    let keepalive_message: [u8; 19] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x13, 0x03,
+        ];
+    println!("keepalive_message: {:?}", keepalive_message);
+    println!("keepalive_message length: {}", keepalive_message.len());
+    let parsed_header = structs::Header::from_bytes(&keepalive_message[0..19]).unwrap();
+    println!("Parsed header: {:?}", parsed_header);
+    let parsed_keepalive_message = structs::keepaliveMessage::from_bytes(&keepalive_message[..]).unwrap();
+    println!("Parsed keepalive message: {:?}", parsed_keepalive_message);
+    assert_eq!(keepalive_message.as_ref(), parsed_keepalive_message.to_bytes().as_slice());
 }
