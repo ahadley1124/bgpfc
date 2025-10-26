@@ -8,7 +8,7 @@
 - [RFC 4760 - Multiprotocol Extensions for BGP-4](https://datatracker.ietf.org/doc/html/rfc4760)
 - [RFC 6793 - BGP Support for Four-Octet AS Number Space](https://datatracker.ietf.org/doc/html/rfc6793)
 - [RFC 6811 - BGP Prefix Origin Validation](https://datatracker.ietf.org/doc/html/rfc6811)
-- [RFC 7938 - BGP Large Communities](https://datatracker.ietf.org/doc/html/rfc7938)
+- [RFC 8092 - BGP Large Communities](https://datatracker.ietf.org/doc/html/rfc8092)
 - [RFC 8654 - BGP Prefix-SID Encoding](https://datatracker.ietf.org/doc/html/rfc8654)
 - [RFC 8893 - Resource Public Key Infrastructure (RPKI) Origin Validation for BGP Export](https://datatracker.ietf.org/doc/html/rfc8893)
 - [RFC 8950 - BGP Encodings for Link State and TE Metric Extensions](https://datatracker.ietf.org/doc/html/rfc8950)
