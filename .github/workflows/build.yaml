@@ -43,4 +43,4 @@ jobs:
         with:
           name: build-${{ matrix.os }}
           path: |
-            target/release/bgpfc${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+            target/release/openbgpify${{ matrix.os == 'windows-latest' && '.exe' || '' }}
