@@ -1,0 +1,19 @@
+name: Set up Rust
+description: >-
+  Installs the Rust toolchain used by this repository. Kept as a composite
+  action so the toolchain is defined in exactly one place.
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install.
+    required: false
+    default: stable
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        override: true
