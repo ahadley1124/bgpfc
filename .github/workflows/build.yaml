@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -16,10 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: ./.github/actions/setup-rust
 
       - name: Run tests
         run: cargo test --verbose
@@ -36,10 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: ./.github/actions/setup-rust
 
       - name: Build
         run: cargo build --release --verbose
@@ -48,5 +45,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}
+          if-no-files-found: error
           path: |
-            target/release/bgpfc${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+            target/release/openbgpify${{ matrix.os == 'windows-latest' && '.exe' || '' }}

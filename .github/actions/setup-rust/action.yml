@@ -1,0 +1,40 @@
+name: Set up Rust
+description: >-
+  Installs the Rust toolchain used by this repository and restores the cargo
+  cache. Kept as a composite action so the toolchain and the cache
+  configuration are each defined in exactly one place.
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install.
+    required: false
+    default: stable
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        rustup toolchain install "$TOOLCHAIN" --no-self-update
+        rustup override set "$TOOLCHAIN"
+        rustc --version
+        cargo --version
+
+    # registry/src is left out on purpose: cargo regenerates it from
+    # registry/cache, so caching both just doubles the upload.
+    # github.job keeps jobs that build different profiles (debug vs
+    # release) from overwriting each other's target/ cache.
+    - name: Cache cargo registry and build output
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-${{ runner.os }}-${{ github.job }}-
