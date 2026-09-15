@@ -1,52 +1,106 @@
-name: Build Rust Project
+name: CI
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in step with rust-version in Cargo.toml once the crate exists.
+  MSRV: "1.85"
 
 jobs:
+  # There is no Cargo project in this repository yet — the prototype was removed
+  # and the rewrite has not started. Every job below is gated on this check so
+  # CI stays green (and honest) until the first code lands, at which point it
+  # starts doing real work with no workflow changes needed.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_crate: ${{ steps.check.outputs.has_crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "has_crate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_crate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Cargo.toml yet — skipping build, lint and test."
+          fi
+
+  # Zero runtime dependencies is a project rule, not an aspiration. Fail the
+  # build if [dependencies] ever grows an entry without the manifest being
+  # changed deliberately. [dev-dependencies] are allowed and not checked here.
+  no-deps:
+    needs: detect
+    if: needs.detect.outputs.has_crate == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert empty [dependencies]
+        run: |
+          deps=$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && NF && $0 !~ /^#/' Cargo.toml)
+          if [ -n "$deps" ]; then
+            echo "::error::Runtime dependencies found; this project is std-only."
+            echo "$deps"
+            exit 1
+          fi
+
+  lint:
+    needs: detect
+    if: needs.detect.outputs.has_crate == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    needs: detect
+    if: needs.detect.outputs.has_crate == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - run: cargo check --all-targets
+
   test:
+    needs: detect
+    if: needs.detect.outputs.has_crate == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Run tests
-        run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets --verbose
 
   build:
-    needs: test
+    needs: [detect, test]
+    if: needs.detect.outputs.has_crate == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --verbose
+      - uses: actions/upload-artifact@v4
         with:
-          toolchain: stable
-          override: true
-
-      - name: Build
-        run: cargo build --release --verbose
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-${{ matrix.os }}
+          name: openbgpify-${{ matrix.os }}
           path: |
-            target/release/bgpfc${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+            target/release/openbgpify
+            target/release/openbgpify.exe
+          if-no-files-found: error
