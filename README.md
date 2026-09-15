@@ -167,7 +167,7 @@ Not planned, and a patch implementing one will be declined unless the scope
 decision is revisited first:
 
 - MPLS VPNs (RFC 4364) and EVPN (RFC 7432)
-- BGP-LS (RFC 9552) and Segment Routing Policy (RFC 9830)
+- BGP-LS (RFC 9552) and Segment Routing Policy distribution
 - FlowSpec (RFC 8955)
 - BGPsec (RFC 8205)
 - Route-server operation (RFC 7947)
