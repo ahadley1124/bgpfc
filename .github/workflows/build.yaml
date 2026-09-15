@@ -45,5 +45,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}
+          if-no-files-found: error
           path: |
             target/release/openbgpify${{ matrix.os == 'windows-latest' && '.exe' || '' }}
