@@ -103,7 +103,7 @@ its RTR socket auto-wired to localhost. The operator configures one thing, in
 one file, and gets a validating speaker. Pointing at an existing organizational
 validator instead — and skipping the sidecar entirely — stays a config option.
 
-## v1 goals
+## v1.0.0 goals
 
 - **Wire format** — header, OPEN, KEEPALIVE, NOTIFICATION encode/decode; 4-byte
   ASN negotiation with AS_TRANS fallback (RFC 6793); Multiprotocol Extensions
@@ -143,7 +143,7 @@ validator instead — and skipping the sidecar entirely — stays a config optio
   implementations cross-checking the parser is the point; a speaker that only
   talks to itself validates nothing.
 
-## v1.1 goals
+## v1.1.0 goals
 
 - **ASPA (opt-in, draft-track)** — see below.
 - **Fuller sidecar supervision** — backoff, health checks, log plumbing,
