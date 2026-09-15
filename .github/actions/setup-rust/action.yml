@@ -13,7 +13,11 @@ runs:
   using: composite
   steps:
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ inputs.toolchain }}
-        override: true
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        rustup toolchain install "$TOOLCHAIN" --no-self-update
+        rustup override set "$TOOLCHAIN"
+        rustc --version
+        cargo --version
