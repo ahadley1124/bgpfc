@@ -1,0 +1,6 @@
+# Third-party assets pulled in from the /brag skill and npm at build time.
+# They are not redistributed here — see README.md to restore them before re-rendering.
+composition/assets/music/
+composition/assets/sfx/
+composition/vendor/
+composition/snapshots/

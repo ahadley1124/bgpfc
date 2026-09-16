@@ -1,0 +1,3 @@
+I wrote a BGP-4 speaker in Rust. It binds TCP/179, hand-parses the 19-byte header, and codes
+OPEN, UPDATE, KEEPALIVE and NOTIFICATION byte for byte — about 700 lines, two dependencies.
+It is compliant with zero RFCs. We are working on it.
