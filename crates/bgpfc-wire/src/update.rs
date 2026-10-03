@@ -481,9 +481,11 @@ fn unknown_attribute(raw: &RawAttribute<'_>) -> Result<Outcome, UpdateError> {
         return Ok(Outcome::Ignore);
     }
     // RFC 4271 §5: unrecognised transitive optional attributes are kept and
-    // passed on with the Partial bit set.
+    // passed on with the Partial bit set. RFC 4271 §4.3: the low-order four
+    // flag bits are ignored on receipt, and Extended Length is a property
+    // of the encoding, so only the category bits and Partial are kept.
     Ok(Outcome::Keep(PathAttribute::Unknown {
-        flags: raw.flags & !flags::EXTENDED_LENGTH,
+        flags: raw.flags & (flags::OPTIONAL | flags::TRANSITIVE | flags::PARTIAL),
         code: raw.code,
         value: raw.value.to_vec(),
     }))
@@ -965,6 +967,38 @@ mod tests {
             UpdateSubcode::UnrecognizedWellKnownAttribute as u8
         );
         assert_eq!(e.notification.data, vec![0x40, 99, 1, 7]);
+    }
+
+    #[test]
+    fn unused_flag_bits_are_ignored_on_receipt() {
+        // Found by the update fuzz target: RFC 4271 §4.3 says the low four
+        // flag bits MUST be ignored, so an unknown attribute with them set
+        // must decode to, and re-encode as, the same canonical flags.
+        let wire = [0, 1, 0, 0, 4, 0xf9, 0, 0, 0];
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(
+            d.message.attributes,
+            vec![PathAttribute::Unknown {
+                flags: 0xe0,
+                code: 0,
+                value: vec![],
+            }]
+        );
+        // The input used the Extended Length form; the canonical encoding
+        // uses one length octet, so only the decoded form must match.
+        let again = d.message.encode(&ENC4).unwrap();
+        assert_eq!(again, [0, 1, 0, 0, 3, 0xe0, 0, 0]);
+        assert_eq!(
+            UpdateMessage::decode(&again, &EBGP4).unwrap().message,
+            d.message
+        );
+        // A known attribute with junk low bits is still recognised.
+        let mut junk = ANNOUNCE.to_vec();
+        junk[4] = 0x4f;
+        assert_eq!(
+            UpdateMessage::decode(&junk, &EBGP2).unwrap().message,
+            announce()
+        );
     }
 
     #[test]
