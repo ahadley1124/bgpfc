@@ -193,7 +193,8 @@ with `fib { mode dry-run; }`.
 
 At startup, bgpfcd reads its effective capabilities from `/proc/self/status`. It
 reports any capability that is missing and exits, unless the configuration does
-not need it.
+not need it. `contrib/bgpfcd.service` is a complete unit with the capabilities
+and hardening settings.
 
 ### Option B: start as root, drop privileges
 
