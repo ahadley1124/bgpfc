@@ -215,7 +215,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
     );
     let log = bgpfcd.log_text();
     assert!(
-        log.contains(&format!("prefix=192.0.2.0/24 next_hop={}", lab.b_addr)),
+        log.contains(&format!("prefix=192.0.2.0/24 gateway={}", lab.b_addr)),
         "{log}"
     );
 
@@ -325,7 +325,7 @@ fn export_policy_filters_and_sets() {
     assert!(
         !bgpfcd
             .log_text()
-            .contains("prefix=198.51.100.0/24 next_hop"),
+            .contains("prefix=198.51.100.0/24 gateway"),
         "{}",
         bgpfcd.log_text()
     );
