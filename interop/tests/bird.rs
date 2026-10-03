@@ -215,7 +215,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
     );
     let log = bgpfcd.log_text();
     assert!(
-        log.contains(&format!("prefix=192.0.2.0/24 next_hop={}", lab.b_addr)),
+        log.contains(&format!("prefix=192.0.2.0/24 gateway={}", lab.b_addr)),
         "{log}"
     );
 
@@ -228,7 +228,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
     });
     assert!(ok, "withdraw not relayed:\n{}", bgpfcd.log_text());
     assert!(
-        bgpfcd.log_text().contains("fib: delete"),
+        bgpfcd.log_text().contains("op=delete"),
         "{}",
         bgpfcd.log_text()
     );
@@ -323,9 +323,7 @@ fn export_policy_filters_and_sets() {
     // Rejected on import: never reaches BIRD 2, nor the FIB.
     assert!(!routes.contains("198.51.100.0/24"), "{routes}");
     assert!(
-        !bgpfcd
-            .log_text()
-            .contains("prefix=198.51.100.0/24 next_hop"),
+        !bgpfcd.log_text().contains("prefix=198.51.100.0/24 gateway"),
         "{}",
         bgpfcd.log_text()
     );
@@ -335,4 +333,79 @@ fn export_policy_filters_and_sets() {
         "{routes}"
     );
     assert!(routes.contains("(65000,42)"), "{routes}");
+}
+
+/// Install mode: relayed routes land in the kernel table of bgpfcd's
+/// namespace with our protocol number, leave with the withdraw, and are
+/// all removed on SIGTERM, which also sends BIRD a Cease.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn fib_install_and_clean_shutdown() {
+    let lab = Lab::new("k", 7);
+    let bird = Bird::start(
+        &lab,
+        &lab.b.clone(),
+        &bird_opts(&lab, true, &["192.0.2.0/24", "198.51.100.0/24"]),
+    );
+    let mut opts = bgpfcd_opts(&lab, false);
+    opts.extra = "fib { mode install; }".to_owned();
+    let mut bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
+    assert_established(&lab, &bird, &bgpfcd);
+    let ns_a = lab.a.clone();
+    let routes = |lab: &Lab| interop::Daemon::ip_in(lab, &ns_a, &["route", "show", "proto", "186"]);
+    let ok = wait_for(Duration::from_secs(15), || {
+        let r = routes(&lab);
+        r.contains("192.0.2.0/24") && r.contains("198.51.100.0/24")
+    });
+    let r = routes(&lab);
+    assert!(ok, "routes not installed:\n{r}\n{}", bgpfcd.log_text());
+    assert!(r.contains(&format!("via {}", lab.b_addr)), "{r}");
+    assert!(r.contains("metric 20"), "{r}");
+    assert!(
+        bgpfcd.log_text().contains("fib: applied"),
+        "{}",
+        bgpfcd.log_text()
+    );
+
+    // Withdraw one: only the other stays.
+    let _ = bird.birdc(&lab, &["disable", "static1"]);
+    let ok = wait_for(Duration::from_secs(15), || {
+        !routes(&lab).contains("192.0.2.0/24")
+    });
+    assert!(
+        ok,
+        "route not removed:\n{}\n{}",
+        routes(&lab),
+        bgpfcd.log_text()
+    );
+    let _ = bird.birdc(&lab, &["enable", "static1"]);
+    let ok = wait_for(Duration::from_secs(15), || {
+        routes(&lab).contains("192.0.2.0/24")
+    });
+    assert!(ok, "route not reinstalled:\n{}", bgpfcd.log_text());
+
+    // SIGTERM: Cease to BIRD, routes gone, process exits.
+    assert!(
+        bgpfcd.terminate(Duration::from_secs(10)),
+        "did not exit:\n{}",
+        bgpfcd.log_text()
+    );
+    let r = routes(&lab);
+    assert!(
+        r.trim().is_empty(),
+        "routes left behind:\n{r}\n{}",
+        bgpfcd.log_text()
+    );
+    let ok = wait_for(Duration::from_secs(10), || {
+        let s = bird.peer_status(&lab);
+        s.contains("Received: Cease") || !s.contains("Established")
+    });
+    assert!(ok, "bird still up:\n{}", bird.peer_status(&lab));
+    assert!(
+        bird.daemon
+            .log_text()
+            .contains("Received: Administrative shutdown"),
+        "{}",
+        bird.daemon.log_text()
+    );
 }

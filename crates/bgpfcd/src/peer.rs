@@ -72,7 +72,8 @@ struct Conn {
     initiator: Initiator,
 }
 
-struct Peer {
+/// One neighbour's thread state.
+pub(crate) struct Peer {
     cfg: PeerConfig,
     fsm: Fsm,
     rx: Receiver<PeerInput>,
@@ -90,8 +91,9 @@ struct Peer {
     overrun: Arc<AtomicBool>,
 }
 
-/// Start the peer thread; it begins with a `ManualStart`.
-pub(crate) fn spawn(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> PeerHandle {
+/// Prepare a peer: its handle can go into the peer table before the
+/// thread runs (listeners bind and privileges drop in between).
+pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
     let overrun = Arc::new(AtomicBool::new(false));
     let handle = PeerHandle {
@@ -114,14 +116,19 @@ pub(crate) fn spawn(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> PeerHandle {
         write_failed: false,
         overrun,
     };
-    thread::Builder::new()
-        .name(format!("peer-{}", handle.addr))
-        .spawn(move || peer.run())
-        .expect("spawning a peer thread");
-    handle
+    (handle, peer)
 }
 
 impl Peer {
+    /// Start the peer thread; it begins with a `ManualStart`.
+    pub(crate) fn start(self) {
+        let name = format!("peer-{}", self.cfg.addr);
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || self.run())
+            .expect("spawning a peer thread");
+    }
+
     fn run(mut self) {
         self.event(Event::ManualStart, Instant::now());
         loop {
@@ -133,7 +140,11 @@ impl Peer {
                     d.saturating_duration_since(now)
                 });
             match self.rx.recv_timeout(timeout) {
-                Ok(input) => self.input(input),
+                Ok(input) => {
+                    if !self.input(input) {
+                        return;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -253,13 +264,14 @@ impl Peer {
         }
     }
 
-    fn input(&mut self, input: PeerInput) {
+    /// Handle one input; `false` when the thread should end.
+    fn input(&mut self, input: PeerInput) -> bool {
         let now = Instant::now();
         match input {
             PeerInput::Connected { attempt, result } => {
                 if attempt != self.attempt {
                     // An attempt the FSM gave up on; the stream closes on drop.
-                    return;
+                    return true;
                 }
                 match result {
                     Ok(stream) => self.accept_stream(stream, Initiator::Local, now),
@@ -295,6 +307,13 @@ impl Peer {
                     self.fsm.message_sent(now);
                 }
             }
+            PeerInput::Stop => {
+                // RFC 4271 §8.2.2 ManualStop: a Cease goes out (RFC 4486
+                // §4 Administrative Shutdown) and the FSM returns to Idle.
+                self.event(Event::ManualStop, now);
+                self.drop_conn();
+                return false;
+            }
         }
         if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
             // RFC 4486 §4: Out of Resources. The peer restarts and gets a
@@ -308,6 +327,7 @@ impl Peer {
                 now,
             );
         }
+        true
     }
 
     /// A TCP connection completed, ours or theirs.

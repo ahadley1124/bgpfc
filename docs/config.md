@@ -188,8 +188,17 @@ session.
 
 ```
 bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
+       [--user USER [--group GROUP]]
 ```
 
-`--check` parses and validates the file, prints any errors, and exits with
-status 0 or 1 without starting anything. `--log-level` and `--fib` override
-the corresponding settings in the file for this run.
+`--check` parses and validates the file (policies included), prints any
+errors, and exits with status 0 or 1 without starting anything.
+`--log-level` and `--fib` override the corresponding settings in the file
+for this run. `--user` is for a daemon started as root: the listeners and
+the netlink socket are opened first, then the process drops to that user
+(README, "Option B"). Without it, an unprivileged daemon must hold
+`CAP_NET_BIND_SERVICE` for a listen port below 1024 and `CAP_NET_ADMIN`
+for `fib { mode install; }`; the daemon checks and names what is missing.
+
+`SIGTERM` and `SIGINT` shut the daemon down: every session gets a Cease
+(Administrative Shutdown) and every route it installed is removed.

@@ -12,7 +12,8 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   ("config golden" is `crates/bgpfc-config/tests/golden/`), `rib/` is
   `crates/bgpfc-rib/src/` ("rib tests" are `crates/bgpfc-rib/src/tests.rs`),
   `policy/` is `crates/bgpfc-policy/src/` ("policy tests" are
-  `crates/bgpfc-policy/src/tests.rs`), and "interop" names a test in
+  `crates/bgpfc-policy/src/tests.rs`), `fib/` is `crates/bgpfc-fib/src/`,
+  `sys/` is `crates/bgpfc-sys/src/`, and "interop" names a test in
   `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
@@ -131,7 +132,7 @@ is `done`.
 | 3.2 | Adj-RIBs-In, Loc-RIB and Adj-RIBs-Out (conceptual) | MUST | done (one table per family holds every candidate and the chosen route; Adj-RIB-Out per peer) | rib/lib.rs `Rib` | rib tests `announce_withdraw_and_fib_changes` |
 | 9 | Run the decision process when an UPDATE changes the Adj-RIB-In | MUST | done (for the destinations the UPDATE touched) | rib/lib.rs `Rib::update`, `reconsider` | rib tests `announce_withdraw_and_fib_changes`, order.rs `loc_rib_is_independent_of_arrival_order` |
 | 9.1.1 | Phase 1: degree of preference is `LOCAL_PREF` for internal routes, local policy otherwise | MUST | done (import policy `set local-pref`, 100 otherwise) | rib/decision.rs `Candidate::degree_of_preference`, policy/lib.rs `apply` | rib tests `degree_of_preference_wins_first`, policy tests `engine_applies_each_neighbors_policies` |
-| 9.1.2 | A route whose `NEXT_HOP` is unresolvable is excluded from Phase 2 | MUST | deviates (no IGP; every next hop counts as resolvable until the FIB thread of milestone 7 can tell) | rib/decision.rs | |
+| 9.1.2 | A route whose `NEXT_HOP` is unresolvable is excluded from Phase 2 | MUST | deviates (no IGP; every next hop counts as resolvable in the decision; the kernel rejects a route whose gateway it cannot reach and the failure is logged) | rib/decision.rs, bgpfcd/fib.rs `report` | |
 | 9.1.2 | A route whose `AS_PATH` contains an AS loop is excluded from Phase 2 | SHOULD | done (not even stored) | rib/lib.rs `Rib::update` | rib tests `as_loop_routes_are_excluded` |
 | 9.1.2 | Select the route with the highest degree of preference; one route per destination | MUST | done | rib/decision.rs `best` | rib tests `degree_of_preference_wins_first` |
 | 9.1.2.2 a | Tie-break: shortest `AS_PATH`, `AS_SET` counts one, confederation segments zero | MUST | done | rib/decision.rs `path_length`, wire/as_path.rs `hop_count` | rib tests `shorter_as_path_wins`, `as_set_counts_as_one_hop` |
@@ -147,7 +148,7 @@ is `done`.
 | 9.2 | Initial Adj-RIB-Out after a session is established | MUST | done | rib/lib.rs `peer_up`, `refresh` | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it`, interop `routes_are_relayed_withdrawn_and_refreshed` |
 | 9.2.1.1 | `MinRouteAdvertisementIntervalTimer` between UPDATEs for the same destination | MUST | todo (updates are sent as the Loc-RIB changes) | | |
 | 9.2.2 | Withdrawn and feasible routes may share an UPDATE; a withdrawn route may be omitted when the same UPDATE announces its replacement | MAY | done (withdrawals and announcements go in separate UPDATEs; a replacement announcement implicitly withdraws) | rib/export.rs `Batch::encode` | rib tests `announce_withdraw_and_fib_changes` |
-| 9.3 | Loc-RIB routes are installed in the forwarding table | MUST | partial (changes are reported as `FibChange`; the FIB thread is milestone 7) | rib/lib.rs `Output::Fib`, bgpfcd/rib.rs `deliver` | rib tests `announce_withdraw_and_fib_changes` |
+| 9.3 | Loc-RIB routes are installed in the forwarding table | MUST | done (rtnetlink, our protocol number, one table; dry-run by default) | fib/lib.rs `Fib`, bgpfcd/fib.rs | fib/route.rs `requests_match_iproute2_captures`, interop `fib_install_and_clean_shutdown` |
 
 ## RFC 5492 — Capabilities Advertisement
 

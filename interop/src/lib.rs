@@ -186,6 +186,34 @@ impl Daemon {
         let _ = self.child.wait();
     }
 
+    /// Send `SIGTERM` and wait up to `timeout` for the process to exit;
+    /// whether it did.
+    pub fn terminate(&mut self, timeout: Duration) -> bool {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// `ip` output from inside namespace `ns`.
+    ///
+    /// # Panics
+    /// If `ip` cannot be run.
+    #[must_use]
+    pub fn ip_in(lab: &Lab, ns: &str, args: &[&str]) -> String {
+        let mut cmd = lab.exec(ns, "ip");
+        cmd.args(args);
+        let out = cmd.output().expect("ip");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     /// Whether the process is still running.
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))

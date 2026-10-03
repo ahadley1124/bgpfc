@@ -5,7 +5,7 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
 
 use bgpfc_fsm::Session;
@@ -13,7 +13,7 @@ use bgpfc_rib::{Output, PeerInfo, Policies, Rib};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
-use crate::messages::{PeerInput, RibMsg};
+use crate::messages::{FibMsg, PeerInput, RibMsg};
 
 /// Start the RIB thread.
 pub(crate) fn spawn(
@@ -21,14 +21,21 @@ pub(crate) fn spawn(
     policies: Box<dyn Policies>,
     rx: Receiver<RibMsg>,
     peers: PeerTable,
+    fib: SyncSender<FibMsg>,
 ) {
     thread::Builder::new()
         .name("rib".to_owned())
-        .spawn(move || run(local_as, policies, &rx, &peers))
+        .spawn(move || run(local_as, policies, &rx, &peers, &fib))
         .expect("spawning the rib thread");
 }
 
-fn run(local_as: Asn, policies: Box<dyn Policies>, rx: &Receiver<RibMsg>, peers: &PeerTable) {
+fn run(
+    local_as: Asn,
+    policies: Box<dyn Policies>,
+    rx: &Receiver<RibMsg>,
+    peers: &PeerTable,
+    fib: &SyncSender<FibMsg>,
+) {
     let mut rib = Rib::with_policies(local_as, policies);
     while let Ok(msg) = rx.recv() {
         let outputs = match msg {
@@ -97,7 +104,7 @@ fn run(local_as: Asn, policies: Box<dyn Policies>, rx: &Receiver<RibMsg>, peers:
                 rib.peer_down(peer)
             }
         };
-        deliver(outputs, peers);
+        deliver(outputs, peers, fib);
     }
 }
 
@@ -114,20 +121,16 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session) -> PeerInfo {
     }
 }
 
-fn deliver(outputs: Vec<Output>, peers: &PeerTable) {
+fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
     for o in outputs {
         match o {
-            Output::Fib(c) => match c.next_hop {
-                // The FIB thread (milestone 7) will take these; until then
-                // every mode is dry-run.
-                Some(nh) => bgpfc_log::debug!(
-                    "fib: route",
-                    family = c.family,
-                    prefix = c.prefix,
-                    next_hop = nh
-                ),
-                None => bgpfc_log::debug!("fib: delete", family = c.family, prefix = c.prefix),
-            },
+            Output::Fib(c) => {
+                // A bounded channel: a slow kernel slows the RIB rather
+                // than growing memory (AGENTS.md §3 backpressure).
+                if fib.send(FibMsg::Change(c)).is_err() {
+                    bgpfc_log::error!("fib thread gone");
+                }
+            }
             Output::Send { peer, messages } => {
                 let Some(handle) = peers.get(&peer) else {
                     continue;
