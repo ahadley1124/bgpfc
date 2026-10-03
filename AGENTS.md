@@ -180,7 +180,9 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 
 **Logging.**
 - `bgpfc-log` writes one line per event to stderr, in this format:
-  `2026-10-03T12:34:56.789Z INFO  peer=198.51.100.1 msg="session established" hold=90`.
+  `2026-10-03T12:34:56.789Z INFO  msg="session established" peer=198.51.100.1 hold=90`.
+  `msg` comes first and is always quoted; fields follow in call order and
+  are quoted only when they contain whitespace, `"`, `\` or `=`.
 - Levels are `error`, `warn`, `info`, `debug`, and `trace`.
 - Timestamps are UTC, formatted by hand from `SystemTime`, because std has no
   date formatting.
