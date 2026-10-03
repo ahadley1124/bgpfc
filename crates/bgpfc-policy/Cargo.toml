@@ -12,5 +12,12 @@ bgpfc-config.workspace = true
 bgpfc-rib.workspace = true
 bgpfc-wire.workspace = true
 
+[dev-dependencies]
+criterion = "0.5"
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "policy"
+harness = false
