@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "interop"]
+# `interop` drives external daemons and needs root; it is built and run only
+# when asked for explicitly (`cargo test -p interop`).
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ahadley1124/bgpfc"
+rust-version = "1.99"
+
+
+# AGENTS.md §5: shared lint table. bgpfc-sys repeats this table with
+# `unsafe_code = "deny"` because a workspace `forbid` cannot be relaxed.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

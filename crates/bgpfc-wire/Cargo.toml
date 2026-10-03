@@ -1,0 +1,13 @@
+[package]
+name = "bgpfc-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "BGP-4 message codec (RFC 4271 and extensions); pure, no I/O"
+
+[dependencies]
+
+[lints]
+workspace = true
