@@ -428,6 +428,16 @@ impl Fsm {
                 self.connect_retry.stop();
                 self.go_idle(now, false, false, actions);
             }
+            // NOTE(interop): RFC 4271 §8.2.2 lists NotifMsg (event 25) under
+            // "any other event" in OpenSent, which would answer the peer's
+            // NOTIFICATION with a Finite State Machine Error NOTIFICATION on
+            // a connection the peer is closing. BIRD and FRR drop the
+            // connection and go to Idle, as §8.2.2 OpenConfirm does for the
+            // same event; so do we.
+            Event::NotifMsg(_) => {
+                self.connect_retry.stop();
+                self.go_idle(now, true, true, actions);
+            }
             // RFC 4271 §8.2.2 OpenSent: any other event is an FSM error.
             other => self.fsm_error(
                 &other,

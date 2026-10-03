@@ -302,7 +302,8 @@ fn open_sent_state_table() {
             (22, Idle, &["notif 2/6", "drop"]),
             (23, Idle, &["notif 6/7", "drop"]),
             (24, Idle, &["drop"]),
-            (25, Idle, &["notif 5/1", "log", "drop"]),
+            // NOTE(interop): no NOTIFICATION in reply to a NOTIFICATION.
+            (25, Idle, &["drop"]),
             (26, Idle, &["notif 5/1", "log", "drop"]),
             (27, Idle, &["notif 5/1", "log", "drop"]),
             (28, Idle, &["notif 5/1", "log", "drop"]),

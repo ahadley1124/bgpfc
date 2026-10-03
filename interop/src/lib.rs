@@ -1,5 +1,5 @@
-//! Interoperability test harness. Drives BIRD (and later FRR and `GoBGP`)
-//! in network namespaces and peers them with `bgpfcd`. Nothing in this
+//! Interoperability test harness. Drives BIRD, FRR and `GoBGP` in network
+//! namespaces and peers them with `bgpfcd`. Nothing in this
 //! crate is shipped (AGENTS.md §1.2).
 //!
 //! Needs root, `iproute2` and the daemon under test:
@@ -151,7 +151,12 @@ impl Drop for Lab {
         if let Some(c) = &self.c {
             let _ = Command::new("ip").args(["netns", "del", c]).status();
         }
-        let _ = fs::remove_dir_all(&self.dir);
+        // Keep the daemons' logs when a test fails: CI prints them.
+        if std::thread::panicking() {
+            eprintln!("lab logs kept in {}", self.dir.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -525,4 +530,212 @@ pub fn read(path: &Path) -> String {
         let _ = f.read_to_string(&mut s);
     }
     s
+}
+
+/// Options shared by the FRR and `GoBGP` instances.
+pub struct OtherOpts {
+    /// The daemon's AS.
+    pub local_as: u32,
+    /// The daemon's address and router ID.
+    pub local: Ipv4Addr,
+    /// The peer's address.
+    pub neighbor: Ipv4Addr,
+    /// The peer's AS.
+    pub remote_as: u32,
+    /// IPv4 prefixes the daemon originates.
+    pub networks: Vec<String>,
+}
+
+/// An FRR `bgpd` run on its own (no zebra, no kernel routes), driven
+/// through `vtysh`.
+pub struct Frr {
+    /// The process.
+    pub daemon: Daemon,
+    vty_dir: PathBuf,
+    lab_ns: String,
+}
+
+impl Frr {
+    /// Write a config and start `bgpd` in namespace `ns`.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bgpd` cannot be spawned.
+    #[must_use]
+    pub fn start(lab: &Lab, ns: &str, opts: &OtherOpts) -> Frr {
+        let dir = lab.dir.join(format!("frr-{ns}"));
+        fs::create_dir_all(&dir).expect("frr dir");
+        let mut networks = String::new();
+        for n in &opts.networks {
+            use std::fmt::Write as _;
+            let _ = writeln!(networks, "  network {n}");
+        }
+        let cfg = dir.join("bgpd.conf");
+        fs::write(
+            &cfg,
+            format!(
+                "hostname frr\nlog stdout\n\
+                 router bgp {local_as}\n\
+                 \x20bgp router-id {local}\n\
+                 \x20no bgp ebgp-requires-policy\n\
+                 \x20no bgp network import-check\n\
+                 \x20neighbor {neighbor} remote-as {remote_as}\n\
+                 \x20neighbor {neighbor} timers 10 30\n\
+                 \x20address-family ipv4 unicast\n\
+                 {networks}\
+                 \x20 neighbor {neighbor} activate\n\
+                 \x20exit-address-family\n",
+                local_as = opts.local_as,
+                local = opts.local,
+                neighbor = opts.neighbor,
+                remote_as = opts.remote_as,
+            ),
+        )
+        .expect("frr config");
+        // bgpd insists on its own user for the vty socket directory.
+        let _ = Command::new("chown")
+            .args(["-R", "frr:frr", dir.to_str().expect("path")])
+            .status();
+        // bgpd connects to any zebra it finds, and the zserv Unix socket is
+        // not namespaced: on a host where FRR's zebra runs (the CI runner),
+        // bgpd would learn the host's interfaces, find none for its own
+        // address and reject every session with an FSM error. Point it at
+        // a socket nobody listens on so it behaves as without zebra.
+        let zebra = dir.join("zserv.api");
+        let mut cmd = lab.exec(ns, "/usr/lib/frr/bgpd");
+        cmd.args([
+            "-z",
+            zebra.to_str().expect("path"),
+            "-f",
+            cfg.to_str().expect("path"),
+            "-i",
+            dir.join("bgpd.pid").to_str().expect("path"),
+            "-Z",
+            "-n",
+            "-S",
+            "--vty_socket",
+            dir.to_str().expect("path"),
+            "--log",
+            "stdout",
+            "--log-level",
+            "debug",
+            "-l",
+            &opts.local.to_string(),
+        ]);
+        let daemon = Daemon::start(cmd, lab.dir.join(format!("frr-{ns}.log")));
+        Frr {
+            daemon,
+            vty_dir: dir,
+            lab_ns: ns.to_owned(),
+        }
+    }
+
+    /// Output of `vtysh -c COMMAND`.
+    ///
+    /// # Panics
+    /// If `vtysh` cannot be run.
+    #[must_use]
+    pub fn vtysh(&self, lab: &Lab, command: &str) -> String {
+        let mut cmd = lab.exec(&self.lab_ns, "vtysh");
+        cmd.args([
+            "--vty_socket",
+            self.vty_dir.to_str().expect("path"),
+            "-d",
+            "bgpd",
+            "-c",
+            command,
+        ]);
+        let out = cmd.output().expect("vtysh");
+        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        s
+    }
+
+    /// `show bgp summary`.
+    #[must_use]
+    pub fn summary(&self, lab: &Lab) -> String {
+        self.vtysh(lab, "show bgp summary")
+    }
+}
+
+/// A `gobgpd` instance driven through the `gobgp` CLI (gRPC on
+/// 127.0.0.1:50051 inside its namespace).
+pub struct GoBgp {
+    /// The process.
+    pub daemon: Daemon,
+    lab_ns: String,
+}
+
+impl GoBgp {
+    /// Write a config and start `gobgpd` in namespace `ns`.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `gobgpd` cannot be spawned.
+    #[must_use]
+    pub fn start(lab: &Lab, ns: &str, opts: &OtherOpts) -> GoBgp {
+        let cfg = lab.dir.join(format!("gobgpd-{ns}.toml"));
+        fs::write(
+            &cfg,
+            format!(
+                "[global.config]\n  as = {local_as}\n  router-id = \"{local}\"\n\
+                 \x20 local-address-list = [\"{local}\"]\n\n\
+                 [[neighbors]]\n  [neighbors.config]\n    neighbor-address = \"{neighbor}\"\n\
+                 \x20   peer-as = {remote_as}\n  [neighbors.timers.config]\n    hold-time = 30\n\
+                 \x20 [[neighbors.afi-safis]]\n    [neighbors.afi-safis.config]\n\
+                 \x20     afi-safi-name = \"ipv4-unicast\"\n",
+                local_as = opts.local_as,
+                local = opts.local,
+                neighbor = opts.neighbor,
+                remote_as = opts.remote_as,
+            ),
+        )
+        .expect("gobgpd config");
+        let mut cmd = lab.exec(ns, "gobgpd");
+        cmd.args([
+            "-f",
+            cfg.to_str().expect("path"),
+            "-p",
+            "-l",
+            "debug",
+            "--api-hosts",
+            "127.0.0.1:50051",
+            "--pprof-disable",
+        ]);
+        let daemon = Daemon::start(cmd, lab.dir.join(format!("gobgpd-{ns}.log")));
+        let g = GoBgp {
+            daemon,
+            lab_ns: ns.to_owned(),
+        };
+        // The gRPC API comes up a moment after the process.
+        assert!(
+            wait_for(Duration::from_secs(10), || g
+                .gobgp(lab, &["global"])
+                .contains("AS:")),
+            "gobgpd api not up:\n{}",
+            g.daemon.log_text()
+        );
+        for n in &opts.networks {
+            let _ = g.gobgp(lab, &["global", "rib", "add", n]);
+        }
+        g
+    }
+
+    /// Output of `gobgp ARGS`.
+    ///
+    /// # Panics
+    /// If `gobgp` cannot be run.
+    #[must_use]
+    pub fn gobgp(&self, lab: &Lab, args: &[&str]) -> String {
+        let mut cmd = lab.exec(&self.lab_ns, "gobgp");
+        cmd.args(["-u", "127.0.0.1", "-p", "50051"]).args(args);
+        let out = cmd.output().expect("gobgp");
+        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        s
+    }
+
+    /// `gobgp neighbor`.
+    #[must_use]
+    pub fn neighbors(&self, lab: &Lab) -> String {
+        self.gobgp(lab, &["neighbor"])
+    }
 }
