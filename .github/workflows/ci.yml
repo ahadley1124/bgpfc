@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, rewrite]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  gates:
+    name: fmt, clippy, test, check-deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the channel; rustup picks it up.
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: gates-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: scripts/check-deps.sh
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  miri:
+    name: miri (wire, sys, fib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal -c miri -c rust-src
+      - run: cargo +nightly miri setup
+      - run: scripts/miri.sh
+
+  interop:
+    # Drives real BIRD/FRR/GoBGP daemons in network namespaces; needs root.
+    # Scenarios land from milestone 3. Until then this only proves the harness builds.
+    name: interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo build -p interop --tests
+      - run: sudo -E "$(command -v cargo)" test -p interop -- --include-ignored
