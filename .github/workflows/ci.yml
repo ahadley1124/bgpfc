@@ -80,5 +80,8 @@ jobs:
       - run: bird --version
       - run: cargo build -p bgpfcd -p interop --tests
       - run: sudo -E env PATH="$PATH" "$(command -v cargo)" test -p interop -- --include-ignored --test-threads=1
+      # The privilege-drop test changes the test process's own uid, so it
+      # runs on its own.
+      - run: sudo -E env PATH="$PATH" "$(command -v cargo)" test -p bgpfc-sys -- --include-ignored root_drops
       - if: failure()
         run: for f in /tmp/bgpfc-interop-*/*.log; do echo "== $f"; cat "$f"; done
