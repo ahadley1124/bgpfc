@@ -13,6 +13,7 @@
 //! RFC 8950 §3; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774 §3.
 #![forbid(unsafe_code)]
 
+pub mod as_path;
 pub mod capability;
 pub mod error;
 pub mod header;
@@ -24,6 +25,7 @@ pub mod reader;
 pub mod route_refresh;
 pub mod types;
 
+pub use as_path::{AsPath, AsPathSegment, SegmentType};
 pub use capability::Capability;
 pub use error::{
     CeaseSubcode, DecodeError, EncodeError, ErrorCode, FsmSubcode, HeaderSubcode, OpenSubcode,
