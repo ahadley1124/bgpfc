@@ -7,9 +7,34 @@ per-neighbor import/export policy, and installs best paths into the Linux kernel
 routing table over rtnetlink. It also ships with `bgpfcctl`, a command-line
 client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 
-> **Status:** rewrite in progress on the `rewrite` branch. Nothing here is usable
-> yet. It is not production-ready, and it is not claimed to comply with any RFC
-> until [`COMPLIANCE.md`](COMPLIANCE.md) says so.
+> **Status:** v1 feature-complete on the `rewrite` branch and exercised against
+> BIRD, FRR and GoBGP in CI, but young: it has not run in production anywhere.
+> [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
+> row is `done` for RFC 5492, 6793, 2918, 8654, 1997, 4360, 8092, 4486, 6608,
+> 9003, 7607, 9072, 9687 and 9774. RFC 4271 is complete except next-hop
+> resolvability (there is no IGP; the kernel's verdict is logged) and the
+> MinRouteAdvertisementInterval timer; RFC 4760 and 7606 each have one `partial`
+> row; the RFC 8950 extended next hop capability is not advertised yet. Nothing
+> else is claimed.
+
+### What works
+
+- Sessions with 2- and 4-octet AS peers over IPv4 and IPv6, with route refresh,
+  extended messages, send hold timer, collision detection and RFC 7606 error
+  handling; interop tests against BIRD 2, FRR 8 and GoBGP 3 run on every push.
+- The RFC 4271 decision process over interned attribute sets, per-neighbor
+  import/export policy with prefix lists, an AS-path regex engine and community
+  matching, and update generation packed to the negotiated message size.
+- Routes installed through rtnetlink under a dedicated protocol number, with
+  dry-run as the default and a runtime toggle; privilege drop and a capability
+  check; clean shutdown on `SIGTERM`.
+- `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
+  with a configuration diff ([`docs/control.md`](docs/control.md)).
+
+Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
+decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
+per route and withdraw on peer loss about 0.6 µs per route (100k routes);
+policy evaluation through six terms about 0.8 µs per route.
 
 ## Why std-only?
 
