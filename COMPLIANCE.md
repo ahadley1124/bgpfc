@@ -36,8 +36,19 @@ is `done`.
 | 6.2 | Syntactically bad BGP Identifier → Bad BGP Identifier | MUST | done (RFC 6286 §2.1: non-zero) | wire/open.rs, wire/types.rs `RouterId::new` | open.rs `fixed_field_errors`, types.rs `router_id_rejects_zero_only` |
 | 6.2 | Unrecognised optional parameter → Unsupported Optional Parameters | MUST | done | wire/open.rs `decode_parameters` | open.rs `parameter_errors` |
 | 6.2 | Recognised but malformed optional parameter → subcode 0 | MUST | done | wire/open.rs `malformed`, wire/capability.rs `malformed` | open.rs `parameter_errors`, capability.rs `malformed_known_capabilities_are_unspecific_open_errors` |
+| 4.4 | KEEPALIVE is the 19-octet header only | MUST | done | wire/keepalive.rs `KEEPALIVE` | keepalive.rs `keepalive_is_the_bare_header` |
+| 4.4 | KEEPALIVEs at most one per second; none when Hold Time is zero | MUST | todo (FSM) | | |
+| 4.4 | May adjust the KEEPALIVE rate to the Hold Time | MAY | todo (FSM) | | |
+| 4.5 | NOTIFICATION: code, subcode, data; connection closed after sending | MUST | done (codec; close is the FSM's) | wire/notification.rs | notification.rs `plain_notifications_round_trip` |
+| 4.5 | Subcode 0 when the code defines none | MUST | done | wire/notification.rs `hold_timer_expired` | notification.rs `display_names` |
+| 4.5 | Minimum NOTIFICATION length is 21 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs `length_bounds_carry_the_length_field_as_data` |
+| 6.4 | Errors in a received NOTIFICATION are logged, never answered | SHOULD | done (decoder never rejects; `is_recognised` for the log) | wire/notification.rs `decode`, `is_recognised` | notification.rs `unknown_codes_are_kept_and_flagged` |
+| 6.5 | Hold Timer Expired NOTIFICATION, then close | MUST | done (message; timer is the FSM's) | wire/notification.rs `hold_timer_expired` | notification.rs `plain_notifications_round_trip` |
+| 6.6 | FSM errors use Error Code Finite State Machine Error | MUST | done (message; detection is the FSM's) | wire/notification.rs `fsm` | notification.rs `plain_notifications_round_trip` |
+| 6.7 | Cease only in the absence of a fatal error | MUST | todo (FSM) | | |
+| 6.7 | May impose a prefix limit and Cease when reached | MAY | todo (RIB) | | |
 
-Rows for §4.3–§4.5, §5, §6.3–§6.8, §8 and §9 are added by the PRs that
+Rows for §4.3, §5, §6.3, §6.8, §8 and §9 are added by the PRs that
 implement them.
 
 ## RFC 5492 — Capabilities Advertisement
@@ -76,7 +87,8 @@ implement them.
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
 | 2 | Capability 2, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
-| 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | partial (type code; message in next PR) | wire/header.rs `MessageType::RouteRefresh` | header.rs `message_type_table` |
+| 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | done | wire/header.rs `MessageType::RouteRefresh`, wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
+| 3 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
 | 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | todo (RIB) | | |
 
 ## RFC 7606 — Revised Error Handling
@@ -96,7 +108,7 @@ implement them.
 | 4 | Having advertised it, accept up to 65535 octets | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 4 | Over 4096 without the capability → Bad Message Length | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 5 | Never accept extended messages without having advertised the capability | MUST | done | wire/header.rs `Header::decode` (`extended` flag) | header.rs |
-| 5 | NOTIFICATION to a non-extended peer at most 4096 octets | MUST | todo (NOTIFICATION PR) | | |
+| 5 | NOTIFICATION to a non-extended peer at most 4096 octets | MUST | done | wire/notification.rs `encode` | notification.rs `notification_size_limit_depends_on_extended_messages` |
 | 4 | Shrink or withhold an over-size UPDATE for a non-extended neighbour | SHOULD | todo (RIB) | | |
 
 ## RFC 1997 / 4360 / 8092 — Communities
@@ -108,6 +120,20 @@ implement them.
 
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
+| 4486 §3 | Cease subcodes 1–8 | MUST | done | wire/error.rs `CeaseSubcode`, `subcode_name` | error.rs `subcode_names_cover_every_defined_subcode` |
+| 4486 §4 | Prefix limit exceeded → Cease / Maximum Number of Prefixes Reached | MUST | done (message; limit is the RIB's) | wire/notification.rs `max_prefixes_reached` | notification.rs `max_prefixes_data_field` |
+| 4486 §4 | Maximum Prefixes Data: AFI, SAFI, upper bound | MAY | done | wire/notification.rs `max_prefixes_reached`, `max_prefixes` | notification.rs `max_prefixes_data_field` |
+| 4486 §4 | Administrative Shutdown / Peer De-configured / Administrative Reset / Connection Rejected / Other Configuration Change / Connection Collision Resolution subcodes in their situations | SHOULD | done (messages; sending is the FSM's) | wire/notification.rs `cease` | notification.rs |
+| 4486 §4 | Out of Resources subcode | MAY | done (message) | wire/notification.rs `cease` | notification.rs |
+| 4486 §4 | Damp oscillations after Shutdown / De-configured / Rejected / Out of Resources; bound automatic retries | SHOULD | todo (FSM) | | |
+| 6608 §3 | FSM subcodes 0–3 | MUST | done | wire/error.rs `FsmSubcode` | error.rs `subcode_names_cover_every_defined_subcode` |
+| 6608 §4 | Unexpected message in OpenSent / OpenConfirm / Established → the matching subcode, Data = message type | MUST | done (message; detection is the FSM's) | wire/notification.rs `fsm` | notification.rs `plain_notifications_round_trip` |
+| 9003 §2 | Shutdown Communication only with subcode 2 or 4 | MUST | done | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
+| 9003 §2 | One-octet length; zero means absent | MUST | done | wire/notification.rs `shutdown`, `shutdown_communication` | notification.rs `shutdown_communication_round_trips` |
+| 9003 §2 | UTF-8, shortest form; invalid sequences never interpreted | MUST | done (`std::str::from_utf8` rejects non-shortest forms) | wire/notification.rs `shutdown_communication` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
+| 9003 §2 | Report the communication, e.g. via syslog | SHOULD | todo (FSM logs it) | | |
+| 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is a config concern) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
+| 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done (reported as `InvalidUtf8` for the FSM to log) | wire/notification.rs `ShutdownCommunicationError` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 
 ## RFC 7607 / 9072 / 9687 / 9774 — AS 0, extended OPEN parameters, send hold timer, AS_SET deprecation
 
