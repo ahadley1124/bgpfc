@@ -228,7 +228,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
     });
     assert!(ok, "withdraw not relayed:\n{}", bgpfcd.log_text());
     assert!(
-        bgpfcd.log_text().contains("fib: delete"),
+        bgpfcd.log_text().contains("op=delete"),
         "{}",
         bgpfcd.log_text()
     );
@@ -323,9 +323,7 @@ fn export_policy_filters_and_sets() {
     // Rejected on import: never reaches BIRD 2, nor the FIB.
     assert!(!routes.contains("198.51.100.0/24"), "{routes}");
     assert!(
-        !bgpfcd
-            .log_text()
-            .contains("prefix=198.51.100.0/24 gateway"),
+        !bgpfcd.log_text().contains("prefix=198.51.100.0/24 gateway"),
         "{}",
         bgpfcd.log_text()
     );
