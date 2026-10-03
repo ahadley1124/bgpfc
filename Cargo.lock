@@ -58,7 +58,9 @@ version = "0.1.0"
 name = "bgpfcd"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-fsm",
  "bgpfc-log",
+ "bgpfc-wire",
 ]
 
 [[package]]

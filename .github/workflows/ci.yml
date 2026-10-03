@@ -69,12 +69,16 @@ jobs:
           done
 
   interop:
-    # Drives real BIRD/FRR/GoBGP daemons in network namespaces; needs root.
-    # Scenarios land from milestone 3. Until then this only proves the harness builds.
-    name: interop
+    # Drives a real BIRD in network namespaces and peers it with bgpfcd;
+    # needs root for the namespaces.
+    name: interop (BIRD)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - run: cargo build -p interop --tests
-      - run: sudo -E "$(command -v cargo)" test -p interop -- --include-ignored
+      - run: sudo apt-get update -q && sudo apt-get install -y -q bird2 iproute2
+      - run: bird --version
+      - run: cargo build -p bgpfcd -p interop --tests
+      - run: sudo -E env PATH="$PATH" "$(command -v cargo)" test -p interop -- --include-ignored --test-threads=1
+      - if: failure()
+        run: for f in /tmp/bgpfc-interop-*/*.log; do echo "== $f"; cat "$f"; done

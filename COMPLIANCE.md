@@ -6,8 +6,10 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   NOT count as MUST and SHOULD).
 - **Status**: `done`, `partial`, `todo`, `n/a`, or `deviates` (with a reason).
 - **Code** / **Test**: file paths, `path:line` where useful. `wire/` is
-  `crates/bgpfc-wire/src/`, `fsm/` is `crates/bgpfc-fsm/src/`, and "fsm
-  tests" are `crates/bgpfc-fsm/src/machine/tests.rs`.
+  `crates/bgpfc-wire/src/`, `fsm/` is `crates/bgpfc-fsm/src/`, "fsm
+  tests" are `crates/bgpfc-fsm/src/machine/tests.rs`, `bgpfcd/` is
+  `crates/bgpfcd/src/`, and "interop" names a test in
+  `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -87,8 +89,8 @@ is `done`.
 | 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (RIB) | | |
 | 6.3 | Correct attributes with no NLRI is a valid UPDATE | MUST | done | wire/update.rs `decode` | update.rs `missing_mandatory_attributes` |
 
-| 6.8 | One of two colliding connections is closed; the one from the higher BGP Identifier is kept | MUST | partial (FSM handles OpenCollisionDump and exposes the peer's Identifier; comparison is the coordinator's, milestone 3) | fsm/machine.rs `collision_dump` | fsm tests state tables |
-| 6.8 | Examine OpenConfirm connections on every OPEN; may examine OpenSent | MUST / MAY | todo (coordinator) | | |
+| 6.8 | One of two colliding connections is closed; the one from the higher BGP Identifier is kept | MUST | done | bgpfcd/peer.rs `resolve_collision`, fsm/machine.rs `collision_dump` | interop `session_survives_simultaneous_connect` |
+| 6.8 | Examine OpenConfirm connections on every OPEN; may examine OpenSent | MUST / MAY | done (a second connection is tracked in both states until its OPEN) | bgpfcd/peer.rs `accept_stream`, `track_pending` | interop `session_survives_simultaneous_connect` |
 | 6.8 | A collision with an Established connection closes the new one unless configured | MUST | done (`collision_detect_established`) | fsm/machine.rs (event 23 in Established) | fsm tests `collision_dump_in_established_needs_the_option` |
 | 6.8 | Close the losing connection with a Cease | MUST | done (Connection Collision Resolution subcode) | fsm/machine.rs `collision_dump` | fsm tests state tables |
 | 8 | Mandatory session attributes: State, ConnectRetryCounter, ConnectRetryTimer/Time, HoldTimer/Time, KeepaliveTimer/Time | MUST | done | fsm/machine.rs `Fsm`, fsm/lib.rs `Config` | fsm tests |
@@ -97,8 +99,10 @@ is `done`.
 | 8.1.3 | Timer events 9–13 | MUST / MAY | done | fsm/lib.rs `TimerKind::event` | fsm tests |
 | 8.1.4 | TCP events 14–18 | MUST / MAY | done | fsm/lib.rs `Event` | fsm tests state tables |
 | 8.1.5 | Message events 19–28 | MUST / MAY | done (20 derived from the DelayOpenTimer) | fsm/lib.rs `Event` | fsm tests state tables, `delay_open` |
-| 8.2.1 | One FSM per configured peer and per unidentified incoming connection; listen on and connect to port 179 | MUST | partial (FSM is per connection; listener and coordinator are milestone 3) | fsm/machine.rs `Fsm::new` | |
-| 8.2.1.2 | Dispose of the losing FSM after collision resolution | SHOULD | todo (coordinator) | | |
+| 8.2.1 | One FSM per configured peer and per unidentified incoming connection; listen on and connect to port 179 | MUST | done (one peer thread and FSM per neighbour; a second connection is tracked without its own FSM until its OPEN; connections from unconfigured addresses are refused) | bgpfcd/peer.rs, bgpfcd/coordinator.rs | interop `session_with_bird_bgpfcd_connects`, `session_with_bird_bird_connects` |
+| 8.2.1.2 | Dispose of the losing FSM after collision resolution | SHOULD | done (the losing connection is closed; the FSM restarts on the winner) | bgpfcd/peer.rs `resolve_collision` | interop `session_survives_simultaneous_connect` |
+| 8.2.2 | Idle refuses all incoming connections | MUST | done | bgpfcd/peer.rs `accept_stream` | |
+| 8.2.2 | Second connection in OpenSent/OpenConfirm tracked until its OPEN; invalid requests ignored | MUST | done | bgpfcd/peer.rs `track_pending`, `pending_message` | interop `session_survives_simultaneous_connect` |
 | 8.2.2 | Idle: start events initialise, zero the counter, start ConnectRetryTimer, connect or listen; stop events ignored; other events ignored | MUST | done | fsm/machine.rs `in_idle`, `start` | fsm tests `idle_state_table` |
 | 8.2.2 | Connect: every event per the text (ConnectRetryTimer restart, DelayOpen handling, OPEN on connect, failures to Idle with damping) | MUST | done | fsm/machine.rs `in_connect` | fsm tests `connect_state_table`, `delay_open`, `send_notification_without_open` |
 | 8.2.2 | Active: every event per the text | MUST | done; a PassiveTcpEstablishment peer stays Active on ConnectRetryTimer expiry (NOTE(interop)) | fsm/machine.rs `in_active` | fsm tests `active_state_table`, `active_retries_connect_when_not_passive` |
@@ -156,7 +160,7 @@ Rows for §9 are added by the RIB PRs.
 | 4 | `MP_UNREACH_NLRI` type 15: AFI, SAFI, withdrawn routes; no other attributes required | MUST | done | wire/mp.rs `MpUnreach` | mp.rs `unreach_round_trip_and_errors` |
 | 5 | NLRI `<length, prefix>` encoding | MUST | done | wire/prefix.rs | prefix.rs |
 | 6 | SAFI 1 unicast, 2 multicast | MAY | done (unicast only is parsed) | wire/types.rs `Safi`, wire/mp.rs `supported` | mp.rs `reach_errors` |
-| 7 | Incorrect MP attribute → drop that family's routes from the peer, ignore the family for the session | MUST / SHOULD | done (codec reports `AfiSafiDisable`; RIB acts) | wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
+| 7 | Incorrect MP attribute → drop that family's routes from the peer, ignore the family for the session | MUST / SHOULD | partial (reported to the RIB as `FamilyDisabled`; the RIB acts in milestone 5) | wire/update.rs `mp_failure`, bgpfcd/peer.rs `update` | update.rs `mp_attribute_errors_disable_the_family` |
 | 7 | May reset with Optional Attribute Error | MAY | done (NOTIFICATION supplied) | wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
 
 ## RFC 2918 — Route Refresh
@@ -166,7 +170,7 @@ Rows for §9 are added by the RIB PRs.
 | 2 | Capability 2, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | done | wire/header.rs `MessageType::RouteRefresh`, wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
-| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (`Session::route_refresh` records it; the RIB acts on it) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
+| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (a ROUTE-REFRESH for an unadvertised family is ignored; sending is the RIB's) | bgpfcd/peer.rs `primary_message`, fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 
 ## RFC 7606 — Revised Error Handling
 
@@ -247,9 +251,9 @@ Rows for §9 are added by the RIB PRs.
 | 9003 §2 | Shutdown Communication only with subcode 2 or 4 | MUST | done | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | One-octet length; zero means absent | MUST | done | wire/notification.rs `shutdown`, `shutdown_communication` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | UTF-8, shortest form; invalid sequences never interpreted | MUST | done (`std::str::from_utf8` rejects non-shortest forms) | wire/notification.rs `shutdown_communication` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
-| 9003 §2 | Report the communication, e.g. via syslog | SHOULD | todo (peer thread logs it, milestone 3) | | |
+| 9003 §2 | Report the communication, e.g. via syslog | SHOULD | done (logged at warn with the NOTIFICATION) | bgpfcd/peer.rs `primary_message` | interop `bird_shutdown_sends_cease_and_bgpfcd_retries` |
 | 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is a config concern) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
-| 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done (reported as `InvalidUtf8` for the FSM to log) | wire/notification.rs `ShutdownCommunicationError` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
+| 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done | wire/notification.rs `ShutdownCommunicationError`, bgpfcd/peer.rs `primary_message` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 
 ## RFC 7607 / 9072 / 9687 / 9774 — AS 0, extended OPEN parameters, send hold timer, AS_SET deprecation
 

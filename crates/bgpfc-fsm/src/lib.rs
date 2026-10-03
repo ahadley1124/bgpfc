@@ -126,6 +126,12 @@ pub enum Event {
     UpdateMsgErr(DecodeError),
     /// 29: the `SendHoldTimer` expired (RFC 9687 §4.2).
     SendHoldTimerExpires,
+    /// A ROUTE-REFRESH was received (RFC 2918 §3). RFC 4271 defines no
+    /// event for it: in Established it is the RIB's business and does not
+    /// touch the `HoldTimer` (§6.5 names only KEEPALIVE, UPDATE and
+    /// NOTIFICATION); before Established it is an unexpected message
+    /// (RFC 6608 §4 lists it for `OpenSent` and `OpenConfirm`).
+    RouteRefreshMsg,
 }
 
 impl Event {
@@ -158,6 +164,9 @@ impl Event {
             Event::UpdateMsg => 27,
             Event::UpdateMsgErr(_) => 28,
             Event::SendHoldTimerExpires => 29,
+            // Not numbered by RFC 4271; RFC 6608 §4 treats it like any
+            // unexpected message.
+            Event::RouteRefreshMsg => 0,
         }
     }
 }

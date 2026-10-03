@@ -570,7 +570,8 @@ impl Fsm {
             | Event::TcpConnectionConfirmed
             | Event::TcpCrInvalid
             | Event::BgpOpen(_)
-            | Event::OpenCollisionDump => {}
+            | Event::OpenCollisionDump
+            | Event::RouteRefreshMsg => {}
             // RFC 4271 §8.2.2 Established: NOTIFICATION or TCP failure; no
             // damping named.
             Event::NotifMsgVerErr | Event::NotifMsg(_) | Event::TcpConnectionFails => {
@@ -824,6 +825,7 @@ impl Fsm {
             Event::UpdateMsg | Event::UpdateMsgErr(_) => Some(MessageType::Update),
             Event::NotifMsg(_) => Some(MessageType::Notification),
             Event::KeepAliveMsg => Some(MessageType::Keepalive),
+            Event::RouteRefreshMsg => Some(MessageType::RouteRefresh),
             _ => None,
         };
         let notification = match kind {

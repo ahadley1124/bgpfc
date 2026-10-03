@@ -91,6 +91,7 @@ fn every_event() -> Vec<(u8, Event)> {
         (27, Event::UpdateMsg),
         (28, Event::UpdateMsgErr(update_err())),
         (29, Event::SendHoldTimerExpires),
+        (0, Event::RouteRefreshMsg),
     ]
 }
 
@@ -195,6 +196,7 @@ fn idle_state_table() {
             (27, Idle, &[]),
             (28, Idle, &[]),
             (29, Idle, &[]),
+            (0, Idle, &[]),
         ],
     );
 }
@@ -230,6 +232,7 @@ fn connect_state_table() {
             (27, Idle, &["drop"]),
             (28, Idle, &["drop"]),
             (29, Idle, &["drop"]),
+            (0, Idle, &["drop"]),
         ],
     );
 }
@@ -268,6 +271,7 @@ fn active_state_table() {
             (27, Idle, &["drop"]),
             (28, Idle, &["drop"]),
             (29, Idle, &["drop"]),
+            (0, Idle, &["drop"]),
         ],
     );
 }
@@ -303,6 +307,7 @@ fn open_sent_state_table() {
             (27, Idle, &["notif 5/1", "log", "drop"]),
             (28, Idle, &["notif 5/1", "log", "drop"]),
             (29, Idle, &["notif 5/0", "log", "drop"]),
+            (0, Idle, &["notif 5/1", "log", "drop"]),
         ],
     );
 }
@@ -338,6 +343,7 @@ fn open_confirm_state_table() {
             (27, Idle, &["notif 5/2", "log", "drop"]),
             (28, Idle, &["notif 5/2", "log", "drop"]),
             (29, Idle, &["notif 5/0", "log", "drop"]),
+            (0, Idle, &["notif 5/2", "log", "drop"]),
         ],
     );
 }
@@ -373,6 +379,7 @@ fn established_state_table() {
             (27, Established, &[]),
             (28, Idle, &["notif 3/1", "down", "drop"]),
             (29, Idle, &["notif 8/0", "log", "down", "drop"]),
+            (0, Established, &[]),
         ],
     );
 }
@@ -398,6 +405,13 @@ fn fsm_error_data_names_the_unexpected_message() {
         panic!("{a:?}");
     };
     assert_eq!((n.subcode, n.data.clone()), (3, vec![1]));
+    // ROUTE-REFRESH before Established: RFC 6608 §4 names it; type 5.
+    let (mut f, now) = fsm_at(State::OpenSent, config());
+    let a = f.handle(Event::RouteRefreshMsg, now);
+    let Action::SendNotification(n) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert_eq!((n.subcode, n.data.clone()), (1, vec![5]));
 }
 
 #[test]
