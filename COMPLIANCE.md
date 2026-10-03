@@ -48,8 +48,45 @@ is `done`.
 | 6.7 | Cease only in the absence of a fatal error | MUST | todo (FSM) | | |
 | 6.7 | May impose a prefix limit and Cease when reached | MAY | todo (RIB) | | |
 
-Rows for §4.3, §5, §6.3, §6.8, §8 and §9 are added by the PRs that
-implement them.
+| 4.3 | UPDATE: withdrawn routes length/field, total path attribute length/field, NLRI | MUST | done | wire/update.rs `encode`, `split_fields` | update.rs `announce_round_trips`, `withdraw_only_and_empty_updates` |
+| 4.3 | Prefix `<length, prefix>` with minimal octets; length 0 is the default route; trailing bits irrelevant | MUST | done | wire/prefix.rs | prefix.rs `encoding_uses_the_minimum_octets`, `trailing_bits_are_ignored_on_decode` |
+| 4.3 | Attribute flags: Optional, Transitive, Partial, Extended Length; low bits zero on send, ignored on receipt | MUST | done | wire/attribute.rs `flags`, `encode_attribute`, `parse_raw` | attribute.rs `extended_length_is_used_above_255_octets`, `well_known_attributes_encode_with_their_flags` |
+| 4.3 | Well-known attributes carry Transitive=1 and Partial=0 | MUST | done (send); receive checked per RFC 7606 §3 c | wire/attribute.rs `expected_flags` | update.rs `attribute_length_and_flag_errors` |
+| 4.3 | ORIGIN values 0..=2 | MUST | done | wire/attribute.rs `Origin` | attribute.rs `origin_table`, update.rs `bad_origin_is_treat_as_withdraw` |
+| 4.3 | `AS_PATH` segments `<type, count, ASes>`, types `AS_SET`/`AS_SEQUENCE` | MUST | done | wire/as_path.rs | as_path.rs `two_and_four_octet_round_trips` |
+| 4.3 | `NEXT_HOP` four-octet IPv4 address | MUST | done | wire/attribute.rs, wire/update.rs | update.rs `announce_round_trips` |
+| 4.3 | `MULTI_EXIT_DISC` optional non-transitive four octets | MUST | done | wire/attribute.rs | update.rs `announce_round_trips` |
+| 4.3 | `LOCAL_PREF` well-known four octets | MUST | done | wire/attribute.rs | update.rs `local_pref_depends_on_the_peer_kind` |
+| 4.3 | `ATOMIC_AGGREGATE` length 0 | MUST | done | wire/attribute.rs | attribute.rs, update.rs `attribute_length_and_flag_errors` |
+| 4.3 | AGGREGATOR optional transitive, AS (2 octets) + IPv4 | MUST | done (4 octets per RFC 6793) | wire/attribute.rs, wire/update.rs `decode_aggregator` | attribute.rs `four_octet_as_in_as_path_and_aggregator` |
+| 4.3 | Minimum UPDATE length 23 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs |
+| 4.3 | Same prefix in both withdrawn and NLRI: accept, treat as not withdrawn | MUST / SHOULD | todo (RIB) | | |
+| 5 | Recognise all well-known attributes | MUST | done | wire/attribute.rs `expected_flags` | attribute.rs `expected_flags_table` |
+| 5 | Mandatory attributes present in every UPDATE with NLRI | MUST | done (receive; RFC 7606 §3 d treat-as-withdraw) | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
+| 5 | Pass well-known attributes on to peers | MUST | todo (RIB) | | |
+| 5 | Accept unrecognised transitive optional attributes; pass on with Partial set | SHOULD / MUST | done (kept with flags); Partial set by the RIB on export | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
+| 5 | Never clear a Partial bit set upstream | MUST | todo (RIB) | | |
+| 5 | Quietly ignore unrecognised non-transitive optional attributes | MUST | done | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
+| 5 | Send attributes in ascending type order | SHOULD | done | wire/update.rs `encode` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt` |
+| 5 | Accept attributes in any order | MUST | done | wire/update.rs `decode` | update.rs `announce_round_trips` |
+| 5 | An attribute appears at most once | MUST | done (receive per RFC 7606 §3 g) | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
+| 5.1.5 | Ignore `LOCAL_PREF` from an external peer | MUST | done | wire/update.rs `decode_one` | update.rs `local_pref_depends_on_the_peer_kind` |
+| 6.3 | Withdrawn + attribute lengths + 23 over the message length → Malformed Attribute List | MUST | done | wire/update.rs `split_fields` | update.rs `length_overruns_reset_the_session` |
+| 6.3 | Attribute Flags Error, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
+| 6.3 | Attribute Length Error, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
+| 6.3 | Missing Well-known Attribute, Data = type code | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
+| 6.3 | Unrecognized Well-known Attribute, Data = the attribute; session reset | MUST | done | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
+| 6.3 | Invalid ORIGIN Attribute, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `bad_origin_is_treat_as_withdraw` |
+| 6.3 | Invalid `NEXT_HOP`: semantic errors logged and route ignored, no NOTIFICATION | SHOULD | todo (RIB) | | |
+| 6.3 | Malformed `AS_PATH` | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_as_path` | update.rs `as_path_rules` |
+| 6.3 | Leftmost AS equals the external peer's AS | MAY | todo (RIB; RFC 7606 §7.2 treat-as-withdraw) | | |
+| 6.3 | Optional Attribute Error, Data = the attribute | MUST | done | wire/update.rs `discard_malformed`, `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
+| 6.3 | Duplicate attribute → Malformed Attribute List | MUST | done (as revised by RFC 7606 §3 g) | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
+| 6.3 | Invalid Network Field for syntactically bad NLRI | MUST | done | wire/update.rs `decode` | update.rs `bad_nlri_syntax_resets_the_session` |
+| 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (RIB) | | |
+| 6.3 | Correct attributes with no NLRI is a valid UPDATE | MUST | done | wire/update.rs `decode` | update.rs `missing_mandatory_attributes` |
+
+Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 
 ## RFC 5492 — Capabilities Advertisement
 
@@ -69,8 +106,15 @@ implement them.
 |---|---|---|---|---|---|
 | 3 | Capability 65, length 4, carries the speaker's ASN | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | My Autonomous System = `AS_TRANS` (23456) when the ASN is not mappable | MUST | done | wire/open.rs `OpenMessage::new`, wire/types.rs `Asn::to_two_octet` | open.rs `new_uses_as_trans_for_a_four_octet_asn` |
-| 3 | AS4_PATH / AS4_AGGREGATOR attributes | MUST | todo (UPDATE PR) | | |
-| 4 | Interaction between NEW and OLD speakers | MUST | todo (UPDATE PR) | | |
+| 3 | `AS4_PATH` / `AS4_AGGREGATOR` optional transitive, four-octet; no confederation segments in `AS4_PATH` | MUST | done | wire/update.rs `as4_companion`, `decode_as4_path` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt` |
+| 4.2.2 | To an OLD speaker: two-octet `AS_PATH` with `AS_TRANS`, plus `AS4_PATH` only when a non-mappable ASN is present | MUST | done | wire/update.rs `as4_companion`, wire/as_path.rs `encode` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt`, as_path.rs `as_trans_replaces_non_mappable_asns_in_two_octet_paths` |
+| 4.2.2 | AGGREGATOR with `AS_TRANS` plus `AS4_AGGREGATOR` for a non-mappable aggregator; neither otherwise | MUST | done | wire/update.rs `as4_companion` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt` |
+| 4.2.3 | Accept `AS4_PATH` with `AS_PATH` from an OLD speaker and reconstruct | MUST | done | wire/as_path.rs `merge_as4`, wire/update.rs `apply_as4` | as_path.rs `as4_merge_per_rfc6793` |
+| 4.2.3 | AGGREGATOR not `AS_TRANS` → ignore `AS4_AGGREGATOR` and `AS4_PATH`; else take `AS4_AGGREGATOR` | MUST | done | wire/update.rs `apply_as4` | update.rs `as4_aggregator_from_an_old_aggregator_wins` |
+| 4.2.3 | `AS_PATH` shorter than `AS4_PATH` → ignore `AS4_PATH`; else prepend the leading ASes | MUST | done | wire/as_path.rs `merge_as4` | as_path.rs `as4_merge_per_rfc6793` |
+| 6 | Malformed `AS4_PATH` / `AS4_AGGREGATOR` → attribute discard | MUST | done | wire/update.rs `decode_as4_path` | update.rs |
+| 6 | `AS4_*` between NEW speakers: discard and continue, log | MUST / SHOULD | done (reported as `FromNewSpeaker` for the log) | wire/update.rs `decode_one` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt` |
+| 6 | Confederation segments in a received `AS4_PATH` are discarded | MUST | done | wire/update.rs `decode_as4_path` | as_path.rs `counting_and_predicates` |
 
 ## RFC 4760 — Multiprotocol Extensions
 
@@ -80,7 +124,15 @@ implement them.
 | 8 | Capability 1, length 4: AFI, reserved, SAFI | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 8 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/capability.rs | capability.rs `multiprotocol_ignores_the_reserved_octet` |
 | 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | todo (FSM) | | |
-| 3–5 | MP_REACH_NLRI / MP_UNREACH_NLRI | MUST | todo (UPDATE PR) | | |
+| 3 | `MP_REACH_NLRI` type 14, optional non-transitive: AFI, SAFI, next hop length, next hop, reserved, NLRI | MUST | done | wire/mp.rs `MpReach` | mp.rs `ipv6_unicast_reach_round_trips` |
+| 3 | Reserved octet zero on send, ignored on receipt | MUST / SHOULD | done | wire/mp.rs | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
+| 3 | UPDATE with `MP_REACH_NLRI` carries ORIGIN and `AS_PATH` (and `LOCAL_PREF` on iBGP) | MUST | done for ORIGIN/`AS_PATH` (treat-as-withdraw); `LOCAL_PREF` left to the RIB | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
+| 3 | `NEXT_HOP` ignored when only `MP_REACH_NLRI` carries routes | SHOULD | todo (RIB) | | |
+| 4 | `MP_UNREACH_NLRI` type 15: AFI, SAFI, withdrawn routes; no other attributes required | MUST | done | wire/mp.rs `MpUnreach` | mp.rs `unreach_round_trip_and_errors` |
+| 5 | NLRI `<length, prefix>` encoding | MUST | done | wire/prefix.rs | prefix.rs |
+| 6 | SAFI 1 unicast, 2 multicast | MAY | done (unicast only is parsed) | wire/types.rs `Safi`, wire/mp.rs `supported` | mp.rs `reach_errors` |
+| 7 | Incorrect MP attribute → drop that family's routes from the peer, ignore the family for the session | MUST / SHOULD | done (codec reports `AfiSafiDisable`; RIB acts) | wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
+| 7 | May reset with Optional Attribute Error | MAY | done (NOTIFICATION supplied) | wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
 
 ## RFC 2918 — Route Refresh
 
@@ -95,13 +147,41 @@ implement them.
 
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
+| 3 a | NOTIFICATION only for errors specified as session reset | MUST | done | wire/update.rs `UpdateError` vs `DecodedUpdate` | update.rs |
+| 3 b | Length overrun → Malformed Attribute List, session reset | MUST | done | wire/update.rs `split_fields` | update.rs `length_overruns_reset_the_session` |
+| 3 c | Optional/Transitive flag conflict → treat-as-withdraw unless the attribute says otherwise | MUST | done | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
+| 3 d | Missing well-known mandatory attribute → treat-as-withdraw | MUST | done | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
+| 3 e | ORIGIN, `AS_PATH`, `NEXT_HOP`, MED, `LOCAL_PREF` errors → treat-as-withdraw | MUST | done | wire/update.rs `decode_one` | update.rs `bad_origin_is_treat_as_withdraw`, `as_path_rules`, `local_pref_depends_on_the_peer_kind` |
+| 3 f | `ATOMIC_AGGREGATE`, AGGREGATOR errors → attribute discard | MUST | done | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
+| 3 g | Repeated MP attribute → Malformed Attribute List; other repeats discarded | MUST / SHALL | done | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
+| 3 h | Strongest approach wins when several errors exist | MUST | done (reset/disable return at once; withdraw outranks discard) | wire/update.rs `decode_attributes` | update.rs |
+| 3 i | Withdrawn Routes checked for syntax like NLRI | MUST | done | wire/update.rs `decode` | update.rs `bad_nlri_syntax_resets_the_session` |
+| 3 j | NLRI not parseable → session reset / AFI-SAFI disable | MUST | done | wire/update.rs `decode`, `mp_failure` | update.rs `bad_nlri_syntax_resets_the_session`, `mp_attribute_errors_disable_the_family` |
+| 4 | Attribute overrun or underrun → treat-as-withdraw; NLRI located by Total Attribute Length | MUST | done | wire/attribute.rs `parse_raw`, wire/update.rs `decode_attributes` | update.rs `truncated_attribute_header_is_treat_as_withdraw` |
+| 4 | Zero length is a syntax error except for `AS_PATH` and `ATOMIC_AGGREGATE` | SHALL | done for known attributes (per-attribute length rules) | wire/update.rs `decode_one` | update.rs |
+| 5.1 | MP attributes encoded first; at most one of withdrawn/NLRI/`MP_REACH`/`MP_UNREACH` | SHALL / MUST | partial (MP first on encode; the RIB packs one kind per UPDATE) | wire/update.rs `encode` | update.rs `missing_mandatory_attributes` |
+| 5.1 | Accept the fields in any position or combination | MUST | done | wire/update.rs `decode` | update.rs `mp_unreach_withdrawals_and_treat_as_withdraw_cover_mp_reach` |
+| 5.2 | No reachable NLRI plus attributes other than `MP_UNREACH_NLRI` and a non-discard error → session reset | MUST | done | wire/update.rs `decode` | update.rs `no_reachable_nlri_escalates_withdraw_to_reset` |
+| 5.3 | NLRI syntax: length over the family size, or overrun | SHALL | done | wire/prefix.rs `decode_prefixes` | prefix.rs `field_decoding_and_syntax_errors` |
+| 5.3 | MP attribute incorrect: bad NLRI, inconsistent flags, `MP_UNREACH` < 3 or `MP_REACH` < 5 | SHALL | done | wire/mp.rs, wire/update.rs `decode_one` | mp.rs `reach_errors`, update.rs `mp_attribute_errors_disable_the_family` |
+| 7.1 | ORIGIN: length 1 and defined value, else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `bad_origin_is_treat_as_withdraw` |
+| 7.2 | `AS_PATH`: unknown segment type, overrun, underrun, zero length → treat-as-withdraw | SHALL | done | wire/as_path.rs `decode` | as_path.rs `malformations_per_rfc7606` |
+| 7.2 | Leftmost-AS check failure → treat-as-withdraw (reset if configured) | SHOULD / MAY | todo (RIB) | | |
+| 7.3 | `NEXT_HOP` length 4 else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `attribute_length_and_flag_errors` |
+| 7.4 | MED length 4 else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs |
+| 7.5 | `LOCAL_PREF` from external: discard; internal with length ≠ 4: treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `local_pref_depends_on_the_peer_kind` |
+| 7.6 | `ATOMIC_AGGREGATE` length ≠ 0 → discard | SHALL | done | wire/update.rs | update.rs `attribute_length_and_flag_errors` |
+| 7.7 | AGGREGATOR length 6 (two-octet) / 8 (four-octet) else discard | SHALL | done | wire/update.rs `decode_aggregator` | update.rs |
+| 7.8 | COMMUNITIES length non-zero multiple of 4 else treat-as-withdraw | SHALL | done | wire/community.rs | update.rs `communities_round_trip_and_length_errors` |
+| 7.11 | `MP_REACH_NLRI` next hop length inconsistent → session reset / AFI-SAFI disable | MUST | done | wire/mp.rs `NextHop::decode`, wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
+| 7.14 | Extended Communities length non-zero multiple of 8 else treat-as-withdraw; unknown types never an error | SHALL / MUST | done | wire/community.rs | community.rs `extended_communities` |
 
 ## RFC 8654 — Extended Messages
 
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
 | 3 | Capability 6, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
-| 3 | Peers using it must support RFC 7606 error handling | MUST | todo (UPDATE PR) | | |
+| 3 | Peers using it must support RFC 7606 error handling | MUST | done | wire/update.rs | update.rs |
 | 4 | Applies to all messages except OPEN and KEEPALIVE | MUST | done | wire/header.rs `MessageType::max_len` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 4 | Advertise the capability when able | SHOULD | todo (config/FSM) | | |
 | 4 | Send extended messages only if the peer advertised the capability | MAY | todo (RIB update packing) | | |
@@ -115,6 +195,17 @@ implement them.
 
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
+| 1997 | COMMUNITIES type 8, optional transitive, set of four-octet values | MUST | done | wire/community.rs, wire/attribute.rs | community.rs `standard_communities` |
+| 1997 | `NO_EXPORT`, `NO_ADVERTISE`, `NO_EXPORT_SUBCONFED` recognised | MUST | done (values; export rules are the RIB's) | wire/community.rs `Community` consts | community.rs `standard_communities` |
+| 1997 | Routes with the well-known communities are not advertised as each specifies | MUST | todo (RIB) | | |
+| 4360 §2 | Extended Communities type 16, optional transitive, eight-octet values; equal only when all octets equal | MUST | done | wire/community.rs `ExtendedCommunity` | community.rs `extended_communities` |
+| 4360 §2 | Transitive bit (T) of the type high octet | MUST | done | wire/community.rs `is_transitive` | community.rs `extended_communities` |
+| 4360 §3.1–3.3 | Two-octet AS, IPv4 address and opaque templates | MUST | done (constructors and display) | wire/community.rs | community.rs `extended_communities` |
+| 4360 §6 | Non-transitive extended communities not propagated across ASes | MUST | todo (RIB) | | |
+| 8092 §3 | Large Communities type 32, optional transitive, twelve-octet values | MUST | done | wire/community.rs `LargeCommunity` | community.rs `large_communities` |
+| 8092 §3 | Never transmit duplicates; silently remove duplicates on receipt | MUST | done | wire/community.rs `decode_large_communities` | community.rs `large_communities` |
+| 8092 §5 | Canonical `global:local1:local2` representation | MUST | done | wire/community.rs `Display` | community.rs `large_communities` |
+| 8092 §6 | Length non-zero multiple of 12 else treat-as-withdraw; duplicates and reserved ASNs are not errors | SHALL / MUST | done | wire/community.rs, wire/update.rs | community.rs `large_communities`, update.rs |
 
 ## RFC 4486 / 6608 / 9003 — NOTIFICATION subcodes and shutdown communication
 
@@ -141,7 +232,14 @@ implement them.
 |---|---|---|---|---|---|
 | 7607 §2 | AS 0 as peer AS in OPEN → Bad Peer AS | MUST | done | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
 | 7607 §2 | Never initiate a connection claiming AS 0 | MUST | todo (config validation) | | |
-| 7607 §2 | AS 0 in AS_PATH / AGGREGATOR | MUST | todo (UPDATE PR) | | |
+| 7607 §2 | Never originate or propagate a route with AS 0 | MUST | todo (RIB) | | |
+| 7607 §2 | AS 0 in `AS_PATH` → malformed per RFC 7606 (treat-as-withdraw); in AGGREGATOR → attribute discard | MUST | done | wire/update.rs `decode_as_path`, `decode_one` | update.rs `as_path_rules` |
+| 7607 §2 | AS 0 in `AS4_PATH` / `AS4_AGGREGATOR` → malformed per RFC 6793 (discard) | MUST | done | wire/update.rs `decode_as4_path` | update.rs |
+| 9774 §3 | Never advertise `AS_SET` / `AS_CONFED_SET` | MUST | todo (RIB never generates them; encoder still accepts them for tests) | | |
+| 9774 §3 | `AS_SET` / `AS_CONFED_SET` in `AS_PATH` or `AS4_PATH` → treat-as-withdraw unless configured | MUST | done (`DecodeContext::allow_as_set`) | wire/update.rs `decode_as_path`, `decode_as4_path` | update.rs `as_path_rules` |
+| 2545 §3 | IPv6 next hop: global address, link-local appended only when on a shared subnet; length 16 or 32 | MUST | done (codec; the RIB decides when to append) | wire/mp.rs `NextHop` | mp.rs `ipv6_unicast_reach_round_trips` |
+| 8950 §3 | IPv4 NLRI with a 16- or 32-octet IPv6 next hop; the length selects the protocol | MUST | done | wire/mp.rs `NextHop::decode` | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
+| 8950 §4 | Extended Next Hop Encoding capability | MUST | todo (capability code 5; needed before sending IPv6 next hops for IPv4) | | |
 | 9072 §2 | Use the RFC 4271 encoding when parameters fit 255 octets | SHOULD | done | wire/open.rs `encode_with` | open.rs `open_with_capabilities_round_trips` |
 | 9072 §2 | May force the extended encoding by configuration | MAY | done (codec flag; config knob later) | wire/open.rs `encode_with(true)` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
 | 9072 §2 | Accept the extended encoding even for ≤255 octets | MUST | done | wire/open.rs `decode_parameters` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
