@@ -1,6 +1,7 @@
 # Fuzz targets
 
-cargo-fuzz targets for every decoder in `bgpfc-wire` (AGENTS.md §5). This
+cargo-fuzz targets for every decoder in `bgpfc-wire` and for the
+configuration parser (AGENTS.md §5). This
 crate is deliberately outside the workspace: `libfuzzer-sys` and
 `arbitrary` are allowed here and nowhere else (AGENTS.md §1.2).
 

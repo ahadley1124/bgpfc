@@ -12,13 +12,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bgpfc-config"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+ "bgpfc-wire",
+]
+
+[[package]]
 name = "bgpfc-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "bgpfc-config",
  "bgpfc-wire",
  "libfuzzer-sys",
 ]
+
+[[package]]
+name = "bgpfc-log"
+version = "0.1.0"
 
 [[package]]
 name = "bgpfc-wire"
