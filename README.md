@@ -83,8 +83,9 @@ The binaries are written to `target/release/bgpfcd` and `target/release/bgpfcctl
 ## Configure
 
 bgpfc uses its own block-style configuration language, similar to BIRD's and
-OpenBGPD's. The example below is a sketch. Once it exists,
-[`docs/config.md`](docs/config.md) is the authoritative grammar.
+OpenBGPD's. [`docs/config.md`](docs/config.md) is the authoritative grammar;
+[`contrib/bgpfc.conf`](contrib/bgpfc.conf) is the example below as a file.
+`bgpfcd -c FILE --check` validates a file without starting anything.
 
 ```
 router-id 192.0.2.1;
@@ -141,7 +142,7 @@ without them is rejected.
 
 In `fib { mode dry-run; }`, bgpfc computes every kernel route change and logs it,
 but never writes to the kernel. `mode install` applies the changes. The mode can
-be overridden at startup with `bgpfcd --fib=dry-run|install` and changed at
+be overridden at startup with `bgpfcd --fib dry-run|install` and changed at
 runtime with `bgpfcctl fib mode <dry-run|install>`. **Dry-run is the default.**
 
 In install mode, bgpfc only touches routes tagged with its own protocol number.

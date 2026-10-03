@@ -1,0 +1,247 @@
+Config {
+    router_id: RouterId(
+        167772161,
+    ),
+    local_as: Asn(
+        4200000000,
+    ),
+    log_level: Debug,
+    listen: [
+        10.0.0.1:179,
+        [2001:db8::1]:1179,
+    ],
+    fib: Fib {
+        mode: Install,
+        table: 100,
+        protocol: 200,
+    },
+    control: Control {
+        socket: Some(
+            "/tmp/bgpfc.sock",
+        ),
+        http: Some(
+            Http {
+                listen: [::1]:8179,
+                writes: true,
+                token_file: Some(
+                    "/etc/bgpfc/token",
+                ),
+            },
+        ),
+    },
+    prefix_lists: [
+        PrefixList {
+            pos: Pos {
+                line: 12,
+                col: 1,
+            },
+            name: "V6",
+            entries: [
+                PrefixEntry {
+                    prefix: 2001:db8::/32,
+                    ge: Some(
+                        48,
+                    ),
+                    le: Some(
+                        64,
+                    ),
+                },
+                PrefixEntry {
+                    prefix: ::/0,
+                    ge: None,
+                    le: None,
+                },
+            ],
+        },
+    ],
+    policies: [
+        Policy {
+            pos: Pos {
+                line: 16,
+                col: 1,
+            },
+            name: "IN",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 17,
+                        col: 5,
+                    },
+                    name: "a",
+                    matches: [
+                        Prefix(
+                            PrefixEntry {
+                                prefix: 10.0.0.0/8,
+                                ge: Some(
+                                    16,
+                                ),
+                                le: Some(
+                                    24,
+                                ),
+                            },
+                        ),
+                        PrefixList(
+                            "V6",
+                        ),
+                        AsPath(
+                            "^65001 .* 65002$",
+                        ),
+                        Community(
+                            65000:100,
+                        ),
+                        ExtCommunity(
+                            as2:2:65000:1,
+                        ),
+                        LargeCommunity(
+                            65000:1:2,
+                        ),
+                        Origin(
+                            Igp,
+                        ),
+                        Neighbor(
+                            10.0.0.2,
+                        ),
+                    ],
+                    sets: [
+                        LocalPref(
+                            200,
+                        ),
+                        Med(
+                            10,
+                        ),
+                        Community(
+                            Add,
+                            [
+                                65000:1,
+                                no-export,
+                            ],
+                        ),
+                        ExtCommunity(
+                            Remove,
+                            [
+                                ipv4:2:192.0.2.1:1,
+                            ],
+                        ),
+                        LargeCommunity(
+                            Replace,
+                            [
+                                65000:0:0,
+                            ],
+                        ),
+                        AsPathPrepend(
+                            [
+                                Asn(
+                                    65000,
+                                ),
+                                Asn(
+                                    65000,
+                                ),
+                            ],
+                        ),
+                        NextHopSelf,
+                    ],
+                    action: Next,
+                },
+                Term {
+                    pos: Pos {
+                        line: 35,
+                        col: 5,
+                    },
+                    name: "b",
+                    matches: [],
+                    sets: [],
+                    action: Accept,
+                },
+            ],
+        },
+        Policy {
+            pos: Pos {
+                line: 37,
+                col: 1,
+            },
+            name: "OUT",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 37,
+                        col: 14,
+                    },
+                    name: "all",
+                    matches: [],
+                    sets: [],
+                    action: Reject,
+                },
+            ],
+        },
+    ],
+    neighbors: [
+        Neighbor {
+            pos: Pos {
+                line: 38,
+                col: 1,
+            },
+            addr: 10.0.0.2,
+            remote_as: Asn(
+                65001,
+            ),
+            description: Some(
+                "v4 peer",
+            ),
+            port: 1179,
+            hold_time: HoldTime(
+                30,
+            ),
+            keepalive_time: Some(
+                5s,
+            ),
+            connect_retry_time: 10s,
+            send_hold_time: Seconds(
+                120,
+            ),
+            families: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+            ],
+            import: "IN",
+            export: "OUT",
+            passive: true,
+            allow_as_set: true,
+            collision_detect_established: true,
+        },
+        Neighbor {
+            pos: Pos {
+                line: 53,
+                col: 1,
+            },
+            addr: 2001:db8::2,
+            remote_as: Asn(
+                65002,
+            ),
+            description: None,
+            port: 179,
+            hold_time: HoldTime(
+                0,
+            ),
+            keepalive_time: None,
+            connect_retry_time: 120s,
+            send_hold_time: Off,
+            families: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+                AddressFamily {
+                    afi: Ipv6,
+                    safi: Unicast,
+                },
+            ],
+            import: "IN",
+            export: "OUT",
+            passive: false,
+            allow_as_set: false,
+            collision_detect_established: false,
+        },
+    ],
+}

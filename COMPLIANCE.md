@@ -8,8 +8,9 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
 - **Code** / **Test**: file paths, `path:line` where useful. `wire/` is
   `crates/bgpfc-wire/src/`, `fsm/` is `crates/bgpfc-fsm/src/`, "fsm
   tests" are `crates/bgpfc-fsm/src/machine/tests.rs`, `bgpfcd/` is
-  `crates/bgpfcd/src/`, and "interop" names a test in
-  `interop/tests/bird.rs`.
+  `crates/bgpfcd/src/`, `config/` is `crates/bgpfc-config/src/`
+  ("config golden" is `crates/bgpfc-config/tests/golden/`), and "interop"
+  names a test in `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -112,7 +113,7 @@ is `done`.
 | 8.2.2 | Established: KEEPALIVE/UPDATE restart HoldTimer; KeepaliveTimer restarts on every sent KEEPALIVE/UPDATE unless Hold Time is zero; stops and errors delete routes and send the NOTIFICATION; others → FSM error | MUST | done; event 21 sends the header error per §6.1 rather than an FSM error (NOTE(interop)) | fsm/machine.rs `in_established`, `message_sent` | fsm tests `established_state_table`, `established_timers_and_send_hold` |
 | 8.2.2 | "Large" HoldTimer value while waiting for the peer's OPEN; 4 minutes suggested | SHOULD | done | fsm/lib.rs `Config::open_hold_time` | fsm tests `connect_retry_timer_in_connect_and_open_sent` |
 | 10 | Suggested defaults: ConnectRetryTime 120 s, HoldTime 90 s, KeepaliveTime one third | SHOULD | done | fsm/lib.rs `Config::new` | fsm tests `open_negotiation` |
-| 10 | HoldTimer configurable per peer; other timers may be | MUST / MAY | done (all per-peer in `Config`; the config file is milestone 4) | fsm/lib.rs `Config` | |
+| 10 | HoldTimer configurable per peer; other timers may be | MUST / MAY | done (`hold-time`, `keepalive-time`, `connect-retry-time` per neighbor) | config/lower.rs `NeighborBuilder`, bgpfcd/wiring.rs `peer_config` | config golden `full.conf`, bgpfcd/wiring.rs `neighbor_becomes_peer_config` |
 | 10 | Jitter on KeepaliveTimer and ConnectRetryTimer, factor uniformly in [0.75, 1.0], redrawn each time | SHOULD | done | fsm/timers.rs `Jitter` | timers.rs `jitter_stays_within_rfc_bounds`, fsm tests `jitter_shortens_timers_within_bounds` |
 
 Rows for §9 are added by the RIB PRs.
@@ -252,7 +253,7 @@ Rows for §9 are added by the RIB PRs.
 | 9003 §2 | One-octet length; zero means absent | MUST | done | wire/notification.rs `shutdown`, `shutdown_communication` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | UTF-8, shortest form; invalid sequences never interpreted | MUST | done (`std::str::from_utf8` rejects non-shortest forms) | wire/notification.rs `shutdown_communication` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 | 9003 §2 | Report the communication, e.g. via syslog | SHOULD | done (logged at warn with the NOTIFICATION) | bgpfcd/peer.rs `primary_message` | interop `bird_shutdown_sends_cease_and_bgpfcd_retries` |
-| 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is a config concern) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
+| 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is checked when `bgpfcctl` sends one, milestone 8) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done | wire/notification.rs `ShutdownCommunicationError`, bgpfcd/peer.rs `primary_message` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 
 ## RFC 7607 / 9072 / 9687 / 9774 — AS 0, extended OPEN parameters, send hold timer, AS_SET deprecation
@@ -260,22 +261,22 @@ Rows for §9 are added by the RIB PRs.
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
 | 7607 §2 | AS 0 as peer AS in OPEN → Bad Peer AS | MUST | done | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
-| 7607 §2 | Never initiate a connection claiming AS 0 | MUST | partial (the FSM sends whatever `Config::local_as` holds; config validation rejects 0 in milestone 4) | fsm/machine.rs `build_open` | |
+| 7607 §2 | Never initiate a connection claiming AS 0 | MUST | done (`local-as 0` and `remote-as 0` are configuration errors) | config/lower.rs `asn` | config golden `value-errors.conf` |
 | 7607 §2 | Never originate or propagate a route with AS 0 | MUST | todo (RIB) | | |
 | 7607 §2 | AS 0 in `AS_PATH` → malformed per RFC 7606 (treat-as-withdraw); in AGGREGATOR → attribute discard | MUST | done | wire/update.rs `decode_as_path`, `decode_one` | update.rs `as_path_rules` |
 | 7607 §2 | AS 0 in `AS4_PATH` / `AS4_AGGREGATOR` → malformed per RFC 6793 (discard) | MUST | done | wire/update.rs `decode_as4_path` | update.rs |
 | 9774 §3 | Never advertise `AS_SET` / `AS_CONFED_SET` | MUST | todo (RIB never generates them; encoder still accepts them for tests) | | |
-| 9774 §3 | `AS_SET` / `AS_CONFED_SET` in `AS_PATH` or `AS4_PATH` → treat-as-withdraw unless configured | MUST | done (`DecodeContext::allow_as_set`) | wire/update.rs `decode_as_path`, `decode_as4_path` | update.rs `as_path_rules` |
+| 9774 §3 | `AS_SET` / `AS_CONFED_SET` in `AS_PATH` or `AS4_PATH` → treat-as-withdraw unless configured | MUST | done (`DecodeContext::allow_as_set`; `allow-as-set yes` per neighbor) | wire/update.rs `decode_as_path`, `decode_as4_path`, config/lower.rs | update.rs `as_path_rules`, config golden `full.conf` |
 | 2545 §3 | IPv6 next hop: global address, link-local appended only when on a shared subnet; length 16 or 32 | MUST | done (codec; the RIB decides when to append) | wire/mp.rs `NextHop` | mp.rs `ipv6_unicast_reach_round_trips` |
 | 8950 §3 | IPv4 NLRI with a 16- or 32-octet IPv6 next hop; the length selects the protocol | MUST | done | wire/mp.rs `NextHop::decode` | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
 | 8950 §4 | Extended Next Hop Encoding capability | MUST | todo (capability code 5; needed before sending IPv6 next hops for IPv4) | | |
 | 9072 §2 | Use the RFC 4271 encoding when parameters fit 255 octets | SHOULD | done | wire/open.rs `encode_with` | open.rs `open_with_capabilities_round_trips` |
 | 9072 §2 | May force the extended encoding by configuration | MAY | done (codec flag; config knob later) | wire/open.rs `encode_with(true)` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
-| 9687 §4.1 | SendHoldTimer / SendHoldTime session attributes, per peer | MAY | done | fsm/lib.rs `SendHoldTime`, fsm/machine.rs | fsm tests `send_hold_time_configuration` |
+| 9687 §4.1 | SendHoldTimer / SendHoldTime session attributes, per peer | MAY | done (`send-hold-time N | off` per neighbor) | fsm/lib.rs `SendHoldTime`, config/lower.rs | fsm tests `send_hold_time_configuration`, config golden `full.conf` |
 | 9687 §4.3 | Start the SendHoldTimer on entering Established when SendHoldTime is non-zero | MUST | done | fsm/machine.rs (event 26 in OpenConfirm) | fsm tests `established_timers_and_send_hold` |
 | 9687 §4.3 | On expiry: optional NOTIFICATION, log an error, release resources, drop, counter +1, damp, Idle | MUST | done | fsm/machine.rs (event 29) | fsm tests `established_state_table` |
 | 9687 §4.3 | Restart the SendHoldTimer on every sent message; stop it when SendHoldTime or the negotiated Hold Time is zero; stop it on leaving Established | MUST | done | fsm/machine.rs `restart_send_hold`, `message_sent`, `release_resources` | fsm tests `established_timers_and_send_hold`, `hold_time_zero_disables_timers` |
-| 9687 §4.4 | A non-zero SendHoldTime must exceed the Hold Time | MUST | done (a smaller configured value falls back to the default) | fsm/machine.rs `restart_send_hold` | fsm tests `send_hold_time_configuration` |
+| 9687 §4.4 | A non-zero SendHoldTime must exceed the Hold Time | MUST | done (a configuration error; the FSM also falls back to the default against the negotiated value) | config/validate.rs, fsm/machine.rs `restart_send_hold` | config golden `validation-errors.conf`, fsm tests `send_hold_time_configuration` |
 | 9687 §5 | Close the connection and log on expiry; NOTIFICATION may be sent | MUST / MAY | done (sent) | fsm/machine.rs (event 29) | fsm tests `established_state_table` |
 | 9687 §6 | Enabled by default; default the greater of 8 minutes and twice the Hold Time; subcode 0, no data | SHOULD | done | fsm/lib.rs `SendHoldTime::Default`, fsm/machine.rs `restart_send_hold` | fsm tests `established_timers_and_send_hold` |
 | 9687 §9 | Error code 8 "Send Hold Timer Expired" | MUST | done | fsm/machine.rs `SEND_HOLD_TIMER_EXPIRED` | fsm tests `established_state_table` |

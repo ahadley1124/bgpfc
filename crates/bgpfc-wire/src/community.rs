@@ -158,6 +158,61 @@ impl fmt::Display for ExtendedCommunity {
     }
 }
 
+impl FromStr for ExtendedCommunity {
+    type Err = ParseCommunityError;
+
+    /// Parse the forms [`Display`](fmt::Display) produces:
+    /// `as2:SUB:ASN:LOCAL`, `as4:SUB:ASN:LOCAL`, `ipv4:SUB:ADDR:LOCAL`
+    /// (all transitive; prefix the kind with `nt-` for non-transitive) or
+    /// sixteen hex digits after `0x`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            if hex.len() != 16 {
+                return Err(ParseCommunityError);
+            }
+            let mut b = [0u8; 8];
+            for (i, o) in b.iter_mut().enumerate() {
+                *o = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                    .map_err(|_| ParseCommunityError)?;
+            }
+            return Ok(ExtendedCommunity(b));
+        }
+        let parts: Vec<&str> = s.split(':').collect();
+        let [kind, sub, admin, local] = parts.as_slice() else {
+            return Err(ParseCommunityError);
+        };
+        let (kind, transitive) = match kind.strip_prefix("nt-") {
+            Some(k) => (k, false),
+            None => (*kind, true),
+        };
+        let sub: u8 = sub.parse().map_err(|_| ParseCommunityError)?;
+        match kind {
+            "as2" => {
+                let asn: u16 = admin.parse().map_err(|_| ParseCommunityError)?;
+                let local: u32 = local.parse().map_err(|_| ParseCommunityError)?;
+                Ok(ExtendedCommunity::two_octet_as(sub, transitive, asn, local))
+            }
+            "as4" => {
+                let asn: u32 = admin.parse().map_err(|_| ParseCommunityError)?;
+                let local: u16 = local.parse().map_err(|_| ParseCommunityError)?;
+                // RFC 5668 §2: type high 0x02 transitive, 0x42 otherwise.
+                let high = if transitive { 0x02 } else { 0x42 };
+                let a = asn.to_be_bytes();
+                let l = local.to_be_bytes();
+                Ok(ExtendedCommunity([
+                    high, sub, a[0], a[1], a[2], a[3], l[0], l[1],
+                ]))
+            }
+            "ipv4" => {
+                let addr: Ipv4Addr = admin.parse().map_err(|_| ParseCommunityError)?;
+                let local: u16 = local.parse().map_err(|_| ParseCommunityError)?;
+                Ok(ExtendedCommunity::ipv4(sub, transitive, addr, local))
+            }
+            _ => Err(ParseCommunityError),
+        }
+    }
+}
+
 impl fmt::Debug for ExtendedCommunity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -423,5 +478,30 @@ mod tests {
             Err(BadCommunityLength { len: 13, unit: 12 })
         );
         assert!(decode_large_communities(&[]).is_err());
+    }
+
+    #[test]
+    fn extended_community_text_round_trips() {
+        for text in [
+            "as2:2:65000:100",
+            "as4:2:4200000000:7",
+            "ipv4:2:192.0.2.1:9",
+            "0x0300000000000001",
+        ] {
+            let c: ExtendedCommunity = text.parse().unwrap();
+            assert_eq!(c.to_string(), text);
+        }
+        let nt: ExtendedCommunity = "nt-as2:3:1:2".parse().unwrap();
+        assert!(!nt.is_transitive());
+        assert_eq!(nt.0[0], 0x40);
+        for bad in [
+            "as2:2:65000",
+            "as2:2:70000:1",
+            "x:1:2:3",
+            "0x12",
+            "0xzz00000000000000",
+        ] {
+            assert!(bad.parse::<ExtendedCommunity>().is_err(), "{bad}");
+        }
     }
 }
