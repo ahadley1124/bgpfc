@@ -6,7 +6,8 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   NOT count as MUST and SHOULD).
 - **Status**: `done`, `partial`, `todo`, `n/a`, or `deviates` (with a reason).
 - **Code** / **Test**: file paths, `path:line` where useful. `wire/` is
-  `crates/bgpfc-wire/src/`.
+  `crates/bgpfc-wire/src/`, `fsm/` is `crates/bgpfc-fsm/src/`, and "fsm
+  tests" are `crates/bgpfc-fsm/src/machine/tests.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -19,9 +20,9 @@ is `done`.
 | 4.1 | Length field 19..=4096 inclusive (65535 per RFC 8654) | MUST | done | wire/header.rs `Header::decode` | header.rs `length_bounds_carry_the_length_field_as_data` |
 | 4.1 | No padding; Length is the smallest value for the message | MUST | done (OPEN) | wire/open.rs `OpenMessage::decode` trailing check | open.rs `parameter_errors` |
 | 4.1 | Type is OPEN/UPDATE/NOTIFICATION/KEEPALIVE (+ROUTE-REFRESH) | MUST | done | wire/header.rs `MessageType` | header.rs `message_type_table` |
-| 4.2 | Hold Timer = min(configured, received) | MUST | todo (FSM) | | |
+| 4.2 | Hold Timer = min(configured, received) | MUST | done | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 | 4.2 | Hold Time is zero or at least three seconds | MUST | done | wire/types.rs `HoldTime::new` | types.rs `hold_time_rejects_one_and_two` |
-| 4.2 | May reject connections on the basis of Hold Time | MAY | todo (FSM) | | |
+| 4.2 | May reject connections on the basis of Hold Time | MAY | n/a (not exercised; one and two seconds are rejected by the codec) | | |
 | 4.2 | Minimum OPEN length is 29 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs `length_bounds_carry_the_length_field_as_data` |
 | 6.1 | Header errors use Error Code Message Header Error | MUST | done | wire/error.rs `DecodeError::header` | header.rs tests |
 | 6.1 | Bad marker → Connection Not Synchronized | MUST | done | wire/header.rs `Header::decode` | header.rs `bad_marker_is_connection_not_synchronized` |
@@ -29,23 +30,23 @@ is `done`.
 | 6.1 | Unknown Type → Bad Message Type, Data = Type field | MUST | done | wire/header.rs `Header::decode` | header.rs `unknown_type_carries_the_type_as_data` |
 | 6.2 | OPEN errors use Error Code OPEN Message Error | MUST | done | wire/error.rs `DecodeError::open` | open.rs tests |
 | 6.2 | Unsupported version → Unsupported Version Number, Data = 2-octet supported version | MUST | done | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
-| 6.2 | Unacceptable AS → Bad Peer AS | MUST | partial (AS 0 only; configured-AS check is the FSM's) | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
+| 6.2 | Unacceptable AS → Bad Peer AS | MUST | done (AS 0 in the codec, configured AS in the FSM) | wire/open.rs `OpenMessage::decode`, fsm/machine.rs `accept_open` | open.rs `fixed_field_errors`, fsm tests `bad_peer_as_and_unsupported_capability` |
 | 6.2 | Hold Time 1 or 2 → Unacceptable Hold Time | MUST | done | wire/open.rs, wire/types.rs `HoldTime::new` | open.rs `fixed_field_errors` |
-| 6.2 | May reject any Hold Time | MAY | todo (FSM) | | |
-| 6.2 | Use the negotiated Hold Time | MUST | todo (FSM) | | |
+| 6.2 | May reject any Hold Time | MAY | n/a | | |
+| 6.2 | Use the negotiated Hold Time | MUST | done | fsm/machine.rs `start_session_timers` | fsm tests `open_negotiation`, `established_timers_and_send_hold` |
 | 6.2 | Syntactically bad BGP Identifier → Bad BGP Identifier | MUST | done (RFC 6286 §2.1: non-zero) | wire/open.rs, wire/types.rs `RouterId::new` | open.rs `fixed_field_errors`, types.rs `router_id_rejects_zero_only` |
 | 6.2 | Unrecognised optional parameter → Unsupported Optional Parameters | MUST | done | wire/open.rs `decode_parameters` | open.rs `parameter_errors` |
 | 6.2 | Recognised but malformed optional parameter → subcode 0 | MUST | done | wire/open.rs `malformed`, wire/capability.rs `malformed` | open.rs `parameter_errors`, capability.rs `malformed_known_capabilities_are_unspecific_open_errors` |
 | 4.4 | KEEPALIVE is the 19-octet header only | MUST | done | wire/keepalive.rs `KEEPALIVE` | keepalive.rs `keepalive_is_the_bare_header` |
-| 4.4 | KEEPALIVEs at most one per second; none when Hold Time is zero | MUST | todo (FSM) | | |
-| 4.4 | May adjust the KEEPALIVE rate to the Hold Time | MAY | todo (FSM) | | |
+| 4.4 | KEEPALIVEs at most one per second; none when Hold Time is zero | MUST | done (KeepaliveTime ≥ Hold Time/3 ≥ 1 s; none at zero) | fsm/machine.rs `accept_open`, `start_session_timers` | fsm tests `hold_time_zero_disables_timers` |
+| 4.4 | May adjust the KEEPALIVE rate to the Hold Time | MAY | done (one third of the negotiated value) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 | 4.5 | NOTIFICATION: code, subcode, data; connection closed after sending | MUST | done (codec; close is the FSM's) | wire/notification.rs | notification.rs `plain_notifications_round_trip` |
 | 4.5 | Subcode 0 when the code defines none | MUST | done | wire/notification.rs `hold_timer_expired` | notification.rs `display_names` |
 | 4.5 | Minimum NOTIFICATION length is 21 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs `length_bounds_carry_the_length_field_as_data` |
 | 6.4 | Errors in a received NOTIFICATION are logged, never answered | SHOULD | done (decoder never rejects; `is_recognised` for the log) | wire/notification.rs `decode`, `is_recognised` | notification.rs `unknown_codes_are_kept_and_flagged` |
-| 6.5 | Hold Timer Expired NOTIFICATION, then close | MUST | done (message; timer is the FSM's) | wire/notification.rs `hold_timer_expired` | notification.rs `plain_notifications_round_trip` |
-| 6.6 | FSM errors use Error Code Finite State Machine Error | MUST | done (message; detection is the FSM's) | wire/notification.rs `fsm` | notification.rs `plain_notifications_round_trip` |
-| 6.7 | Cease only in the absence of a fatal error | MUST | todo (FSM) | | |
+| 6.5 | Hold Timer Expired NOTIFICATION, then close | MUST | done | wire/notification.rs `hold_timer_expired`, fsm/machine.rs (event 10) | fsm tests state tables |
+| 6.6 | FSM errors use Error Code Finite State Machine Error | MUST | done | fsm/machine.rs `fsm_error` | fsm tests state tables, `fsm_error_data_names_the_unexpected_message` |
+| 6.7 | Cease only in the absence of a fatal error | MUST | done (Cease only for stops and collisions) | fsm/machine.rs | fsm tests state tables |
 | 6.7 | May impose a prefix limit and Cease when reached | MAY | todo (RIB) | | |
 
 | 4.3 | UPDATE: withdrawn routes length/field, total path attribute length/field, NLRI | MUST | done | wire/update.rs `encode`, `split_fields` | update.rs `announce_round_trips`, `withdraw_only_and_empty_updates` |
@@ -86,7 +87,31 @@ is `done`.
 | 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (RIB) | | |
 | 6.3 | Correct attributes with no NLRI is a valid UPDATE | MUST | done | wire/update.rs `decode` | update.rs `missing_mandatory_attributes` |
 
-Rows for §6.8, §8 and §9 are added by the PRs that implement them.
+| 6.8 | One of two colliding connections is closed; the one from the higher BGP Identifier is kept | MUST | partial (FSM handles OpenCollisionDump and exposes the peer's Identifier; comparison is the coordinator's, milestone 3) | fsm/machine.rs `collision_dump` | fsm tests state tables |
+| 6.8 | Examine OpenConfirm connections on every OPEN; may examine OpenSent | MUST / MAY | todo (coordinator) | | |
+| 6.8 | A collision with an Established connection closes the new one unless configured | MUST | done (`collision_detect_established`) | fsm/machine.rs (event 23 in Established) | fsm tests `collision_dump_in_established_needs_the_option` |
+| 6.8 | Close the losing connection with a Cease | MUST | done (Connection Collision Resolution subcode) | fsm/machine.rs `collision_dump` | fsm tests state tables |
+| 8 | Mandatory session attributes: State, ConnectRetryCounter, ConnectRetryTimer/Time, HoldTimer/Time, KeepaliveTimer/Time | MUST | done | fsm/machine.rs `Fsm`, fsm/lib.rs `Config` | fsm tests |
+| 8.1.1 | Optional attributes: DampPeerOscillations/IdleHoldTime/IdleHoldTimer, PassiveTcpEstablishment, DelayOpen/DelayOpenTime/DelayOpenTimer, SendNOTIFICATIONwithoutOPEN, CollisionDetectEstablishedState | MAY | done; AllowAutomaticStart implicit (configured peers restart), AcceptConnectionsUnconfiguredPeers and TrackTcpState not supported | fsm/lib.rs `Config` | fsm tests `delay_open`, `damping_doubles_the_idle_hold_and_a_session_resets_it`, `send_notification_without_open`, `active_retries_connect_when_not_passive` |
+| 8.1.2 | Events 1 and 2 mandatory; 3–8 optional | MUST | done (3, 5–7 as `AutomaticStart` with config; 4 as `ManualStartPassive`; 8 with its Cease) | fsm/lib.rs `Event` | fsm tests `event_numbers_and_timer_events` |
+| 8.1.3 | Timer events 9–13 | MUST / MAY | done | fsm/lib.rs `TimerKind::event` | fsm tests |
+| 8.1.4 | TCP events 14–18 | MUST / MAY | done | fsm/lib.rs `Event` | fsm tests state tables |
+| 8.1.5 | Message events 19–28 | MUST / MAY | done (20 derived from the DelayOpenTimer) | fsm/lib.rs `Event` | fsm tests state tables, `delay_open` |
+| 8.2.1 | One FSM per configured peer and per unidentified incoming connection; listen on and connect to port 179 | MUST | partial (FSM is per connection; listener and coordinator are milestone 3) | fsm/machine.rs `Fsm::new` | |
+| 8.2.1.2 | Dispose of the losing FSM after collision resolution | SHOULD | todo (coordinator) | | |
+| 8.2.2 | Idle: start events initialise, zero the counter, start ConnectRetryTimer, connect or listen; stop events ignored; other events ignored | MUST | done | fsm/machine.rs `in_idle`, `start` | fsm tests `idle_state_table` |
+| 8.2.2 | Connect: every event per the text (ConnectRetryTimer restart, DelayOpen handling, OPEN on connect, failures to Idle with damping) | MUST | done | fsm/machine.rs `in_connect` | fsm tests `connect_state_table`, `delay_open`, `send_notification_without_open` |
+| 8.2.2 | Active: every event per the text | MUST | done; a PassiveTcpEstablishment peer stays Active on ConnectRetryTimer expiry (NOTE(interop)) | fsm/machine.rs `in_active` | fsm tests `active_state_table`, `active_retries_connect_when_not_passive` |
+| 8.2.2 | OpenSent: Cease on stops, Hold Timer Expired, TcpConnectionFails → Active, OPEN → KEEPALIVE + timers + OpenConfirm, errors → NOTIFICATION, collision → Cease, version error → Idle, others → FSM error | MUST | done | fsm/machine.rs `in_open_sent` | fsm tests `open_sent_state_table` |
+| 8.2.2 | OpenSent: internal/external set from the AS field | MUST | done | fsm/machine.rs `accept_open` | fsm tests `internal_session_and_old_speaker` |
+| 8.2.2 | OpenConfirm: every event per the text; KEEPALIVE → Established | MUST | done | fsm/machine.rs `in_open_confirm` | fsm tests `open_confirm_state_table` |
+| 8.2.2 | Established: KEEPALIVE/UPDATE restart HoldTimer; KeepaliveTimer restarts on every sent KEEPALIVE/UPDATE unless Hold Time is zero; stops and errors delete routes and send the NOTIFICATION; others → FSM error | MUST | done; event 21 sends the header error per §6.1 rather than an FSM error (NOTE(interop)) | fsm/machine.rs `in_established`, `message_sent` | fsm tests `established_state_table`, `established_timers_and_send_hold` |
+| 8.2.2 | "Large" HoldTimer value while waiting for the peer's OPEN; 4 minutes suggested | SHOULD | done | fsm/lib.rs `Config::open_hold_time` | fsm tests `connect_retry_timer_in_connect_and_open_sent` |
+| 10 | Suggested defaults: ConnectRetryTime 120 s, HoldTime 90 s, KeepaliveTime one third | SHOULD | done | fsm/lib.rs `Config::new` | fsm tests `open_negotiation` |
+| 10 | HoldTimer configurable per peer; other timers may be | MUST / MAY | done (all per-peer in `Config`; the config file is milestone 4) | fsm/lib.rs `Config` | |
+| 10 | Jitter on KeepaliveTimer and ConnectRetryTimer, factor uniformly in [0.75, 1.0], redrawn each time | SHOULD | done | fsm/timers.rs `Jitter` | timers.rs `jitter_stays_within_rfc_bounds`, fsm tests `jitter_shortens_timers_within_bounds` |
+
+Rows for §9 are added by the RIB PRs.
 
 ## RFC 5492 — Capabilities Advertisement
 
@@ -97,7 +122,7 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 4 | Accept duplicate identical capabilities | MUST | done | wire/open.rs `decode_parameters` | open.rs `several_capabilities_parameters_are_merged` |
 | 4 | Include the Capabilities parameter once | SHOULD | done | wire/open.rs `encode_with` | open.rs `several_capabilities_parameters_are_merged` |
 | 4 | Accept several Capabilities parameters and merge them | MUST | done | wire/open.rs `decode_parameters` | open.rs `several_capabilities_parameters_are_merged` |
-| 5 | Unsupported Capability subcode 7, Data lists the capabilities | MUST | partial (subcode defined; sending is the FSM's) | wire/error.rs `OpenSubcode::UnsupportedCapability` | error.rs `constructors_set_code_and_subcode` |
+| 5 | Unsupported Capability subcode 7, Data lists the capabilities | MUST | done (sent when no address family is shared) | fsm/machine.rs `accept_open` | fsm tests `bad_peer_as_and_unsupported_capability` |
 | 5 | Never send Unsupported Capability for a capability not understood; ignore it | MUST | done (decoder keeps it as `Unknown`) | wire/capability.rs `Capability::decode` | capability.rs `unknown_capabilities_are_kept_not_rejected` |
 
 ## RFC 6793 — Four-Octet AS Numbers
@@ -123,7 +148,7 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 8 | Use capability advertisement to negotiate | SHOULD | done (codec; FSM uses it later) | wire/capability.rs | capability.rs |
 | 8 | Capability 1, length 4: AFI, reserved, SAFI | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 8 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/capability.rs | capability.rs `multiprotocol_ignores_the_reserved_octet` |
-| 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | todo (FSM) | | |
+| 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | done (no Multiprotocol capability means IPv4 unicast only) | fsm/machine.rs `negotiate_families` | fsm tests `open_negotiation`, `internal_session_and_old_speaker` |
 | 3 | `MP_REACH_NLRI` type 14, optional non-transitive: AFI, SAFI, next hop length, next hop, reserved, NLRI | MUST | done | wire/mp.rs `MpReach` | mp.rs `ipv6_unicast_reach_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | MUST / SHOULD | done | wire/mp.rs | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
 | 3 | UPDATE with `MP_REACH_NLRI` carries ORIGIN and `AS_PATH` (and `LOCAL_PREF` on iBGP) | MUST | done for ORIGIN/`AS_PATH` (treat-as-withdraw); `LOCAL_PREF` left to the RIB | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
@@ -141,7 +166,7 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 2 | Capability 2, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | done | wire/header.rs `MessageType::RouteRefresh`, wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
-| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | todo (RIB) | | |
+| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (`Session::route_refresh` records it; the RIB acts on it) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 
 ## RFC 7606 — Revised Error Handling
 
@@ -183,7 +208,7 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 3 | Capability 6, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | Peers using it must support RFC 7606 error handling | MUST | done | wire/update.rs | update.rs |
 | 4 | Applies to all messages except OPEN and KEEPALIVE | MUST | done | wire/header.rs `MessageType::max_len` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
-| 4 | Advertise the capability when able | SHOULD | todo (config/FSM) | | |
+| 4 | Advertise the capability when able | SHOULD | done (`Config::capabilities`; both sides needed for `Session::extended_messages`) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 | 4 | Send extended messages only if the peer advertised the capability | MAY | todo (RIB update packing) | | |
 | 4 | Having advertised it, accept up to 65535 octets | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 4 | Over 4096 without the capability → Bad Message Length | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
@@ -214,15 +239,15 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 4486 §3 | Cease subcodes 1–8 | MUST | done | wire/error.rs `CeaseSubcode`, `subcode_name` | error.rs `subcode_names_cover_every_defined_subcode` |
 | 4486 §4 | Prefix limit exceeded → Cease / Maximum Number of Prefixes Reached | MUST | done (message; limit is the RIB's) | wire/notification.rs `max_prefixes_reached` | notification.rs `max_prefixes_data_field` |
 | 4486 §4 | Maximum Prefixes Data: AFI, SAFI, upper bound | MAY | done | wire/notification.rs `max_prefixes_reached`, `max_prefixes` | notification.rs `max_prefixes_data_field` |
-| 4486 §4 | Administrative Shutdown / Peer De-configured / Administrative Reset / Connection Rejected / Other Configuration Change / Connection Collision Resolution subcodes in their situations | SHOULD | done (messages; sending is the FSM's) | wire/notification.rs `cease` | notification.rs |
+| 4486 §4 | Administrative Shutdown / Peer De-configured / Administrative Reset / Connection Rejected / Other Configuration Change / Connection Collision Resolution subcodes in their situations | SHOULD | done (ManualStop → Administrative Shutdown, collisions → Connection Collision Resolution; AutomaticStop carries the caller's subcode) | fsm/machine.rs | fsm tests state tables |
 | 4486 §4 | Out of Resources subcode | MAY | done (message) | wire/notification.rs `cease` | notification.rs |
-| 4486 §4 | Damp oscillations after Shutdown / De-configured / Rejected / Out of Resources; bound automatic retries | SHOULD | todo (FSM) | | |
+| 4486 §4 | Damp oscillations after Shutdown / De-configured / Rejected / Out of Resources; bound automatic retries | SHOULD | partial (IdleHoldTime doubles up to a cap after every damped failure; no retry bound) | fsm/machine.rs `go_idle` | fsm tests `damping_doubles_the_idle_hold_and_a_session_resets_it` |
 | 6608 §3 | FSM subcodes 0–3 | MUST | done | wire/error.rs `FsmSubcode` | error.rs `subcode_names_cover_every_defined_subcode` |
-| 6608 §4 | Unexpected message in OpenSent / OpenConfirm / Established → the matching subcode, Data = message type | MUST | done (message; detection is the FSM's) | wire/notification.rs `fsm` | notification.rs `plain_notifications_round_trip` |
+| 6608 §4 | Unexpected message in OpenSent / OpenConfirm / Established → the matching subcode, Data = message type | MUST | done | fsm/machine.rs `fsm_error` | fsm tests `fsm_error_data_names_the_unexpected_message` |
 | 9003 §2 | Shutdown Communication only with subcode 2 or 4 | MUST | done | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | One-octet length; zero means absent | MUST | done | wire/notification.rs `shutdown`, `shutdown_communication` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | UTF-8, shortest form; invalid sequences never interpreted | MUST | done (`std::str::from_utf8` rejects non-shortest forms) | wire/notification.rs `shutdown_communication` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
-| 9003 §2 | Report the communication, e.g. via syslog | SHOULD | todo (FSM logs it) | | |
+| 9003 §2 | Report the communication, e.g. via syslog | SHOULD | todo (peer thread logs it, milestone 3) | | |
 | 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is a config concern) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done (reported as `InvalidUtf8` for the FSM to log) | wire/notification.rs `ShutdownCommunicationError` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 
@@ -231,7 +256,7 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
 | 7607 §2 | AS 0 as peer AS in OPEN → Bad Peer AS | MUST | done | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
-| 7607 §2 | Never initiate a connection claiming AS 0 | MUST | todo (config validation) | | |
+| 7607 §2 | Never initiate a connection claiming AS 0 | MUST | partial (the FSM sends whatever `Config::local_as` holds; config validation rejects 0 in milestone 4) | fsm/machine.rs `build_open` | |
 | 7607 §2 | Never originate or propagate a route with AS 0 | MUST | todo (RIB) | | |
 | 7607 §2 | AS 0 in `AS_PATH` → malformed per RFC 7606 (treat-as-withdraw); in AGGREGATOR → attribute discard | MUST | done | wire/update.rs `decode_as_path`, `decode_one` | update.rs `as_path_rules` |
 | 7607 §2 | AS 0 in `AS4_PATH` / `AS4_AGGREGATOR` → malformed per RFC 6793 (discard) | MUST | done | wire/update.rs `decode_as4_path` | update.rs |
@@ -242,6 +267,14 @@ Rows for §6.8, §8 and §9 are added by the PRs that implement them.
 | 8950 §4 | Extended Next Hop Encoding capability | MUST | todo (capability code 5; needed before sending IPv6 next hops for IPv4) | | |
 | 9072 §2 | Use the RFC 4271 encoding when parameters fit 255 octets | SHOULD | done | wire/open.rs `encode_with` | open.rs `open_with_capabilities_round_trips` |
 | 9072 §2 | May force the extended encoding by configuration | MAY | done (codec flag; config knob later) | wire/open.rs `encode_with(true)` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
+| 9687 §4.1 | SendHoldTimer / SendHoldTime session attributes, per peer | MAY | done | fsm/lib.rs `SendHoldTime`, fsm/machine.rs | fsm tests `send_hold_time_configuration` |
+| 9687 §4.3 | Start the SendHoldTimer on entering Established when SendHoldTime is non-zero | MUST | done | fsm/machine.rs (event 26 in OpenConfirm) | fsm tests `established_timers_and_send_hold` |
+| 9687 §4.3 | On expiry: optional NOTIFICATION, log an error, release resources, drop, counter +1, damp, Idle | MUST | done | fsm/machine.rs (event 29) | fsm tests `established_state_table` |
+| 9687 §4.3 | Restart the SendHoldTimer on every sent message; stop it when SendHoldTime or the negotiated Hold Time is zero; stop it on leaving Established | MUST | done | fsm/machine.rs `restart_send_hold`, `message_sent`, `release_resources` | fsm tests `established_timers_and_send_hold`, `hold_time_zero_disables_timers` |
+| 9687 §4.4 | A non-zero SendHoldTime must exceed the Hold Time | MUST | done (a smaller configured value falls back to the default) | fsm/machine.rs `restart_send_hold` | fsm tests `send_hold_time_configuration` |
+| 9687 §5 | Close the connection and log on expiry; NOTIFICATION may be sent | MUST / MAY | done (sent) | fsm/machine.rs (event 29) | fsm tests `established_state_table` |
+| 9687 §6 | Enabled by default; default the greater of 8 minutes and twice the Hold Time; subcode 0, no data | SHOULD | done | fsm/lib.rs `SendHoldTime::Default`, fsm/machine.rs `restart_send_hold` | fsm tests `established_timers_and_send_hold` |
+| 9687 §9 | Error code 8 "Send Hold Timer Expired" | MUST | done | fsm/machine.rs `SEND_HOLD_TIMER_EXPIRED` | fsm tests `established_state_table` |
 | 9072 §2 | Accept the extended encoding even for ≤255 octets | MUST | done | wire/open.rs `decode_parameters` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
 | 9072 §2 | Use the extended encoding when parameters exceed 255 octets | MUST | done | wire/open.rs `encode_with` | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
 | 9072 §2 | Non-Ext OP Len. 255 on send, never 0, ignored on receipt | SHOULD/MUST | done | wire/open.rs | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
