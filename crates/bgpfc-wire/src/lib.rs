@@ -15,6 +15,7 @@
 
 pub mod as_path;
 pub mod capability;
+pub mod community;
 pub mod error;
 pub mod header;
 pub mod keepalive;
@@ -27,6 +28,7 @@ pub mod types;
 
 pub use as_path::{AsPath, AsPathSegment, SegmentType};
 pub use capability::Capability;
+pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use error::{
     CeaseSubcode, DecodeError, EncodeError, ErrorCode, FsmSubcode, HeaderSubcode, OpenSubcode,
     UpdateSubcode, subcode_name,
