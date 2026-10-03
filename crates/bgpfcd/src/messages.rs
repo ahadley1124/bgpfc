@@ -71,6 +71,9 @@ pub(crate) enum PeerInput {
         /// Which connection.
         conn: ConnId,
     },
+    /// Framed UPDATE messages from the RIB thread, to write in order while
+    /// Established (RFC 4271 §9.2).
+    Send(Vec<Vec<u8>>),
 }
 
 /// What peer threads tell the RIB thread.
@@ -80,6 +83,9 @@ pub(crate) enum RibMsg {
     PeerUp {
         /// Peer address.
         peer: IpAddr,
+        /// Our address on the connection: the next hop for external
+        /// peers (RFC 4271 §5.1.3).
+        local_addr: IpAddr,
         /// Negotiated parameters.
         session: Session,
     },
