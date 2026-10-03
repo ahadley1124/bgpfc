@@ -1,8 +1,8 @@
 //! `bgpfcd`: the bgpfc BGP-4 routing daemon.
 //!
-//! Milestone 4 shape (AGENTS.md §3): the configuration file, listener
-//! threads, one thread per neighbour driving its FSM, and a stand-in RIB
-//! thread.
+//! Milestone 5 shape (AGENTS.md §3): the configuration file, listener
+//! threads, one thread per neighbour driving its FSM, and the RIB thread.
+//! Route changes are logged until the FIB thread arrives.
 #![forbid(unsafe_code)]
 
 mod args;
@@ -10,7 +10,7 @@ mod coordinator;
 mod messages;
 mod peer;
 mod reader;
-mod rib_stub;
+mod rib;
 mod wiring;
 
 use std::collections::HashMap;
@@ -65,7 +65,6 @@ fn main() {
     );
 
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
-    rib_stub::spawn(rib_rx);
 
     let mut table = HashMap::new();
     for n in &config.neighbors {
@@ -82,6 +81,7 @@ fn main() {
         table.insert(handle.addr, handle);
     }
     let table = Arc::new(table);
+    rib::spawn(config.local_as, rib_rx, Arc::clone(&table));
     for addr in config.listen {
         if let Err(e) = coordinator::listen(addr, Arc::clone(&table)) {
             bgpfc_log::error!("cannot listen", address = addr, error = e);

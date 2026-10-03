@@ -59,6 +59,10 @@ pub(crate) struct PeerHandle {
     pub(crate) addr: IpAddr,
     /// Its input queue.
     pub(crate) tx: SyncSender<PeerInput>,
+    /// Set by the RIB thread when the queue was full and UPDATEs had to be
+    /// dropped: the peer thread resets the session rather than leave the
+    /// peer with a partial view (AGENTS.md §3, backpressure).
+    pub(crate) overrun: Arc<AtomicBool>,
 }
 
 struct Conn {
@@ -83,14 +87,17 @@ struct Peer {
     attempt: u64,
     session: Option<Session>,
     write_failed: bool,
+    overrun: Arc<AtomicBool>,
 }
 
 /// Start the peer thread; it begins with a `ManualStart`.
 pub(crate) fn spawn(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> PeerHandle {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
+    let overrun = Arc::new(AtomicBool::new(false));
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
+        overrun: Arc::clone(&overrun),
     };
     let fsm = Fsm::new(cfg.fsm.clone());
     let peer = Peer {
@@ -105,6 +112,7 @@ pub(crate) fn spawn(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> PeerHandle {
         attempt: 0,
         session: None,
         write_failed: false,
+        overrun,
     };
     thread::Builder::new()
         .name(format!("peer-{}", handle.addr))
@@ -222,8 +230,14 @@ impl Peer {
                             .store(session.extended_messages, Ordering::Relaxed);
                     }
                     self.session = Some(session.clone());
+                    let local_addr = self
+                        .conn
+                        .as_ref()
+                        .and_then(|c| c.stream.local_addr().ok())
+                        .map_or(self.cfg.addr, |a| crate::coordinator::canonical(a.ip()));
                     self.rib_send(RibMsg::PeerUp {
                         peer: self.cfg.addr,
+                        local_addr,
                         session,
                     });
                 }
@@ -273,6 +287,26 @@ impl Peer {
                     self.pending = None;
                 }
             }
+            PeerInput::Send(messages) => {
+                if self.fsm.state() == State::Established {
+                    for m in &messages {
+                        self.write_raw(m);
+                    }
+                    self.fsm.message_sent(now);
+                }
+            }
+        }
+        if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
+            // RFC 4486 §4: Out of Resources. The peer restarts and gets a
+            // complete Adj-RIB-Out again.
+            bgpfc_log::error!(
+                "output queue overrun, resetting session",
+                peer = self.cfg.addr
+            );
+            self.event(
+                Event::AutomaticStop(NotificationMessage::cease(CeaseSubcode::OutOfResources)),
+                now,
+            );
         }
     }
 

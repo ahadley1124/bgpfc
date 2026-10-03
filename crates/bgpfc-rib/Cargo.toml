@@ -8,6 +8,15 @@ rust-version.workspace = true
 description = "Adj-RIB-In, Loc-RIB, Adj-RIB-Out and the RFC 4271 §9 decision process"
 
 [dependencies]
+bgpfc-wire.workspace = true
+
+[dev-dependencies]
+proptest = "1.11"
+criterion = "0.5"
+
+[[bench]]
+name = "rib"
+harness = false
 
 [lints]
 workspace = true

@@ -58,7 +58,7 @@ fn accept_loop(listener: &TcpListener, peers: &PeerTable) {
 
 /// An IPv4 peer reaching a dual-stack listener shows up as `::ffff:a.b.c.d`;
 /// the peer table is keyed by the plain IPv4 address.
-fn canonical(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         IpAddr::V4(_) => ip,

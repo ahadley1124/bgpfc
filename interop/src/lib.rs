@@ -16,7 +16,7 @@
 
 use std::fs;
 use std::io::Read as _;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -50,6 +50,13 @@ pub struct Lab {
     pub b_addr: Ipv4Addr,
     /// Scratch directory for configs, sockets and logs.
     pub dir: PathBuf,
+    /// Namespace name of side C, once [`Lab::add_c`] created it.
+    pub c: Option<String>,
+    /// Address of side A on the link to C.
+    pub a2_addr: Ipv4Addr,
+    /// Address of side C.
+    pub c_addr: Ipv4Addr,
+    id: String,
 }
 
 impl Lab {
@@ -92,7 +99,40 @@ impl Lab {
             a_addr,
             b_addr,
             dir,
+            c: None,
+            a2_addr: Ipv4Addr::new(10, 98, subnet, 1),
+            c_addr: Ipv4Addr::new(10, 98, subnet, 2),
+            id,
         }
+    }
+
+    /// Add a third namespace `c`, joined to `a` by a second veth pair on
+    /// `10.98.<subnet>.0/24`; the namespace name is returned and kept in
+    /// `self.c`.
+    ///
+    /// # Panics
+    /// If `ip` fails.
+    pub fn add_c(&mut self) -> String {
+        let c = format!("bgpfc-{}-c", self.id);
+        let va = format!("v{}a2", self.id);
+        let vc = format!("v{}c", self.id);
+        sh("ip", &["netns", "add", &c]);
+        sh(
+            "ip",
+            &["link", "add", &va, "type", "veth", "peer", "name", &vc],
+        );
+        sh("ip", &["link", "set", &va, "netns", &self.a]);
+        sh("ip", &["link", "set", &vc, "netns", &c]);
+        for (ns, dev, addr) in [(&self.a, &va, self.a2_addr), (&c, &vc, self.c_addr)] {
+            sh(
+                "ip",
+                &["-n", ns, "addr", "add", &format!("{addr}/24"), "dev", dev],
+            );
+            sh("ip", &["-n", ns, "link", "set", dev, "up"]);
+            sh("ip", &["-n", ns, "link", "set", "lo", "up"]);
+        }
+        self.c = Some(c.clone());
+        c
     }
 
     /// A command that runs inside namespace `ns`.
@@ -108,6 +148,9 @@ impl Drop for Lab {
     fn drop(&mut self) {
         let _ = Command::new("ip").args(["netns", "del", &self.a]).status();
         let _ = Command::new("ip").args(["netns", "del", &self.b]).status();
+        if let Some(c) = &self.c {
+            let _ = Command::new("ip").args(["netns", "del", c]).status();
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -186,20 +229,58 @@ pub fn bgpfcd_path() -> PathBuf {
     .clone()
 }
 
-/// Options for one `bgpfcd` under test.
-pub struct BgpfcdOpts {
-    /// Our AS.
-    pub local_as: u32,
-    /// Router ID (also the listen address).
-    pub router_id: Ipv4Addr,
+/// One neighbor of a daemon under test.
+#[derive(Clone, Debug)]
+pub struct NeighborOpts {
     /// The peer's address.
-    pub neighbor: Ipv4Addr,
+    pub addr: IpAddr,
+    /// The peer's TCP port.
+    pub port: u16,
     /// The peer's AS.
     pub remote_as: u32,
     /// Hold time in seconds.
     pub hold_time: u16,
     /// Never initiate the TCP connection.
     pub passive: bool,
+}
+
+impl NeighborOpts {
+    /// An active neighbor on port 179 with a 30 s hold time.
+    #[must_use]
+    pub fn new(addr: impl Into<IpAddr>, remote_as: u32) -> NeighborOpts {
+        NeighborOpts {
+            addr: addr.into(),
+            port: 179,
+            remote_as,
+            hold_time: 30,
+            passive: false,
+        }
+    }
+}
+
+/// Options for one `bgpfcd` under test.
+pub struct BgpfcdOpts {
+    /// Our AS.
+    pub local_as: u32,
+    /// Router ID.
+    pub router_id: Ipv4Addr,
+    /// Listen addresses (port 179 each).
+    pub listen: Vec<IpAddr>,
+    /// Neighbors.
+    pub neighbors: Vec<NeighborOpts>,
+}
+
+impl BgpfcdOpts {
+    /// A daemon listening on `router_id` with one neighbor.
+    #[must_use]
+    pub fn single(local_as: u32, router_id: Ipv4Addr, neighbor: NeighborOpts) -> BgpfcdOpts {
+        BgpfcdOpts {
+            local_as,
+            router_id,
+            listen: vec![IpAddr::V4(router_id)],
+            neighbors: vec![neighbor],
+        }
+    }
 }
 
 /// Write a configuration and start `bgpfcd` in namespace `ns` with debug
@@ -210,31 +291,28 @@ pub struct BgpfcdOpts {
 /// If the config cannot be written or the process cannot be spawned.
 #[must_use]
 pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+    use std::fmt::Write as _;
     let cfg = lab.dir.join(format!("bgpfcd-{ns}.conf"));
-    fs::write(
-        &cfg,
-        format!(
-            "router-id {rid};\n\
-             local-as {local_as};\n\
-             log {{ level debug; }}\n\
-             listen {{ address {rid}; port 179; }}\n\
-             policy ANY {{ term all {{ action accept; }} }}\n\
-             neighbor {neighbor} {{\n\
-             \x20   remote-as {remote_as};\n\
-             \x20   hold-time {hold};\n\
-             \x20   passive {passive};\n\
-             \x20   import ANY;\n\
-             \x20   export ANY;\n\
-             }}\n",
-            rid = opts.router_id,
-            local_as = opts.local_as,
-            neighbor = opts.neighbor,
-            remote_as = opts.remote_as,
-            hold = opts.hold_time,
-            passive = if opts.passive { "yes" } else { "no" },
-        ),
-    )
-    .expect("bgpfcd config");
+    let mut text = format!(
+        "router-id {};\nlocal-as {};\nlog {{ level debug; }}\n\
+         policy ANY {{ term all {{ action accept; }} }}\n",
+        opts.router_id, opts.local_as
+    );
+    for l in &opts.listen {
+        let _ = writeln!(text, "listen {{ address {l}; port 179; }}");
+    }
+    for n in &opts.neighbors {
+        let _ = writeln!(
+            text,
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import ANY; export ANY; }}",
+            n.addr,
+            n.remote_as,
+            n.port,
+            n.hold_time,
+            if n.passive { "yes" } else { "no" }
+        );
+    }
+    fs::write(&cfg, text).expect("bgpfcd config");
     let mut cmd = lab.exec(ns, bgpfcd_path().to_str().expect("path"));
     cmd.args(["-c", cfg.to_str().expect("path")]);
     Daemon::start(cmd, lab.dir.join(format!("bgpfcd-{ns}.log")))
@@ -254,8 +332,12 @@ pub struct BirdOpts {
     pub local_as: u32,
     /// BIRD's address and router ID.
     pub local: Ipv4Addr,
+    /// The port BIRD listens on and connects from.
+    pub local_port: u16,
     /// The peer's address.
     pub neighbor: Ipv4Addr,
+    /// The peer's port.
+    pub neighbor_port: u16,
     /// The peer's AS.
     pub remote_as: u32,
     /// Hold time in seconds.
@@ -293,15 +375,17 @@ impl Bird {
                  protocol device {{ }}\n\
                  protocol static {{\n    ipv4;\n{statics}}}\n\
                  protocol bgp peer {{\n\
-                 \x20   local {local} as {local_as};\n\
-                 \x20   neighbor {neighbor} as {remote_as};\n\
+                 \x20   local {local} port {local_port} as {local_as};\n\
+                 \x20   neighbor {neighbor} port {neighbor_port} as {remote_as};\n\
                  \x20   hold time {hold};\n\
                  {passive}\
                  \x20   ipv4 {{ import all; export all; }};\n\
                  }}\n",
                 local = opts.local,
+                local_port = opts.local_port,
                 local_as = opts.local_as,
                 neighbor = opts.neighbor,
+                neighbor_port = opts.neighbor_port,
                 remote_as = opts.remote_as,
                 hold = opts.hold_time,
             ),
