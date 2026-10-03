@@ -1,0 +1,66 @@
+# cargo-fuzz targets for the decoders (AGENTS.md §5). Not a workspace
+# member: libfuzzer-sys and arbitrary live only here, and only nightly
+# builds it. Run with `cargo +nightly fuzz run <target>` from this directory
+# or `cargo +nightly fuzz run <target>` at the repository root with
+# `--fuzz-dir fuzz`.
+[package]
+name = "bgpfc-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bgpfc-wire = { path = "../crates/bgpfc-wire" }
+
+# Keep this crate out of the root workspace (AGENTS.md §2).
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "header"
+path = "fuzz_targets/header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "notification"
+path = "fuzz_targets/notification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_refresh"
+path = "fuzz_targets/route_refresh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update"
+path = "fuzz_targets/update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attributes"
+path = "fuzz_targets/attributes.rs"
+test = false
+doc = false
+bench = false
