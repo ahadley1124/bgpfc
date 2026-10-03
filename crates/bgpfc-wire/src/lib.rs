@@ -19,6 +19,7 @@ pub mod community;
 pub mod error;
 pub mod header;
 pub mod keepalive;
+pub mod mp;
 pub mod notification;
 pub mod open;
 pub mod prefix;
@@ -35,6 +36,7 @@ pub use error::{
 };
 pub use header::{HEADER_LEN, Header, MessageType, frame};
 pub use keepalive::KEEPALIVE;
+pub use mp::{MpReach, MpUnreach, NextHop};
 pub use notification::{NotificationMessage, ShutdownCommunicationError};
 pub use open::OpenMessage;
 pub use prefix::Prefix;
