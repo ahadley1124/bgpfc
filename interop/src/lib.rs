@@ -257,6 +257,41 @@ pub fn bgpfcd_path() -> PathBuf {
     .clone()
 }
 
+/// Path to the `bgpfcctl` binary next to `bgpfcd`.
+///
+/// # Panics
+/// If the binary cannot be located or built.
+#[must_use]
+pub fn bgpfcctl_path() -> PathBuf {
+    let candidate = bgpfcd_path().with_file_name("bgpfcctl");
+    if !candidate.exists() {
+        let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "bgpfcctl", "-q"])
+            .status()
+            .expect("cargo build -p bgpfcctl");
+        assert!(status.success(), "building bgpfcctl");
+    }
+    candidate
+}
+
+/// Run `bgpfcctl -s socket args...`; stdout and stderr, and whether it
+/// succeeded.
+///
+/// # Panics
+/// If the binary cannot be run.
+#[must_use]
+pub fn bgpfcctl(socket: &Path, args: &[&str]) -> (String, bool) {
+    let out = Command::new(bgpfcctl_path())
+        .arg("-s")
+        .arg(socket)
+        .args(args)
+        .output()
+        .expect("bgpfcctl");
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    (s, out.status.success())
+}
+
 /// One neighbor of a daemon under test.
 #[derive(Clone, Debug)]
 pub struct NeighborOpts {
