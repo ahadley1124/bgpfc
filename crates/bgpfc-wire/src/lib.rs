@@ -27,6 +27,7 @@ pub mod prefix;
 pub mod reader;
 pub mod route_refresh;
 pub mod types;
+pub mod update;
 
 pub use as_path::{AsPath, AsPathSegment, SegmentType};
 pub use attribute::{Aggregator, Origin, PathAttribute};
@@ -44,3 +45,7 @@ pub use open::OpenMessage;
 pub use prefix::Prefix;
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
+pub use update::{
+    DecodeContext, DecodedUpdate, DiscardReason, DiscardedAttribute, EncodeContext, ErrorAction,
+    PeerKind, UpdateError, UpdateMessage,
+};
