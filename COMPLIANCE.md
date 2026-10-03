@@ -9,8 +9,9 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   `crates/bgpfc-wire/src/`, `fsm/` is `crates/bgpfc-fsm/src/`, "fsm
   tests" are `crates/bgpfc-fsm/src/machine/tests.rs`, `bgpfcd/` is
   `crates/bgpfcd/src/`, `config/` is `crates/bgpfc-config/src/`
-  ("config golden" is `crates/bgpfc-config/tests/golden/`), and "interop"
-  names a test in `interop/tests/bird.rs`.
+  ("config golden" is `crates/bgpfc-config/tests/golden/`), `rib/` is
+  `crates/bgpfc-rib/src/` ("rib tests" are `crates/bgpfc-rib/src/tests.rs`),
+  and "interop" names a test in `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -64,30 +65,39 @@ is `done`.
 | 4.3 | `ATOMIC_AGGREGATE` length 0 | MUST | done | wire/attribute.rs | attribute.rs, update.rs `attribute_length_and_flag_errors` |
 | 4.3 | AGGREGATOR optional transitive, AS (2 octets) + IPv4 | MUST | done (4 octets per RFC 6793) | wire/attribute.rs, wire/update.rs `decode_aggregator` | attribute.rs `four_octet_as_in_as_path_and_aggregator` |
 | 4.3 | Minimum UPDATE length 23 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs |
-| 4.3 | Same prefix in both withdrawn and NLRI: accept, treat as not withdrawn | MUST / SHOULD | todo (RIB) | | |
+| 4.3 | Same prefix in both withdrawn and NLRI: accept, treat as not withdrawn | MUST / SHOULD | done (withdrawals are applied before announcements) | rib/lib.rs `Rib::update` | rib tests `prefix_in_both_withdrawn_and_nlri_is_announced` |
 | 5 | Recognise all well-known attributes | MUST | done | wire/attribute.rs `expected_flags` | attribute.rs `expected_flags_table` |
 | 5 | Mandatory attributes present in every UPDATE with NLRI | MUST | done (receive; RFC 7606 §3 d treat-as-withdraw) | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
-| 5 | Pass well-known attributes on to peers | MUST | todo (RIB) | | |
+| 5 | Pass well-known attributes on to peers | MUST | done | rib/attrs.rs `PathAttrs::to_update` | rib tests `attributes_round_trip_through_an_update` |
 | 5 | Accept unrecognised transitive optional attributes; pass on with Partial set | SHOULD / MUST | done (kept with flags); Partial set by the RIB on export | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
-| 5 | Never clear a Partial bit set upstream | MUST | todo (RIB) | | |
+| 5 | Never clear a Partial bit set upstream | MUST | done (flags are kept and Partial is only ever added) | rib/attrs.rs `to_attributes` | rib tests `attributes_round_trip_through_an_update` |
 | 5 | Quietly ignore unrecognised non-transitive optional attributes | MUST | done | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
 | 5 | Send attributes in ascending type order | SHOULD | done | wire/update.rs `encode` | update.rs `as4_path_is_generated_for_old_peers_and_merged_on_receipt` |
 | 5 | Accept attributes in any order | MUST | done | wire/update.rs `decode` | update.rs `announce_round_trips` |
 | 5 | An attribute appears at most once | MUST | done (receive per RFC 7606 §3 g) | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
+| 5.1.2 | `AS_PATH` to an internal peer unchanged; to an external peer with the local AS prepended | MUST | done | rib/export.rs `export`, `prepend` | rib tests `export_to_external_peer_prepends_and_rewrites`, `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
+| 5.1.2 | Prepend as `AS_SEQUENCE`; a segment holds at most 255 ASes | MUST | done | rib/export.rs `prepend` | rib tests `prepend_respects_segment_limit_and_sets` |
+| 5.1.3 | `NEXT_HOP` to an internal peer unchanged | SHOULD | done | rib/export.rs `export` | rib tests `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
+| 5.1.3 | `NEXT_HOP` to an external peer: the local address of the session (next-hop-self) | MUST (the "shall" cases) | done; third-party next hops on a shared subnet (MAY) are not used | rib/export.rs `export` | rib tests `export_to_external_peer_prepends_and_rewrites`, `ipv6_next_hop_self_and_v4_over_v6_session`, interop `routes_are_relayed_withdrawn_and_refreshed` |
+| 5.1.3 | Never use the peer's own address or an address of the sending speaker's peer as `NEXT_HOP` (MUST NOT) | MUST | done (next-hop-self only) | rib/export.rs `export` | rib tests `export_to_external_peer_prepends_and_rewrites` |
+| 5.1.4 | MED received from a neighboring AS not propagated to other neighboring ASes; passed on to internal peers | MUST / SHOULD | done | rib/export.rs `export` | rib tests `export_to_external_peer_prepends_and_rewrites`, `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
+| 5.1.5 | `LOCAL_PREF` included to internal peers, never to external peers | MUST | done | rib/export.rs `export` | rib tests `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
 | 5.1.5 | Ignore `LOCAL_PREF` from an external peer | MUST | done | wire/update.rs `decode_one` | update.rs `local_pref_depends_on_the_peer_kind` |
+| 5.1.6 | `ATOMIC_AGGREGATE` is passed on; no de-aggregation | MUST | done (no aggregation is performed) | rib/attrs.rs `to_attributes` | rib tests `attributes_round_trip_through_an_update` |
+| 5.1.7 | AGGREGATOR when aggregating | MAY | n/a (no aggregation); a received one is passed on | rib/attrs.rs | rib tests `attributes_round_trip_through_an_update` |
 | 6.3 | Withdrawn + attribute lengths + 23 over the message length → Malformed Attribute List | MUST | done | wire/update.rs `split_fields` | update.rs `length_overruns_reset_the_session` |
 | 6.3 | Attribute Flags Error, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
 | 6.3 | Attribute Length Error, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `attribute_length_and_flag_errors` |
 | 6.3 | Missing Well-known Attribute, Data = type code | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
 | 6.3 | Unrecognized Well-known Attribute, Data = the attribute; session reset | MUST | done | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
 | 6.3 | Invalid ORIGIN Attribute, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `bad_origin_is_treat_as_withdraw` |
-| 6.3 | Invalid `NEXT_HOP`: semantic errors logged and route ignored, no NOTIFICATION | SHOULD | todo (RIB) | | |
+| 6.3 | Invalid `NEXT_HOP`: semantic errors logged and route ignored, no NOTIFICATION | SHOULD | todo (next hop validation arrives with the FIB in milestone 7) | | |
 | 6.3 | Malformed `AS_PATH` | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_as_path` | update.rs `as_path_rules` |
-| 6.3 | Leftmost AS equals the external peer's AS | MAY | todo (RIB; RFC 7606 §7.2 treat-as-withdraw) | | |
+| 6.3 | Leftmost AS equals the external peer's AS | MAY | done (treat-as-withdraw per RFC 7606 §7.2) | rib/lib.rs `Rib::update` | rib tests `leftmost_as_must_be_the_external_peer` |
 | 6.3 | Optional Attribute Error, Data = the attribute | MUST | done | wire/update.rs `discard_malformed`, `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
 | 6.3 | Duplicate attribute → Malformed Attribute List | MUST | done (as revised by RFC 7606 §3 g) | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
 | 6.3 | Invalid Network Field for syntactically bad NLRI | MUST | done | wire/update.rs `decode` | update.rs `bad_nlri_syntax_resets_the_session` |
-| 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (RIB) | | |
+| 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (policy, milestone 6) | | |
 | 6.3 | Correct attributes with no NLRI is a valid UPDATE | MUST | done | wire/update.rs `decode` | update.rs `missing_mandatory_attributes` |
 
 | 6.8 | One of two colliding connections is closed; the one from the higher BGP Identifier is kept | MUST | done | bgpfcd/peer.rs `resolve_collision`, fsm/machine.rs `collision_dump` | interop `session_survives_simultaneous_connect` |
@@ -116,7 +126,26 @@ is `done`.
 | 10 | HoldTimer configurable per peer; other timers may be | MUST / MAY | done (`hold-time`, `keepalive-time`, `connect-retry-time` per neighbor) | config/lower.rs `NeighborBuilder`, bgpfcd/wiring.rs `peer_config` | config golden `full.conf`, bgpfcd/wiring.rs `neighbor_becomes_peer_config` |
 | 10 | Jitter on KeepaliveTimer and ConnectRetryTimer, factor uniformly in [0.75, 1.0], redrawn each time | SHOULD | done | fsm/timers.rs `Jitter` | timers.rs `jitter_stays_within_rfc_bounds`, fsm tests `jitter_shortens_timers_within_bounds` |
 
-Rows for §9 are added by the RIB PRs.
+| 3.2 | Adj-RIBs-In, Loc-RIB and Adj-RIBs-Out (conceptual) | MUST | done (one table per family holds every candidate and the chosen route; Adj-RIB-Out per peer) | rib/lib.rs `Rib` | rib tests `announce_withdraw_and_fib_changes` |
+| 9 | Run the decision process when an UPDATE changes the Adj-RIB-In | MUST | done (for the destinations the UPDATE touched) | rib/lib.rs `Rib::update`, `reconsider` | rib tests `announce_withdraw_and_fib_changes`, order.rs `loc_rib_is_independent_of_arrival_order` |
+| 9.1.1 | Phase 1: degree of preference is `LOCAL_PREF` for internal routes, local policy otherwise | MUST | done (100 unless import policy sets `LOCAL_PREF`; policy is milestone 6) | rib/decision.rs `Candidate::degree_of_preference` | rib tests `degree_of_preference_wins_first` |
+| 9.1.2 | A route whose `NEXT_HOP` is unresolvable is excluded from Phase 2 | MUST | deviates (no IGP; every next hop counts as resolvable until the FIB thread of milestone 7 can tell) | rib/decision.rs | |
+| 9.1.2 | A route whose `AS_PATH` contains an AS loop is excluded from Phase 2 | SHOULD | done (not even stored) | rib/lib.rs `Rib::update` | rib tests `as_loop_routes_are_excluded` |
+| 9.1.2 | Select the route with the highest degree of preference; one route per destination | MUST | done | rib/decision.rs `best` | rib tests `degree_of_preference_wins_first` |
+| 9.1.2.2 a | Tie-break: shortest `AS_PATH`, `AS_SET` counts one, confederation segments zero | MUST | done | rib/decision.rs `path_length`, wire/as_path.rs `hop_count` | rib tests `shorter_as_path_wins`, `as_set_counts_as_one_hop` |
+| 9.1.2.2 b | Lowest ORIGIN | MUST | done | rib/decision.rs `compare` | rib tests `lower_origin_wins` |
+| 9.1.2.2 c | Lowest MED, compared only between routes from the same neighboring AS; a missing MED is the lowest value | MUST | done (comparison-order independent: the per-AS minimum is computed first) | rib/decision.rs `best`, `med_rank` | rib tests `med_compares_within_the_neighboring_as_only`, `med_uses_the_leftmost_as_for_internal_routes` |
+| 9.1.2.2 d | External over internal | MUST | done | rib/decision.rs `kind_rank` | rib tests `external_beats_internal` |
+| 9.1.2.2 e | Lowest interior cost to the `NEXT_HOP` | MUST | n/a (no IGP; every cost is equal) | rib/decision.rs `compare` | |
+| 9.1.2.2 f | Lowest BGP Identifier | MUST | done | rib/decision.rs `compare` | rib tests `lower_router_id_then_lower_peer_address` |
+| 9.1.2.2 g | Lowest peer address | MUST | done | rib/decision.rs `compare` | rib tests `lower_router_id_then_lower_peer_address` |
+| 9.1.3 | Phase 3: Adj-RIBs-Out follow Loc-RIB changes, subject to export policy; a route previously advertised is withdrawn when no longer sent | MUST | done (export policy is milestone 6) | rib/lib.rs `reconsider`, rib/export.rs `export` | rib tests `announce_withdraw_and_fib_changes` |
+| 9.1.4 | Overlapping routes are independent destinations; no special handling | MAY | done (longest-match is the FIB's) | rib/lib.rs | rib tests `announce_withdraw_and_fib_changes` |
+| 9.2 | UPDATE generation: routes with identical attributes share an UPDATE; a route learned from an internal peer is not redistributed to internal peers | MUST | done | rib/export.rs `Batch`, `export` | rib tests `large_batches_are_packed_within_the_message_limit`, `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
+| 9.2 | Initial Adj-RIB-Out after a session is established | MUST | done | rib/lib.rs `peer_up`, `refresh` | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it`, interop `routes_are_relayed_withdrawn_and_refreshed` |
+| 9.2.1.1 | `MinRouteAdvertisementIntervalTimer` between UPDATEs for the same destination | MUST | todo (updates are sent as the Loc-RIB changes) | | |
+| 9.2.2 | Withdrawn and feasible routes may share an UPDATE; a withdrawn route may be omitted when the same UPDATE announces its replacement | MAY | done (withdrawals and announcements go in separate UPDATEs; a replacement announcement implicitly withdraws) | rib/export.rs `Batch::encode` | rib tests `announce_withdraw_and_fib_changes` |
+| 9.3 | Loc-RIB routes are installed in the forwarding table | MUST | partial (changes are reported as `FibChange`; the FIB thread is milestone 7) | rib/lib.rs `Output::Fib`, bgpfcd/rib.rs `deliver` | rib tests `announce_withdraw_and_fib_changes` |
 
 ## RFC 5492 — Capabilities Advertisement
 
@@ -157,7 +186,7 @@ Rows for §9 are added by the RIB PRs.
 | 3 | `MP_REACH_NLRI` type 14, optional non-transitive: AFI, SAFI, next hop length, next hop, reserved, NLRI | MUST | done | wire/mp.rs `MpReach` | mp.rs `ipv6_unicast_reach_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | MUST / SHOULD | done | wire/mp.rs | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
 | 3 | UPDATE with `MP_REACH_NLRI` carries ORIGIN and `AS_PATH` (and `LOCAL_PREF` on iBGP) | MUST | done for ORIGIN/`AS_PATH` (treat-as-withdraw); `LOCAL_PREF` left to the RIB | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
-| 3 | `NEXT_HOP` ignored when only `MP_REACH_NLRI` carries routes | SHOULD | todo (RIB) | | |
+| 3 | `NEXT_HOP` ignored when only `MP_REACH_NLRI` carries routes | SHOULD | done (the family's next hop comes from `MP_REACH_NLRI`) | rib/attrs.rs `PathAttrs::from_update` | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it` |
 | 4 | `MP_UNREACH_NLRI` type 15: AFI, SAFI, withdrawn routes; no other attributes required | MUST | done | wire/mp.rs `MpUnreach` | mp.rs `unreach_round_trip_and_errors` |
 | 5 | NLRI `<length, prefix>` encoding | MUST | done | wire/prefix.rs | prefix.rs |
 | 6 | SAFI 1 unicast, 2 multicast | MAY | done (unicast only is parsed) | wire/types.rs `Safi`, wire/mp.rs `supported` | mp.rs `reach_errors` |
@@ -171,7 +200,8 @@ Rows for §9 are added by the RIB PRs.
 | 2 | Capability 2, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | done | wire/header.rs `MessageType::RouteRefresh`, wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
-| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (a ROUTE-REFRESH for an unadvertised family is ignored; sending is the RIB's) | bgpfcd/peer.rs `primary_message`, fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
+| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (a ROUTE-REFRESH for an unadvertised family is ignored; sending one is the control plane's, milestone 8) | bgpfcd/peer.rs `primary_message`, fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
+| 4 | On a ROUTE-REFRESH, re-advertise the Adj-RIB-Out of the family | MUST | done | rib/lib.rs `refresh`, bgpfcd/rib.rs | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it`, interop `routes_are_relayed_withdrawn_and_refreshed` |
 
 ## RFC 7606 — Revised Error Handling
 
@@ -196,7 +226,7 @@ Rows for §9 are added by the RIB PRs.
 | 5.3 | MP attribute incorrect: bad NLRI, inconsistent flags, `MP_UNREACH` < 3 or `MP_REACH` < 5 | SHALL | done | wire/mp.rs, wire/update.rs `decode_one` | mp.rs `reach_errors`, update.rs `mp_attribute_errors_disable_the_family` |
 | 7.1 | ORIGIN: length 1 and defined value, else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `bad_origin_is_treat_as_withdraw` |
 | 7.2 | `AS_PATH`: unknown segment type, overrun, underrun, zero length → treat-as-withdraw | SHALL | done | wire/as_path.rs `decode` | as_path.rs `malformations_per_rfc7606` |
-| 7.2 | Leftmost-AS check failure → treat-as-withdraw (reset if configured) | SHOULD / MAY | todo (RIB) | | |
+| 7.2 | Leftmost-AS check failure → treat-as-withdraw (reset if configured) | SHOULD / MAY | done (treat-as-withdraw; no reset option) | rib/lib.rs `Rib::update` | rib tests `leftmost_as_must_be_the_external_peer` |
 | 7.3 | `NEXT_HOP` length 4 else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `attribute_length_and_flag_errors` |
 | 7.4 | MED length 4 else treat-as-withdraw | SHALL | done | wire/update.rs | update.rs |
 | 7.5 | `LOCAL_PREF` from external: discard; internal with length ≠ 4: treat-as-withdraw | SHALL | done | wire/update.rs | update.rs `local_pref_depends_on_the_peer_kind` |
@@ -214,12 +244,12 @@ Rows for §9 are added by the RIB PRs.
 | 3 | Peers using it must support RFC 7606 error handling | MUST | done | wire/update.rs | update.rs |
 | 4 | Applies to all messages except OPEN and KEEPALIVE | MUST | done | wire/header.rs `MessageType::max_len` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 4 | Advertise the capability when able | SHOULD | done (`Config::capabilities`; both sides needed for `Session::extended_messages`) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
-| 4 | Send extended messages only if the peer advertised the capability | MAY | todo (RIB update packing) | | |
+| 4 | Send extended messages only if the peer advertised the capability | MAY | done | rib/peer.rs `PeerInfo::max_message_len`, rib/export.rs `Batch::encode` | rib tests `large_batches_are_packed_within_the_message_limit` |
 | 4 | Having advertised it, accept up to 65535 octets | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 4 | Over 4096 without the capability → Bad Message Length | MUST | done | wire/header.rs `Header::decode` | header.rs `extended_messages_only_when_negotiated_and_never_for_open_or_keepalive` |
 | 5 | Never accept extended messages without having advertised the capability | MUST | done | wire/header.rs `Header::decode` (`extended` flag) | header.rs |
 | 5 | NOTIFICATION to a non-extended peer at most 4096 octets | MUST | done | wire/notification.rs `encode` | notification.rs `notification_size_limit_depends_on_extended_messages` |
-| 4 | Shrink or withhold an over-size UPDATE for a non-extended neighbour | SHOULD | todo (RIB) | | |
+| 4 | Shrink or withhold an over-size UPDATE for a non-extended neighbour | SHOULD | done (prefixes are split across UPDATEs; an attribute set that fits in no message is reported, not sent) | rib/export.rs `Batch::encode`, `chunks` | rib tests `large_batches_are_packed_within_the_message_limit` |
 
 ## RFC 1997 / 4360 / 8092 — Communities
 
@@ -227,11 +257,11 @@ Rows for §9 are added by the RIB PRs.
 |---|---|---|---|---|---|
 | 1997 | COMMUNITIES type 8, optional transitive, set of four-octet values | MUST | done | wire/community.rs, wire/attribute.rs | community.rs `standard_communities` |
 | 1997 | `NO_EXPORT`, `NO_ADVERTISE`, `NO_EXPORT_SUBCONFED` recognised | MUST | done (values; export rules are the RIB's) | wire/community.rs `Community` consts | community.rs `standard_communities` |
-| 1997 | Routes with the well-known communities are not advertised as each specifies | MUST | todo (RIB) | | |
+| 1997 | Routes with the well-known communities are not advertised as each specifies | MUST | done | rib/export.rs `export` | rib tests `well_known_communities_limit_export` |
 | 4360 §2 | Extended Communities type 16, optional transitive, eight-octet values; equal only when all octets equal | MUST | done | wire/community.rs `ExtendedCommunity` | community.rs `extended_communities` |
 | 4360 §2 | Transitive bit (T) of the type high octet | MUST | done | wire/community.rs `is_transitive` | community.rs `extended_communities` |
 | 4360 §3.1–3.3 | Two-octet AS, IPv4 address and opaque templates | MUST | done (constructors and display) | wire/community.rs | community.rs `extended_communities` |
-| 4360 §6 | Non-transitive extended communities not propagated across ASes | MUST | todo (RIB) | | |
+| 4360 §6 | Non-transitive extended communities not propagated across ASes | MUST | done | rib/export.rs `export` | rib tests `non_transitive_extended_communities_stay_in_the_as` |
 | 8092 §3 | Large Communities type 32, optional transitive, twelve-octet values | MUST | done | wire/community.rs `LargeCommunity` | community.rs `large_communities` |
 | 8092 §3 | Never transmit duplicates; silently remove duplicates on receipt | MUST | done | wire/community.rs `decode_large_communities` | community.rs `large_communities` |
 | 8092 §5 | Canonical `global:local1:local2` representation | MUST | done | wire/community.rs `Display` | community.rs `large_communities` |
@@ -262,12 +292,12 @@ Rows for §9 are added by the RIB PRs.
 |---|---|---|---|---|---|
 | 7607 §2 | AS 0 as peer AS in OPEN → Bad Peer AS | MUST | done | wire/open.rs `OpenMessage::decode` | open.rs `fixed_field_errors` |
 | 7607 §2 | Never initiate a connection claiming AS 0 | MUST | done (`local-as 0` and `remote-as 0` are configuration errors) | config/lower.rs `asn` | config golden `value-errors.conf` |
-| 7607 §2 | Never originate or propagate a route with AS 0 | MUST | todo (RIB) | | |
+| 7607 §2 | Never originate or propagate a route with AS 0 | MUST | done (nothing is originated; a received AS 0 path is treated as withdrawn before it can reach the Loc-RIB) | wire/update.rs `decode_as_path`, rib/lib.rs | update.rs `as_path_rules` |
 | 7607 §2 | AS 0 in `AS_PATH` → malformed per RFC 7606 (treat-as-withdraw); in AGGREGATOR → attribute discard | MUST | done | wire/update.rs `decode_as_path`, `decode_one` | update.rs `as_path_rules` |
 | 7607 §2 | AS 0 in `AS4_PATH` / `AS4_AGGREGATOR` → malformed per RFC 6793 (discard) | MUST | done | wire/update.rs `decode_as4_path` | update.rs |
-| 9774 §3 | Never advertise `AS_SET` / `AS_CONFED_SET` | MUST | todo (RIB never generates them; encoder still accepts them for tests) | | |
+| 9774 §3 | Never advertise `AS_SET` / `AS_CONFED_SET` | MUST | done (no aggregation; prepending always uses `AS_SEQUENCE`; a set accepted under `allow-as-set` is relayed as received, the operator's choice) | rib/export.rs `prepend` | rib tests `prepend_respects_segment_limit_and_sets` |
 | 9774 §3 | `AS_SET` / `AS_CONFED_SET` in `AS_PATH` or `AS4_PATH` → treat-as-withdraw unless configured | MUST | done (`DecodeContext::allow_as_set`; `allow-as-set yes` per neighbor) | wire/update.rs `decode_as_path`, `decode_as4_path`, config/lower.rs | update.rs `as_path_rules`, config golden `full.conf` |
-| 2545 §3 | IPv6 next hop: global address, link-local appended only when on a shared subnet; length 16 or 32 | MUST | done (codec; the RIB decides when to append) | wire/mp.rs `NextHop` | mp.rs `ipv6_unicast_reach_round_trips` |
+| 2545 §3 | IPv6 next hop: global address, link-local appended only when on a shared subnet; length 16 or 32 | MUST | done (codec; next-hop-self sends the global address only) | wire/mp.rs `NextHop`, rib/export.rs `export` | mp.rs `ipv6_unicast_reach_round_trips`, rib tests `ipv6_next_hop_self_and_v4_over_v6_session` |
 | 8950 §3 | IPv4 NLRI with a 16- or 32-octet IPv6 next hop; the length selects the protocol | MUST | done | wire/mp.rs `NextHop::decode` | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
 | 8950 §4 | Extended Next Hop Encoding capability | MUST | todo (capability code 5; needed before sending IPv6 next hops for IPv4) | | |
 | 9072 §2 | Use the RFC 4271 encoding when parameters fit 255 octets | SHOULD | done | wire/open.rs `encode_with` | open.rs `open_with_capabilities_round_trips` |
