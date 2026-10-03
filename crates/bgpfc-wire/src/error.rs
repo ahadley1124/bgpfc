@@ -264,6 +264,9 @@ impl std::error::Error for DecodeError {}
 /// Why a message could not be encoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodeError {
+    /// An `AS_PATH` segment with no ASes, which the wire format cannot
+    /// express without being malformed (RFC 7606 §7.2).
+    EmptySegment,
     /// A Shutdown Communication was requested on a Cease subcode other than
     /// Administrative Shutdown or Administrative Reset (RFC 9003 §2).
     NotShutdown,
@@ -281,6 +284,7 @@ pub enum EncodeError {
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EncodeError::EmptySegment => f.write_str("AS_PATH segment with no ASes"),
             EncodeError::NotShutdown => f.write_str(
                 "shutdown communication is only allowed with Administrative Shutdown or Reset",
             ),
