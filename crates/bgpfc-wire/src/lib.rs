@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod as_path;
+pub mod attribute;
 pub mod capability;
 pub mod community;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod route_refresh;
 pub mod types;
 
 pub use as_path::{AsPath, AsPathSegment, SegmentType};
+pub use attribute::{Aggregator, Origin, PathAttribute};
 pub use capability::Capability;
 pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use error::{
