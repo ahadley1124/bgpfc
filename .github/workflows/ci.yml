@@ -44,6 +44,30 @@ jobs:
       - run: cargo +nightly miri setup
       - run: scripts/miri.sh
 
+  fuzz:
+    # Builds every cargo-fuzz target and runs each for a short while, so a
+    # decoder panic on a shallow input is caught on every push. Long
+    # campaigns are run by hand (fuzz/README.md).
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+      - run: command -v cargo-fuzz || cargo install cargo-fuzz
+      - run: cargo +nightly fuzz build --fuzz-dir fuzz
+      - run: |
+          for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
+            cargo +nightly fuzz run --fuzz-dir fuzz "$target" -- -max_total_time=20
+          done
+
   interop:
     # Drives real BIRD/FRR/GoBGP daemons in network namespaces; needs root.
     # Scenarios land from milestone 3. Until then this only proves the harness builds.
