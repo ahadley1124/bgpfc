@@ -8,11 +8,15 @@ use bgpfc_config::ast::FibMode;
 /// Usage text, also printed on a bad argument.
 pub(crate) const USAGE: &str = "\
 usage: bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
+              [--user USER [--group GROUP]]
 
   -c, --config FILE       configuration file (docs/config.md)
   --check                 parse and validate FILE, then exit
   --log-level LEVEL       override log { level }: error | warn | info | debug | trace
   --fib MODE              override fib { mode }: dry-run | install
+  --user USER             when started as root: drop to this user after
+                          opening the listeners and the netlink socket
+  --group GROUP           the group to drop to (default: USER's primary group)
 ";
 
 /// Parsed arguments.
@@ -26,6 +30,10 @@ pub(crate) struct Args {
     pub(crate) log_level: Option<bgpfc_log::Level>,
     /// FIB mode override.
     pub(crate) fib: Option<FibMode>,
+    /// User to drop to (README, "Option B").
+    pub(crate) user: Option<String>,
+    /// Group to drop to.
+    pub(crate) group: Option<String>,
 }
 
 /// Parse `argv[1..]`.
@@ -38,6 +46,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
     let mut check = false;
     let mut log_level = None;
     let mut fib = None;
+    let mut user = None;
+    let mut group = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -63,16 +73,23 @@ pub(crate) fn parse(args: &[String]) -> Result<Args, String> {
                     _ => return Err("--fib takes dry-run or install".to_owned()),
                 });
             }
+            "--user" => user = Some(value()?),
+            "--group" => group = Some(value()?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
         i += if used_value { 2 } else { 1 };
+    }
+    if group.is_some() && user.is_none() {
+        return Err("--group needs --user".to_owned());
     }
     Ok(Args {
         config: config.ok_or("-c FILE is required")?,
         check,
         log_level,
         fib,
+        user,
+        group,
     })
 }
 
@@ -97,8 +114,13 @@ mod tests {
                 check: true,
                 log_level: Some(bgpfc_log::Level::Debug),
                 fib: Some(FibMode::Install),
+                user: None,
+                group: None,
             }
         );
+        let a = parse(&argv("-c x --user bgpfc --group net")).unwrap();
+        assert_eq!(a.user.as_deref(), Some("bgpfc"));
+        assert_eq!(a.group.as_deref(), Some("net"));
         let a = parse(&argv("--config x.conf")).unwrap();
         assert_eq!(a.config, PathBuf::from("x.conf"));
         assert!(!a.check);
@@ -115,6 +137,7 @@ mod tests {
             "-c x --log-level loud",
             "-c x --fib maybe",
             "-c x --bogus",
+            "-c x --group g",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad}");
         }

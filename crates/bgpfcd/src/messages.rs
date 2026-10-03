@@ -74,6 +74,18 @@ pub(crate) enum PeerInput {
     /// Framed UPDATE messages from the RIB thread, to write in order while
     /// Established (RFC 4271 §9.2).
     Send(Vec<Vec<u8>>),
+    /// Shut the session down (`ManualStop`, RFC 4271 §8.1.2 event 2) and
+    /// end the thread.
+    Stop,
+}
+
+/// What the RIB thread tells the FIB thread.
+#[derive(Debug)]
+pub(crate) enum FibMsg {
+    /// A Loc-RIB change (RFC 4271 §9.3).
+    Change(bgpfc_rib::FibChange),
+    /// Remove every installed route and reply on the sender.
+    Shutdown(std::sync::mpsc::SyncSender<()>),
 }
 
 /// What peer threads tell the RIB thread.
