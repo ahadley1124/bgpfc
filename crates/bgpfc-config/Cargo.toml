@@ -8,6 +8,8 @@ rust-version.workspace = true
 description = "bgpfc configuration language lexer, parser and validation"
 
 [dependencies]
+bgpfc-log.workspace = true
+bgpfc-wire.workspace = true
 
 [lints]
 workspace = true

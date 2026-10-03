@@ -1,0 +1,167 @@
+Config {
+    router_id: RouterId(
+        3221225985,
+    ),
+    local_as: Asn(
+        65000,
+    ),
+    log_level: Info,
+    listen: [
+        [::]:179,
+    ],
+    fib: Fib {
+        mode: DryRun,
+        table: 254,
+        protocol: 186,
+    },
+    control: Control {
+        socket: Some(
+            "/run/bgpfc/bgpfc.sock",
+        ),
+        http: Some(
+            Http {
+                listen: 127.0.0.1:8179,
+                writes: false,
+                token_file: None,
+            },
+        ),
+    },
+    prefix_lists: [
+        PrefixList {
+            pos: Pos {
+                line: 25,
+                col: 1,
+            },
+            name: "BOGONS",
+            entries: [
+                PrefixEntry {
+                    prefix: 10.0.0.0/8,
+                    ge: None,
+                    le: Some(
+                        32,
+                    ),
+                },
+                PrefixEntry {
+                    prefix: 192.168.0.0/16,
+                    ge: None,
+                    le: Some(
+                        32,
+                    ),
+                },
+            ],
+        },
+    ],
+    policies: [
+        Policy {
+            pos: Pos {
+                line: 30,
+                col: 1,
+            },
+            name: "UPSTREAM-IN",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 31,
+                        col: 5,
+                    },
+                    name: "no-bogons",
+                    matches: [
+                        PrefixList(
+                            "BOGONS",
+                        ),
+                    ],
+                    sets: [],
+                    action: Reject,
+                },
+                Term {
+                    pos: Pos {
+                        line: 32,
+                        col: 5,
+                    },
+                    name: "rest",
+                    matches: [],
+                    sets: [
+                        LocalPref(
+                            100,
+                        ),
+                    ],
+                    action: Accept,
+                },
+            ],
+        },
+        Policy {
+            pos: Pos {
+                line: 35,
+                col: 1,
+            },
+            name: "UPSTREAM-OUT",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 36,
+                        col: 5,
+                    },
+                    name: "own",
+                    matches: [
+                        Prefix(
+                            PrefixEntry {
+                                prefix: 203.0.113.0/24,
+                                ge: None,
+                                le: None,
+                            },
+                        ),
+                    ],
+                    sets: [],
+                    action: Accept,
+                },
+                Term {
+                    pos: Pos {
+                        line: 37,
+                        col: 5,
+                    },
+                    name: "rest",
+                    matches: [],
+                    sets: [],
+                    action: Reject,
+                },
+            ],
+        },
+    ],
+    neighbors: [
+        Neighbor {
+            pos: Pos {
+                line: 40,
+                col: 1,
+            },
+            addr: 198.51.100.1,
+            remote_as: Asn(
+                64511,
+            ),
+            description: Some(
+                "transit",
+            ),
+            port: 179,
+            hold_time: HoldTime(
+                90,
+            ),
+            keepalive_time: None,
+            connect_retry_time: 120s,
+            send_hold_time: Default,
+            families: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+                AddressFamily {
+                    afi: Ipv6,
+                    safi: Unicast,
+                },
+            ],
+            import: "UPSTREAM-IN",
+            export: "UPSTREAM-OUT",
+            passive: false,
+            allow_as_set: false,
+            collision_detect_established: false,
+        },
+    ],
+}
