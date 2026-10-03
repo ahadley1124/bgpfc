@@ -12,6 +12,11 @@ bgpfc-wire.workspace = true
 
 [dev-dependencies]
 proptest = "1.11"
+criterion = "0.5"
+
+[[bench]]
+name = "rib"
+harness = false
 
 [lints]
 workspace = true
