@@ -16,6 +16,7 @@ rust-version = "1.99"
 # cargo can warn about unused entries.
 [workspace.dependencies]
 bgpfc-log = { path = "crates/bgpfc-log" }
+bgpfc-wire = { path = "crates/bgpfc-wire" }
 
 # AGENTS.md §5: shared lint table. bgpfc-sys repeats this table with
 # `unsafe_code = "deny"` because a workspace `forbid` cannot be relaxed.
