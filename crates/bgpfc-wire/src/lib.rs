@@ -15,8 +15,11 @@
 pub mod capability;
 pub mod error;
 pub mod header;
+pub mod keepalive;
+pub mod notification;
 pub mod open;
 pub mod reader;
+pub mod route_refresh;
 pub mod types;
 
 pub use capability::Capability;
@@ -25,5 +28,8 @@ pub use error::{
     UpdateSubcode, subcode_name,
 };
 pub use header::{HEADER_LEN, Header, MessageType, frame};
+pub use keepalive::KEEPALIVE;
+pub use notification::{NotificationMessage, ShutdownCommunicationError};
 pub use open::OpenMessage;
+pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
