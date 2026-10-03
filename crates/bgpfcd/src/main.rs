@@ -1,11 +1,14 @@
 //! `bgpfcd`: the bgpfc BGP-4 routing daemon.
 //!
-//! Milestone 7 shape (AGENTS.md §3): the configuration file, listener
+//! Milestone 8 shape (AGENTS.md §3): the configuration file, listener
 //! threads, one thread per neighbour driving its FSM, the RIB thread, the
-//! FIB thread, and a main thread that waits for signals.
+//! FIB thread, the control threads, and a main thread (the coordinator)
+//! that owns the configuration and the peer table and acts on signals
+//! and reload requests.
 #![forbid(unsafe_code)]
 
 mod args;
+mod control;
 mod coordinator;
 mod fib;
 mod messages;
@@ -16,8 +19,16 @@ mod rib;
 mod wiring;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::net::IpAddr;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, RwLock};
+
+use bgpfc_config::diff::{ConfigDiff, GlobalChange};
+use bgpfc_wire::error::CeaseSubcode;
+
+use crate::control::CoordMsg;
+use crate::coordinator::PeerTable;
+use crate::messages::{FibMsg, PeerInput, RibMsg};
 
 /// Updates the RIB thread may have queued before peers block.
 const RIB_QUEUE: usize = 1024;
@@ -53,7 +64,7 @@ fn main() {
         router_id = config.router_id,
         fib_mode = config.fib.mode
     );
-    run(&opts, &config, engine);
+    run(&opts, config, engine);
 }
 
 /// Parse, validate and compile the configuration file, with the command
@@ -85,18 +96,18 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
     (config, engine)
 }
 
-/// Bring everything up in the order privileges require, then wait for
-/// signals.
-fn run(opts: &args::Args, config: &bgpfc_config::Config, engine: bgpfc_policy::Engine) {
+/// Bring everything up in the order privileges require, then run the
+/// coordinator loop.
+fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::Engine) {
     // Signals first, so every thread inherits the handlers (AGENTS.md §3).
-    let mut signals = match bgpfc_sys::Signals::install() {
+    let signals = match bgpfc_sys::Signals::install() {
         Ok(s) => s,
         Err(e) => {
             bgpfc_log::error!("cannot install signal handlers", error = e);
             std::process::exit(1);
         }
     };
-    privileges::check(config, opts.user.as_deref());
+    privileges::check(&config, opts.user.as_deref());
 
     // The netlink socket and the listeners are opened while still
     // privileged (README, "Option B"); the FIB thread flushes stale
@@ -113,29 +124,31 @@ fn run(opts: &args::Args, config: &bgpfc_config::Config, engine: bgpfc_policy::E
         }
     };
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
-    let mut table = HashMap::new();
+    let table: PeerTable = Arc::new(RwLock::new(HashMap::new()));
     let mut peers = Vec::new();
     for n in &config.neighbors {
-        let cfg = wiring::peer_config(config.local_as, config.router_id, n);
-        bgpfc_log::info!(
-            "neighbor configured",
-            peer = cfg.addr,
-            remote_as = cfg.fsm.remote_as,
-            passive = cfg.fsm.passive,
-            import = n.import,
-            export = n.export
-        );
-        let (handle, peer) = peer::prepare(cfg, rib_tx.clone());
-        table.insert(handle.addr, handle);
-        peers.push(peer);
+        peers.push(prepare_peer(&config, n, &rib_tx, &table));
     }
-    let table = Arc::new(table);
     for addr in &config.listen {
         if let Err(e) = coordinator::listen(*addr, Arc::clone(&table)) {
             bgpfc_log::error!("cannot listen", address = addr, error = e);
             std::process::exit(1);
         }
     }
+    let (coord_tx, coord_rx) = sync_channel::<CoordMsg>(16);
+    start_control(
+        &config,
+        control::Ctx {
+            peers: Arc::clone(&table),
+            rib: rib_tx.clone(),
+            fib: fib_tx.clone(),
+            coord: coord_tx.clone(),
+            local_as: config.local_as,
+            router_id: config.router_id,
+            writes: config.control.http.as_ref().is_some_and(|h| h.writes),
+            token: read_token(&config),
+        },
+    );
     if let Some(user) = &opts.user {
         privileges::drop(user, opts.group.as_deref());
     }
@@ -150,39 +163,252 @@ fn run(opts: &args::Args, config: &bgpfc_config::Config, engine: bgpfc_policy::E
     for peer in peers {
         peer.start();
     }
+    forward_signals(signals, coord_tx);
 
-    loop {
-        match signals.wait() {
-            Ok(bgpfc_sys::Signal::Hup) => {
-                bgpfc_log::warn!("reload requested; reload arrives with the control plane");
-            }
-            Ok(sig) => {
+    let mut coord = Coordinator {
+        opts,
+        config,
+        table,
+        rib_tx,
+        fib_tx,
+    };
+    while let Ok(msg) = coord_rx.recv() {
+        match msg {
+            CoordMsg::Signal(bgpfc_sys::Signal::Hup) => match coord.reload() {
+                Ok(summary) => bgpfc_log::info!("reloaded", summary = summary),
+                Err(e) => bgpfc_log::error!("reload failed; running configuration kept", error = e),
+            },
+            CoordMsg::Signal(sig) => {
                 bgpfc_log::info!("shutting down", signal = format!("{sig:?}"));
-                shutdown(&table, &fib_tx);
+                coord.shutdown();
                 return;
             }
-            Err(e) => {
-                bgpfc_log::error!("signal pipe failed", error = e);
-                std::process::exit(1);
+            CoordMsg::Reload(reply) => {
+                let r = coord.reload();
+                match &r {
+                    Ok(summary) => bgpfc_log::info!("reloaded", summary = summary),
+                    Err(e) => {
+                        bgpfc_log::error!("reload failed; running configuration kept", error = e);
+                    }
+                }
+                let _ = reply.send(r);
             }
         }
     }
 }
 
-/// Stop every session with a Cease (RFC 4486 §4 Administrative Shutdown)
-/// and remove our routes from the kernel.
-fn shutdown(
-    table: &coordinator::PeerTable,
-    fib_tx: &std::sync::mpsc::SyncSender<messages::FibMsg>,
-) {
-    for handle in table.values() {
-        let _ = handle.tx.try_send(messages::PeerInput::Stop);
+/// The bearer token from `token-file`, if configured; exits if the file
+/// cannot be read.
+fn read_token(config: &bgpfc_config::Config) -> Option<String> {
+    let path = config.control.http.as_ref()?.token_file.as_ref()?;
+    match std::fs::read_to_string(path) {
+        Ok(t) => Some(t.trim().to_owned()),
+        Err(e) => {
+            bgpfc_log::error!("cannot read token file", path = path.display(), error = e);
+            std::process::exit(1);
+        }
     }
-    // Give the peer threads a moment to write their NOTIFICATIONs.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let (done_tx, done_rx) = sync_channel(1);
-    if fib_tx.send(messages::FibMsg::Shutdown(done_tx)).is_ok() {
-        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+}
+
+/// Bind the control socket and the HTTP API, if configured.
+fn start_control(config: &bgpfc_config::Config, ctx: control::Ctx) {
+    if let Some(path) = &config.control.socket
+        && let Err(e) = control::serve_unix(path, ctx.clone())
+    {
+        bgpfc_log::error!(
+            "cannot bind control socket",
+            path = path.display(),
+            error = e
+        );
+        std::process::exit(1);
     }
-    bgpfc_log::info!("bgpfcd stopped");
+    if let Some(h) = &config.control.http
+        && let Err(e) = control::serve_http(h.listen, ctx)
+    {
+        bgpfc_log::error!("cannot bind http api", address = h.listen, error = e);
+        std::process::exit(1);
+    }
+}
+
+/// Read the signal pipe on its own thread so the coordinator can wait on
+/// one channel.
+fn forward_signals(mut signals: bgpfc_sys::Signals, tx: SyncSender<CoordMsg>) {
+    let _ = std::thread::Builder::new()
+        .name("signals".to_owned())
+        .spawn(move || {
+            while let Ok(sig) = signals.wait() {
+                if tx.send(CoordMsg::Signal(sig)).is_err() {
+                    return;
+                }
+            }
+        });
+}
+
+/// Build a peer's thread state and register its handle.
+fn prepare_peer(
+    config: &bgpfc_config::Config,
+    n: &bgpfc_config::ast::Neighbor,
+    rib_tx: &SyncSender<RibMsg>,
+    table: &PeerTable,
+) -> peer::Peer {
+    let cfg = wiring::peer_config(config.local_as, config.router_id, n);
+    bgpfc_log::info!(
+        "neighbor configured",
+        peer = cfg.addr,
+        remote_as = cfg.fsm.remote_as,
+        passive = cfg.fsm.passive,
+        import = n.import,
+        export = n.export
+    );
+    let (handle, peer) = peer::prepare(cfg, rib_tx.clone());
+    if let Ok(mut t) = table.write() {
+        t.insert(handle.addr, handle);
+    }
+    peer
+}
+
+/// The main thread's state: the running configuration and what reload
+/// and shutdown need.
+struct Coordinator<'a> {
+    opts: &'a args::Args,
+    config: bgpfc_config::Config,
+    table: PeerTable,
+    rib_tx: SyncSender<RibMsg>,
+    fib_tx: SyncSender<FibMsg>,
+}
+
+impl Coordinator<'_> {
+    fn stop_peer(&self, addr: IpAddr, subcode: CeaseSubcode) {
+        let handle = self.table.write().ok().and_then(|mut t| t.remove(&addr));
+        if let Some(h) = handle {
+            let _ = h.tx.try_send(PeerInput::Stop(subcode));
+        }
+    }
+
+    /// Re-read the configuration file and apply the difference
+    /// (`docs/config.md`, "Reload"). On any error nothing changes.
+    fn reload(&mut self) -> Result<String, String> {
+        let (new, engine) = load_checked(self.opts)?;
+        let diff = ConfigDiff::between(&self.config, &new);
+        let mut notes = Vec::new();
+        for g in &diff.global {
+            match g {
+                GlobalChange::Identity => {
+                    return Err("router-id or local-as changed: restart the daemon".to_owned());
+                }
+                GlobalChange::Listen | GlobalChange::Control => {
+                    notes.push(format!("{g:?} changed: takes effect at the next restart"));
+                }
+                GlobalChange::Log => bgpfc_log::init(new.log_level),
+                GlobalChange::Fib => {
+                    if new.fib.table != self.config.fib.table
+                        || new.fib.protocol != self.config.fib.protocol
+                    {
+                        notes.push(
+                            "fib table or protocol changed: takes effect at the next restart"
+                                .to_owned(),
+                        );
+                    }
+                    if new.fib.mode != self.config.fib.mode {
+                        let (tx, rx) = sync_channel(1);
+                        if self
+                            .fib_tx
+                            .send(FibMsg::SetMode(fib::mode_of(new.fib.mode), tx))
+                            .is_ok()
+                        {
+                            let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+                        }
+                    }
+                }
+            }
+        }
+        // RFC 4486 §4: de-configured peers and peers whose session
+        // parameters changed get the matching Cease subcode.
+        for addr in &diff.removed {
+            self.stop_peer(*addr, CeaseSubcode::PeerDeconfigured);
+        }
+        for addr in &diff.reset {
+            self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
+        }
+        // Policies always follow the new file: the engine knows every
+        // neighbor's policy names.
+        let _ = self.rib_tx.send(RibMsg::SetPolicies {
+            policies: messages::NewPolicies(Box::new(engine)),
+            reexport: diff.policy_changed.clone(),
+        });
+        // Import policy changes need the peer's routes again (RFC 2918).
+        if let Ok(t) = self.table.read() {
+            for addr in &diff.policy_changed {
+                if let Some(h) = t.get(addr) {
+                    let _ = h.tx.try_send(PeerInput::RequestRoutes);
+                }
+            }
+        }
+        let mut started = Vec::new();
+        for addr in diff.added.iter().chain(&diff.reset) {
+            if let Some(n) = new.neighbor(*addr) {
+                started.push(prepare_peer(&new, n, &self.rib_tx, &self.table));
+            }
+        }
+        for p in started {
+            p.start();
+        }
+        let summary = format!(
+            "added {} removed {} reset {} policy {} unchanged {}{}",
+            diff.added.len(),
+            diff.removed.len(),
+            diff.reset.len(),
+            diff.policy_changed.len(),
+            diff.unchanged.len(),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", notes.join("; "))
+            }
+        );
+        self.config = new;
+        Ok(summary)
+    }
+
+    /// Stop every session with a Cease (RFC 4486 §4 Administrative
+    /// Shutdown) and remove our routes from the kernel.
+    fn shutdown(&self) {
+        if let Ok(t) = self.table.read() {
+            for handle in t.values() {
+                let _ = handle
+                    .tx
+                    .try_send(PeerInput::Stop(CeaseSubcode::AdministrativeShutdown));
+            }
+        }
+        // Give the peer threads a moment to write their NOTIFICATIONs.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (done_tx, done_rx) = sync_channel(1);
+        if self.fib_tx.send(FibMsg::Shutdown(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        }
+        if let Some(path) = &self.config.control.socket {
+            let _ = std::fs::remove_file(path);
+        }
+        bgpfc_log::info!("bgpfcd stopped");
+    }
+}
+
+/// [`load`] without exiting: for reload, where the running configuration
+/// must survive a bad file.
+fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy::Engine), String> {
+    let mut config = bgpfc_config::parse_file(&opts.config).map_err(|e| e.to_string())?;
+    let engine = bgpfc_policy::Engine::new(&config).map_err(|errors| {
+        errors
+            .iter()
+            .map(|e| format!("{}:{e}", opts.config.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    if let Some(level) = opts.log_level {
+        config.log_level = level;
+    }
+    if let Some(mode) = opts.fib {
+        config.fib.mode = mode;
+    }
+    Ok((config, engine))
 }

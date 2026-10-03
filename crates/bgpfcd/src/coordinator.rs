@@ -15,7 +15,9 @@ use crate::messages::PeerInput;
 use crate::peer::PeerHandle;
 
 /// The configured neighbours, by address.
-pub(crate) type PeerTable = Arc<HashMap<IpAddr, PeerHandle>>;
+/// The peer table is replaced on reload, so readers take a lock; nothing
+/// holds it for longer than a lookup.
+pub(crate) type PeerTable = Arc<std::sync::RwLock<HashMap<IpAddr, PeerHandle>>>;
 
 /// Bind `addr` and serve it on a new thread.
 ///
@@ -40,7 +42,8 @@ fn accept_loop(listener: &TcpListener, peers: &PeerTable) {
             }
         };
         let ip = canonical(from.ip());
-        let Some(peer) = peers.get(&ip) else {
+        let peer = peers.read().ok().and_then(|t| t.get(&ip).cloned());
+        let Some(peer) = peer else {
             bgpfc_log::debug!("connection from unconfigured address", from = from);
             drop(stream);
             continue;
