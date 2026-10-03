@@ -93,12 +93,16 @@ dependencies = [
 [[package]]
 name = "bgpfcctl"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-control",
+]
 
 [[package]]
 name = "bgpfcd"
 version = "0.1.0"
 dependencies = [
  "bgpfc-config",
+ "bgpfc-control",
  "bgpfc-fib",
  "bgpfc-fsm",
  "bgpfc-log",

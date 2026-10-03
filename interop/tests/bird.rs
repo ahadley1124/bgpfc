@@ -409,3 +409,171 @@ fn fib_install_and_clean_shutdown() {
         bird.daemon.log_text()
     );
 }
+
+/// The control plane end to end: bgpfcctl over the Unix socket, the HTTP
+/// API with curl inside the namespace, a soft reset that makes BIRD send
+/// its routes again, a FIB mode switch, and a reload that changes an
+/// import policy.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn control_plane_commands() {
+    use std::fs;
+    let lab = Lab::new("m", 8);
+    let bird = Bird::start(
+        &lab,
+        &lab.b.clone(),
+        &bird_opts(&lab, true, &["192.0.2.0/24", "198.51.100.0/24"]),
+    );
+    let socket = lab.dir.join("ctl.sock");
+    let token_file = lab.dir.join("token");
+    fs::write(&token_file, "s3cret\n").unwrap();
+    let mut opts = bgpfcd_opts(&lab, false);
+    opts.extra = format!(
+        "control {{ socket {}; http {{ listen 127.0.0.1:8179; writes yes; token-file {}; }} }}",
+        socket.display(),
+        token_file.display()
+    );
+    let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
+    assert_established(&lab, &bird, &bgpfcd);
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
+
+    let (out, ok) = ctl(&["show", "neighbors"]);
+    assert!(ok && out.contains("Established"), "{out}");
+    let (out, ok) = ctl(&["show", "neighbor", &lab.b_addr.to_string()]);
+    assert!(ok && out.contains("route-refresh=true"), "{out}");
+    let ok = wait_for(Duration::from_secs(10), || {
+        ctl(&["show", "routes"]).0.contains("192.0.2.0/24")
+    });
+    assert!(ok, "{}", ctl(&["show", "routes"]).0);
+    let (out, ok) = ctl(&["show", "routes", "192.0.2.0/24"]);
+    assert!(
+        ok && out.contains("*192.0.2.0/24") && out.contains("65001"),
+        "{out}"
+    );
+    let (out, ok) = ctl(&["show", "fib"]);
+    assert!(ok && out.starts_with("mode dry-run"), "{out}");
+    let (out, ok) = ctl(&["show", "status"]);
+    assert!(ok && out.contains("established 1"), "{out}");
+    let (out, ok) = ctl(&["bogus"]);
+    assert!(!ok && out.contains("unknown command"), "{out}");
+
+    // HTTP, from inside the namespace.
+    let curl = |args: &[&str]| {
+        let mut cmd = lab.exec(&lab.a, "curl");
+        cmd.args(["-s", "-i", "--max-time", "5"]).args(args);
+        let out = cmd.output().expect("curl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let r = curl(&["http://127.0.0.1:8179/v1/status"]);
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+    let auth = "Authorization: Bearer s3cret";
+    let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/status"]);
+    assert!(
+        r.starts_with("HTTP/1.1 200") && r.contains("\"established\":1"),
+        "{r}"
+    );
+    let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/neighbors"]);
+    assert!(r.contains("\"state\":\"Established\""), "{r}");
+    let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/routes?family=ipv4"]);
+    assert!(
+        r.contains("\"prefix\":\"192.0.2.0/24\"") && r.contains("\"as_path\":[65001]"),
+        "{r}"
+    );
+    let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/nope"]);
+    assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+
+    // Soft reset: a ROUTE-REFRESH goes to BIRD, which answers with its
+    // routes again.
+    let before = bgpfcd.log_text().matches("rib: update").count();
+    let (out, ok) = ctl(&["clear", "neighbor", &lab.b_addr.to_string(), "soft"]);
+    assert!(ok, "{out}");
+    let ok = wait_for(Duration::from_secs(10), || {
+        let log = bgpfcd.log_text();
+        log.contains("route refresh sent") && log.matches("rib: update").count() > before
+    });
+    assert!(ok, "no refresh:\n{}", bgpfcd.log_text());
+
+    // FIB mode switch over HTTP: routes get installed.
+    let r = curl(&[
+        "-X",
+        "POST",
+        "-H",
+        auth,
+        "http://127.0.0.1:8179/v1/fib/mode/install",
+    ]);
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let ns_a = lab.a.clone();
+    let ok = wait_for(Duration::from_secs(10), || {
+        interop::Daemon::ip_in(&lab, &ns_a, &["route", "show", "proto", "186"])
+            .contains("192.0.2.0/24")
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
+    let (out, ok) = ctl(&["show", "fib"]);
+    assert!(ok && out.contains("installed"), "{out}");
+}
+
+/// Reload with a policy change, refusal of a broken file, and a hard
+/// reset carrying a shutdown communication.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn control_plane_reload_and_reset() {
+    use std::fs;
+    let lab = Lab::new("n", 9);
+    let bird = Bird::start(
+        &lab,
+        &lab.b.clone(),
+        &bird_opts(&lab, true, &["192.0.2.0/24", "198.51.100.0/24"]),
+    );
+    let socket = lab.dir.join("ctl.sock");
+    let mut opts = bgpfcd_opts(&lab, false);
+    opts.extra = format!(
+        "control {{ socket {}; }} fib {{ mode install; }}",
+        socket.display()
+    );
+    let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
+    assert_established(&lab, &bird, &bgpfcd);
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
+    let ns_a = lab.a.clone();
+    let ok = wait_for(Duration::from_secs(10), || {
+        interop::Daemon::ip_in(&lab, &ns_a, &["route", "show", "proto", "186"])
+            .contains("198.51.100.0/24")
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
+
+    // Reload with an import policy that drops one prefix: it leaves the
+    // RIB and the kernel without a session reset.
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
+    let cfg = fs::read_to_string(&cfg_path).unwrap();
+    let cfg = cfg.replace(
+        "policy ANY { term all { action accept; } }",
+        "policy ANY { term drop { match prefix 198.51.100.0/24; action reject; } term all { action accept; } }",
+    );
+    fs::write(&cfg_path, cfg).unwrap();
+    let (out, ok) = ctl(&["reload"]);
+    assert!(ok && out.contains("policy 1"), "{out}");
+    let ok = wait_for(Duration::from_secs(10), || {
+        !ctl(&["show", "routes"]).0.contains("198.51.100.0/24")
+            && !interop::Daemon::ip_in(&lab, &ns_a, &["route", "show", "proto", "186"])
+                .contains("198.51.100.0/24")
+    });
+    assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
+    assert_eq!(bgpfcd.log_text().matches("session established").count(), 1);
+    // A broken file is refused and the running configuration kept.
+    fs::write(&cfg_path, "router-id 192.0.2.1;").unwrap();
+    let (out, ok) = ctl(&["reload"]);
+    assert!(!ok && out.contains("local-as"), "{out}");
+    let (out, ok) = ctl(&["show", "status"]);
+    assert!(ok && out.contains("established 1"), "{out}");
+
+    // Hard reset with a shutdown communication reaches BIRD.
+    let (out, ok) = ctl(&["clear", "neighbor", &lab.b_addr.to_string(), "maintenance"]);
+    assert!(ok, "{out}");
+    let ok = wait_for(Duration::from_secs(10), || {
+        bird.daemon.log_text().contains("maintenance")
+    });
+    assert!(ok, "no communication seen:\n{}", bird.daemon.log_text());
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().matches("session established").count() >= 2
+    });
+    assert!(ok, "no reconnect:\n{}", bgpfcd.log_text());
+}

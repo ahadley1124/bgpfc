@@ -281,6 +281,52 @@ impl Rib {
         Rib::emit(&info, family, &batch)
     }
 
+    /// Re-run export for `addr` and `family` after a policy change: only
+    /// what differs from the Adj-RIB-Out is sent (announcements for new
+    /// or changed routes, withdrawals for routes no longer exported).
+    pub fn reexport(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+        let Some(state) = self.peers.get(&addr) else {
+            return Vec::new();
+        };
+        if !state.info.speaks(family) {
+            return Vec::new();
+        }
+        let info = state.info.clone();
+        let old = state.adj_out.get(&family).cloned().unwrap_or_default();
+        let bests: Vec<(Prefix, BestRoute)> = self
+            .tables
+            .get(&family)
+            .into_iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|(p, d)| d.best.clone().map(|b| (*p, b)))
+            .collect();
+        let mut batch = Batch::default();
+        let mut adj_out = HashMap::new();
+        for (prefix, best) in bests {
+            if let Some(a) = self.exported(family, prefix, &best, &info) {
+                if !old.get(&prefix).is_some_and(|o| Arc::ptr_eq(o, &a)) {
+                    batch.announce(&a, prefix);
+                }
+                adj_out.insert(prefix, a);
+            }
+        }
+        for prefix in old.keys() {
+            if !adj_out.contains_key(prefix) {
+                batch.withdraw.push(*prefix);
+            }
+        }
+        if let Some(state) = self.peers.get_mut(&addr) {
+            state.adj_out.insert(family, adj_out);
+        }
+        Rib::emit(&info, family, &batch)
+    }
+
+    /// What the RIB knows about peer `addr`, if it is up.
+    #[must_use]
+    pub fn peer(&self, addr: IpAddr) -> Option<&PeerInfo> {
+        self.peers.get(&addr).map(|p| &p.info)
+    }
+
     /// An UPDATE from `addr`: apply its withdrawals and announcements to
     /// the Adj-RIB-In, rerun the decision process for the destinations
     /// touched, and produce the FIB changes and UPDATEs that follow.

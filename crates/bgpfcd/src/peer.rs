@@ -23,9 +23,10 @@ use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
+use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::update::{DecodeContext, ErrorAction, PeerKind, UpdateMessage};
 
-use crate::messages::{ConnId, Inbound, Initiator, PeerInput, RibMsg};
+use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
 use crate::reader;
 
 /// How long an outgoing TCP connect may take; RFC 4271 §8.2.2 asks the
@@ -89,6 +90,10 @@ pub(crate) struct Peer {
     session: Option<Session>,
     write_failed: bool,
     overrun: Arc<AtomicBool>,
+    /// When the FSM last changed state.
+    state_since: Instant,
+    updates_in: u64,
+    updates_out: u64,
 }
 
 /// Prepare a peer: its handle can go into the peer table before the
@@ -115,6 +120,9 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         session: None,
         write_failed: false,
         overrun,
+        state_since: Instant::now(),
+        updates_in: 0,
+        updates_out: 0,
     };
     (handle, peer)
 }
@@ -174,6 +182,7 @@ impl Peer {
                 event = number
             );
         } else {
+            self.state_since = now;
             bgpfc_log::info!(
                 "session state",
                 peer = self.cfg.addr,
@@ -304,15 +313,60 @@ impl Peer {
                     for m in &messages {
                         self.write_raw(m);
                     }
+                    self.updates_out += 1;
                     self.fsm.message_sent(now);
                 }
             }
-            PeerInput::Stop => {
+            PeerInput::Stop(subcode) => {
                 // RFC 4271 §8.2.2 ManualStop: a Cease goes out (RFC 4486
-                // §4 Administrative Shutdown) and the FSM returns to Idle.
-                self.event(Event::ManualStop, now);
+                // §4 Administrative Shutdown) and the FSM returns to Idle;
+                // any other subcode travels in an AutomaticStop.
+                if subcode == CeaseSubcode::AdministrativeShutdown {
+                    self.event(Event::ManualStop, now);
+                } else {
+                    self.event(
+                        Event::AutomaticStop(NotificationMessage::cease(subcode)),
+                        now,
+                    );
+                }
                 self.drop_conn();
                 return false;
+            }
+            PeerInput::Reset(message) => {
+                // RFC 4486 §4 Administrative Reset, with the RFC 9003
+                // communication when one was given.
+                let n = match message.as_deref() {
+                    Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
+                        .unwrap_or_else(|_| {
+                            NotificationMessage::cease(CeaseSubcode::AdministrativeReset)
+                        }),
+                    None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
+                };
+                bgpfc_log::info!("session reset by operator", peer = self.cfg.addr);
+                self.event(Event::AutomaticStop(n), now);
+                self.event(Event::ManualStart, now);
+            }
+            PeerInput::SoftReset => {
+                if self.request_routes(now) {
+                    self.rib_send(RibMsg::Resend {
+                        peer: self.cfg.addr,
+                    });
+                }
+            }
+            PeerInput::RequestRoutes => {
+                self.request_routes(now);
+            }
+            PeerInput::Report(reply) => {
+                let _ = reply.send(PeerReport {
+                    addr: self.cfg.addr,
+                    remote_as: self.cfg.fsm.remote_as,
+                    state: self.fsm.state(),
+                    since: now.saturating_duration_since(self.state_since),
+                    session: self.session.clone(),
+                    updates_in: self.updates_in,
+                    updates_out: self.updates_out,
+                    admin_down: self.fsm.is_admin_down(),
+                });
             }
         }
         if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
@@ -327,6 +381,33 @@ impl Peer {
                 now,
             );
         }
+        true
+    }
+
+    /// RFC 2918 §4: ask for every negotiated family again, only if the
+    /// peer advertised the capability. Without it the request is refused
+    /// rather than turned into a hard reset. Whether anything was sent.
+    fn request_routes(&mut self, now: Instant) -> bool {
+        let Some(session) = self.session.clone() else {
+            bgpfc_log::warn!(
+                "route refresh: session not established",
+                peer = self.cfg.addr
+            );
+            return false;
+        };
+        if !session.route_refresh {
+            bgpfc_log::warn!(
+                "route refresh: peer did not advertise the capability",
+                peer = self.cfg.addr
+            );
+            return false;
+        }
+        for family in &session.families {
+            let body = RouteRefreshMessage { family: *family }.encode();
+            self.write_message(MessageType::RouteRefresh, &body);
+            bgpfc_log::info!("route refresh sent", peer = self.cfg.addr, family = family);
+        }
+        self.fsm.message_sent(now);
         true
     }
 
@@ -556,6 +637,7 @@ impl Peer {
                 let established = self.fsm.state() == State::Established;
                 self.event(Event::UpdateMsg, now);
                 if established {
+                    self.updates_in += 1;
                     if let Some(e) = &decoded.treated_as_withdraw {
                         bgpfc_log::warn!(
                             "update treated as withdraw",

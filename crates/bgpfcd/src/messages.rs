@@ -7,9 +7,11 @@
 //! memory.
 
 use std::net::{IpAddr, TcpStream};
+use std::sync::mpsc::SyncSender;
+use std::time::Duration;
 
 use bgpfc_fsm::Session;
-use bgpfc_wire::error::DecodeError;
+use bgpfc_wire::error::{CeaseSubcode, DecodeError};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
@@ -74,18 +76,104 @@ pub(crate) enum PeerInput {
     /// Framed UPDATE messages from the RIB thread, to write in order while
     /// Established (RFC 4271 §9.2).
     Send(Vec<Vec<u8>>),
-    /// Shut the session down (`ManualStop`, RFC 4271 §8.1.2 event 2) and
-    /// end the thread.
-    Stop,
+    /// Shut the session down with this Cease subcode (`ManualStop` for
+    /// Administrative Shutdown, RFC 4271 §8.1.2 event 2; `AutomaticStop`
+    /// with the subcode otherwise, RFC 4486 §4) and end the thread.
+    Stop(CeaseSubcode),
+    /// Reset the session: Cease / Administrative Reset, with a shutdown
+    /// communication when given (RFC 9003), then start again.
+    Reset(Option<String>),
+    /// Soft reset: ask the peer for its routes again with ROUTE-REFRESH
+    /// (RFC 2918 §4) for every negotiated family; the RIB re-sends ours.
+    SoftReset,
+    /// Only the first half of a soft reset: ask the peer for its routes
+    /// again (after an import policy change).
+    RequestRoutes,
+    /// Report the session's state on the sender.
+    Report(SyncSender<PeerReport>),
 }
 
-/// What the RIB thread tells the FIB thread.
+/// What a peer thread reports about itself.
+#[derive(Clone, Debug)]
+pub(crate) struct PeerReport {
+    /// The neighbour's address.
+    pub(crate) addr: IpAddr,
+    /// Configured remote AS.
+    pub(crate) remote_as: bgpfc_wire::types::Asn,
+    /// FSM state.
+    pub(crate) state: bgpfc_fsm::State,
+    /// How long the state has been held.
+    pub(crate) since: Duration,
+    /// Negotiated session, when Established.
+    pub(crate) session: Option<Session>,
+    /// UPDATEs received since the thread started.
+    pub(crate) updates_in: u64,
+    /// UPDATE batches sent.
+    pub(crate) updates_out: u64,
+    /// Administratively stopped (a `ManualStop` with no restart).
+    pub(crate) admin_down: bool,
+}
+
+/// What the RIB thread tells the FIB thread, and what the control plane
+/// asks it.
 #[derive(Debug)]
 pub(crate) enum FibMsg {
     /// A Loc-RIB change (RFC 4271 §9.3).
     Change(bgpfc_rib::FibChange),
+    /// Switch between dry-run and install; the reply says what was done.
+    SetMode(bgpfc_fib::Mode, SyncSender<usize>),
+    /// Report the tables on the sender.
+    Query(SyncSender<FibReport>),
     /// Remove every installed route and reply on the sender.
-    Shutdown(std::sync::mpsc::SyncSender<()>),
+    Shutdown(SyncSender<()>),
+}
+
+/// A snapshot of the FIB manager.
+#[derive(Clone, Debug)]
+pub(crate) struct FibReport {
+    /// The mode.
+    pub(crate) mode: bgpfc_fib::Mode,
+    /// Desired routes.
+    pub(crate) desired: bgpfc_fib::Table,
+    /// Routes believed installed.
+    pub(crate) installed: bgpfc_fib::Table,
+}
+
+/// A question for the RIB thread.
+#[derive(Clone, Debug)]
+pub(crate) enum RibQuery {
+    /// Per-peer route counts and session facts.
+    Peers,
+    /// Loc-RIB routes of a family, optionally one prefix with all its
+    /// candidates.
+    Routes {
+        /// The family.
+        family: AddressFamily,
+        /// Only this destination.
+        prefix: Option<bgpfc_wire::prefix::Prefix>,
+    },
+}
+
+/// One Loc-RIB route or candidate in a reply.
+#[derive(Clone, Debug)]
+pub(crate) struct RouteReport {
+    /// The destination.
+    pub(crate) prefix: bgpfc_wire::prefix::Prefix,
+    /// The peer it came from.
+    pub(crate) peer: IpAddr,
+    /// Its attributes.
+    pub(crate) attrs: std::sync::Arc<bgpfc_rib::PathAttrs>,
+    /// Whether it is the chosen route.
+    pub(crate) best: bool,
+}
+
+/// The RIB's answer.
+#[derive(Clone, Debug)]
+pub(crate) enum RibReply {
+    /// Answer to [`RibQuery::Peers`].
+    Peers(Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)>),
+    /// Answer to [`RibQuery::Routes`].
+    Routes(Vec<RouteReport>),
 }
 
 /// What peer threads tell the RIB thread.
@@ -128,4 +216,30 @@ pub(crate) enum RibMsg {
         /// Peer address.
         peer: IpAddr,
     },
+    /// A control-plane question.
+    Query(RibQuery, SyncSender<RibReply>),
+    /// New policies after a reload; `reexport` lists the peers whose
+    /// export policy changed and whose Adj-RIB-Out is recomputed.
+    SetPolicies {
+        /// The compiled policies.
+        policies: NewPolicies,
+        /// Peers to re-export to.
+        reexport: Vec<IpAddr>,
+    },
+    /// Re-send the Adj-RIB-Out of every family to `peer` in full (a soft
+    /// reset, RFC 2918 §4).
+    Resend {
+        /// Peer address.
+        peer: IpAddr,
+    },
+}
+
+/// A policy set on its way to the RIB thread (`dyn Policies` has no
+/// `Debug`, and the message enum wants one).
+pub(crate) struct NewPolicies(pub(crate) Box<dyn bgpfc_rib::Policies>);
+
+impl std::fmt::Debug for NewPolicies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NewPolicies")
+    }
 }

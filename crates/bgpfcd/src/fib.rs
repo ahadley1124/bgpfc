@@ -7,7 +7,7 @@ use std::thread;
 
 use bgpfc_fib::{Applied, Fib, Mode, Op};
 
-use crate::messages::FibMsg;
+use crate::messages::{FibMsg, FibReport};
 
 /// Changes the RIB thread may queue before it blocks.
 const QUEUE: usize = 4096;
@@ -33,6 +33,19 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             FibMsg::Change(c) => report(&fib.set(c.prefix, c.next_hop)),
+            FibMsg::SetMode(mode, reply) => {
+                bgpfc_log::info!("fib: mode", mode = mode);
+                let applied = fib.set_mode(mode);
+                report(&applied);
+                let _ = reply.send(applied.len());
+            }
+            FibMsg::Query(reply) => {
+                let _ = reply.send(FibReport {
+                    mode: fib.mode(),
+                    desired: fib.desired().clone(),
+                    installed: fib.installed().clone(),
+                });
+            }
             FibMsg::Shutdown(done) => {
                 report(&fib.clear());
                 let _ = done.send(());

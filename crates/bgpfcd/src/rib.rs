@@ -13,7 +13,7 @@ use bgpfc_rib::{Output, PeerInfo, Policies, Rib};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
-use crate::messages::{FibMsg, PeerInput, RibMsg};
+use crate::messages::{FibMsg, PeerInput, RibMsg, RibQuery, RibReply, RouteReport};
 
 /// Start the RIB thread.
 pub(crate) fn spawn(
@@ -58,32 +58,7 @@ fn run(
                 rib.peer_up(peer_info(peer, local_addr, &session))
             }
             RibMsg::Update { peer, update } => {
-                let announced = update.announcements().count();
-                let withdrawn = update.withdrawals().count();
-                bgpfc_log::debug!(
-                    "rib: update",
-                    peer = peer,
-                    announced = announced,
-                    withdrawn = withdrawn
-                );
-                if bgpfc_log::enabled(bgpfc_log::Level::Trace) {
-                    for (family, prefix) in update.announcements() {
-                        bgpfc_log::trace!(
-                            "rib: announce",
-                            peer = peer,
-                            family = family,
-                            prefix = prefix
-                        );
-                    }
-                    for (family, prefix) in update.withdrawals() {
-                        bgpfc_log::trace!(
-                            "rib: withdraw",
-                            peer = peer,
-                            family = family,
-                            prefix = prefix
-                        );
-                    }
-                }
+                log_update(peer, &update);
                 rib.update(peer, &update)
             }
             RibMsg::FamilyDisabled { peer, family } => {
@@ -102,6 +77,37 @@ fn run(
                     routes_deleted = stats.received.iter().map(|(_, n)| n).sum::<usize>()
                 );
                 rib.peer_down(peer)
+            }
+            RibMsg::Query(q, reply) => {
+                let _ = reply.send(answer(&rib, &q));
+                Vec::new()
+            }
+            RibMsg::SetPolicies { policies, reexport } => {
+                rib.set_policies(policies.0);
+                let mut out = Vec::new();
+                for peer in reexport {
+                    let families: Vec<_> = rib
+                        .peer(peer)
+                        .map(|p| p.families.clone())
+                        .unwrap_or_default();
+                    for family in families {
+                        bgpfc_log::info!("rib: re-export", peer = peer, family = family);
+                        out.extend(rib.reexport(peer, family));
+                    }
+                }
+                out
+            }
+            RibMsg::Resend { peer } => {
+                let families: Vec<_> = rib
+                    .peer(peer)
+                    .map(|p| p.families.clone())
+                    .unwrap_or_default();
+                let mut out = Vec::new();
+                for family in families {
+                    bgpfc_log::info!("rib: resend", peer = peer, family = family);
+                    out.extend(rib.refresh(peer, family));
+                }
+                out
             }
         };
         deliver(outputs, peers, fib);
@@ -132,7 +138,8 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                 }
             }
             Output::Send { peer, messages } => {
-                let Some(handle) = peers.get(&peer) else {
+                let handle = peers.read().ok().and_then(|t| t.get(&peer).cloned());
+                let Some(handle) = handle else {
                     continue;
                 };
                 bgpfc_log::debug!("rib: send", peer = peer, messages = messages.len());
@@ -153,5 +160,73 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                 bgpfc_log::error!("rib: cannot encode update", peer = peer, error = error);
             }
         }
+    }
+}
+
+fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
+    let announced = update.announcements().count();
+    let withdrawn = update.withdrawals().count();
+    bgpfc_log::debug!(
+        "rib: update",
+        peer = peer,
+        announced = announced,
+        withdrawn = withdrawn
+    );
+    if bgpfc_log::enabled(bgpfc_log::Level::Trace) {
+        for (family, prefix) in update.announcements() {
+            bgpfc_log::trace!(
+                "rib: announce",
+                peer = peer,
+                family = family,
+                prefix = prefix
+            );
+        }
+        for (family, prefix) in update.withdrawals() {
+            bgpfc_log::trace!(
+                "rib: withdraw",
+                peer = peer,
+                family = family,
+                prefix = prefix
+            );
+        }
+    }
+}
+
+fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
+    match q {
+        RibQuery::Peers => RibReply::Peers(
+            rib.peers()
+                .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
+                .collect(),
+        ),
+        RibQuery::Routes { family, prefix } => match prefix {
+            Some(prefix) => {
+                let best = rib
+                    .loc_rib(*family)
+                    .find(|(p, _)| p == prefix)
+                    .map(|(_, b)| b.peer);
+                RibReply::Routes(
+                    rib.candidates(*family, *prefix)
+                        .iter()
+                        .map(|c| RouteReport {
+                            prefix: *prefix,
+                            peer: c.peer,
+                            attrs: std::sync::Arc::clone(&c.attrs),
+                            best: best == Some(c.peer),
+                        })
+                        .collect(),
+                )
+            }
+            None => RibReply::Routes(
+                rib.loc_rib(*family)
+                    .map(|(prefix, b)| RouteReport {
+                        prefix,
+                        peer: b.peer,
+                        attrs: std::sync::Arc::clone(&b.attrs),
+                        best: true,
+                    })
+                    .collect(),
+            ),
+        },
     }
 }
