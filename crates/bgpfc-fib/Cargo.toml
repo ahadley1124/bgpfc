@@ -8,6 +8,11 @@ rust-version.workspace = true
 description = "rtnetlink codec and kernel FIB reconciliation"
 
 [dependencies]
+bgpfc-sys.workspace = true
+bgpfc-wire.workspace = true
+
+[dev-dependencies]
+proptest = "1.11"
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@ rust-version = "1.99"
 # cargo can warn about unused entries.
 [workspace.dependencies]
 bgpfc-config = { path = "crates/bgpfc-config" }
+bgpfc-fib = { path = "crates/bgpfc-fib" }
 bgpfc-fsm = { path = "crates/bgpfc-fsm" }
 bgpfc-log = { path = "crates/bgpfc-log" }
 bgpfc-policy = { path = "crates/bgpfc-policy" }

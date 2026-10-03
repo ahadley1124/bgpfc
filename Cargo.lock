@@ -44,6 +44,11 @@ version = "0.1.0"
 [[package]]
 name = "bgpfc-fib"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-sys",
+ "bgpfc-wire",
+ "proptest",
+]
 
 [[package]]
 name = "bgpfc-fsm"
@@ -94,10 +99,12 @@ name = "bgpfcd"
 version = "0.1.0"
 dependencies = [
  "bgpfc-config",
+ "bgpfc-fib",
  "bgpfc-fsm",
  "bgpfc-log",
  "bgpfc-policy",
  "bgpfc-rib",
+ "bgpfc-sys",
  "bgpfc-wire",
 ]
 
