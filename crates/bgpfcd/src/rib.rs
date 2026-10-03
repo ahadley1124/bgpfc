@@ -9,22 +9,27 @@ use std::sync::mpsc::{Receiver, TrySendError};
 use std::thread;
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Rib};
+use bgpfc_rib::{Output, PeerInfo, Policies, Rib};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{PeerInput, RibMsg};
 
 /// Start the RIB thread.
-pub(crate) fn spawn(local_as: Asn, rx: Receiver<RibMsg>, peers: PeerTable) {
+pub(crate) fn spawn(
+    local_as: Asn,
+    policies: Box<dyn Policies>,
+    rx: Receiver<RibMsg>,
+    peers: PeerTable,
+) {
     thread::Builder::new()
         .name("rib".to_owned())
-        .spawn(move || run(local_as, &rx, &peers))
+        .spawn(move || run(local_as, policies, &rx, &peers))
         .expect("spawning the rib thread");
 }
 
-fn run(local_as: Asn, rx: &Receiver<RibMsg>, peers: &PeerTable) {
-    let mut rib = Rib::new(local_as);
+fn run(local_as: Asn, policies: Box<dyn Policies>, rx: &Receiver<RibMsg>, peers: &PeerTable) {
+    let mut rib = Rib::with_policies(local_as, policies);
     while let Ok(msg) = rx.recv() {
         let outputs = match msg {
             RibMsg::PeerUp {

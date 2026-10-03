@@ -242,6 +242,10 @@ pub struct NeighborOpts {
     pub hold_time: u16,
     /// Never initiate the TCP connection.
     pub passive: bool,
+    /// Import policy name (`ANY`, accept-all, is always defined).
+    pub import: String,
+    /// Export policy name.
+    pub export: String,
 }
 
 impl NeighborOpts {
@@ -254,6 +258,8 @@ impl NeighborOpts {
             remote_as,
             hold_time: 30,
             passive: false,
+            import: "ANY".to_owned(),
+            export: "ANY".to_owned(),
         }
     }
 }
@@ -268,6 +274,8 @@ pub struct BgpfcdOpts {
     pub listen: Vec<IpAddr>,
     /// Neighbors.
     pub neighbors: Vec<NeighborOpts>,
+    /// Extra configuration text: policies and prefix lists.
+    pub extra: String,
 }
 
 impl BgpfcdOpts {
@@ -279,6 +287,7 @@ impl BgpfcdOpts {
             router_id,
             listen: vec![IpAddr::V4(router_id)],
             neighbors: vec![neighbor],
+            extra: String::new(),
         }
     }
 }
@@ -295,8 +304,8 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
     let cfg = lab.dir.join(format!("bgpfcd-{ns}.conf"));
     let mut text = format!(
         "router-id {};\nlocal-as {};\nlog {{ level debug; }}\n\
-         policy ANY {{ term all {{ action accept; }} }}\n",
-        opts.router_id, opts.local_as
+         policy ANY {{ term all {{ action accept; }} }}\n{}\n",
+        opts.router_id, opts.local_as, opts.extra
     );
     for l in &opts.listen {
         let _ = writeln!(text, "listen {{ address {l}; port 179; }}");
@@ -304,12 +313,14 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
     for n in &opts.neighbors {
         let _ = writeln!(
             text,
-            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import ANY; export ANY; }}",
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {}; }}",
             n.addr,
             n.remote_as,
             n.port,
             n.hold_time,
-            if n.passive { "yes" } else { "no" }
+            if n.passive { "yes" } else { "no" },
+            n.import,
+            n.export
         );
     }
     fs::write(&cfg, text).expect("bgpfcd config");

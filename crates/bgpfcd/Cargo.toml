@@ -11,6 +11,7 @@ description = "bgpfc BGP-4 routing daemon"
 bgpfc-config.workspace = true
 bgpfc-fsm.workspace = true
 bgpfc-log.workspace = true
+bgpfc-policy.workspace = true
 bgpfc-rib.workspace = true
 bgpfc-wire.workspace = true
 

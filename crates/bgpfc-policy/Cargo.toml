@@ -8,6 +8,9 @@ rust-version.workspace = true
 description = "Routing policy: prefix lists, AS-path regex, community matching"
 
 [dependencies]
+bgpfc-config.workspace = true
+bgpfc-rib.workspace = true
+bgpfc-wire.workspace = true
 
 [lints]
 workspace = true

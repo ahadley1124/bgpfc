@@ -16,6 +16,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 bgpfc-config = { path = "../crates/bgpfc-config" }
+bgpfc-policy = { path = "../crates/bgpfc-policy" }
 bgpfc-wire = { path = "../crates/bgpfc-wire" }
 
 # Keep this crate out of the root workspace (AGENTS.md §2).
@@ -69,6 +70,13 @@ bench = false
 [[bin]]
 name = "config"
 path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "as_path_regex"
+path = "fuzz_targets/as_path_regex.rs"
 test = false
 doc = false
 bench = false

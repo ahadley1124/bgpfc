@@ -34,6 +34,25 @@ pub struct Source {
     pub kind: PeerKind,
 }
 
+/// Whether a route from `source` may be advertised to `to` at all,
+/// before any policy: the family is negotiated, it is not the source peer,
+/// and it is not internal-to-internal.
+#[must_use]
+pub fn eligible(family: AddressFamily, source: Source, to: &PeerInfo) -> bool {
+    if !to.speaks(family) {
+        return false;
+    }
+    // NOTE(interop): RFC 4271 does not forbid advertising a route back to
+    // the peer it came from (the receiver's AS-loop check drops it), but
+    // BIRD and FRR do not, and neither do we.
+    if source.peer == to.addr {
+        return false;
+    }
+    // RFC 4271 §9.2: a route learned from an internal peer is not
+    // redistributed to other internal peers (no route reflection).
+    !(source.kind == PeerKind::Internal && to.kind == PeerKind::Internal)
+}
+
 /// The attributes to advertise to `to`, or `None` when the route is not
 /// advertised to that peer at all. `local_as` is our AS.
 #[must_use]
@@ -44,18 +63,7 @@ pub fn export(
     attrs: &PathAttrs,
     to: &PeerInfo,
 ) -> Option<PathAttrs> {
-    if !to.speaks(family) {
-        return None;
-    }
-    // NOTE(interop): RFC 4271 does not forbid advertising a route back to
-    // the peer it came from (the receiver's AS-loop check drops it), but
-    // BIRD and FRR do not, and neither do we.
-    if source.peer == to.addr {
-        return None;
-    }
-    // RFC 4271 §9.2: a route learned from an internal peer is not
-    // redistributed to other internal peers (no route reflection).
-    if source.kind == PeerKind::Internal && to.kind == PeerKind::Internal {
+    if !eligible(family, source, to) {
         return None;
     }
     // RFC 1997: NO_ADVERTISE goes nowhere; NO_EXPORT and

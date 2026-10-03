@@ -32,6 +32,55 @@ pub use decision::Candidate;
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
 
+/// What a policy decided about a route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Keep the route with its attributes as they are.
+    Accept,
+    /// Keep the route with these attributes instead.
+    Modified(PathAttrs),
+    /// Drop the route.
+    Reject,
+}
+
+/// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
+/// policy, §9.1.3 export policy). `peer` is the peer the route came from
+/// on import and the peer it is going to on export.
+pub trait Policies: Send {
+    /// Decide whether and how a received route enters the Adj-RIB-In.
+    fn import(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        attrs: &PathAttrs,
+    ) -> Verdict;
+
+    /// Decide whether and how a Loc-RIB route is advertised to `peer`,
+    /// before the RFC 4271 §5.1 rewriting for the session.
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        attrs: &PathAttrs,
+    ) -> Verdict;
+}
+
+/// The policy that accepts every route unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcceptAll;
+
+impl Policies for AcceptAll {
+    fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        Verdict::Accept
+    }
+
+    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        Verdict::Accept
+    }
+}
+
 /// A Loc-RIB change the FIB must follow (RFC 4271 §9.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FibChange {
@@ -103,6 +152,7 @@ pub struct PeerStats {
 /// All RIB state.
 pub struct Rib {
     local_as: Asn,
+    policies: Box<dyn Policies>,
     peers: HashMap<IpAddr, PeerState>,
     /// Adj-RIBs-In and Loc-RIB together: every candidate per destination
     /// and the best among them.
@@ -111,15 +161,28 @@ pub struct Rib {
 }
 
 impl Rib {
-    /// An empty RIB for a speaker in `local_as`.
+    /// An empty RIB for a speaker in `local_as` that accepts every route.
     #[must_use]
     pub fn new(local_as: Asn) -> Rib {
+        Rib::with_policies(local_as, Box::new(AcceptAll))
+    }
+
+    /// An empty RIB for a speaker in `local_as` with the given policies.
+    #[must_use]
+    pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
             local_as,
+            policies,
             peers: HashMap::new(),
             tables: HashMap::new(),
             interner: Interner::default(),
         }
+    }
+
+    /// Replace the policies. The caller re-evaluates routes afterwards
+    /// (route refresh for imports, [`Rib::refresh`] for exports).
+    pub fn set_policies(&mut self, policies: Box<dyn Policies>) {
+        self.policies = policies;
     }
 
     /// Our AS.
@@ -207,7 +270,7 @@ impl Rib {
             .filter_map(|(p, d)| d.best.clone().map(|b| (*p, b)))
             .collect();
         for (prefix, best) in bests {
-            if let Some(a) = self.exported(family, &best, &info) {
+            if let Some(a) = self.exported(family, prefix, &best, &info) {
                 batch.announce(&a, prefix);
                 adj_out.insert(prefix, a);
             }
@@ -225,9 +288,10 @@ impl Rib {
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
         };
-        let kind = state.info.kind;
-        let router_id = state.info.router_id.to_u32();
-        let remote_as = state.info.remote_as;
+        let info = state.info.clone();
+        let kind = info.kind;
+        let router_id = info.router_id.to_u32();
+        let remote_as = info.remote_as;
         let disabled = state.disabled.clone();
         let mut dirty = Vec::new();
         for (family, prefix) in update.withdrawals() {
@@ -265,7 +329,18 @@ impl Rib {
             // Neither kind is stored.
             let leftmost_ok =
                 kind == PeerKind::Internal || attrs.as_path.first_asn() == Some(remote_as);
-            if attrs.as_path.contains(self.local_as) || !leftmost_ok {
+            // RFC 4271 §9.1.1: import policy decides what enters, and may
+            // change attributes (the degree of preference among them).
+            let accepted = if attrs.as_path.contains(self.local_as) || !leftmost_ok {
+                None
+            } else {
+                match self.policies.import(&info, family, prefix, &attrs) {
+                    Verdict::Accept => Some(attrs),
+                    Verdict::Modified(a) => Some(self.interner.intern(a)),
+                    Verdict::Reject => None,
+                }
+            };
+            let Some(attrs) = accepted else {
                 if let Some(dest) = self
                     .tables
                     .get_mut(&family)
@@ -276,7 +351,7 @@ impl Rib {
                     dirty.push((family, prefix));
                 }
                 continue;
-            }
+            };
             let dest = self
                 .tables
                 .entry(family)
@@ -412,7 +487,7 @@ impl Rib {
             for info in infos {
                 let exported = new_best
                     .as_ref()
-                    .and_then(|b| self.exported(family, b, &info));
+                    .and_then(|b| self.exported(family, prefix, b, &info));
                 let Some(state) = self.peers.get_mut(&info.addr) else {
                     continue;
                 };
@@ -446,10 +521,13 @@ impl Rib {
         out
     }
 
-    /// The interned attributes `best` is advertised with to `to`, if any.
+    /// The interned attributes `best` is advertised with to `to`, if any:
+    /// export policy first (RFC 4271 §9.1.3), then the session rewriting
+    /// of §5.1.
     fn exported(
         &mut self,
         family: AddressFamily,
+        prefix: Prefix,
         best: &BestRoute,
         to: &PeerInfo,
     ) -> Option<Arc<PathAttrs>> {
@@ -461,8 +539,21 @@ impl Rib {
             peer: best.peer,
             kind,
         };
-        export::export(self.local_as, family, source, &best.attrs, to)
-            .map(|a| self.interner.intern(a))
+        // The route is not offered to the policy at all when §9.2 rules
+        // it out, so a policy cannot override those.
+        if !export::eligible(family, source, to) {
+            return None;
+        }
+        let modified;
+        let attrs: &PathAttrs = match self.policies.export(to, family, prefix, &best.attrs) {
+            Verdict::Reject => return None,
+            Verdict::Accept => &best.attrs,
+            Verdict::Modified(a) => {
+                modified = a;
+                &modified
+            }
+        };
+        export::export(self.local_as, family, source, attrs, to).map(|a| self.interner.intern(a))
     }
 
     fn emit(to: &PeerInfo, family: AddressFamily, batch: &Batch) -> Vec<Output> {

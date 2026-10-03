@@ -125,15 +125,39 @@ with the following term keeping the modifications. If no term decides, the
 route is rejected (AGENTS.md §3, "Policy").
 
 Match clauses: `prefix` and `prefix-list` compare the route's NLRI;
-`as-path` is a regular expression over AS numbers (see the policy engine's
-documentation; operators act on ASN tokens, not characters); the three
+`as-path` is a regular expression over AS numbers (below); the three
 community clauses hold when the route carries the value; `origin` compares
 the ORIGIN attribute; `neighbor` compares the peer the route was received
-from.
+from (import) or is being sent to (export).
 
 Set actions change the route's attributes before the decision process
-(import) or before sending (export). `next-hop self` is only meaningful in
-export policies.
+(import) or before sending (export). On export they run before the
+session rewriting of RFC 4271 §5.1 (our AS is prepended after a policy's
+`as-path prepend`; the next hop of a route to an external peer is always
+our address). `next-hop self` is therefore only meaningful in export
+policies towards internal peers. A policy cannot advertise a route to the
+peer it came from, nor an internal route to another internal peer.
+
+**AS-path regular expressions.** The pattern is matched against the
+route's `AS_PATH` as a sequence of AS numbers; every operator acts on
+whole AS numbers, never on digits:
+
+| Syntax | Meaning |
+|---|---|
+| `65001` | that AS |
+| `.` | any one AS |
+| `[64512-65534 1 2]` | any AS in the set; `[^...]` any AS not in it |
+| `^`, `$` | the start and the end of the path |
+| `X*`, `X+`, `X?` | zero or more, one or more, zero or one `X` |
+| `(X Y)`, `X\|Y` | grouping and alternation |
+| space, `_` | separate tokens; no meaning of their own |
+
+A pattern without `^` matches anywhere in the path. `AS_SET` members are
+matched as if they were a sequence. The engine is a state-set simulation
+of a Thompson NFA, so matching time is bounded by pattern size times path
+length whatever the pattern; a pattern compiling to more than 4096 NFA
+instructions is rejected at load time. Pattern errors are reported with
+the term's position and the offset in the pattern.
 
 **Neighbors.** Each neighbor is identified by its address; defining one twice
 is an error. `import` and `export` must name policies defined in the same

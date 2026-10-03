@@ -59,6 +59,11 @@ version = "0.1.0"
 [[package]]
 name = "bgpfc-policy"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-config",
+ "bgpfc-rib",
+ "bgpfc-wire",
+]
 
 [[package]]
 name = "bgpfc-rib"
@@ -91,6 +96,7 @@ dependencies = [
  "bgpfc-config",
  "bgpfc-fsm",
  "bgpfc-log",
+ "bgpfc-policy",
  "bgpfc-rib",
  "bgpfc-wire",
 ]

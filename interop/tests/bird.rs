@@ -186,6 +186,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
                 NeighborOpts::new(lab.b_addr, BIRD_AS),
                 NeighborOpts::new(lab.c_addr, BIRD2_AS),
             ],
+            extra: String::new(),
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -248,4 +249,90 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
     let routes = bird2.birdc(&lab, &["show", "route"]);
     assert!(routes.contains("192.0.2.0/24"), "{routes}");
     bird2.daemon.kill();
+}
+
+/// Import and export policies shape what BIRD 2 receives: one static is
+/// rejected on import by prefix list, the other gets a prepended AS path
+/// and a community on export.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn export_policy_filters_and_sets() {
+    const BIRD2_AS: u32 = 65_002;
+    let mut lab = Lab::new("f", 6);
+    let ns_c = lab.add_c();
+    let bird_b = Bird::start(
+        &lab,
+        &lab.b.clone(),
+        &bird_opts(&lab, true, &["192.0.2.0/24", "198.51.100.0/24"]),
+    );
+    let bird2 = Bird::start(
+        &lab,
+        &ns_c,
+        &BirdOpts {
+            local_as: BIRD2_AS,
+            local: lab.c_addr,
+            local_port: 179,
+            neighbor: lab.a2_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: Vec::new(),
+        },
+    );
+    let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
+    to_bird2.export = "OUT".to_owned();
+    let mut from_bird_b = NeighborOpts::new(lab.b_addr, BIRD_AS);
+    from_bird_b.import = "IN".to_owned();
+    let bgpfcd = start_bgpfcd(
+        &lab,
+        &lab.a.clone(),
+        &BgpfcdOpts {
+            local_as: BGPFC_AS,
+            router_id: lab.a_addr,
+            listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
+            neighbors: vec![from_bird_b, to_bird2],
+            extra: "prefix-list DROP { 198.51.100.0/24; }
+                    policy IN {
+                        term drop { match prefix-list DROP; action reject; }
+                        term rest { match as-path \"^65001$\"; set local-pref 150; action accept; }
+                    }
+                    policy OUT {
+                        term tag { set community add 65000:42; set as-path prepend 65000; action accept; }
+                    }"
+            .to_owned(),
+        },
+    );
+    assert_established(&lab, &bird_b, &bgpfcd);
+    let ok = wait_for(ESTABLISH, || {
+        bird2.peer_status(&lab).contains("Established")
+    });
+    assert!(
+        ok,
+        "bird2:\n{}\n{}",
+        bird2.peer_status(&lab),
+        bgpfcd.log_text()
+    );
+    let ok = wait_for(Duration::from_secs(15), || {
+        bird2
+            .birdc(&lab, &["show", "route", "all"])
+            .contains("192.0.2.0/24")
+    });
+    let routes = bird2.birdc(&lab, &["show", "route", "all"]);
+    assert!(ok, "route not relayed:\n{routes}\n{}", bgpfcd.log_text());
+    // Rejected on import: never reaches BIRD 2, nor the FIB.
+    assert!(!routes.contains("198.51.100.0/24"), "{routes}");
+    assert!(
+        !bgpfcd
+            .log_text()
+            .contains("prefix=198.51.100.0/24 next_hop"),
+        "{}",
+        bgpfcd.log_text()
+    );
+    // Export set actions, then our AS prepended by the session rules.
+    assert!(
+        routes.contains("BGP.as_path: 65000 65000 65001"),
+        "{routes}"
+    );
+    assert!(routes.contains("(65000,42)"), "{routes}");
 }

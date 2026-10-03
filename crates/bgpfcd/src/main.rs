@@ -39,6 +39,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Policies compile after validation: only AS-path regexes can fail.
+    let engine = match bgpfc_policy::Engine::new(&config) {
+        Ok(e) => e,
+        Err(errors) => {
+            for e in errors {
+                eprintln!("{}:{e}", opts.config.display());
+            }
+            std::process::exit(1);
+        }
+    };
     if opts.check {
         println!(
             "{}: ok ({} neighbors, {} policies)",
@@ -81,7 +91,12 @@ fn main() {
         table.insert(handle.addr, handle);
     }
     let table = Arc::new(table);
-    rib::spawn(config.local_as, rib_rx, Arc::clone(&table));
+    rib::spawn(
+        config.local_as,
+        Box::new(engine),
+        rib_rx,
+        Arc::clone(&table),
+    );
     for addr in config.listen {
         if let Err(e) = coordinator::listen(addr, Arc::clone(&table)) {
             bgpfc_log::error!("cannot listen", address = addr, error = e);

@@ -25,6 +25,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "bgpfc-config",
+ "bgpfc-policy",
  "bgpfc-wire",
  "libfuzzer-sys",
 ]
@@ -32,6 +33,22 @@ dependencies = [
 [[package]]
 name = "bgpfc-log"
 version = "0.1.0"
+
+[[package]]
+name = "bgpfc-policy"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-config",
+ "bgpfc-rib",
+ "bgpfc-wire",
+]
+
+[[package]]
+name = "bgpfc-rib"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-wire",
+]
 
 [[package]]
 name = "bgpfc-wire"

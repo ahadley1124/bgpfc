@@ -11,7 +11,9 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   `crates/bgpfcd/src/`, `config/` is `crates/bgpfc-config/src/`
   ("config golden" is `crates/bgpfc-config/tests/golden/`), `rib/` is
   `crates/bgpfc-rib/src/` ("rib tests" are `crates/bgpfc-rib/src/tests.rs`),
-  and "interop" names a test in `interop/tests/bird.rs`.
+  `policy/` is `crates/bgpfc-policy/src/` ("policy tests" are
+  `crates/bgpfc-policy/src/tests.rs`), and "interop" names a test in
+  `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -97,7 +99,7 @@ is `done`.
 | 6.3 | Optional Attribute Error, Data = the attribute | MUST | done | wire/update.rs `discard_malformed`, `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
 | 6.3 | Duplicate attribute → Malformed Attribute List | MUST | done (as revised by RFC 7606 §3 g) | wire/update.rs `decode_attributes` | update.rs `duplicates_discard_or_reset` |
 | 6.3 | Invalid Network Field for syntactically bad NLRI | MUST | done | wire/update.rs `decode` | update.rs `bad_nlri_syntax_resets_the_session` |
-| 6.3 | Semantically bad prefix: log and ignore | SHOULD | todo (policy, milestone 6) | | |
+| 6.3 | Semantically bad prefix: log and ignore | SHOULD | n/a (syntax is checked by the codec; what is semantically unwanted, martians and the like, is the import policy's `prefix-list` to reject) | policy/lib.rs `PolicySet::evaluate` | policy tests `terms_run_in_order_and_undecided_rejects` |
 | 6.3 | Correct attributes with no NLRI is a valid UPDATE | MUST | done | wire/update.rs `decode` | update.rs `missing_mandatory_attributes` |
 
 | 6.8 | One of two colliding connections is closed; the one from the higher BGP Identifier is kept | MUST | done | bgpfcd/peer.rs `resolve_collision`, fsm/machine.rs `collision_dump` | interop `session_survives_simultaneous_connect` |
@@ -128,7 +130,7 @@ is `done`.
 
 | 3.2 | Adj-RIBs-In, Loc-RIB and Adj-RIBs-Out (conceptual) | MUST | done (one table per family holds every candidate and the chosen route; Adj-RIB-Out per peer) | rib/lib.rs `Rib` | rib tests `announce_withdraw_and_fib_changes` |
 | 9 | Run the decision process when an UPDATE changes the Adj-RIB-In | MUST | done (for the destinations the UPDATE touched) | rib/lib.rs `Rib::update`, `reconsider` | rib tests `announce_withdraw_and_fib_changes`, order.rs `loc_rib_is_independent_of_arrival_order` |
-| 9.1.1 | Phase 1: degree of preference is `LOCAL_PREF` for internal routes, local policy otherwise | MUST | done (100 unless import policy sets `LOCAL_PREF`; policy is milestone 6) | rib/decision.rs `Candidate::degree_of_preference` | rib tests `degree_of_preference_wins_first` |
+| 9.1.1 | Phase 1: degree of preference is `LOCAL_PREF` for internal routes, local policy otherwise | MUST | done (import policy `set local-pref`, 100 otherwise) | rib/decision.rs `Candidate::degree_of_preference`, policy/lib.rs `apply` | rib tests `degree_of_preference_wins_first`, policy tests `engine_applies_each_neighbors_policies` |
 | 9.1.2 | A route whose `NEXT_HOP` is unresolvable is excluded from Phase 2 | MUST | deviates (no IGP; every next hop counts as resolvable until the FIB thread of milestone 7 can tell) | rib/decision.rs | |
 | 9.1.2 | A route whose `AS_PATH` contains an AS loop is excluded from Phase 2 | SHOULD | done (not even stored) | rib/lib.rs `Rib::update` | rib tests `as_loop_routes_are_excluded` |
 | 9.1.2 | Select the route with the highest degree of preference; one route per destination | MUST | done | rib/decision.rs `best` | rib tests `degree_of_preference_wins_first` |
@@ -139,7 +141,7 @@ is `done`.
 | 9.1.2.2 e | Lowest interior cost to the `NEXT_HOP` | MUST | n/a (no IGP; every cost is equal) | rib/decision.rs `compare` | |
 | 9.1.2.2 f | Lowest BGP Identifier | MUST | done | rib/decision.rs `compare` | rib tests `lower_router_id_then_lower_peer_address` |
 | 9.1.2.2 g | Lowest peer address | MUST | done | rib/decision.rs `compare` | rib tests `lower_router_id_then_lower_peer_address` |
-| 9.1.3 | Phase 3: Adj-RIBs-Out follow Loc-RIB changes, subject to export policy; a route previously advertised is withdrawn when no longer sent | MUST | done (export policy is milestone 6) | rib/lib.rs `reconsider`, rib/export.rs `export` | rib tests `announce_withdraw_and_fib_changes` |
+| 9.1.3 | Phase 3: Adj-RIBs-Out follow Loc-RIB changes, subject to export policy; a route previously advertised is withdrawn when no longer sent | MUST | done | rib/lib.rs `reconsider`, `exported`, policy/lib.rs `Engine` | rib tests `announce_withdraw_and_fib_changes`, interop `export_policy_filters_and_sets` |
 | 9.1.4 | Overlapping routes are independent destinations; no special handling | MAY | done (longest-match is the FIB's) | rib/lib.rs | rib tests `announce_withdraw_and_fib_changes` |
 | 9.2 | UPDATE generation: routes with identical attributes share an UPDATE; a route learned from an internal peer is not redistributed to internal peers | MUST | done | rib/export.rs `Batch`, `export` | rib tests `large_batches_are_packed_within_the_message_limit`, `export_to_internal_peer_keeps_attributes_and_sets_local_pref` |
 | 9.2 | Initial Adj-RIB-Out after a session is established | MUST | done | rib/lib.rs `peer_up`, `refresh` | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it`, interop `routes_are_relayed_withdrawn_and_refreshed` |
