@@ -1,0 +1,13 @@
+[package]
+name = "bgpfc-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Routing policy: prefix lists, AS-path regex, community matching"
+
+[dependencies]
+
+[lints]
+workspace = true

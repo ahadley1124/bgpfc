@@ -1,0 +1,12 @@
+[package]
+name = "interop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Interoperability tests against BIRD, FRR and GoBGP (dev-only, needs root)"
+
+[dependencies]
+
+[lints]
+workspace = true

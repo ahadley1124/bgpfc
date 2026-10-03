@@ -1,0 +1,13 @@
+[package]
+name = "bgpfc-rib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Adj-RIB-In, Loc-RIB, Adj-RIB-Out and the RFC 4271 §9 decision process"
+
+[dependencies]
+
+[lints]
+workspace = true
