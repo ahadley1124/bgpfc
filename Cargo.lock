@@ -45,6 +45,9 @@ version = "0.1.0"
 [[package]]
 name = "bgpfcd"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+]
 
 [[package]]
 name = "interop"

@@ -12,6 +12,10 @@ license = "MIT"
 repository = "https://github.com/ahadley1124/bgpfc"
 rust-version = "1.99"
 
+# Workspace crates are added here as they gain their first dependant, so
+# cargo can warn about unused entries.
+[workspace.dependencies]
+bgpfc-log = { path = "crates/bgpfc-log" }
 
 # AGENTS.md §5: shared lint table. bgpfc-sys repeats this table with
 # `unsafe_code = "deny"` because a workspace `forbid` cannot be relaxed.

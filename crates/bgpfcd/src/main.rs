@@ -2,6 +2,6 @@
 #![forbid(unsafe_code)]
 
 fn main() {
-    eprintln!("bgpfcd: not implemented yet");
-    std::process::exit(2);
+    bgpfc_log::init(bgpfc_log::Level::Info);
+    bgpfc_log::info!("bgpfcd starting", version = env!("CARGO_PKG_VERSION"));
 }
