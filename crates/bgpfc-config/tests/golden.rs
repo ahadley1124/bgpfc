@@ -49,11 +49,22 @@ fn golden_files() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The shipped example stays parseable.
+/// The shipped example and the README's sketch of it stay parseable.
 #[test]
 fn shipped_example_parses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let example = fs::read_to_string(root.join("contrib/bgpfc.conf")).unwrap();
     let cfg = bgpfc_config::parse_str("contrib/bgpfc.conf", &example).unwrap();
     assert_eq!(cfg.neighbors.len(), 1);
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let start = readme
+        .find("\n```\nrouter-id")
+        .expect("README config example");
+    let body = &readme[start + 5..];
+    let end = body.find("\n```").unwrap();
+    let readme_cfg = bgpfc_config::parse_str("README.md", &body[..end]).unwrap();
+    // Same content; only the positions differ.
+    let diff = bgpfc_config::ConfigDiff::between(&cfg, &readme_cfg);
+    assert!(diff.is_empty(), "{diff:?}");
+    assert_eq!(readme_cfg.neighbors.len(), cfg.neighbors.len());
 }

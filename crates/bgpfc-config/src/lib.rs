@@ -1,5 +1,5 @@
-//! Configuration language: lexer, parser, typed configuration and
-//! validation (AGENTS.md §3, "Config"). The grammar is documented
+//! Configuration language: lexer, parser, typed configuration, validation
+//! and reload diffing (AGENTS.md §3, "Config"). The grammar is documented
 //! in `docs/config.md`.
 //!
 //! Implements: RFC 4271 §4.2 and §10 (Hold Time and timer defaults per
@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod diff;
 pub mod error;
 pub mod lexer;
 mod lower;
@@ -25,6 +26,7 @@ mod validate;
 use std::path::Path;
 
 pub use ast::Config;
+pub use diff::ConfigDiff;
 pub use error::{ConfigError, ConfigErrors, Pos};
 
 /// Parse and validate configuration text. `file` names it in errors.
