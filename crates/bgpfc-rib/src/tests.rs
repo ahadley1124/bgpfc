@@ -718,3 +718,46 @@ fn interner_shares_and_sweeps() {
     i.sweep();
     assert_eq!(i.len(), 0);
 }
+
+#[test]
+fn reexport_sends_only_the_difference() {
+    use crate::{Policies, Verdict};
+    struct DropOdd;
+    impl Policies for DropOdd {
+        fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+            Verdict::Accept
+        }
+        fn export(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> Verdict {
+            if p == self::p("192.0.2.0/24") {
+                Verdict::Reject
+            } else {
+                Verdict::Accept
+            }
+        }
+    }
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone());
+    rib.peer_up(e2.clone());
+    rib.update(
+        e1.addr,
+        &announce(
+            &["192.0.2.0/24", "198.51.100.0/24"],
+            &attrs(&[65_001], "10.0.0.1"),
+        ),
+    );
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 2);
+    // Nothing changed: nothing sent.
+    assert_eq!(rib.reexport(e2.addr, V4).len(), 0);
+    rib.set_policies(Box::new(DropOdd));
+    let out = rib.reexport(e2.addr, V4);
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
+    assert_eq!(m[0].nlri.len(), 0);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 1);
+    assert!(rib.peer(e2.addr).is_some());
+    assert!(rib.peer(ip("10.9.9.9")).is_none());
+    assert_eq!(rib.reexport(ip("10.9.9.9"), V4).len(), 0);
+}
