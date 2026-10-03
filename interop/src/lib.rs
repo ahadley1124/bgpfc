@@ -151,7 +151,12 @@ impl Drop for Lab {
         if let Some(c) = &self.c {
             let _ = Command::new("ip").args(["netns", "del", c]).status();
         }
-        let _ = fs::remove_dir_all(&self.dir);
+        // Keep the daemons' logs when a test fails: CI prints them.
+        if std::thread::panicking() {
+            eprintln!("lab logs kept in {}", self.dir.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -590,8 +595,16 @@ impl Frr {
         let _ = Command::new("chown")
             .args(["-R", "frr:frr", dir.to_str().expect("path")])
             .status();
+        // bgpd connects to any zebra it finds, and the zserv Unix socket is
+        // not namespaced: on a host where FRR's zebra runs (the CI runner),
+        // bgpd would learn the host's interfaces, find none for its own
+        // address and reject every session with an FSM error. Point it at
+        // a socket nobody listens on so it behaves as without zebra.
+        let zebra = dir.join("zserv.api");
         let mut cmd = lab.exec(ns, "/usr/lib/frr/bgpd");
         cmd.args([
+            "-z",
+            zebra.to_str().expect("path"),
             "-f",
             cfg.to_str().expect("path"),
             "-i",
