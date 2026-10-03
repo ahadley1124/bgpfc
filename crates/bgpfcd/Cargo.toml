@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "bgpfc BGP-4 routing daemon"
 
 [dependencies]
+bgpfc-config.workspace = true
 bgpfc-fsm.workspace = true
 bgpfc-log.workspace = true
 bgpfc-wire.workspace = true

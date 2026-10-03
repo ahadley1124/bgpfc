@@ -202,32 +202,41 @@ pub struct BgpfcdOpts {
     pub passive: bool,
 }
 
-/// Start `bgpfcd` in namespace `ns` with debug logging.
+/// Write a configuration and start `bgpfcd` in namespace `ns` with debug
+/// logging. Both families are offered, and an accept-all policy is used
+/// in both directions.
 ///
 /// # Panics
-/// If the process cannot be spawned.
+/// If the config cannot be written or the process cannot be spawned.
 #[must_use]
 pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+    let cfg = lab.dir.join(format!("bgpfcd-{ns}.conf"));
+    fs::write(
+        &cfg,
+        format!(
+            "router-id {rid};\n\
+             local-as {local_as};\n\
+             log {{ level debug; }}\n\
+             listen {{ address {rid}; port 179; }}\n\
+             policy ANY {{ term all {{ action accept; }} }}\n\
+             neighbor {neighbor} {{\n\
+             \x20   remote-as {remote_as};\n\
+             \x20   hold-time {hold};\n\
+             \x20   passive {passive};\n\
+             \x20   import ANY;\n\
+             \x20   export ANY;\n\
+             }}\n",
+            rid = opts.router_id,
+            local_as = opts.local_as,
+            neighbor = opts.neighbor,
+            remote_as = opts.remote_as,
+            hold = opts.hold_time,
+            passive = if opts.passive { "yes" } else { "no" },
+        ),
+    )
+    .expect("bgpfcd config");
     let mut cmd = lab.exec(ns, bgpfcd_path().to_str().expect("path"));
-    cmd.args([
-        "--local-as",
-        &opts.local_as.to_string(),
-        "--router-id",
-        &opts.router_id.to_string(),
-        "--listen",
-        &format!("{}:179", opts.router_id),
-        "--log-level",
-        "debug",
-        "--neighbor",
-        &opts.neighbor.to_string(),
-        "--remote-as",
-        &opts.remote_as.to_string(),
-        "--hold-time",
-        &opts.hold_time.to_string(),
-    ]);
-    if opts.passive {
-        cmd.arg("--passive");
-    }
+    cmd.args(["-c", cfg.to_str().expect("path")]);
     Daemon::start(cmd, lab.dir.join(format!("bgpfcd-{ns}.log")))
 }
 
