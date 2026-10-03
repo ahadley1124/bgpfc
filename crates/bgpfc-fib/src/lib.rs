@@ -180,6 +180,7 @@ impl Fib {
     /// Change the desired route for `prefix` (`None` deletes) and apply
     /// what follows.
     pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Vec<Applied> {
+        let previous = self.desired.get(&prefix).copied();
         match gateway {
             Some(gw) => {
                 self.desired.insert(prefix, gw);
@@ -188,9 +189,16 @@ impl Fib {
                 self.desired.remove(&prefix);
             }
         }
+        // Dry-run installs nothing, so what it reports is the change to
+        // the desired table itself: what install mode would have done.
+        let reference = if self.mode == Mode::DryRun {
+            previous
+        } else {
+            self.installed.get(&prefix).copied()
+        };
         // Only this prefix can differ now; a full plan is cheap enough
         // but a single-prefix plan keeps the common case O(log n).
-        let ops = match (self.desired.get(&prefix), self.installed.get(&prefix)) {
+        let ops = match (self.desired.get(&prefix), reference.as_ref()) {
             (Some(d), i) if i != Some(d) => vec![Op::Set {
                 prefix,
                 gateway: *d,
@@ -370,9 +378,14 @@ mod tests {
         );
         assert_eq!(fib.desired().len(), 1);
         assert_eq!(fib.installed().len(), 0);
-        // Same again: still reported (nothing was installed).
-        assert_eq!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).len(), 1);
-        // Delete of something never installed: nothing to do.
+        // Same again: no change to report.
+        assert_eq!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).len(), 0);
+        // A new gateway, then the delete, are each reported once.
+        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.2")));
+        assert_eq!(out.len(), 1);
+        let out = fib.set(p("192.0.2.0/24"), None);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].op, Op::Delete { .. }));
         assert_eq!(fib.set(p("192.0.2.0/24"), None).len(), 0);
         assert_eq!(fib.desired().len(), 0);
         assert_eq!(fib.mode(), Mode::DryRun);
