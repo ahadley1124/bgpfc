@@ -203,7 +203,7 @@ is `done`.
 | 2 | Capability 2, length 0 | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 3 | ROUTE-REFRESH message type 5, `<AFI, Res, SAFI>` | MUST | done | wire/header.rs `MessageType::RouteRefresh`, wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/route_refresh.rs | route_refresh.rs `route_refresh_round_trips` |
-| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | partial (a ROUTE-REFRESH for an unadvertised family is ignored; sending one is the control plane's, milestone 8) | bgpfcd/peer.rs `primary_message`, fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
+| 4 | Send only if the peer advertised the capability; ignore unadvertised families | SHOULD | done (a soft reset or import-policy reload sends ROUTE-REFRESH only to peers that advertised it, for negotiated families; one received for an unadvertised family is ignored) | bgpfcd/peer.rs `request_routes`, `primary_message` | interop `control_plane_commands`, fsm tests `open_negotiation` |
 | 4 | On a ROUTE-REFRESH, re-advertise the Adj-RIB-Out of the family | MUST | done | rib/lib.rs `refresh`, bgpfcd/rib.rs | rib tests `new_peer_receives_the_loc_rib_and_route_refresh_resends_it`, interop `routes_are_relayed_withdrawn_and_refreshed` |
 
 ## RFC 7606 — Revised Error Handling
@@ -286,7 +286,7 @@ is `done`.
 | 9003 §2 | One-octet length; zero means absent | MUST | done | wire/notification.rs `shutdown`, `shutdown_communication` | notification.rs `shutdown_communication_round_trips` |
 | 9003 §2 | UTF-8, shortest form; invalid sequences never interpreted | MUST | done (`std::str::from_utf8` rejects non-shortest forms) | wire/notification.rs `shutdown_communication` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 | 9003 §2 | Report the communication, e.g. via syslog | SHOULD | done (logged at warn with the NOTIFICATION) | bgpfcd/peer.rs `primary_message` | interop `bird_shutdown_sends_cease_and_bgpfcd_retries` |
-| 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | partial (255 enforced; 128 is checked when `bgpfcctl` sends one, milestone 8) | wire/notification.rs `shutdown` | notification.rs `shutdown_communication_round_trips` |
+| 9003 §3 | At most 255 octets; at most 128 to a peer not known to support RFC 9003 | MAY / SHOULD | done (the codec enforces 255; the control plane refuses more than 128, as nothing tells it which peers support the RFC) | wire/notification.rs `shutdown`, bgpfcd/control.rs `check_communication` | notification.rs `shutdown_communication_round_trips`, bgpfcd/control.rs `parses_commands` |
 | 9003 §4 | Log an invalid UTF-8 communication | SHOULD | done | wire/notification.rs `ShutdownCommunicationError`, bgpfcd/peer.rs `primary_message` | notification.rs `malformed_shutdown_communication_is_reported_not_interpreted` |
 
 ## RFC 7607 / 9072 / 9687 / 9774 — AS 0, extended OPEN parameters, send hold timer, AS_SET deprecation
