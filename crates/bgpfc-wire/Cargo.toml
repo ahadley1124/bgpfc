@@ -9,5 +9,9 @@ description = "BGP-4 message codec (RFC 4271 and extensions); pure, no I/O"
 
 [dependencies]
 
+# AGENTS.md §1.2: verification only; never a normal dependency.
+[dev-dependencies]
+proptest = "1.11"
+
 [lints]
 workspace = true
