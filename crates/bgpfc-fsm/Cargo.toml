@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "BGP-4 session finite state machine (RFC 4271 §8); pure, time injected"
 
 [dependencies]
+bgpfc-wire.workspace = true
 
 [lints]
 workspace = true

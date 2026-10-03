@@ -88,6 +88,9 @@ impl fmt::Display for RouterId {
 pub struct HoldTime(u16);
 
 impl HoldTime {
+    /// Hold Time zero: no keepalives, no hold timer (RFC 4271 §4.4).
+    pub const ZERO: HoldTime = HoldTime(0);
+
     /// Validate a Hold Time: `0` or `>= 3` (RFC 4271 §4.2; §6.2 requires
     /// rejecting one and two seconds).
     #[must_use]

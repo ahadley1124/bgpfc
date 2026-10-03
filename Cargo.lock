@@ -23,6 +23,9 @@ version = "0.1.0"
 [[package]]
 name = "bgpfc-fsm"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-wire",
+]
 
 [[package]]
 name = "bgpfc-log"
