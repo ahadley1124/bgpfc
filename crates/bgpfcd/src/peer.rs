@@ -551,11 +551,15 @@ impl Peer {
                 four_octet_as: s.four_octet_as,
                 peer: s.peer,
                 allow_as_set: self.cfg.allow_as_set,
+                // RFC 8950 §4: not negotiated yet; RFC 7606 §7.11 then
+                // expects four octets of next hop for IPv4 unicast.
+                extended_next_hop: false,
             },
             None => DecodeContext {
                 four_octet_as: false,
                 peer: PeerKind::External,
                 allow_as_set: self.cfg.allow_as_set,
+                extended_next_hop: false,
             },
         }
     }

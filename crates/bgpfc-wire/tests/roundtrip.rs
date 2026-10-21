@@ -282,10 +282,13 @@ fn update_message(confed: bool) -> impl Strategy<Value = UpdateMessage> {
         )
 }
 
+/// The round trips negotiate RFC 8950 so that IPv4 NLRI may carry an IPv6
+/// next hop; `ipv6_next_hop_for_ipv4_only_when_negotiated` covers the rest.
 const IBGP4: DecodeContext = DecodeContext {
     four_octet_as: true,
     peer: PeerKind::Internal,
     allow_as_set: true,
+    extended_next_hop: true,
 };
 const IBGP2: DecodeContext = DecodeContext {
     four_octet_as: false,
@@ -298,9 +301,11 @@ const EBGP4: DecodeContext = DecodeContext {
 };
 const ENC4: EncodeContext = EncodeContext {
     four_octet_as: true,
+    extended_next_hop: true,
 };
 const ENC2: EncodeContext = EncodeContext {
     four_octet_as: false,
+    extended_next_hop: true,
 };
 
 // ---------------------------------------------------------------- round trips
@@ -432,7 +437,34 @@ proptest! {
     fn mp_reach_round_trip(m in mp_reach()) {
         let mut wire = Vec::new();
         m.encode(&mut wire);
-        prop_assert_eq!(MpReach::decode(&wire).unwrap(), m);
+        prop_assert_eq!(MpReach::decode(&wire, true).unwrap(), m);
+    }
+
+    #[test]
+    fn ipv6_next_hop_for_ipv4_only_when_negotiated(m in update_message(true)) {
+        // RFC 8950 §4 on send, RFC 7606 §7.11 on receipt: without the
+        // capability an IPv4 MP_REACH_NLRI with an IPv6 next hop is
+        // neither encoded nor accepted; everything else is unaffected.
+        let v6_for_v4 = m.mp_reach.as_ref().is_some_and(|r| {
+            r.family.afi == Afi::Ipv4 && matches!(r.next_hop, NextHop::Ipv6 { .. })
+        });
+        let plain = EncodeContext { extended_next_hop: false, ..ENC4 };
+        let wire = m.encode(&ENC4).unwrap();
+        let dec = DecodeContext { extended_next_hop: false, ..IBGP4 };
+        let d = UpdateMessage::decode(&wire, &dec);
+        if v6_for_v4 {
+            prop_assert_eq!(
+                m.encode(&plain),
+                Err(bgpfc_wire::error::EncodeError::NextHopNotNegotiated(AddressFamily::IPV4_UNICAST))
+            );
+            prop_assert_eq!(
+                d.unwrap_err().action,
+                bgpfc_wire::update::ErrorAction::AfiSafiDisable(AddressFamily::IPV4_UNICAST)
+            );
+        } else {
+            prop_assert_eq!(m.encode(&plain).unwrap(), wire);
+            prop_assert_eq!(d.unwrap().message, m);
+        }
     }
 
     #[test]
@@ -512,7 +544,7 @@ proptest! {
         let _ = AsPath::decode(&bytes, flag);
         let _ = decode_prefixes(&bytes, Afi::Ipv4);
         let _ = decode_prefixes(&bytes, Afi::Ipv6);
-        let _ = MpReach::decode(&bytes);
+        let _ = MpReach::decode(&bytes, flag);
         let _ = MpUnreach::decode(&bytes);
     }
 

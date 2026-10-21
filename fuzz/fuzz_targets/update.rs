@@ -1,6 +1,6 @@
 //! UpdateMessage::decode must never panic under any session context, and a
 //! message it accepts without treat-as-withdraw must encode and decode back
-//! to itself.
+//! to itself. The contexts alternate RFC 8950 extended next hop on and off.
 #![no_main]
 
 use bgpfc_wire::update::{DecodeContext, EncodeContext, PeerKind, UpdateMessage};
@@ -11,21 +11,25 @@ const CONTEXTS: [DecodeContext; 4] = [
         four_octet_as: true,
         peer: PeerKind::Internal,
         allow_as_set: true,
+        extended_next_hop: true,
     },
     DecodeContext {
         four_octet_as: false,
         peer: PeerKind::Internal,
         allow_as_set: true,
+        extended_next_hop: false,
     },
     DecodeContext {
         four_octet_as: true,
         peer: PeerKind::External,
         allow_as_set: false,
+        extended_next_hop: false,
     },
     DecodeContext {
         four_octet_as: false,
         peer: PeerKind::External,
         allow_as_set: false,
+        extended_next_hop: true,
     },
 ];
 
@@ -41,6 +45,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let enc = EncodeContext {
             four_octet_as: ctx.four_octet_as,
+            extended_next_hop: ctx.extended_next_hop,
         };
         // A decoded message may hold attributes that the encoder cannot
         // write back (an unknown attribute over 65535 octets cannot occur,

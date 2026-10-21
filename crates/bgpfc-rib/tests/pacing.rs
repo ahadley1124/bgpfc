@@ -132,6 +132,7 @@ fn note(log: &mut Log, out: &[Output], infos: &[PeerInfo], at: Instant) {
             four_octet_as: info.four_octet_as,
             peer: info.kind,
             allow_as_set: false,
+            extended_next_hop: false,
         };
         for m in messages {
             assert!(m.len() <= info.max_message_len());

@@ -127,6 +127,7 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         four_octet_as: to.four_octet_as,
         peer: to.kind,
         allow_as_set: false,
+        extended_next_hop: false,
     };
     messages
         .iter()

@@ -176,6 +176,9 @@ impl Batch {
     ) -> Result<Vec<Vec<u8>>, EncodeError> {
         let ctx = EncodeContext {
             four_octet_as: to.four_octet_as,
+            // RFC 8950 §4: not negotiated yet, so an IPv6 next hop for
+            // IPv4 NLRI is an encode error rather than sent.
+            extended_next_hop: false,
         };
         let max_body = to.max_message_len() - HEADER_LEN;
         let mut out = Vec::new();

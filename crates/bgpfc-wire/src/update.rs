@@ -15,7 +15,8 @@
 //! Implements: RFC 4271 §4.3 (format), §5 (attribute categories), §6.3
 //! (error subcodes); RFC 7606 §3, §4, §5.1–§5.3, §7.1–§7.8, §7.11, §7.12,
 //! §7.14; RFC 4760 §3, §4, §7; RFC 6793 §4.2.2, §4.2.3, §6; RFC 7607 §2;
-//! RFC 9774 §3; RFC 8092 §6.
+//! RFC 9774 §3; RFC 8092 §6; RFC 8950 §3, §4 (IPv6 next hops for IPv4
+//! NLRI, only when negotiated).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -27,7 +28,7 @@ use crate::attribute::{
 };
 use crate::community::{decode_communities, decode_extended_communities, decode_large_communities};
 use crate::error::{DecodeError, EncodeError, UpdateSubcode};
-use crate::mp::{MpReach, MpUnreach, family_of};
+use crate::mp::{MpReach, MpUnreach, NextHop, family_of};
 use crate::prefix::{Prefix, decode_prefixes, encode_prefixes};
 use crate::reader::{Reader, WriteBytes as _};
 use crate::types::{AddressFamily, Afi, Asn};
@@ -54,6 +55,12 @@ pub struct DecodeContext {
     /// Accept `AS_SET` segments. RFC 9774 §3 deprecates them and requires
     /// treat-as-withdraw unless an operator explicitly configures otherwise.
     pub allow_as_set: bool,
+    /// Both sides advertised Extended Next Hop Encoding for IPv4 unicast
+    /// with an IPv6 next hop (RFC 8950 §4): an IPv4 unicast
+    /// `MP_REACH_NLRI` may carry a 16- or 32-octet IPv6 next hop (§3).
+    /// Without it four octets are the only length expected, and any other
+    /// makes the attribute malformed (RFC 7606 §7.11).
+    pub extended_next_hop: bool,
 }
 
 /// What the encoder needs to know about the session.
@@ -63,6 +70,11 @@ pub struct EncodeContext {
     /// `AS_PATH` and AGGREGATOR are two-octet with `AS_TRANS` and the
     /// `AS4_*` attributes are generated as RFC 6793 §4.2.2 requires.
     pub four_octet_as: bool,
+    /// Both sides advertised Extended Next Hop Encoding for IPv4 unicast
+    /// (RFC 8950 §4). When false, IPv4 NLRI with an IPv6 next hop is an
+    /// [`EncodeError`], so the peer is never sent what it did not agree
+    /// to take.
+    pub extended_next_hop: bool,
 }
 
 /// An UPDATE message body.
@@ -135,8 +147,9 @@ impl UpdateMessage {
     /// (RFC 6793 §4.2.2).
     ///
     /// # Errors
-    /// [`EncodeError`] if a field exceeds its length field or an `AS_PATH`
-    /// segment cannot be encoded.
+    /// [`EncodeError`] if a field exceeds its length field, an `AS_PATH`
+    /// segment cannot be encoded, or IPv4 NLRI has an IPv6 next hop
+    /// without RFC 8950 negotiated.
     pub fn encode(&self, ctx: &EncodeContext) -> Result<Vec<u8>, EncodeError> {
         let mut withdrawn = Vec::new();
         encode_prefixes(&self.withdrawn, &mut withdrawn);
@@ -148,6 +161,14 @@ impl UpdateMessage {
 
         let mut encoded: Vec<(u8, Vec<u8>)> = Vec::with_capacity(self.attributes.len() + 4);
         if let Some(m) = &self.mp_reach {
+            // RFC 8950 §4: IPv4 NLRI goes with an IPv6 next hop only to a
+            // peer that advertised Extended Next Hop Encoding for it.
+            if m.family.afi == Afi::Ipv4
+                && matches!(m.next_hop, NextHop::Ipv6 { .. })
+                && !ctx.extended_next_hop
+            {
+                return Err(EncodeError::NextHopNotNegotiated(m.family));
+            }
             let mut buf = Vec::new();
             PathAttribute::MpReach(m.clone()).encode(ctx.four_octet_as, &mut buf)?;
             encoded.push((0, buf));
@@ -432,7 +453,7 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
             Ok(cs) => Outcome::Keep(PathAttribute::Communities(cs)),
             Err(_) => length_error(),
         },
-        code::MP_REACH_NLRI => match MpReach::decode(v) {
+        code::MP_REACH_NLRI => match MpReach::decode(v, ctx.extended_next_hop) {
             Ok(m) => Outcome::Keep(PathAttribute::MpReach(m)),
             Err(e) => return Err(mp_failure(raw, e.family())),
         },
@@ -754,6 +775,7 @@ mod tests {
         four_octet_as: false,
         peer: PeerKind::External,
         allow_as_set: false,
+        extended_next_hop: false,
     };
     const EBGP4: DecodeContext = DecodeContext {
         four_octet_as: true,
@@ -765,9 +787,11 @@ mod tests {
     };
     const ENC2: EncodeContext = EncodeContext {
         four_octet_as: false,
+        extended_next_hop: false,
     };
     const ENC4: EncodeContext = EncodeContext {
         four_octet_as: true,
+        extended_next_hop: false,
     };
 
     /// 10.0.0.0/8 via 192.0.2.1, path 65001 65002, origin IGP, MED 50, from
@@ -1331,6 +1355,81 @@ mod tests {
                 (AddressFamily::IPV6_UNICAST, p("2001:db8:2::/48")),
                 (AddressFamily::IPV6_UNICAST, p("2001:db8:1::/48")),
             ]
+        );
+    }
+
+    #[test]
+    fn ipv4_routes_with_an_ipv6_next_hop_need_rfc8950() {
+        // RFC 8950 §6.1: IPv4 unicast NLRI in MP_REACH_NLRI with a 16-octet
+        // IPv6 next hop, and no NEXT_HOP attribute (RFC 4760 §3).
+        let global: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let m = UpdateMessage {
+            mp_reach: Some(MpReach {
+                family: AddressFamily::IPV4_UNICAST,
+                next_hop: NextHop::Ipv6 {
+                    global,
+                    link_local: None,
+                },
+                nlri: vec![p("192.0.2.0/24")],
+            }),
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+            ],
+            ..UpdateMessage::default()
+        };
+        // RFC 8950 §4: never sent without the capability.
+        assert_eq!(
+            m.encode(&ENC4),
+            Err(EncodeError::NextHopNotNegotiated(
+                AddressFamily::IPV4_UNICAST
+            ))
+        );
+        let enc = EncodeContext {
+            extended_next_hop: true,
+            ..ENC4
+        };
+        let wire = m.encode(&enc).unwrap();
+        let mut attr = vec![0x80, code::MP_REACH_NLRI, 25, 0, 1, 1, 16];
+        attr.extend_from_slice(&global.octets());
+        attr.extend_from_slice(&[0, 24, 192, 0, 2]);
+        assert_eq!(&wire[4..4 + attr.len()], &attr[..]);
+        // Negotiated: an ordinary announcement.
+        let ctx = DecodeContext {
+            extended_next_hop: true,
+            ..EBGP4
+        };
+        let d = UpdateMessage::decode(&wire, &ctx).unwrap();
+        assert_eq!(d.message, m);
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(
+            d.announcements().collect::<Vec<_>>(),
+            vec![(AddressFamily::IPV4_UNICAST, p("192.0.2.0/24"))]
+        );
+        // Not negotiated: the next hop length is not the expected one, the
+        // attribute is malformed and IPv4 unicast is disabled (RFC 7606
+        // §7.11, RFC 4760 §7), with the attribute as NOTIFICATION data.
+        let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
+        assert_eq!(
+            e.action,
+            ErrorAction::AfiSafiDisable(AddressFamily::IPV4_UNICAST)
+        );
+        assert_eq!(
+            e.notification.subcode,
+            UpdateSubcode::OptionalAttributeError as u8
+        );
+        assert_eq!(e.notification.data, attr);
+        // An IPv4 next hop in MP_REACH_NLRI needs nothing, and IPv6 NLRI
+        // is not affected by the flag.
+        let mut v4 = m.clone();
+        if let Some(r) = &mut v4.mp_reach {
+            r.next_hop = NextHop::Ipv4(Ipv4Addr::new(192, 0, 2, 1));
+        }
+        let wire = v4.encode(&ENC4).unwrap();
+        assert_eq!(UpdateMessage::decode(&wire, &EBGP4).unwrap().message, v4);
+        assert_eq!(
+            EncodeError::NextHopNotNegotiated(AddressFamily::IPV4_UNICAST).to_string(),
+            "IPv6 next hop for ipv4-unicast without the Extended Next Hop Encoding capability"
         );
     }
 
