@@ -79,6 +79,12 @@ crates/
   bgpfc-log/            leveled logger to stderr.
   bgpfc-control/        Unix-socket line protocol, minimal HTTP/1.1 server,
                         JSON writer (and a minimal JSON reader if needed).
+  bgpfc-rpki/           VRP set, RFC 6811 route origin validation, and the
+                        ValidationSource trait. Pure: no sockets, no clock.
+  bgpfc-rtr/            RFC 8210 RTR: PDU codec (pure, Miri-tested), session
+                        machine with injected time, and the client thread.
+  bgpfc-sidecar/        Routinator supervision: a child process spawned and
+                        restarted through std::process::Command.
   bgpfcd/               daemon binary: wiring, threads, signals.
   bgpfcctl/             CLI binary.
 fuzz/                   cargo-fuzz crate, NOT a workspace member. Nightly allowed.
@@ -93,8 +99,10 @@ COMPLIANCE.md           RFC requirement matrix (see §6).
 
 The dependency direction is strictly downward:
 `bgpfcd → {control, rib, policy, fsm, config, fib, log} → wire`, and `fib → sys`.
-`wire`, `fsm`, `policy`, and `config` must not depend on `sys`. Keep
-protocol logic pure so it can be tested without sockets or time.
+Route origin validation adds `rpki → wire`, `rtr → {rpki, wire, log}`,
+`sidecar → {sys, log}`, and `rib → rpki`; `bgpfcd` may depend on all three.
+`wire`, `fsm`, `policy`, `config`, `rpki`, and `rtr` must not depend on
+`sys`. Keep protocol logic pure so it can be tested without sockets or time.
 
 The crate names and boundaries above are the plan. Changing them, for example
 by merging two crates, is fine if it is justified in the PR description and
@@ -247,6 +255,12 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 - **Address families in v1**: IPv4 unicast and IPv6 unicast. That includes
   IPv6 link-local next hops (RFC 2545) and IPv4 NLRI over an IPv6 next hop
   (RFC 8950).
+- **RTR transport (RFC 8210 §9).** RTR runs over plain TCP, the one
+  transport §9 makes mandatory to implement. The protected transports §9
+  lists (SSH, TLS, TCP-MD5, TCP-AO, IPsec) are out of scope. §9 requires a
+  router and a cache on unprotected TCP to share a trusted, controlled
+  network, so operators keep the cache on loopback or a trusted network.
+  `docs/config.md` says so next to the `rpki` block.
 
 ## 5. Testing and verification
 
@@ -261,12 +275,16 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-config` | Golden tests: input file → AST/debug output, and input file → error message snapshot. A fuzz target. |
 | `bgpfc-fib` | Netlink encode/decode tests against byte captures from `ip -d monitor` or strace. Miri on the pure parts. A reconcile-logic proptest. |
 | `bgpfc-sys` | Layout assertions. Real-socket tests where no privileges are needed. Mark tests that need privileges `#[ignore]`, and document how to run them. |
+| `bgpfc-rpki` | Validation vectors from RFC 6811 §2 and the RFC 9319 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length. A proptest that checks VRP lookup and validation against a naive linear-scan model. |
+| `bgpfc-rtr` | Unit tests with PDU byte vectors built from RFC 8210 §5. `proptest` round-trips. A fuzz target for the PDU decoder. Miri. Table-driven session tests with injected time, including the RFC 8210 §7 version fallback and the §6 timers. Client tests against an in-process cache served from a std `TcpListener`. |
+| `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
 | `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Uses network namespaces and needs root, so it runs in CI and on demand. |
 | benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation. Do not regress them without saying so in the PR. |
 
 Miri cannot run FFI. Put real syscalls behind
 `#[cfg(not(miri))]` and keep the encode/decode logic separate so Miri can cover
-it.
+it. The commit that creates `bgpfc-rtr` adds it to `scripts/miri.sh` and to
+the Miri line below.
 
 ### Gates: all must pass before every commit
 
@@ -370,6 +388,9 @@ row per requirement:
 Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
+Steps 0–9 are complete: they built v1. Their text stays as a record of what
+v1 covers. Work continues at step 10.
+
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.
    - CI.
@@ -408,12 +429,46 @@ updated COMPLIANCE.md.
    - Full-table benchmarks, and the interop matrix against FRR and GoBGP.
    - Fuzzing campaign.
    - README status update.
+10. **v1 gaps (branch `m10-v1-gaps`).**
+    - MRAI pacing (issue #66).
+    - RFC 8950 extended next hop.
+    - The RFC 4271 §6.7 prefix limit and the RFC 4486 §4 retry bound.
+    - RFC 4271 §6.3 NEXT_HOP semantic checks.
+    - The RFC 4760 §7 and §5.1 rows in COMPLIANCE.md.
+11. **Validation source (new crate `bgpfc-rpki`, issues #52, #56).**
+    - A `RovState`, plus an `AspaState` placeholder, on every route.
+    - The `ValidationSource` trait, with a null source.
+    - A re-evaluation command on the RIB thread's channel.
+12. **RTR client (new crate `bgpfc-rtr`, issues #57, #58).**
+    - RFC 8210 version 1, falling back to version 0 (RFC 6810) as RFC 8210
+      §7 allows.
+    - Reconnect with backoff.
+    - A stale-data policy for VRPs from a cache that has gone away
+      (RFC 8210 §6, Expire Interval).
+13. **ROV (issues #59–#61).**
+    - RFC 6811 in the decision process, and a policy match on validation
+      state (RFC 6811 §3).
+    - Drop Invalid by default, with a non-enforcing prefer-valid mode.
+    - Re-evaluate only the prefixes a VRP delta affects (RFC 6811 §4).
+    - `rpki` config: external caches, or disabled.
+14. **Routinator sidecar (new crate `bgpfc-sidecar`, issues #70–#72).**
+    - A Routinator child supervised through `std::process::Command`.
+      Routinator is an external executable; bgpfc neither bundles nor links
+      it.
+    - `PR_SET_PDEATHSIG` through `bgpfc-sys`. Setting it takes an `unsafe`
+      `pre_exec` hook, so `bgpfc-sys` owns the hook behind a safe wrapper
+      (§1.3). The signal fires when the spawning *thread* exits, so spawn
+      from a thread that lives as long as the daemon.
+    - Localhost RTR auto-wiring.
+    - A unified config surface for external caches and the sidecar.
 
-**Out of scope until the maintainer says otherwise:** RPKI/RTR, BGP roles
-(9234), RFC 8212, graceful restart, ADD-PATH, route reflection, confederations,
-ECMP, VPN families, TCP-MD5/AO, and non-Linux platforms. Do not add hooks or
-abstractions "for later". Build v1 cleanly, and refactor when a feature
-actually lands.
+**Out of scope until the maintainer says otherwise:** ASPA (planned for
+v1.1.0), BGPsec (RFC 8205), the protected RTR transports (RFC 8210 §9; see
+§4), BGP roles (9234), RFC 8212, graceful restart, ADD-PATH, route
+reflection, confederations, ECMP, VPN families, TCP-MD5/AO, and non-Linux
+platforms. Do not add hooks or abstractions "for later"; the `AspaState`
+placeholder in step 11 is the one exception the maintainer asked for. Build
+cleanly, and refactor when a feature actually lands.
 
 ## 10. When unsure
 
