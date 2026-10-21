@@ -85,10 +85,12 @@ pub struct SidecarConfig {
     /// verbatim at the end of the command line, such as
     /// `--http=127.0.0.1:8323`.
     pub extra_server_args: Vec<OsString>,
-    /// Restart delays after a failure.
+    /// Restart delays after a failure. The cap is at most
+    /// [`MAX_DELAY`](Self::MAX_DELAY), the stable period at most
+    /// [`MAX_STABLE`](Self::MAX_STABLE).
     pub backoff: BackoffConfig,
     /// How long a graceful stop (`SIGTERM`) may take before the child is
-    /// killed (`SIGKILL`).
+    /// killed (`SIGKILL`). At most [`MAX_DELAY`](Self::MAX_DELAY).
     pub stop_timeout: Duration,
     /// After this many consecutive failures, the sidecar is reported as
     /// failed: an alarm that stays raised while it keeps retrying at the
@@ -106,6 +108,15 @@ impl SidecarConfig {
 
     /// Default consecutive-failure threshold.
     pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+    /// Longest backoff cap and graceful-stop timeout. A validator retried
+    /// less often than hourly, or a stop that may take longer, is not
+    /// supervised in any useful sense; the bound also keeps every deadline
+    /// the supervisor computes far from the end of `Instant`'s range.
+    pub const MAX_DELAY: Duration = Duration::from_hours(1);
+
+    /// Longest stable period.
+    pub const MAX_STABLE: Duration = Duration::from_hours(24);
 
     /// Settings with defaults: RTR on `127.0.0.1` with a port picked at
     /// start, the RIR TALs without ARIN's, Routinator's default refresh,
@@ -197,16 +208,34 @@ impl SidecarConfig {
                 expected: "at least the initial backoff",
             });
         }
+        if b.cap > Self::MAX_DELAY {
+            return Err(SidecarError::OutOfRange {
+                setting: "backoff cap",
+                expected: "at most an hour",
+            });
+        }
         if b.stable.is_zero() {
             return Err(SidecarError::OutOfRange {
                 setting: "stable period",
                 expected: "longer than zero",
             });
         }
+        if b.stable > Self::MAX_STABLE {
+            return Err(SidecarError::OutOfRange {
+                setting: "stable period",
+                expected: "at most a day",
+            });
+        }
         if self.stop_timeout.is_zero() {
             return Err(SidecarError::OutOfRange {
                 setting: "stop timeout",
                 expected: "longer than zero",
+            });
+        }
+        if self.stop_timeout > Self::MAX_DELAY {
+            return Err(SidecarError::OutOfRange {
+                setting: "stop timeout",
+                expected: "at most an hour",
             });
         }
         if self.failure_threshold == 0 {
@@ -319,6 +348,12 @@ mod tests {
             ("longest refresh", |c| c.refresh = Duration::from_secs(7199)),
             ("backoff at its cap from the start", |c| {
                 c.backoff.cap = c.backoff.initial;
+            }),
+            ("longest durations", |c| {
+                c.backoff.initial = SidecarConfig::MAX_DELAY;
+                c.backoff.cap = SidecarConfig::MAX_DELAY;
+                c.backoff.stable = SidecarConfig::MAX_STABLE;
+                c.stop_timeout = SidecarConfig::MAX_DELAY;
             }),
             ("threshold of one", |c| c.failure_threshold = 1),
         ]);
@@ -483,14 +518,34 @@ mod tests {
                 out_of_range("backoff cap", "at least the initial backoff"),
             ),
             (
+                "backoff cap over an hour",
+                |c| c.backoff.cap = Duration::from_secs(3601),
+                out_of_range("backoff cap", "at most an hour"),
+            ),
+            (
+                "backoff cap that would overflow a deadline",
+                |c| c.backoff.cap = Duration::MAX,
+                out_of_range("backoff cap", "at most an hour"),
+            ),
+            (
                 "zero stable period",
                 |c| c.backoff.stable = Duration::ZERO,
                 out_of_range("stable period", "longer than zero"),
             ),
             (
+                "stable period over a day",
+                |c| c.backoff.stable = Duration::from_secs(86_401),
+                out_of_range("stable period", "at most a day"),
+            ),
+            (
                 "zero stop timeout",
                 |c| c.stop_timeout = Duration::ZERO,
                 out_of_range("stop timeout", "longer than zero"),
+            ),
+            (
+                "stop timeout over an hour",
+                |c| c.stop_timeout = Duration::from_millis(3_600_001),
+                out_of_range("stop timeout", "at most an hour"),
             ),
             (
                 "zero failure threshold",
