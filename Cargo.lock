@@ -83,6 +83,10 @@ dependencies = [
 [[package]]
 name = "bgpfc-sidecar"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+ "bgpfc-sys",
+]
 
 [[package]]
 name = "bgpfc-sys"

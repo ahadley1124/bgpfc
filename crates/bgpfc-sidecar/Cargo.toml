@@ -8,6 +8,8 @@ rust-version.workspace = true
 description = "Supervision logic for the Routinator RPKI sidecar: settings, command line, version check, restart backoff and a pure state machine"
 
 [dependencies]
+bgpfc-log.workspace = true
+bgpfc-sys.workspace = true
 
 [lints]
 workspace = true

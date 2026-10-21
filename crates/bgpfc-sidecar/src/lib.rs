@@ -16,6 +16,11 @@
 //!   [`TESTED_VERSION`] (issue #72).
 //! - [`Backoff`]: restart delays that double up to a cap, with jitter,
 //!   reset once the child has stayed up for a stable period.
+//! - [`Supervisor`]: the state machine that starts the child, restarts it
+//!   with backoff, raises the [`SidecarState::Failed`] alarm after
+//!   repeated failures (issue #70) and stops it with `SIGTERM`, then
+//!   `SIGKILL`, never restarting it during a requested shutdown.
+//! - [`SidecarStatus`]: the snapshot the control plane shows.
 //!
 //! Nothing here reads the clock, touches the file system or starts a
 //! process: time is passed in, so every behaviour is testable with
@@ -29,10 +34,14 @@ mod args;
 mod backoff;
 mod config;
 mod error;
+mod status;
+mod supervisor;
 mod version;
 
 pub use args::routinator_args;
 pub use backoff::{Backoff, BackoffConfig};
 pub use config::{SidecarConfig, TalConfig};
 pub use error::SidecarError;
+pub use status::{ExitReason, SidecarState, SidecarStatus};
+pub use supervisor::{Action, Event, LogField, Supervisor};
 pub use version::{TESTED_VERSION, Version, check_compatible, check_version_output, parse_version};
