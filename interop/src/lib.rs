@@ -317,6 +317,9 @@ pub struct NeighborOpts {
     /// `advertisement-interval` in seconds; `None` keeps the RFC 4271 §10
     /// default (30 s external, 5 s internal).
     pub advertisement_interval: Option<u16>,
+    /// More statements for the `neighbor` block, such as
+    /// `extended-next-hop yes;`.
+    pub extra: String,
 }
 
 impl NeighborOpts {
@@ -333,6 +336,7 @@ impl NeighborOpts {
             import: "ANY".to_owned(),
             export: "ANY".to_owned(),
             advertisement_interval: None,
+            extra: String::new(),
         }
     }
 }
@@ -390,14 +394,15 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
             .unwrap_or_default();
         let _ = writeln!(
             text,
-            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {};{interval} }}",
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {};{interval} {} }}",
             n.addr,
             n.remote_as,
             n.port,
             n.hold_time,
             if n.passive { "yes" } else { "no" },
             n.import,
-            n.export
+            n.export,
+            n.extra
         );
     }
     fs::write(&cfg, text).expect("bgpfcd config");
@@ -434,6 +439,9 @@ pub struct BirdOpts {
     pub passive: bool,
     /// IPv4 prefixes BIRD originates as blackhole statics.
     pub statics: Vec<String>,
+    /// More options for the BGP `ipv4` channel, such as
+    /// `extended next hop on;`.
+    pub channel: String,
 }
 
 impl Bird {
@@ -467,7 +475,7 @@ impl Bird {
                  \x20   neighbor {neighbor} port {neighbor_port} as {remote_as};\n\
                  \x20   hold time {hold};\n\
                  {passive}\
-                 \x20   ipv4 {{ import all; export all; }};\n\
+                 \x20   ipv4 {{ import all; export all; {channel} }};\n\
                  }}\n",
                 local = opts.local,
                 local_port = opts.local_port,
@@ -476,6 +484,7 @@ impl Bird {
                 neighbor_port = opts.neighbor_port,
                 remote_as = opts.remote_as,
                 hold = opts.hold_time,
+                channel = opts.channel,
             ),
         )
         .expect("bird config");

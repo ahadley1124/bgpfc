@@ -42,6 +42,7 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
             hold_time: 30,
             passive: true,
             statics: vec!["203.0.113.0/24".to_owned()],
+            channel: String::new(),
         },
     );
     let socket = lab.dir.join("ctl.sock");
