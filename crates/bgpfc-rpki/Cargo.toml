@@ -12,7 +12,12 @@ bgpfc-wire.workspace = true
 
 # AGENTS.md §1.2: verification only; never a normal dependency.
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1.11"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "validate"
+harness = false
