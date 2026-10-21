@@ -1,0 +1,19 @@
+[package]
+name = "bgpfc-rtr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "RPKI-to-Router protocol (RFC 8210, RFC 6810): PDU codec and stream framing"
+
+[dependencies]
+bgpfc-rpki.workspace = true
+bgpfc-wire.workspace = true
+
+# AGENTS.md §1.2: verification only; never a normal dependency.
+[dev-dependencies]
+proptest = "1.11"
+
+[lints]
+workspace = true
