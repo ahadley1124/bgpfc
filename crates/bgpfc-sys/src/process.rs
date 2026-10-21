@@ -7,6 +7,9 @@
 //! (`waitid(2)` with `WNOWAIT`), so the thread that owns the child stays
 //! the only one that reaps it and its signals cannot reach a reused id.
 //!
+//! A signal can also go to a child's whole process group, to reach what
+//! it started.
+//!
 //! Implements the process plumbing of the supervised RPKI relying-party
 //! sidecar (GitHub issues #26, #70, #71, #72).
 
@@ -258,6 +261,46 @@ pub fn wait_for_exit(pid: u32) -> io::Result<()> {
     }
 }
 
+/// Send `signal` to every process in the process group `pgid` (`kill(2)`
+/// with `-pgid`).
+///
+/// This is for a child started as the leader of its own group
+/// ([`CommandExt::process_group`] with `0`): its group id is its process
+/// id, and the processes it starts join the group unless they leave it,
+/// so this reaches the helpers [`send_signal`] does not, such as those a
+/// child that was killed left behind. Pass the id of a child that has not
+/// been reaped yet, say after [`wait_for_exit`]: until then the kernel
+/// keeps the id, and with it the group, so it cannot name a newer group.
+///
+/// `0`, `1` and anything above `i32::MAX` are refused before any system
+/// call: `kill` reads a `pid` of `0` as the caller's own group, `-1` as
+/// every process the caller may signal, and a value above `i32::MAX`
+/// would turn positive.
+///
+/// # Errors
+/// `InvalidInput` for a `pgid` that does not name one process group;
+/// otherwise the `kill` failure, such as `ESRCH` when the group is empty
+/// or `EPERM` when the caller may signal none of its members.
+#[allow(unsafe_code, reason = "kill(2) with integer arguments")]
+pub fn send_signal_to_group(pgid: u32, signal: ChildSignal) -> io::Result<()> {
+    let group = match ffi::pid_t::try_from(pgid) {
+        Ok(g) if g > 1 => g,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pgid must name one process group: 2 to i32::MAX",
+            ));
+        }
+    };
+    // SAFETY: integer arguments only. `group` is 2 to `i32::MAX`, so
+    // `-group` cannot overflow and lies in `-i32::MAX..=-2`: one process
+    // group, never the caller's own (`0`) or every process (`-1`).
+    if unsafe { ffi::kill(-group, signal.number()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +338,19 @@ mod tests {
             let err = wait_for_exit(pid).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "pid {pid}");
             assert_eq!(err.raw_os_error(), None, "pid {pid}: no syscall made");
+        }
+    }
+
+    /// `kill(0)` and `kill(-1)` must be unreachable through the group
+    /// signal, as must a group id that would turn the `pid` positive.
+    /// Refused before the system call, so this runs under Miri too.
+    #[test]
+    fn send_signal_to_group_refuses_own_group_and_everyone() {
+        let too_big = u32::try_from(i32::MAX).unwrap() + 1;
+        for pgid in [0, 1, too_big, u32::MAX] {
+            let err = send_signal_to_group(pgid, ChildSignal::Kill).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "pgid {pgid}");
+            assert_eq!(err.raw_os_error(), None, "pgid {pgid}: no syscall made");
         }
     }
 
@@ -616,6 +672,52 @@ mod tests {
         fn wait_for_exit_needs_a_child() {
             let err = wait_for_exit(1).unwrap_err();
             assert_eq!(err.raw_os_error(), Some(ECHILD));
+        }
+
+        /// The group signal reaches what a group leader started and left
+        /// behind, and nothing outside the group: a shell in its own group
+        /// starts `sleep` in the background, the group gets `SIGKILL`, and
+        /// a `sleep` outside the group, the control, survives.
+        #[test]
+        fn group_signal_reaches_the_grandchildren() {
+            use std::io::BufRead;
+
+            let mut leader = Command::new("/bin/sh")
+                .args(["-c", "/bin/sleep 30 & echo $!; wait"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn /bin/sh");
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let grandchild: u32 = line.trim().parse().unwrap();
+            let mut control = sleep_30().spawn().expect("spawn /bin/sleep");
+            let (_, grandchild_start) = proc_stat(grandchild).expect("grandchild exists");
+            let (_, control_start) = proc_stat(control.id()).expect("control exists");
+
+            // The leader is unreaped, so its id still names this group.
+            send_signal_to_group(leader.id(), ChildSignal::Kill).unwrap();
+            let status = wait_with_deadline(&mut leader, Duration::from_secs(5));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while running(grandchild, grandchild_start) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let grandchild_survived = running(grandchild, grandchild_start);
+            let control_survived = running(control.id(), control_start);
+            if grandchild_survived {
+                send_signal(grandchild, ChildSignal::Kill).unwrap();
+            }
+            let _ = control.kill();
+            let _ = control.wait();
+            assert_eq!(status.signal(), Some(ChildSignal::Kill.number()));
+            assert!(
+                !grandchild_survived,
+                "the group signal missed the grandchild"
+            );
+            assert!(control_survived, "the group signal reached another group");
         }
     }
 }
