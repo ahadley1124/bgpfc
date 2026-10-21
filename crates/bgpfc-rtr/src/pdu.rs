@@ -60,7 +60,7 @@ const ROUTER_KEY_MIN_LEN: u32 = 32;
 const _: () = assert!(ROUTER_KEY_MIN_LEN as usize == ROUTER_KEY_FIXED_LEN);
 
 /// [`MAX_PDU_LEN`] as a buffer size.
-const MAX_PDU_USIZE: usize = MAX_PDU_LEN as usize;
+pub(crate) const MAX_PDU_USIZE: usize = MAX_PDU_LEN as usize;
 
 /// The Protocol Version of a PDU (RFC 8210 §5.1, §7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -633,7 +633,7 @@ impl Pdu {
 }
 
 /// Decode one PDU; `expected` is the negotiated version, if there is one.
-fn decode_pdu(bytes: &[u8], expected: Option<Version>) -> Result<Pdu, RtrError> {
+pub(crate) fn decode_pdu(bytes: &[u8], expected: Option<Version>) -> Result<Pdu, RtrError> {
     let mut r = Reader::new(bytes);
     let header = Header::read(&mut r).ok_or(RtrError::Truncated {
         pdu_type: bytes.get(1).copied(),
