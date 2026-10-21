@@ -1,0 +1,14 @@
+[package]
+name = "bgpfc-rpki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "RPKI route origin validation (RFC 6811): VRP sets and validation sources"
+
+[dependencies]
+bgpfc-wire.workspace = true
+
+[lints]
+workspace = true
