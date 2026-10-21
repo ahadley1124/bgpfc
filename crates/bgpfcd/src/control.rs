@@ -458,6 +458,11 @@ fn write_neighbor(
             for f in &s.families {
                 j.display(f);
             }
+            // RFC 8950 §4: families that may carry an IPv6 next hop.
+            j.end_array().key("extended_next_hop").begin_array();
+            for f in &s.extended_next_hop {
+                j.display(f);
+            }
             j.end_array().end_object();
         }
         None => {
@@ -520,6 +525,16 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
             "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
             s.four_octet_as, s.extended_messages, s.route_refresh
         ));
+        if !s.extended_next_hop.is_empty() {
+            lines.push(format!(
+                "  extended-next-hop {}",
+                s.extended_next_hop
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         lines.push(format!(
             "  families {}",
             s.families
@@ -761,6 +776,52 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn neighbor_detail_shows_the_extended_next_hop_families() {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let mut session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: true,
+            route_refresh: true,
+            families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+            extended_next_hop: vec![AddressFamily::IPV4_UNICAST],
+            peer_capabilities: Vec::new(),
+        };
+        let mut report = PeerReport {
+            addr: "2001:db8::2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session.clone()),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+        };
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  extended-next-hop ipv4-unicast".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""extended_next_hop":["ipv4-unicast"]"#),
+            "{}",
+            r.json
+        );
+        // RFC 8950 §4 not negotiated: no line, an empty list.
+        session.extended_next_hop.clear();
+        report.session = Some(session);
+        let r = render_neighbor(&report, &[]);
+        assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
+        assert!(r.json.contains(r#""extended_next_hop":[]"#), "{}", r.json);
     }
 
     #[test]

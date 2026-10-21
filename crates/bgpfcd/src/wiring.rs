@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use bgpfc_config::ast::{self, Neighbor};
 use bgpfc_fsm::{Config, SendHoldTime};
-use bgpfc_wire::capability::Capability;
-use bgpfc_wire::types::{Asn, RouterId};
+use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_wire::types::{Afi, Asn, RouterId};
 
 use crate::messages::Intervals;
 use crate::peer::PeerConfig;
@@ -31,6 +31,20 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         .map(|f| Capability::Multiprotocol(*f))
         .chain([Capability::RouteRefresh, Capability::ExtendedMessage])
         .collect();
+    // RFC 8950 §4: one triple per `extended-next-hop` family, each with an
+    // IPv6 next hop, in one capability.
+    if !n.extended_next_hop.is_empty() {
+        fsm.capabilities.push(Capability::ExtendedNextHop(
+            n.extended_next_hop
+                .iter()
+                .map(|f| NextHopEncoding {
+                    nlri_afi: f.afi,
+                    nlri_safi: u16::from(f.safi.to_u8()),
+                    next_hop_afi: Afi::Ipv6,
+                })
+                .collect(),
+        ));
+    }
     // RFC 4271 §10: jitter from something that differs per process.
     fsm.jitter_seed = jitter_seed(&n.addr);
     PeerConfig {
@@ -114,6 +128,33 @@ mod tests {
         assert_eq!(q.fsm.send_hold_time, SendHoldTime::Disabled);
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
+    }
+
+    #[test]
+    fn extended_next_hop_is_advertised_only_when_configured() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 2001:db8::2 { remote-as 65001; import A; export A; extended-next-hop yes; }
+             neighbor 2001:db8::3 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        // RFC 8950 §4 / §6.1: <1, 1, 2> after the other capabilities.
+        let p = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        assert_eq!(
+            p.fsm.capabilities.last(),
+            Some(&Capability::ExtendedNextHop(vec![
+                NextHopEncoding::IPV4_UNICAST_VIA_IPV6
+            ]))
+        );
+        let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert!(
+            !q.fsm
+                .capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::ExtendedNextHop(_)))
+        );
     }
 
     #[test]

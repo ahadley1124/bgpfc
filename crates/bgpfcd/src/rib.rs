@@ -92,6 +92,12 @@ fn handle(rib: &mut Rib, intervals: &mut Intervals, msg: RibMsg, now: Instant) -
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
+                extended_next_hop = session
+                    .extended_next_hop
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
                 advertisement_interval = interval.as_secs()
             );
             rib.peer_up(peer_info(peer, local_addr, &session, interval), now)

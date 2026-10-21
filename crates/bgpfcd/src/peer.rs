@@ -24,6 +24,7 @@ use bgpfc_wire::keepalive::KEEPALIVE;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
+use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::{DecodeContext, ErrorAction, PeerKind, UpdateMessage};
 
 use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
@@ -551,9 +552,9 @@ impl Peer {
                 four_octet_as: s.four_octet_as,
                 peer: s.peer,
                 allow_as_set: self.cfg.allow_as_set,
-                // RFC 8950 §4: not negotiated yet; RFC 7606 §7.11 then
+                // RFC 8950 §4 as negotiated; without it RFC 7606 §7.11
                 // expects four octets of next hop for IPv4 unicast.
-                extended_next_hop: false,
+                extended_next_hop: s.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
             },
             None => DecodeContext {
                 four_octet_as: false,
