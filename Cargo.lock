@@ -81,6 +81,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bgpfc-rpki"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-wire",
+]
+
+[[package]]
 name = "bgpfc-sys"
 version = "0.1.0"
 
