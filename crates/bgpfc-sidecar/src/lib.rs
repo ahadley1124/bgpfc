@@ -6,6 +6,11 @@
 //! looking after that child; the I/O shell that spawns, signals and reaps
 //! it lives in bgpfcd.
 //!
+//! - [`SidecarConfig`]: what to run and how to supervise it, checked by
+//!   [`SidecarConfig::validate`]: an absolute binary path that is never
+//!   looked up on `PATH` (issue #70), RTR on loopback only (issue #71).
+//! - [`routinator_args`]: Routinator's command line, with an escape hatch
+//!   for options bgpfcd does not model (issue #72).
 //! - [`parse_version`] and [`check_compatible`]: the startup check that
 //!   the binary is the release series the command line was written for,
 //!   [`TESTED_VERSION`] (issue #72).
@@ -16,13 +21,18 @@
 //! process: time is passed in, so every behaviour is testable with
 //! injected time (AGENTS.md §3, "Time").
 //!
-//! Implements: no RFC.
+//! Implements: RFC 8210 §6 (the bounds on the refresh interval Routinator
+//! announces).
 #![forbid(unsafe_code)]
 
+mod args;
 mod backoff;
+mod config;
 mod error;
 mod version;
 
+pub use args::routinator_args;
 pub use backoff::{Backoff, BackoffConfig};
+pub use config::{SidecarConfig, TalConfig};
 pub use error::SidecarError;
 pub use version::{TESTED_VERSION, Version, check_compatible, check_version_output, parse_version};
