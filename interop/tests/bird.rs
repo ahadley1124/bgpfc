@@ -175,6 +175,13 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             statics: Vec::new(),
         },
     );
+    // The scenario re-announces the statics seconds after the first
+    // advertisement; with the 30 s EBGP default of RFC 4271 §10 that
+    // re-announcement would be held past the 15 s wait (§9.2.1.1). An
+    // explicit 1 s interval keeps the test quick and still paced; the
+    // default itself is unchanged.
+    let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
+    to_bird2.advertisement_interval = Some(1);
     let bgpfcd = start_bgpfcd(
         &lab,
         &lab.a.clone(),
@@ -182,10 +189,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             local_as: BGPFC_AS,
             router_id: lab.a_addr,
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
-            neighbors: vec![
-                NeighborOpts::new(lab.b_addr, BIRD_AS),
-                NeighborOpts::new(lab.c_addr, BIRD2_AS),
-            ],
+            neighbors: vec![NeighborOpts::new(lab.b_addr, BIRD_AS), to_bird2],
             extra: String::new(),
         },
     );

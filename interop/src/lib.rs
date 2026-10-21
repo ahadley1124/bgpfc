@@ -314,10 +314,14 @@ pub struct NeighborOpts {
     pub import: String,
     /// Export policy name.
     pub export: String,
+    /// `advertisement-interval` in seconds; `None` keeps the RFC 4271 §10
+    /// default (30 s external, 5 s internal).
+    pub advertisement_interval: Option<u16>,
 }
 
 impl NeighborOpts {
-    /// An active neighbor on port 179 with a 30 s hold time.
+    /// An active neighbor on port 179 with a 30 s hold time and the
+    /// default advertisement interval.
     #[must_use]
     pub fn new(addr: impl Into<IpAddr>, remote_as: u32) -> NeighborOpts {
         NeighborOpts {
@@ -328,6 +332,7 @@ impl NeighborOpts {
             passive: false,
             import: "ANY".to_owned(),
             export: "ANY".to_owned(),
+            advertisement_interval: None,
         }
     }
 }
@@ -379,9 +384,13 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
         let _ = writeln!(text, "listen {{ address {l}; port 179; }}");
     }
     for n in &opts.neighbors {
+        let interval = n
+            .advertisement_interval
+            .map(|s| format!(" advertisement-interval {s};"))
+            .unwrap_or_default();
         let _ = writeln!(
             text,
-            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {}; }}",
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {};{interval} }}",
             n.addr,
             n.remote_as,
             n.port,

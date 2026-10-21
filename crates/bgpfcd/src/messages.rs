@@ -6,6 +6,7 @@
 //! bounded channel so that a flooding peer blocks instead of growing
 //! memory.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
@@ -176,6 +177,10 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
 }
 
+/// Each neighbor's configured `advertisement-interval` (RFC 4271
+/// §9.2.1.1); `None` takes the RFC 4271 §10 default for the session type.
+pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;
+
 /// What peer threads tell the RIB thread.
 #[derive(Debug)]
 pub(crate) enum RibMsg {
@@ -226,6 +231,9 @@ pub(crate) enum RibMsg {
         /// Peers to re-export to.
         reexport: Vec<IpAddr>,
     },
+    /// The advertisement intervals after a reload: sessions that are up
+    /// follow at once, without a reset; later sessions start with them.
+    SetIntervals(Intervals),
     /// Re-send the Adj-RIB-Out of every family to `peer` in full (a soft
     /// reset, RFC 2918 §4).
     Resend {

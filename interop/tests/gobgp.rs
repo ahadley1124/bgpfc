@@ -45,6 +45,13 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
         },
     );
     let socket = lab.dir.join("ctl.sock");
+    // check_soft_clear re-adds the withdrawn prefix seconds after its
+    // first advertisement; with the 30 s EBGP default of RFC 4271 §10 the
+    // re-announcement to BIRD would be held past the 15 s wait
+    // (§9.2.1.1). An explicit 1 s interval keeps the test quick and still
+    // paced; the default itself is unchanged.
+    let mut to_bird = NeighborOpts::new(lab.c_addr, BIRD_AS);
+    to_bird.advertisement_interval = Some(1);
     let bgpfcd = start_bgpfcd(
         &lab,
         &lab.a.clone(),
@@ -52,10 +59,7 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
             local_as: BGPFC_AS,
             router_id: lab.a_addr,
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
-            neighbors: vec![
-                NeighborOpts::new(lab.b_addr, GOBGP_AS),
-                NeighborOpts::new(lab.c_addr, BIRD_AS),
-            ],
+            neighbors: vec![NeighborOpts::new(lab.b_addr, GOBGP_AS), to_bird],
             extra: format!("control {{ socket {}; }}", socket.display()),
         },
     );

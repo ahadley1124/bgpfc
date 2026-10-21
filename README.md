@@ -12,10 +12,11 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 5492, 6793, 2918, 8654, 1997, 4360, 8092, 4486, 6608,
 > 9003, 7607, 9072, 9687 and 9774. RFC 4271 is complete except next-hop
-> resolvability (there is no IGP; the kernel's verdict is logged) and the
-> MinRouteAdvertisementInterval timer; RFC 4760 and 7606 each have one `partial`
-> row; the RFC 8950 extended next hop capability is not advertised yet. Nothing
-> else is claimed.
+> resolvability (there is no IGP; the kernel's verdict is logged) and one
+> deliberate deviation: the MinRouteAdvertisementInterval timer paces
+> announcements but never holds back a withdrawal; RFC 4760 and 7606 each have
+> one `partial` row; the RFC 8950 extended next hop capability is not
+> advertised yet. Nothing else is claimed.
 
 ### What works
 
@@ -24,7 +25,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   handling; interop tests against BIRD 2, FRR 8 and GoBGP 3 run on every push.
 - The RFC 4271 decision process over interned attribute sets, per-neighbor
   import/export policy with prefix lists, an AS-path regex engine and community
-  matching, and update generation packed to the negotiated message size.
+  matching, and update generation packed to the negotiated message size and
+  paced per destination by the RFC 4271 MinRouteAdvertisementInterval timer.
 - Routes installed through rtnetlink under a dedicated protocol number, with
   dry-run as the default and a runtime toggle; privilege drop and a capability
   check; clean shutdown on `SIGTERM`.

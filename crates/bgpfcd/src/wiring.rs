@@ -1,6 +1,5 @@
 //! From the validated configuration to what the threads need.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use bgpfc_config::ast::{self, Neighbor};
@@ -8,6 +7,7 @@ use bgpfc_fsm::{Config, SendHoldTime};
 use bgpfc_wire::capability::Capability;
 use bgpfc_wire::types::{Asn, RouterId};
 
+use crate::messages::Intervals;
 use crate::peer::PeerConfig;
 
 /// The per-peer configuration for `n`.
@@ -32,7 +32,7 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         .chain([Capability::RouteRefresh, Capability::ExtendedMessage])
         .collect();
     // RFC 4271 §10: jitter from something that differs per process.
-    fsm.jitter_seed = jitter_seed(n.addr);
+    fsm.jitter_seed = jitter_seed(&n.addr);
     PeerConfig {
         addr: n.addr,
         port: n.port,
@@ -41,12 +41,22 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
     }
 }
 
-/// A seed that differs per process and per peer, from the clock and the
-/// hasher's random keys; std has no RNG.
-fn jitter_seed(addr: IpAddr) -> u64 {
+/// Every neighbor's `advertisement-interval`, for the RIB thread.
+pub(crate) fn advertisement_intervals(config: &bgpfc_config::Config) -> Intervals {
+    config
+        .neighbors
+        .iter()
+        .map(|n| (n.addr, n.advertisement_interval))
+        .collect()
+}
+
+/// A jitter seed that differs per process and per `salt` (a peer's
+/// address, or the RIB), from the clock and the hasher's random keys; std
+/// has no RNG.
+pub(crate) fn jitter_seed(salt: &impl std::hash::Hash) -> u64 {
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    addr.hash(&mut h);
+    salt.hash(&mut h);
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -59,6 +69,7 @@ fn jitter_seed(addr: IpAddr) -> u64 {
 mod tests {
     use super::*;
     use bgpfc_wire::types::AddressFamily;
+    use std::net::IpAddr;
 
     #[test]
     fn neighbor_becomes_peer_config() {
@@ -103,5 +114,26 @@ mod tests {
         assert_eq!(q.fsm.send_hold_time, SendHoldTime::Disabled);
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
+    }
+
+    #[test]
+    fn advertisement_intervals_reach_the_rib_per_neighbor() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; advertisement-interval 0; }
+             neighbor 192.0.2.3 { remote-as 65000; import A; export A; }",
+        )
+        .unwrap();
+        let i = advertisement_intervals(&cfg);
+        assert_eq!(i.len(), 2);
+        assert_eq!(
+            i.get(&"192.0.2.2".parse::<IpAddr>().unwrap()),
+            Some(&Some(Duration::ZERO))
+        );
+        // Not configured: the RIB thread picks the RFC 4271 §10 default.
+        assert_eq!(i.get(&"192.0.2.3".parse::<IpAddr>().unwrap()), Some(&None));
+        assert_ne!(jitter_seed(&"rib"), 0);
     }
 }
