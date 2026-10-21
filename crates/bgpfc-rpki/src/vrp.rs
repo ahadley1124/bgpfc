@@ -49,6 +49,16 @@ impl Vrp {
         })
     }
 
+    /// A VRP from parts already known to pass [`Vrp::new`]'s checks
+    /// because they were taken from a `Vrp`.
+    pub(crate) const fn from_parts(prefix: Prefix, max_len: u8, asn: Asn) -> Vrp {
+        Vrp {
+            prefix,
+            max_len,
+            asn,
+        }
+    }
+
     /// The VRP Prefix (RFC 6811 §2).
     #[must_use]
     pub const fn prefix(&self) -> Prefix {
