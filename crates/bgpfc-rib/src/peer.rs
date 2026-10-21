@@ -1,9 +1,13 @@
 //! What the RIB knows about a session.
+//!
+//! Implements: RFC 4760 §8 (negotiated families); RFC 8654 §4 (message
+//! size); RFC 8950 §4 (which next hops a peer takes).
 
 use std::net::IpAddr;
 use std::time::Duration;
 
-use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
+use bgpfc_wire::mp::NextHop;
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
 
 /// The session parameters the RIB needs: who the peer is, which families
@@ -27,6 +31,10 @@ pub struct PeerInfo {
     pub four_octet_as: bool,
     /// Both sides accept 65535-octet messages (RFC 8654 §4).
     pub extended_messages: bool,
+    /// Families whose routes may carry an IPv6 next hop to and from this
+    /// peer, because both sides advertised Extended Next Hop Encoding for
+    /// them (RFC 8950 §4): IPv4 unicast or nothing.
+    pub extended_next_hop: Vec<AddressFamily>,
     /// The `MinRouteAdvertisementIntervalTimer` (RFC 4271 §9.2.1.1): the
     /// least time between two advertisements of a destination to this
     /// peer. Zero sends every change at once.
@@ -51,5 +59,18 @@ impl PeerInfo {
     #[must_use]
     pub fn speaks(&self, family: AddressFamily) -> bool {
         self.families.contains(&family)
+    }
+
+    /// Whether a route of `family` may go to this peer with `next_hop`:
+    /// an IPv6 next hop for IPv4 NLRI only where the peer advertised
+    /// Extended Next Hop Encoding for the family (RFC 8950 §4).
+    #[must_use]
+    pub fn takes_next_hop(&self, family: AddressFamily, next_hop: &NextHop) -> bool {
+        match next_hop {
+            NextHop::Ipv6 { .. } if family.afi == Afi::Ipv4 => {
+                self.extended_next_hop.contains(&family)
+            }
+            _ => true,
+        }
     }
 }

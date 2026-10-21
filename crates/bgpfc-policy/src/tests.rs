@@ -231,6 +231,7 @@ fn engine_applies_each_neighbors_policies() {
         families: vec![V4],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
         advertisement_interval: std::time::Duration::ZERO,
     };
     let a = attrs(&[65_001]);

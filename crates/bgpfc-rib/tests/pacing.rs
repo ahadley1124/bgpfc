@@ -50,6 +50,7 @@ fn peers(paced: bool) -> Vec<PeerInfo> {
                 families: vec![V4],
                 four_octet_as: true,
                 extended_messages: false,
+                extended_next_hop: Vec::new(),
                 advertisement_interval: if paced {
                     Duration::from_secs(intervals[usize::from(i)])
                 } else {

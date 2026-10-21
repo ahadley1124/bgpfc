@@ -27,6 +27,7 @@ fn peer(i: u8) -> PeerInfo {
         families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
     }
 }

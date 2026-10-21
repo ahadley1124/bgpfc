@@ -14,7 +14,7 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
-use crate::attrs::PathAttrs;
+use crate::attrs::{PathAttrs, announced};
 use crate::decision::{Candidate, best};
 use crate::export::{Source, export, prepend};
 use crate::peer::PeerInfo;
@@ -74,6 +74,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         families: vec![V4, V6],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
         // Pacing off: these tests are about what is sent; the RFC 4271
         // §9.2.1.1 tests below are about when.
         advertisement_interval: Duration::ZERO,
@@ -127,7 +128,7 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         four_octet_as: to.four_octet_as,
         peer: to.kind,
         allow_as_set: false,
-        extended_next_hop: false,
+        extended_next_hop: to.extended_next_hop.contains(&V4),
     };
     messages
         .iter()
@@ -403,6 +404,174 @@ fn ipv6_next_hop_self_and_v4_over_v6_session() {
     let a4 = attrs(&[65_001], "192.0.2.1");
     let e = export(LOCAL_AS, V4, src, &a4, &to).unwrap();
     assert_eq!(e.next_hop, a4.next_hop);
+}
+
+/// `info` with RFC 8950 extended next hop negotiated for IPv4 unicast.
+fn enh(mut info: PeerInfo) -> PeerInfo {
+    info.extended_next_hop = vec![V4];
+    info
+}
+
+/// An IPv6 next hop with a link-local address (RFC 2545 §3).
+fn v6_next_hop(global: &str, link_local: &str) -> NextHop {
+    NextHop::Ipv6 {
+        global: global.parse().unwrap(),
+        link_local: Some(link_local.parse().unwrap()),
+    }
+}
+
+#[test]
+fn rfc8950_export_rules() {
+    let from = enh(peer("2001:db8::1", 65_001, 1));
+    let src = Source {
+        peer: from.addr,
+        kind: from.kind,
+    };
+    let ext6_enh = enh(peer("2001:db8::2", 65_002, 2));
+    let ext6 = peer("2001:db8::3", 65_003, 3);
+    let ext4 = peer("10.0.0.4", 65_004, 4);
+    let int_enh = enh(peer("10.0.0.5", LOCAL_AS.0, 5));
+    let int = peer("10.0.0.6", LOCAL_AS.0, 6);
+    let self6 = NextHop::Ipv6 {
+        global: "2001:db8::fe".parse().unwrap(),
+        link_local: None,
+    };
+    // An IPv4 route learned with an IPv6 next hop (RFC 8950 §3).
+    let mut a = attrs(&[65_001], "2001:db8::1");
+    a.next_hop = v6_next_hop("2001:db8::1", "fe80::1");
+    // External, over IPv6 with RFC 8950: our IPv6 address (§5).
+    let e = export(LOCAL_AS, V4, src, &a, &ext6_enh).unwrap();
+    assert_eq!(e.next_hop, self6);
+    // External over IPv4: our IPv4 address (RFC 4271 §5.1.3).
+    let e = export(LOCAL_AS, V4, src, &a, &ext4).unwrap();
+    assert_eq!(e.next_hop, NextHop::Ipv4(Ipv4Addr::new(10, 0, 0, 254)));
+    // External over IPv6 without RFC 8950: we have no next hop it may
+    // take, so the route is not advertised (§4).
+    assert_eq!(export(LOCAL_AS, V4, src, &a, &ext6), None);
+    // Internal: the next hop is passed on unchanged with its encoding,
+    // and only to a peer that takes it (§5).
+    let e = export(LOCAL_AS, V4, src, &a, &int_enh).unwrap();
+    assert_eq!(e.next_hop, a.next_hop);
+    assert_eq!(export(LOCAL_AS, V4, src, &a, &int), None);
+    // An IPv4 next hop: with RFC 8950 on an IPv6 session our own address
+    // is the IPv6 one (§5); without it the received one stays.
+    let a4 = attrs(&[65_001], "192.0.2.1");
+    let e = export(LOCAL_AS, V4, src, &a4, &ext6_enh).unwrap();
+    assert_eq!(e.next_hop, self6);
+    let e = export(LOCAL_AS, V4, src, &a4, &ext6).unwrap();
+    assert_eq!(e.next_hop, a4.next_hop);
+    let e = export(LOCAL_AS, V4, src, &a4, &int).unwrap();
+    assert_eq!(e.next_hop, a4.next_hop);
+    // IPv6 routes are not affected.
+    assert!(ext6.takes_next_hop(V6, &self6));
+    assert!(!ext6.takes_next_hop(V4, &self6));
+    assert!(ext6_enh.takes_next_hop(V4, &self6));
+    assert!(ext6.takes_next_hop(V4, &a4.next_hop));
+}
+
+#[test]
+fn rfc8950_ipv4_routes_with_ipv6_next_hops_end_to_end() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let pa = enh(peer("2001:db8::1", 65_001, 1));
+    let pb = enh(peer("2001:db8::2", 65_002, 2));
+    let pc = peer("2001:db8::3", 65_003, 3);
+    let pd = peer("10.0.0.4", 65_004, 4);
+    for info in [&pa, &pb, &pc, &pd] {
+        rib.peer_up(info.clone(), now());
+    }
+    let dst = p("192.0.2.0/24");
+    // D's route with an IPv4 next hop reaches all three, C included.
+    let out = rib.update(
+        pd.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_004, 7], "10.0.0.4")),
+        now(),
+    );
+    let to_c = decode_sent(sends(&out, pc.addr)[0], &pc);
+    assert_eq!(to_c[0].nlri, vec![dst]);
+    assert_eq!(to_c[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 4)));
+    let to_b = decode_sent(sends(&out, pb.addr)[0], &pb);
+    let r = to_b[0].mp_reach.as_ref().unwrap();
+    assert_eq!(
+        (r.family, r.next_hop),
+        (
+            V4,
+            NextHop::Ipv6 {
+                global: "2001:db8::fe".parse().unwrap(),
+                link_local: None
+            }
+        )
+    );
+    // A's shorter route with an IPv6 next hop wins (RFC 8950 §3).
+    let mut via6 = attrs(&[65_001], "2001:db8::1");
+    via6.next_hop = v6_next_hop("2001:db8::1", "fe80::1");
+    let out = rib.update(pa.addr, &announce(&["192.0.2.0/24"], &via6), now());
+    // The FIB gets the global IPv6 address (RFC 2545 §3).
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: dst,
+            next_hop: Some(ip("2001:db8::1")),
+        }]
+    );
+    // B: MP_REACH_NLRI for IPv4 with our IPv6 address, no NEXT_HOP.
+    let to_b = decode_sent(sends(&out, pb.addr)[0], &pb);
+    let r = to_b[0].mp_reach.as_ref().unwrap();
+    assert_eq!(r.family, V4);
+    assert_eq!(r.nlri, vec![dst]);
+    assert_eq!(
+        r.next_hop,
+        NextHop::Ipv6 {
+            global: "2001:db8::fe".parse().unwrap(),
+            link_local: None
+        }
+    );
+    assert_eq!(to_b[0].next_hop(), None);
+    // C cannot take the new best route: what it had is withdrawn
+    // (RFC 8950 §4, §5).
+    let to_c = decode_sent(sends(&out, pc.addr)[0], &pc);
+    assert_eq!(to_c.len(), 1);
+    assert_eq!(to_c[0].withdrawn, vec![dst]);
+    assert!(to_c[0].mp_reach.is_none() && to_c[0].nlri.is_empty());
+    assert_eq!(rib.adj_rib_out(pc.addr, V4).count(), 0);
+    // D, over IPv4: plain NLRI with our IPv4 address.
+    let to_d = decode_sent(sends(&out, pd.addr)[0], &pd);
+    assert_eq!(to_d[0].nlri, vec![dst]);
+    assert_eq!(to_d[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 254)));
+    // A route refresh to C still leaves it out.
+    let out = rib.refresh(pc.addr, V4, now());
+    assert_eq!(sends(&out, pc.addr).len(), 0);
+}
+
+#[test]
+fn an_update_with_both_ipv4_fields_keeps_each_next_hop() {
+    // RFC 7606 §5.1: IPv4 routes in the NLRI field and in MP_REACH_NLRI
+    // at once. RFC 4760 §3: each part has its own next hop, NEXT_HOP for
+    // the NLRI field and the attribute's for the rest, IPv6 under RFC 8950.
+    let mut rib = Rib::new(LOCAL_AS);
+    let a = enh(peer("2001:db8::1", 65_001, 1));
+    rib.peer_up(a.clone(), now());
+    let mut d = announce(&["198.51.100.0/24"], &attrs(&[65_001], "192.0.2.1"));
+    d.message.mp_reach = Some(bgpfc_wire::mp::MpReach {
+        family: V4,
+        next_hop: v6_next_hop("2001:db8::1", "fe80::1"),
+        nlri: vec![p("203.0.113.0/24")],
+    });
+    let parts = announced(&d);
+    assert_eq!(parts.len(), 2);
+    rib.update(a.addr, &d, now());
+    let nh = |prefix| rib.candidates(V4, p(prefix))[0].attrs.next_hop;
+    assert_eq!(
+        nh("198.51.100.0/24"),
+        NextHop::Ipv4(Ipv4Addr::new(192, 0, 2, 1))
+    );
+    assert_eq!(nh("203.0.113.0/24"), v6_next_hop("2001:db8::1", "fe80::1"));
+    // Treated as withdraw: nothing is announced.
+    d.treated_as_withdraw = Some(bgpfc_wire::error::DecodeError::update(
+        bgpfc_wire::error::UpdateSubcode::InvalidOrigin,
+        vec![],
+    ));
+    assert_eq!(announced(&d).len(), 0);
 }
 
 #[test]
@@ -710,8 +879,12 @@ fn attributes_round_trip_through_an_update() {
         value: vec![1, 2],
     }];
     a.normalise();
-    let m = a.to_update(V4, vec![p("192.0.2.0/24")]);
-    let back = PathAttrs::from_update(&m, V4).unwrap();
+    let d = announce(&["192.0.2.0/24"], &a);
+    let parts = announced(&d);
+    assert_eq!(parts.len(), 1);
+    let (family, next_hop, prefixes) = parts[0];
+    assert_eq!((family, prefixes), (V4, &[p("192.0.2.0/24")][..]));
+    let back = PathAttrs::from_update(&d.message, next_hop);
     assert_eq!(
         back.communities,
         vec![Community::new(65_001, 1), Community::new(65_001, 2)]
@@ -721,7 +894,7 @@ fn attributes_round_trip_through_an_update() {
     let mut expect = a.clone();
     expect.unknown[0].flags = 0xe0;
     assert_eq!(back, expect);
-    assert!(PathAttrs::from_update(&UpdateMessage::default(), V4).is_none());
+    assert_eq!(announced(&withdraw(&["192.0.2.0/24"])).len(), 0);
     assert!(a.has_community(Community::new(65_001, 2)));
     assert_eq!(a.next_hop_afi(), bgpfc_wire::types::Afi::Ipv4);
 }

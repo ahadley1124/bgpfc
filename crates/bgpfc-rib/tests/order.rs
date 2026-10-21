@@ -53,6 +53,7 @@ fn peers() -> Vec<PeerInfo> {
             families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
+            extended_next_hop: Vec::new(),
             // Unpaced, so the Adj-RIBs-Out are final after the last step;
             // tests/pacing.rs covers the paced case.
             advertisement_interval: Duration::ZERO,

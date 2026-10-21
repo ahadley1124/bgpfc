@@ -192,6 +192,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         families: s.families.clone(),
         four_octet_as: s.four_octet_as,
         extended_messages: s.extended_messages,
+        extended_next_hop: s.extended_next_hop.clone(),
         advertisement_interval: interval,
     }
 }

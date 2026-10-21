@@ -9,8 +9,10 @@
 //! generation), §9.2.1.1 (`MinRouteAdvertisementIntervalTimer`, see
 //! [`pacing`]), §9.3 (Loc-RIB changes are reported for the FIB), §6.3
 //! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's);
-//! RFC 4760 §5, §7 (per-family RIBs, family disable); RFC 2918 §4
-//! (route refresh re-sends the Adj-RIB-Out).
+//! RFC 4760 §3, §5, §7 (each NLRI field with its own next hop, per-family
+//! RIBs, family disable); RFC 2918 §4 (route refresh re-sends the
+//! Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6 next hop, see
+//! [`export`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -495,9 +497,6 @@ impl Rib {
             return Vec::new();
         };
         let info = state.info.clone();
-        let kind = info.kind;
-        let router_id = info.router_id.to_u32();
-        let remote_as = info.remote_as;
         let disabled = state.disabled.clone();
         let mut dirty = Vec::new();
         for (family, prefix) in update.withdrawals() {
@@ -514,76 +513,85 @@ impl Rib {
                 dirty.push((family, prefix));
             }
         }
-        let mut attrs_for: HashMap<AddressFamily, Option<Arc<PathAttrs>>> = HashMap::new();
-        for (family, prefix) in update.announcements() {
+        for (family, next_hop, prefixes) in attrs::announced(update) {
             if disabled.contains(&family) {
                 continue;
             }
-            let attrs = attrs_for
-                .entry(family)
-                .or_insert_with(|| {
-                    PathAttrs::from_update(&update.message, family).map(|a| self.interner.intern(a))
-                })
-                .clone();
-            let Some(attrs) = attrs else {
-                continue;
-            };
-            // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an
-            // AS loop and is excluded from Phase 2. RFC 4271 §6.3 and
-            // RFC 7606 §7.2: on an external session the leftmost AS must
-            // be the peer's, else the route is treated as withdrawn.
-            // Neither kind is stored.
-            let leftmost_ok =
-                kind == PeerKind::Internal || attrs.as_path.first_asn() == Some(remote_as);
-            // RFC 4271 §9.1.1: import policy decides what enters, and may
-            // change attributes (the degree of preference among them).
-            let accepted = if attrs.as_path.contains(self.local_as) || !leftmost_ok {
-                None
-            } else {
-                match self.policies.import(&info, family, prefix, &attrs) {
-                    Verdict::Accept => Some(attrs),
-                    Verdict::Modified(a) => Some(self.interner.intern(a)),
-                    Verdict::Reject => None,
-                }
-            };
-            let Some(attrs) = accepted else {
-                if let Some(dest) = self
-                    .tables
-                    .get_mut(&family)
-                    .and_then(|t| t.get_mut(&prefix))
-                    && remove_candidate(dest, addr)
-                {
-                    self.count(addr, family, -1);
-                    dirty.push((family, prefix));
-                }
-                continue;
-            };
-            let dest = self
-                .tables
-                .entry(family)
-                .or_default()
-                .entry(prefix)
-                .or_default();
-            let candidate = Candidate {
-                peer: addr,
-                kind,
-                router_id,
-                remote_as,
-                attrs,
-            };
-            if let Some(c) = dest.candidates.iter_mut().find(|c| c.peer == addr) {
-                if Arc::ptr_eq(&c.attrs, &candidate.attrs) {
-                    // An implicit re-announcement of the same route.
-                    continue;
-                }
-                *c = candidate;
-            } else {
-                dest.candidates.push(candidate);
-                self.count(addr, family, 1);
+            let attrs = self
+                .interner
+                .intern(PathAttrs::from_update(&update.message, next_hop));
+            for &prefix in prefixes {
+                self.announce(addr, &info, family, prefix, &attrs, &mut dirty);
             }
-            dirty.push((family, prefix));
         }
         self.reconsider(&dirty, now)
+    }
+
+    /// One announced route from `addr` into the Adj-RIB-In, after the loop
+    /// checks and import policy; `dirty` gets the destination if anything
+    /// changed.
+    fn announce(
+        &mut self,
+        addr: IpAddr,
+        info: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        attrs: &Arc<PathAttrs>,
+        dirty: &mut Vec<(AddressFamily, Prefix)>,
+    ) {
+        // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an AS
+        // loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC 7606
+        // §7.2: on an external session the leftmost AS must be the peer's,
+        // else the route is treated as withdrawn. Neither kind is stored.
+        let leftmost_ok =
+            info.kind == PeerKind::Internal || attrs.as_path.first_asn() == Some(info.remote_as);
+        // RFC 4271 §9.1.1: import policy decides what enters, and may
+        // change attributes (the degree of preference among them).
+        let accepted = if attrs.as_path.contains(self.local_as) || !leftmost_ok {
+            None
+        } else {
+            match self.policies.import(info, family, prefix, attrs) {
+                Verdict::Accept => Some(Arc::clone(attrs)),
+                Verdict::Modified(a) => Some(self.interner.intern(a)),
+                Verdict::Reject => None,
+            }
+        };
+        let Some(attrs) = accepted else {
+            if let Some(dest) = self
+                .tables
+                .get_mut(&family)
+                .and_then(|t| t.get_mut(&prefix))
+                && remove_candidate(dest, addr)
+            {
+                self.count(addr, family, -1);
+                dirty.push((family, prefix));
+            }
+            return;
+        };
+        let dest = self
+            .tables
+            .entry(family)
+            .or_default()
+            .entry(prefix)
+            .or_default();
+        let candidate = Candidate {
+            peer: addr,
+            kind: info.kind,
+            router_id: info.router_id.to_u32(),
+            remote_as: info.remote_as,
+            attrs,
+        };
+        if let Some(c) = dest.candidates.iter_mut().find(|c| c.peer == addr) {
+            if Arc::ptr_eq(&c.attrs, &candidate.attrs) {
+                // An implicit re-announcement of the same route.
+                return;
+            }
+            *c = candidate;
+        } else {
+            dest.candidates.push(candidate);
+            self.count(addr, family, 1);
+        }
+        dirty.push((family, prefix));
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
