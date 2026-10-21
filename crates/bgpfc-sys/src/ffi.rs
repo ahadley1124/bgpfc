@@ -25,6 +25,8 @@ pub(crate) type ssize_t = isize;
 pub(crate) type socklen_t = c_uint;
 /// `__kernel_sa_family_t`, `<linux/socket.h>`.
 pub(crate) type sa_family_t = c_ushort;
+/// `pid_t`: `__kernel_pid_t`, `<asm-generic/posix_types.h>`.
+pub(crate) type pid_t = c_int;
 
 // <bits/socket.h>
 pub(crate) const AF_NETLINK: c_int = 16;
@@ -39,7 +41,12 @@ pub(crate) const SO_RCVBUF: c_int = 8;
 // <asm-generic/signal.h>
 pub(crate) const SIGHUP: c_int = 1;
 pub(crate) const SIGINT: c_int = 2;
+pub(crate) const SIGKILL: c_int = 9;
 pub(crate) const SIGTERM: c_int = 15;
+// <asm-generic/errno-base.h>
+pub(crate) const ESRCH: c_int = 3;
+// <linux/prctl.h>
+pub(crate) const PR_SET_PDEATHSIG: c_int = 1;
 
 /// `struct sockaddr_nl`, `<linux/netlink.h>`.
 #[repr(C)]
@@ -84,10 +91,17 @@ unsafe extern "C" {
     pub(crate) fn getuid() -> uid_t;
     pub(crate) fn setuid(uid: uid_t) -> c_int;
     pub(crate) fn setgid(gid: gid_t) -> c_int;
+    pub(crate) fn getpid() -> pid_t; // getpid(2)
+    pub(crate) fn getppid() -> pid_t; // getppid(2)
+    pub(crate) fn _exit(status: c_int) -> !; // _exit(2)
     // <grp.h>
     pub(crate) fn setgroups(size: size_t, list: *const gid_t) -> c_int;
     // <signal.h>
     pub(crate) fn signal(signum: c_int, handler: sighandler_t) -> c_ulong;
+    pub(crate) fn kill(pid: pid_t, sig: c_int) -> c_int; // kill(2)
+    // <sys/prctl.h>, prctl(2): variadic there, so variadic here; callers
+    // pass all four `unsigned long` arguments the C wrapper reads.
+    pub(crate) fn prctl(option: c_int, ...) -> c_int;
 }
 
 #[cfg(test)]
@@ -103,6 +117,7 @@ mod tests {
         assert_eq!(align_of::<sockaddr_nl>(), 4);
         assert_eq!(size_of::<sa_family_t>(), 2);
         assert_eq!(size_of::<uid_t>(), 4);
+        assert_eq!(size_of::<pid_t>(), 4);
         assert_eq!(size_of::<socklen_t>(), 4);
         assert_eq!(size_of::<size_t>(), size_of::<usize>());
     }
