@@ -11,6 +11,7 @@
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Asn;
 
+use crate::affected::PrefixSet;
 use crate::index::{Bits, LenIndex};
 use crate::origin::RouteOrigin;
 use crate::state::RovState;
@@ -201,6 +202,33 @@ fn validate_in<K: Bits>(family: &Family<K>, key: K, len: u8, origin: RouteOrigin
     } else {
         // RFC 6811 §2: "No VRP Covers the Route Prefix."
         RovState::NotFound
+    }
+}
+
+/// Add to `out` the prefix of every VRP that is in one of `old` and `new`
+/// but not in the other. Compares all the VRPs of a prefix at once.
+pub(crate) fn changed_prefixes(old: &VrpSet, new: &VrpSet, out: &mut PrefixSet) {
+    changed_in(&old.v4, &new.v4, |key, len| {
+        out.insert(key.prefix(len));
+    });
+    changed_in(&old.v6, &new.v6, |key, len| {
+        out.insert(key.prefix(len));
+    });
+}
+
+fn changed_in<K: Bits>(old: &Family<K>, new: &Family<K>, mut changed: impl FnMut(K, u8)) {
+    for (key, len, before) in old.iter() {
+        let after = auths(new, key, len);
+        // Neither list holds an entry twice, so equal lengths and
+        // inclusion one way make them equal.
+        if before.len() != after.len() || !before.iter().all(|a| after.contains(a)) {
+            changed(key, len);
+        }
+    }
+    for (key, len, _) in new.iter() {
+        if old.get(key, len).is_none() {
+            changed(key, len);
+        }
     }
 }
 

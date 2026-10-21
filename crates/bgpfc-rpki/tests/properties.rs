@@ -1,11 +1,13 @@
 //! Property tests: `VrpSet` against a naive model that follows the text of
-//! RFC 6811 §2 and the §2.1 pseudo-code literally, one VRP at a time.
+//! RFC 6811 §2 and the §2.1 pseudo-code literally, one VRP at a time; and
+//! `AffectedPrefixes` against the states that actually change (RFC 6811
+//! §4).
 #![cfg(not(miri))]
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_rpki::{AffectedPrefixes, PrefixSet, RouteOrigin, RovState, Vrp, VrpSet};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Asn;
 use proptest::prelude::*;
@@ -162,6 +164,71 @@ proptest! {
         // with a set built from scratch.
         for (prefix, origin) in routes.into_iter().chain(edge_routes(&pool)) {
             prop_assert_eq!(set.validate(prefix, origin), model(&expected, prefix, origin));
+        }
+    }
+
+    #[test]
+    fn prefix_set_covers_per_the_definition(
+        prefixes in prop::collection::vec(prefix(), 0..32),
+        routes in prop::collection::vec(prefix(), 1..48),
+    ) {
+        let set: PrefixSet = prefixes.iter().copied().collect();
+        let distinct: BTreeSet<Prefix> = prefixes.iter().copied().collect();
+        prop_assert_eq!(set.len(), distinct.len());
+        prop_assert_eq!(set.iter().collect::<BTreeSet<_>>(), distinct);
+        for route in routes.into_iter().chain(prefixes.iter().copied()) {
+            prop_assert_eq!(
+                set.covers(route),
+                prefixes.iter().any(|p| covers(*p, route)),
+                "{}", route
+            );
+        }
+    }
+
+    #[test]
+    fn affected_prefixes_cover_every_route_that_changes_state(
+        old in prop::collection::vec(vrp(), 0..32),
+        keep in prop::collection::vec(any::<bool>(), 32),
+        added in prop::collection::vec(vrp(), 0..16),
+        routes in prop::collection::vec(prefix(), 1..48),
+    ) {
+        // The new set keeps some of the old VRPs and adds others, so the
+        // two overlap the way consecutive RTR snapshots do.
+        let old_set: VrpSet = old.iter().copied().collect();
+        let new_set: VrpSet = old
+            .iter()
+            .zip(&keep)
+            .filter(|(_, keep)| **keep)
+            .map(|(vrp, _)| *vrp)
+            .chain(added.iter().copied())
+            .collect();
+        let delta: Vec<Vrp> = old_set
+            .iter()
+            .filter(|vrp| !new_set.contains(*vrp))
+            .chain(new_set.iter().filter(|vrp| !old_set.contains(*vrp)))
+            .collect();
+        let between = AffectedPrefixes::between(&old_set, &new_set);
+        let from_delta = AffectedPrefixes::from_vrps(delta.iter().copied());
+
+        // Exactly the prefixes of the VRPs that changed, from either side.
+        let changed: PrefixSet = delta.iter().map(Vrp::prefix).collect();
+        prop_assert_eq!(&between, &AffectedPrefixes::CoveredBy(changed.clone()));
+        prop_assert_eq!(&from_delta, &AffectedPrefixes::CoveredBy(changed));
+        prop_assert_eq!(&AffectedPrefixes::between(&new_set, &old_set), &between);
+        prop_assert_eq!(between.is_empty(), old_set == new_set);
+
+        // Sound: a route whose state differs, for any origin, is covered.
+        let mut origins: Vec<RouteOrigin> = vec![RouteOrigin::None];
+        origins.extend((64_496..64_499).map(|a| RouteOrigin::As(Asn(a))));
+        let edges = edge_routes(&old).into_iter().chain(edge_routes(&added)).map(|(p, _)| p);
+        for route in routes.into_iter().chain(edges) {
+            let changes = origins
+                .iter()
+                .any(|o| old_set.validate(route, *o) != new_set.validate(route, *o));
+            if changes {
+                prop_assert!(between.covers(route), "{}", route);
+                prop_assert!(from_delta.covers(route), "{}", route);
+            }
         }
     }
 }
