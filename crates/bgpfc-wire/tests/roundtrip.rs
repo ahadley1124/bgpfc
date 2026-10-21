@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
-use bgpfc_wire::capability::Capability;
+use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::header::{Header, MessageType, frame};
@@ -81,14 +81,35 @@ fn address_family() -> impl Strategy<Value = AddressFamily> {
     })
 }
 
+/// RFC 8950 §4 triples: mostly the values the RFC allows, sometimes any.
+fn next_hop_encoding() -> impl Strategy<Value = NextHopEncoding> {
+    prop_oneof![
+        3 => prop_oneof![Just(1u16), Just(2), Just(4), Just(128), Just(129)].prop_map(|safi| {
+            NextHopEncoding {
+                nlri_safi: safi,
+                ..NextHopEncoding::IPV4_UNICAST_VIA_IPV6
+            }
+        }),
+        1 => (any::<u16>(), any::<u16>(), any::<u16>()).prop_map(|(afi, safi, nh)| {
+            NextHopEncoding {
+                nlri_afi: Afi::from_u16(afi),
+                nlri_safi: safi,
+                next_hop_afi: Afi::from_u16(nh),
+            }
+        }),
+    ]
+}
+
 fn capability() -> impl Strategy<Value = Capability> {
     prop_oneof![
         address_family().prop_map(Capability::Multiprotocol),
         Just(Capability::RouteRefresh),
         Just(Capability::ExtendedMessage),
         any::<u32>().prop_map(|a| Capability::FourOctetAs(Asn(a))),
+        // RFC 8950 §4: at most 42 six-octet triples fit the length octet.
+        vec(next_hop_encoding(), 0..=42).prop_map(Capability::ExtendedNextHop),
         (
-            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 6 | 65)),
+            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65)),
             vec(any::<u8>(), 0..=255)
         )
             .prop_map(|(code, value)| Capability::Unknown { code, value }),
@@ -342,6 +363,24 @@ proptest! {
         let mut r = Reader::new(&wire);
         prop_assert_eq!(Capability::decode(&mut r).unwrap(), c);
         prop_assert!(r.is_empty());
+    }
+
+    #[test]
+    fn extended_next_hop_accepts_exactly_whole_triples(value in vec(any::<u8>(), 0..=255)) {
+        // RFC 8950 §4 / RFC 4271 §6.2: whole six-octet triples decode, and
+        // re-encode to the same octets; anything else is malformed.
+        let mut wire = vec![5, u8::try_from(value.len()).unwrap()];
+        wire.extend_from_slice(&value);
+        let decoded = Capability::decode(&mut Reader::new(&wire));
+        if value.len() % 6 == 0 {
+            let c = decoded.unwrap();
+            prop_assert!(matches!(&c, Capability::ExtendedNextHop(t) if t.len() == value.len() / 6));
+            let mut again = Vec::new();
+            c.encode(&mut again).unwrap();
+            prop_assert_eq!(again, wire);
+        } else {
+            prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
+        }
     }
 
     #[test]
