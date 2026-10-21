@@ -1,6 +1,7 @@
 //! What the RIB knows about a session.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
@@ -26,6 +27,12 @@ pub struct PeerInfo {
     pub four_octet_as: bool,
     /// Both sides accept 65535-octet messages (RFC 8654 §4).
     pub extended_messages: bool,
+    /// The `MinRouteAdvertisementIntervalTimer` (RFC 4271 §9.2.1.1): the
+    /// least time between two advertisements of a destination to this
+    /// peer. Zero sends every change at once.
+    /// [`default_interval`](crate::pacing::default_interval) gives the
+    /// RFC 4271 §10 default.
+    pub advertisement_interval: Duration,
 }
 
 impl PeerInfo {

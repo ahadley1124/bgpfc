@@ -231,6 +231,7 @@ fn engine_applies_each_neighbors_policies() {
         families: vec![V4],
         four_octet_as: true,
         extended_messages: false,
+        advertisement_interval: std::time::Duration::ZERO,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();

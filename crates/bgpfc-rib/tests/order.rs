@@ -4,6 +4,7 @@
 #![cfg(not(miri))]
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, Instant};
 
 use bgpfc_rib::{PeerInfo, Rib};
 use bgpfc_wire::as_path::AsPath;
@@ -52,6 +53,9 @@ fn peers() -> Vec<PeerInfo> {
             families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
+            // Unpaced, so the Adj-RIBs-Out are final after the last step;
+            // tests/pacing.rs covers the paced case.
+            advertisement_interval: Duration::ZERO,
         })
         .collect()
 }
@@ -123,13 +127,14 @@ fn step() -> impl Strategy<Value = Step> {
 /// The final state: best route per prefix and each peer's Adj-RIB-Out.
 fn run(steps: &[Step]) -> (Vec<(Prefix, IpAddr)>, Vec<Vec<Prefix>>) {
     let infos = peers();
+    let now = Instant::now();
     let mut rib = Rib::new(LOCAL_AS);
     for info in &infos {
-        rib.peer_up(info.clone());
+        rib.peer_up(info.clone(), now);
     }
     for s in steps {
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info));
+        rib.update(info.addr, &update(s, info), now);
     }
     let best = rib.loc_rib(V4).map(|(p, b)| (p, b.peer)).collect();
     let outs = infos

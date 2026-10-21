@@ -6,22 +6,30 @@
 //! process: Phase 1 degree of preference, Phase 2 route selection,
 //! Phase 3 route dissemination), §9.1.2 (AS loop exclusion), §9.1.4
 //! (overlapping routes are independent destinations), §9.2 (update
-//! generation), §9.3 (Loc-RIB changes are reported for the FIB), §6.3
+//! generation), §9.2.1.1 (`MinRouteAdvertisementIntervalTimer`, see
+//! [`pacing`]), §9.3 (Loc-RIB changes are reported for the FIB), §6.3
 //! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's);
 //! RFC 4760 §5, §7 (per-family RIBs, family disable); RFC 2918 §4
 //! (route refresh re-sends the Adj-RIB-Out).
+//!
+//! Time is injected: every call that can send takes `now`, and
+//! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
+//! advertisements when their interval ends.
 #![forbid(unsafe_code)]
 
 pub mod attrs;
 pub mod decision;
 pub mod export;
+pub mod pacing;
 pub mod peer;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn};
@@ -31,6 +39,8 @@ pub use attrs::{Interner, PathAttrs};
 pub use decision::Candidate;
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
+
+use pacing::{AdjRibOut, Clock, Jitter, Now, Pace, Step, Tick};
 
 /// What a policy decided about a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,8 +144,9 @@ struct PeerState {
     /// Families disabled after a malformed multiprotocol attribute
     /// (RFC 4760 §7); no more routes are accepted for them.
     disabled: HashSet<AddressFamily>,
-    /// Adj-RIB-Out: what the peer was last told, per family.
-    adj_out: HashMap<AddressFamily, HashMap<Prefix, Arc<PathAttrs>>>,
+    /// Adj-RIB-Out: what the peer was last told, per family, with the
+    /// RFC 4271 §9.2.1.1 pacing state.
+    adj_out: HashMap<AddressFamily, AdjRibOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: HashMap<AddressFamily, usize>,
 }
@@ -149,6 +160,16 @@ pub struct PeerStats {
     pub advertised: Vec<(AddressFamily, usize)>,
 }
 
+/// A wake-up for one destination of one peer (RFC 4271 §9.2.1.1): a held
+/// advertisement may go out, or a remembered one may be forgotten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Deadline {
+    at: Tick,
+    peer: IpAddr,
+    family: AddressFamily,
+    prefix: Prefix,
+}
+
 /// All RIB state.
 pub struct Rib {
     local_as: Asn,
@@ -158,6 +179,13 @@ pub struct Rib {
     /// and the best among them.
     tables: HashMap<AddressFamily, BTreeMap<Prefix, Destination>>,
     interner: Interner,
+    /// Pending wake-ups, earliest first. Entries made stale by later
+    /// changes stay until due and are then ignored.
+    deadlines: BinaryHeap<Reverse<Deadline>>,
+    /// Pacing time, counted from the first instant the RIB was given.
+    clock: Option<Clock>,
+    /// RFC 4271 §10 jitter for the pacing intervals.
+    jitter: Jitter,
 }
 
 impl Rib {
@@ -176,7 +204,16 @@ impl Rib {
             peers: HashMap::new(),
             tables: HashMap::new(),
             interner: Interner::default(),
+            deadlines: BinaryHeap::new(),
+            clock: None,
+            jitter: Jitter::new(0),
         }
+    }
+
+    /// Seed the RFC 4271 §10 jitter of the advertisement intervals; zero,
+    /// the default, applies none.
+    pub fn set_jitter_seed(&mut self, seed: u64) {
+        self.jitter = Jitter::new(seed);
     }
 
     /// Replace the policies. The caller re-evaluates routes afterwards
@@ -193,8 +230,8 @@ impl Rib {
 
     /// A session reached Established: remember the peer and send it the
     /// Loc-RIB for every negotiated family (RFC 4271 §9.2: the initial
-    /// Adj-RIB-Out).
-    pub fn peer_up(&mut self, info: PeerInfo) -> Vec<Output> {
+    /// Adj-RIB-Out). These first advertisements are not held back.
+    pub fn peer_up(&mut self, info: PeerInfo, now: Instant) -> Vec<Output> {
         let addr = info.addr;
         let families = info.families.clone();
         self.peers.insert(
@@ -208,13 +245,13 @@ impl Rib {
         );
         let mut out = Vec::new();
         for family in families {
-            out.extend(self.refresh(addr, family));
+            out.extend(self.refresh(addr, family, now));
         }
         out
     }
 
     /// The session left Established: forget the peer and its routes.
-    pub fn peer_down(&mut self, addr: IpAddr) -> Vec<Output> {
+    pub fn peer_down(&mut self, addr: IpAddr, now: Instant) -> Vec<Output> {
         let Some(state) = self.peers.remove(&addr) else {
             return Vec::new();
         };
@@ -228,12 +265,17 @@ impl Rib {
                 }
             }
         }
-        self.reconsider(&dirty)
+        self.reconsider(&dirty, now)
     }
 
     /// Stop accepting `family` from `addr` and drop what it sent
     /// (RFC 4760 §7).
-    pub fn family_disabled(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    pub fn family_disabled(
+        &mut self,
+        addr: IpAddr,
+        family: AddressFamily,
+        now: Instant,
+    ) -> Vec<Output> {
         let Some(state) = self.peers.get_mut(&addr) else {
             return Vec::new();
         };
@@ -247,12 +289,14 @@ impl Rib {
                 }
             }
         }
-        self.reconsider(&dirty)
+        self.reconsider(&dirty, now)
     }
 
     /// The peer asked for `family` again (RFC 2918 §4): resend the
-    /// Adj-RIB-Out in full. Also used to build the initial one.
-    pub fn refresh(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    /// Adj-RIB-Out in full, held destinations as they are now. Also used
+    /// to build the initial one. Every destination's interval restarts.
+    pub fn refresh(&mut self, addr: IpAddr, family: AddressFamily, now: Instant) -> Vec<Output> {
+        let now = self.now(now);
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
         };
@@ -261,30 +305,29 @@ impl Rib {
         }
         let info = state.info.clone();
         let mut batch = Batch::default();
-        let mut adj_out = HashMap::new();
-        let bests: Vec<(Prefix, BestRoute)> = self
-            .tables
-            .get(&family)
-            .into_iter()
-            .flat_map(|t| t.iter())
-            .filter_map(|(p, d)| d.best.clone().map(|b| (*p, b)))
-            .collect();
-        for (prefix, best) in bests {
+        let mut routes = Vec::new();
+        for (prefix, best) in self.bests(family) {
             if let Some(a) = self.exported(family, prefix, &best, &info) {
                 batch.announce(&a, prefix);
-                adj_out.insert(prefix, a);
+                routes.push((prefix, a));
             }
         }
         if let Some(state) = self.peers.get_mut(&addr) {
-            state.adj_out.insert(family, adj_out);
+            batch.withdraw = state
+                .adj_out
+                .entry(family)
+                .or_default()
+                .readvertise(routes, now);
         }
         Rib::emit(&info, family, &batch)
     }
 
     /// Re-run export for `addr` and `family` after a policy change: only
     /// what differs from the Adj-RIB-Out is sent (announcements for new
-    /// or changed routes, withdrawals for routes no longer exported).
-    pub fn reexport(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    /// or changed routes, withdrawals for routes no longer exported),
+    /// paced like any other change (RFC 4271 §9.2.1.1).
+    pub fn reexport(&mut self, addr: IpAddr, family: AddressFamily, now: Instant) -> Vec<Output> {
+        let now = self.now(now);
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
         };
@@ -292,33 +335,150 @@ impl Rib {
             return Vec::new();
         }
         let info = state.info.clone();
-        let old = state.adj_out.get(&family).cloned().unwrap_or_default();
-        let bests: Vec<(Prefix, BestRoute)> = self
-            .tables
-            .get(&family)
-            .into_iter()
-            .flat_map(|t| t.iter())
-            .filter_map(|(p, d)| d.best.clone().map(|b| (*p, b)))
-            .collect();
         let mut batch = Batch::default();
-        let mut adj_out = HashMap::new();
-        for (prefix, best) in bests {
-            if let Some(a) = self.exported(family, prefix, &best, &info) {
-                if !old.get(&prefix).is_some_and(|o| Arc::ptr_eq(o, &a)) {
-                    batch.announce(&a, prefix);
-                }
-                adj_out.insert(prefix, a);
-            }
+        for (prefix, best) in self.bests(family) {
+            let desired = self.exported(family, prefix, &best, &info);
+            self.offer(addr, family, prefix, desired, now, &mut batch);
         }
-        for prefix in old.keys() {
-            if !adj_out.contains_key(prefix) {
-                batch.withdraw.push(*prefix);
-            }
-        }
-        if let Some(state) = self.peers.get_mut(&addr) {
-            state.adj_out.insert(family, adj_out);
+        // Destinations the peer has that no longer have a route at all.
+        let table = self.tables.get(&family);
+        let gone: Vec<Prefix> = self
+            .peers
+            .get(&addr)
+            .and_then(|s| s.adj_out.get(&family))
+            .into_iter()
+            .flat_map(AdjRibOut::prefixes)
+            .filter(|p| {
+                table
+                    .and_then(|t| t.get(p))
+                    .and_then(|d| d.best.as_ref())
+                    .is_none()
+            })
+            .collect();
+        for prefix in gone {
+            self.offer(addr, family, prefix, None, now, &mut batch);
         }
         Rib::emit(&info, family, &batch)
+    }
+
+    /// Change the `MinRouteAdvertisementIntervalTimer` of peer `addr`
+    /// (RFC 4271 §9.2.1.1). Held destinations move to the new end of
+    /// their interval, and go out now if that has passed.
+    pub fn set_advertisement_interval(
+        &mut self,
+        addr: IpAddr,
+        interval: Duration,
+        now: Instant,
+    ) -> Vec<Output> {
+        let pace_now = self.now(now);
+        let Some(state) = self.peers.get_mut(&addr) else {
+            return Vec::new();
+        };
+        if state.info.advertisement_interval == interval {
+            return Vec::new();
+        }
+        state.info.advertisement_interval = interval;
+        let mut pace = Pace {
+            interval,
+            now: pace_now,
+            jitter: &mut self.jitter,
+        };
+        for (family, adj) in &mut state.adj_out {
+            for (prefix, at) in adj.reschedule(&mut pace) {
+                self.deadlines.push(Reverse(Deadline {
+                    at,
+                    peer: addr,
+                    family: *family,
+                    prefix,
+                }));
+            }
+        }
+        self.flush(now)
+    }
+
+    /// When [`Rib::flush`] next has something to do, if ever: the owner
+    /// calls it then. Stale wake-ups make this early at worst, never late.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let clock = self.clock?;
+        let Reverse(d) = self.deadlines.peek()?;
+        clock.instant(d.at)
+    }
+
+    /// Send what the interval held back and may go out by `now`: for each
+    /// such destination, the route it has now, if that differs from what
+    /// the peer has (RFC 4271 §9.2.1.1). Every Loc-RIB change, whatever
+    /// caused it, is offered to each peer's pacing; what it holds back
+    /// comes out here.
+    pub fn flush(&mut self, now: Instant) -> Vec<Output> {
+        let Some(clock) = self.clock else {
+            return Vec::new();
+        };
+        let now = clock.now(now);
+        let mut due = Vec::new();
+        while let Some(Reverse(d)) = self.deadlines.peek()
+            && d.at <= now.floor
+        {
+            due.push(*d);
+            self.deadlines.pop();
+        }
+        if due.is_empty() {
+            return Vec::new();
+        }
+        // One batch per peer and family, so that what is released together
+        // is packed together (RFC 4271 §9.2).
+        due.sort_unstable_by_key(|d| (d.peer, d.family, d.prefix));
+        due.dedup_by_key(|d| (d.peer, d.family, d.prefix));
+        let mut out = Vec::new();
+        for group in due.chunk_by(|a, b| a.peer == b.peer && a.family == b.family) {
+            let (peer, family) = (group[0].peer, group[0].family);
+            let Some(info) = self.peers.get(&peer).map(|s| s.info.clone()) else {
+                continue;
+            };
+            let mut batch = Batch::default();
+            for d in group {
+                let Some(adj) = self
+                    .peers
+                    .get_mut(&peer)
+                    .and_then(|s| s.adj_out.get_mut(&family))
+                else {
+                    break;
+                };
+                let wake = adj.wake(d.prefix, info.advertisement_interval, now);
+                if let Some(at) = wake.again {
+                    self.deadlines.push(Reverse(Deadline { at, ..*d }));
+                }
+                if !wake.release {
+                    continue;
+                }
+                let desired = self
+                    .best(family, d.prefix)
+                    .and_then(|b| self.exported(family, d.prefix, &b, &info));
+                let Some(state) = self.peers.get_mut(&peer) else {
+                    break;
+                };
+                let mut pace = Pace {
+                    interval: state.info.advertisement_interval,
+                    now,
+                    jitter: &mut self.jitter,
+                };
+                let step = state
+                    .adj_out
+                    .entry(family)
+                    .or_default()
+                    .release(d.prefix, desired, &mut pace);
+                record(
+                    step,
+                    peer,
+                    family,
+                    d.prefix,
+                    &mut batch,
+                    &mut self.deadlines,
+                );
+            }
+            out.extend(Rib::emit(&info, family, &batch));
+        }
+        out
     }
 
     /// What the RIB knows about peer `addr`, if it is up.
@@ -330,7 +490,7 @@ impl Rib {
     /// An UPDATE from `addr`: apply its withdrawals and announcements to
     /// the Adj-RIB-In, rerun the decision process for the destinations
     /// touched, and produce the FIB changes and UPDATEs that follow.
-    pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate) -> Vec<Output> {
+    pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate, now: Instant) -> Vec<Output> {
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
         };
@@ -423,7 +583,7 @@ impl Rib {
             }
             dirty.push((family, prefix));
         }
-        self.reconsider(&dirty)
+        self.reconsider(&dirty, now)
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
@@ -454,7 +614,7 @@ impl Rib {
             .get(&addr)
             .and_then(|p| p.adj_out.get(&family))
             .into_iter()
-            .flat_map(|m| m.iter().map(|(p, a)| (*p, a)))
+            .flat_map(AdjRibOut::iter)
     }
 
     /// Route counts for `addr`.
@@ -468,7 +628,7 @@ impl Rib {
                 .push((*family, p.adj_in_count.get(family).copied().unwrap_or(0)));
             stats
                 .advertised
-                .push((*family, p.adj_out.get(family).map_or(0, HashMap::len)));
+                .push((*family, p.adj_out.get(family).map_or(0, AdjRibOut::len)));
         }
         Some(stats)
     }
@@ -492,8 +652,11 @@ impl Rib {
     }
 
     /// Rerun Phase 2 for each dirty destination and Phase 3 for every
-    /// destination whose best route changed.
-    fn reconsider(&mut self, dirty: &[(AddressFamily, Prefix)]) -> Vec<Output> {
+    /// destination whose best route changed. Phase 3 goes through the
+    /// pacing of each peer (RFC 4271 §9.2.1.1), so every Loc-RIB change,
+    /// whatever caused it, is rate-limited the same way.
+    fn reconsider(&mut self, dirty: &[(AddressFamily, Prefix)], now: Instant) -> Vec<Output> {
+        let now = self.now(now);
         let mut out = Vec::new();
         let mut batches: HashMap<(IpAddr, AddressFamily), Batch> = HashMap::new();
         let mut seen = HashSet::new();
@@ -534,25 +697,8 @@ impl Rib {
                 let exported = new_best
                     .as_ref()
                     .and_then(|b| self.exported(family, prefix, b, &info));
-                let Some(state) = self.peers.get_mut(&info.addr) else {
-                    continue;
-                };
-                let adj_out = state.adj_out.entry(family).or_default();
                 let batch = batches.entry((info.addr, family)).or_default();
-                match exported {
-                    Some(a) => {
-                        let same = adj_out.get(&prefix).is_some_and(|old| Arc::ptr_eq(old, &a));
-                        if !same {
-                            adj_out.insert(prefix, Arc::clone(&a));
-                            batch.announce(&a, prefix);
-                        }
-                    }
-                    None => {
-                        if adj_out.remove(&prefix).is_some() {
-                            batch.withdraw.push(prefix);
-                        }
-                    }
-                }
+                self.offer(info.addr, family, prefix, exported, now, batch);
             }
         }
         let mut keys: Vec<_> = batches.keys().copied().collect();
@@ -565,6 +711,53 @@ impl Rib {
             }
         }
         out
+    }
+
+    /// Offer `desired` for `prefix` to `peer`'s pacing and put what it
+    /// says to send now into `batch`.
+    fn offer(
+        &mut self,
+        peer: IpAddr,
+        family: AddressFamily,
+        prefix: Prefix,
+        desired: Option<Arc<PathAttrs>>,
+        now: Now,
+        batch: &mut Batch,
+    ) {
+        let Some(state) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let mut pace = Pace {
+            interval: state.info.advertisement_interval,
+            now,
+            jitter: &mut self.jitter,
+        };
+        let step = state
+            .adj_out
+            .entry(family)
+            .or_default()
+            .offer(prefix, desired, &mut pace);
+        record(step, peer, family, prefix, batch, &mut self.deadlines);
+    }
+
+    /// The pacing time of `now`; the first instant ever given is tick 0.
+    fn now(&mut self, now: Instant) -> Now {
+        self.clock.get_or_insert(Clock::new(now)).now(now)
+    }
+
+    /// The best route to every destination of `family`, in prefix order.
+    fn bests(&self, family: AddressFamily) -> Vec<(Prefix, BestRoute)> {
+        self.tables
+            .get(&family)
+            .into_iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|(p, d)| d.best.clone().map(|b| (*p, b)))
+            .collect()
+    }
+
+    /// The best route to `prefix`.
+    fn best(&self, family: AddressFamily, prefix: Prefix) -> Option<BestRoute> {
+        self.tables.get(&family)?.get(&prefix)?.best.clone()
     }
 
     /// The interned attributes `best` is advertised with to `to`, if any:
@@ -616,6 +809,37 @@ impl Rib {
                 error,
             }],
         }
+    }
+}
+
+/// Put a pacing decision for `prefix` into `batch`, and its wake-up, if
+/// any, into `deadlines`.
+fn record(
+    step: Step,
+    peer: IpAddr,
+    family: AddressFamily,
+    prefix: Prefix,
+    batch: &mut Batch,
+    deadlines: &mut BinaryHeap<Reverse<Deadline>>,
+) {
+    let wake = |at| {
+        Reverse(Deadline {
+            at,
+            peer,
+            family,
+            prefix,
+        })
+    };
+    match step {
+        Step::Quiet => {}
+        Step::Announce(a) => batch.announce(&a, prefix),
+        Step::Withdraw { forget } => {
+            batch.withdraw.push(prefix);
+            if let Some(at) = forget {
+                deadlines.push(wake(at));
+            }
+        }
+        Step::Hold(at) => deadlines.push(wake(at)),
     }
 }
 

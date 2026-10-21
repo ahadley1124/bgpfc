@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
 use bgpfc_rib::{Output, PeerInfo, Policies, Rib};
@@ -38,6 +39,7 @@ fn run(
 ) {
     let mut rib = Rib::with_policies(local_as, policies);
     while let Ok(msg) = rx.recv() {
+        let now = Instant::now();
         let outputs = match msg {
             RibMsg::PeerUp {
                 peer,
@@ -55,19 +57,19 @@ fn run(
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                rib.peer_up(peer_info(peer, local_addr, &session))
+                rib.peer_up(peer_info(peer, local_addr, &session), now)
             }
             RibMsg::Update { peer, update } => {
                 log_update(peer, &update);
-                rib.update(peer, &update)
+                rib.update(peer, &update, now)
             }
             RibMsg::FamilyDisabled { peer, family } => {
                 bgpfc_log::warn!("rib: family disabled", peer = peer, family = family);
-                rib.family_disabled(peer, family)
+                rib.family_disabled(peer, family, now)
             }
             RibMsg::RouteRefresh { peer, family } => {
                 bgpfc_log::info!("rib: route refresh", peer = peer, family = family);
-                rib.refresh(peer, family)
+                rib.refresh(peer, family, now)
             }
             RibMsg::PeerDown { peer } => {
                 let stats = rib.peer_stats(peer).unwrap_or_default();
@@ -76,7 +78,7 @@ fn run(
                     peer = peer,
                     routes_deleted = stats.received.iter().map(|(_, n)| n).sum::<usize>()
                 );
-                rib.peer_down(peer)
+                rib.peer_down(peer, now)
             }
             RibMsg::Query(q, reply) => {
                 let _ = reply.send(answer(&rib, &q));
@@ -92,7 +94,7 @@ fn run(
                         .unwrap_or_default();
                     for family in families {
                         bgpfc_log::info!("rib: re-export", peer = peer, family = family);
-                        out.extend(rib.reexport(peer, family));
+                        out.extend(rib.reexport(peer, family, now));
                     }
                 }
                 out
@@ -105,7 +107,7 @@ fn run(
                 let mut out = Vec::new();
                 for family in families {
                     bgpfc_log::info!("rib: resend", peer = peer, family = family);
-                    out.extend(rib.refresh(peer, family));
+                    out.extend(rib.refresh(peer, family, now));
                 }
                 out
             }
@@ -124,6 +126,8 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session) -> PeerInfo {
         families: s.families.clone(),
         four_octet_as: s.four_octet_as,
         extended_messages: s.extended_messages,
+        // Unpaced until the configuration carries the interval.
+        advertisement_interval: Duration::ZERO,
     }
 }
 
