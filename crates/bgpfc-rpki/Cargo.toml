@@ -10,5 +10,9 @@ description = "RPKI route origin validation (RFC 6811): VRP sets and validation 
 [dependencies]
 bgpfc-wire.workspace = true
 
+# AGENTS.md §1.2: verification only; never a normal dependency.
+[dev-dependencies]
+proptest = "1.11"
+
 [lints]
 workspace = true

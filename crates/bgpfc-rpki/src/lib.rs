@@ -2,17 +2,21 @@
 //! cache hands to a router, and the validation state each route gets from
 //! them.
 //!
-//! The crate knows nothing about how VRPs arrive; the RTR client fills it
-//! from a cache (RFC 8210).
+//! The crate knows nothing about how VRPs arrive: the RTR client
+//! (RFC 8210) fills a [`VrpSet`] from a cache, and [`VrpSet::validate`]
+//! gives each route its [`RovState`].
 //!
 //! Implements: RFC 6811 §2 (VRPs, the Route Origin ASN, Covered, Matched,
 //! the three validation states); RFC 6483 §2 (validation outcome),
 //! §4 (an AS 0 ROA disavows origination); RFC 7607 §2 (AS 0 is never a
 //! valid origin); RFC 9319 §3 (a VRP authorises nothing longer than its
-//! maxLength); RFC 8210 §5.1, §5.6, §5.7 (bounds of Max Length).
+//! maxLength); RFC 8210 §5.1, §5.6, §5.7 (bounds of Max Length; one VRP
+//! per {Prefix, Len, Max-Len, ASN}).
 #![forbid(unsafe_code)]
 
+mod index;
 pub mod origin;
+pub mod set;
 pub mod state;
 pub mod vrp;
 
@@ -21,6 +25,7 @@ use std::fmt;
 use bgpfc_wire::prefix::Prefix;
 
 pub use origin::RouteOrigin;
+pub use set::VrpSet;
 pub use state::{AspaState, RovState};
 pub use vrp::Vrp;
 
