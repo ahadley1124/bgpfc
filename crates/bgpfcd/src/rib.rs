@@ -322,6 +322,7 @@ mod tests {
             extended_messages: false,
             route_refresh: true,
             families: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop: Vec::new(),
             peer_capabilities: Vec::new(),
         }
     }

@@ -3,11 +3,11 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::Capability;
+use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, UpdateSubcode};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId};
 
 use super::*;
 use crate::{Damping, PeerKind};
@@ -434,6 +434,8 @@ fn open_negotiation() {
     assert!(s.route_refresh);
     // RFC 4760 §8: only IPv4 unicast on both sides.
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+    // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
+    assert_eq!(s.extended_next_hop, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
     assert_eq!(
         f.timer(TimerKind::Keepalive).deadline(),
@@ -470,6 +472,98 @@ fn internal_session_and_old_speaker() {
     assert!(!s.route_refresh);
     assert_eq!(s.hold_time, hold(90));
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+}
+
+#[test]
+fn extended_next_hop_needs_both_sides_and_ipv4_unicast() {
+    let enh = |triples: &[NextHopEncoding]| Capability::ExtendedNextHop(triples.to_vec());
+    let v4_via_v6 = NextHopEncoding::IPV4_UNICAST_VIA_IPV6;
+    let negotiated = |ours: Vec<Capability>, theirs: Vec<Capability>| {
+        let mut cfg = config();
+        cfg.capabilities.extend(ours);
+        let (mut f, now) = fsm_at(State::OpenSent, cfg);
+        f.handle(
+            Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+            now,
+        );
+        let s = f.session().unwrap();
+        (s.extended_next_hop.clone(), s.families.clone())
+    };
+    let v4 = || vec![AddressFamily::IPV4_UNICAST];
+    let mp = |f| Capability::Multiprotocol(f);
+    // RFC 8950 §4: both sides list <1, 1, 2>.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (v4(), v4())
+    );
+    // One side only, either way: not negotiated.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST)]
+        ),
+        (vec![], v4())
+    );
+    assert_eq!(
+        negotiated(
+            vec![],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (vec![], v4())
+    );
+    // Other triples do not stand in for <1, 1, 2>: VPN-IPv4 (§6.2), an
+    // IPv4 next hop, a SAFI that does not fit one octet.
+    let others = [
+        NextHopEncoding {
+            nlri_safi: 128,
+            ..v4_via_v6
+        },
+        NextHopEncoding {
+            next_hop_afi: Afi::Ipv4,
+            ..v4_via_v6
+        },
+        NextHopEncoding {
+            nlri_safi: 0x0101,
+            ..v4_via_v6
+        },
+    ];
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&others)]
+        ),
+        (vec![], v4())
+    );
+    // RFC 5492 §4: the triple may come in a second instance.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![
+                mp(AddressFamily::IPV4_UNICAST),
+                enh(&others),
+                enh(&[v4_via_v6])
+            ]
+        ),
+        (v4(), v4())
+    );
+    // RFC 8950 §4: the capability does not make IPv4 unicast usable; only
+    // the Multiprotocol capability does (RFC 4760 §8).
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (vec![], vec![AddressFamily::IPV6_UNICAST])
+    );
+    // A peer without any Multiprotocol capability speaks IPv4 unicast
+    // implicitly (RFC 4760 §8), so the triple applies.
+    assert_eq!(
+        negotiated(vec![enh(&[v4_via_v6])], vec![enh(&[v4_via_v6])]),
+        (v4(), v4())
+    );
 }
 
 #[test]

@@ -14,7 +14,8 @@
 //! subcodes for administrative stops and collisions); RFC 5492 §5
 //! (Unsupported Capability); RFC 4760 §8 (families need both sides);
 //! RFC 6793 §3 (four-octet AS negotiation); RFC 8654 §4 (Extended Message
-//! negotiation); RFC 7607 §2 (never claim AS 0).
+//! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
+//! RFC 7607 §2 (never claim AS 0).
 #![forbid(unsafe_code)]
 
 mod machine;
@@ -222,6 +223,11 @@ pub struct Session {
     /// Families both sides advertised (RFC 4760 §8), or IPv4 unicast alone
     /// when neither side used the Multiprotocol capability.
     pub families: Vec<AddressFamily>,
+    /// The families in `families` for which both sides advertised
+    /// Extended Next Hop Encoding (RFC 8950 §4): their routes may carry an
+    /// IPv6 next hop either way. Only IPv4 unicast with an IPv6 next hop
+    /// is ever advertised, so this is that family or nothing.
+    pub extended_next_hop: Vec<AddressFamily>,
     /// Capabilities the peer advertised, verbatim.
     pub peer_capabilities: Vec<Capability>,
 }

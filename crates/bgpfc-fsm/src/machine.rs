@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::Capability;
+use bgpfc_wire::capability::{Capability, NextHopEncoding, next_hop_encodings};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, FsmSubcode, OpenSubcode};
 use bgpfc_wire::header::MessageType;
 use bgpfc_wire::notification::NotificationMessage;
@@ -721,6 +721,18 @@ impl Fsm {
         // RFC 2918 §4: send ROUTE-REFRESH only if the peer advertised it.
         let route_refresh = open.has(&Capability::RouteRefresh);
         let families = negotiate_families(ours, &open.capabilities);
+        // RFC 8950 §4: an IPv6 next hop for IPv4 unicast once both sides
+        // listed the triple. The capability says nothing about whether the
+        // family itself is used; the Multiprotocol capability alone decides
+        // that, hence the check against `families`.
+        let extended_next_hop = if families.contains(&AddressFamily::IPV4_UNICAST)
+            && ipv4_unicast_via_ipv6(ours)
+            && ipv4_unicast_via_ipv6(&open.capabilities)
+        {
+            vec![AddressFamily::IPV4_UNICAST]
+        } else {
+            Vec::new()
+        };
         if families.is_empty() {
             // RFC 5492 §5: Unsupported Capability, Data = the capabilities
             // we require, encoded as in the OPEN.
@@ -750,6 +762,7 @@ impl Fsm {
             extended_messages,
             route_refresh,
             families,
+            extended_next_hop,
             peer_capabilities: open.capabilities.clone(),
         })
     }
@@ -911,6 +924,12 @@ impl Fsm {
             .damping
             .map_or(self.config.connect_retry_time, |d| d.initial);
     }
+}
+
+/// Whether `caps` include the RFC 8950 §4 triple `<1, 1, 2>`: IPv4 unicast
+/// NLRI with an IPv6 next hop, in any Extended Next Hop Encoding instance.
+fn ipv4_unicast_via_ipv6(caps: &[Capability]) -> bool {
+    next_hop_encodings(caps).any(|t| t == NextHopEncoding::IPV4_UNICAST_VIA_IPV6)
 }
 
 /// RFC 4760 §8: a family is usable only if both sides advertised it. A side
