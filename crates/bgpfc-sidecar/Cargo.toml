@@ -1,0 +1,13 @@
+[package]
+name = "bgpfc-sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Supervision logic for the Routinator RPKI sidecar: settings, command line, version check, restart backoff and a pure state machine"
+
+[dependencies]
+
+[lints]
+workspace = true
