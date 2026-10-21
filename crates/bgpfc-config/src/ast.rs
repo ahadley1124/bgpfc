@@ -277,12 +277,18 @@ pub struct Neighbor {
     pub allow_as_set: bool,
     /// `collision-detect-established` (RFC 4271 §6.8, §8.1.1).
     pub collision_detect_established: bool,
+    /// `advertisement-interval`: the `MinRouteAdvertisementIntervalTimer`
+    /// (RFC 4271 §9.2.1.1), zero for none. `None` takes the RFC 4271 §10
+    /// default for the session type once it is known: 30 s external, 5 s
+    /// internal.
+    pub advertisement_interval: Option<Duration>,
 }
 
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
-    /// the session reset, are the same. Description and policies are not
-    /// session parameters.
+    /// the session reset, are the same. Description, policies and the
+    /// advertisement interval are not session parameters: the interval
+    /// paces what the RIB sends and changes without a reset.
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr

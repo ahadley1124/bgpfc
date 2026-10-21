@@ -85,3 +85,9 @@ value-errors.conf:27:13: `maybe` is not `yes` or `no`
 value-errors.conf:28:5: unknown statement `unknown-thing` in `neighbor`
       unknown-thing 1;
       ^
+value-errors.conf:29:28: `65536` is not a number of seconds (0-65535)
+      advertisement-interval 65536;
+                             ^
+value-errors.conf:30:5: `advertisement-interval` is given more than once
+      advertisement-interval 5;
+      ^

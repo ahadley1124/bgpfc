@@ -21,6 +21,11 @@ pub struct ConfigDiff {
     /// anything those policies reference) changed: re-evaluate their
     /// routes, with route refresh where the peer supports it.
     pub policy_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `advertisement-interval`
+    /// changed: the RIB paces the running session with the new value
+    /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
+    /// in `policy_changed` too.
+    pub interval_changed: Vec<IpAddr>,
     /// Neighbors in both with only a description change, or none.
     pub unchanged: Vec<IpAddr>,
     /// Which global settings changed.
@@ -71,9 +76,17 @@ impl ConfigDiff {
             };
             if identity_changed || !o.same_session(n) {
                 d.reset.push(n.addr);
-            } else if policy_differs(old, o, new, n) {
+                continue;
+            }
+            let policy = policy_differs(old, o, new, n);
+            let interval = o.advertisement_interval != n.advertisement_interval;
+            if policy {
                 d.policy_changed.push(n.addr);
-            } else {
+            }
+            if interval {
+                d.interval_changed.push(n.addr);
+            }
+            if !policy && !interval {
                 d.unchanged.push(n.addr);
             }
         }
@@ -87,6 +100,7 @@ impl ConfigDiff {
             && self.removed.is_empty()
             && self.reset.is_empty()
             && self.policy_changed.is_empty()
+            && self.interval_changed.is_empty()
             && self.global.is_empty()
     }
 }
@@ -190,6 +204,41 @@ mod tests {
             ConfigDiff::between(a, &e).policy_changed,
             vec![addr("192.0.2.2"), addr("192.0.2.3")]
         );
+    }
+
+    #[test]
+    fn advertisement_interval_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // Set where it was the default, and alongside a policy change.
+        let b = cfg(&BASE
+            .replace(
+                "description \"a\";",
+                "description \"a\"; advertisement-interval 0;",
+            )
+            .replace(
+                "remote-as 65002; import IN;",
+                "remote-as 65002; advertisement-interval 5; import OUT;",
+            ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(
+            d.interval_changed,
+            vec![addr("192.0.2.2"), addr("192.0.2.3")]
+        );
+        assert_eq!(d.policy_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, Vec::<IpAddr>::new());
+        assert!(!d.is_empty());
+        // The explicit default is still a change from "the default": the
+        // daemon resolves both to the same value and does nothing.
+        let c = cfg(&BASE.replace(
+            "description \"a\";",
+            "description \"a\"; advertisement-interval 30;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&a, &c).interval_changed,
+            vec![addr("192.0.2.2")]
+        );
+        assert!(ConfigDiff::between(&b, &b).is_empty());
     }
 
     #[test]

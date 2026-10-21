@@ -3,8 +3,9 @@
 //! in `docs/config.md`.
 //!
 //! Implements: RFC 4271 §4.2 and §10 (Hold Time and timer defaults per
-//! neighbor); RFC 7607 §2 (AS 0 is rejected); RFC 9687 §4.4
-//! (`send-hold-time`); RFC 9774 §3 (`allow-as-set`).
+//! neighbor), §9.2.1.1 (`advertisement-interval`); RFC 7607 §2 (AS 0 is
+//! rejected); RFC 9687 §4.4 (`send-hold-time`); RFC 9774 §3
+//! (`allow-as-set`).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

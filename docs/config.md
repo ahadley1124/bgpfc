@@ -90,6 +90,7 @@ neighbor-item
              | "keepalive-time" u32 ";"              (* default hold-time / 3 *)
              | "connect-retry-time" u32 ";"          (* default 120 *)
              | "send-hold-time" ( u16 | "off" ) ";"  (* default max(480, 2 * hold-time) *)
+             | "advertisement-interval" u16 ";"      (* default 30 external, 5 internal; 0 off *)
              | "families" family { family } ";"      (* default both *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
@@ -164,7 +165,17 @@ is an error. `import` and `export` must name policies defined in the same
 file. Timers are in seconds. `hold-time 0` disables keepalives and the hold
 timer (RFC 4271 §4.4). `keepalive-time` must be below `hold-time`.
 `send-hold-time` must exceed `hold-time` (RFC 9687 §4.4); `off` disables
-the send hold timer. `allow-as-set yes` accepts `AS_SET` in received
+the send hold timer. `advertisement-interval` is the
+MinRouteAdvertisementIntervalTimer of RFC 4271 §9.2.1.1: the least time
+between two advertisements of the same prefix to this neighbor. Changes
+inside the interval are held, and when it ends only the latest route goes
+out, so a flapping route is advertised at most once per interval. The
+first advertisement of a prefix is never held, and withdrawals are always
+sent at once (RFC 4271 applies the interval to withdrawals too; bgpfc does
+not, because holding a withdrawal back prolongs a blackhole). Without the
+statement the interval is the RFC 4271 §10 default for the session: 30
+seconds for an external neighbor, 5 for an internal one. `0` sends every
+change at once. `allow-as-set yes` accepts `AS_SET` in received
 UPDATEs against RFC 9774 §3. `collision-detect-established yes` lets a new
 connection replace an Established session per RFC 4271 §6.8.
 
@@ -178,10 +189,12 @@ loopback address; timer constraints above.
 fails, the running configuration stays and the errors are logged. Otherwise
 the daemon applies the difference: new neighbors start, removed ones stop
 with Cease / Peer De-configured, neighbors whose session parameters changed
-(anything but `description`, `import` and `export`) reset with Cease / Other
-Configuration Change, and neighbors whose policies, or the prefix lists those
-policies use, changed are re-evaluated without a reset, using route refresh
-where the peer supports it. A changed `router-id` or `local-as` resets every
+(anything but `description`, `import`, `export` and
+`advertisement-interval`) reset with Cease / Other Configuration Change, and
+neighbors whose policies, or the prefix lists those policies use, changed are
+re-evaluated without a reset, using route refresh where the peer supports it.
+A changed `advertisement-interval` applies to the running session at once,
+also without a reset. A changed `router-id` or `local-as` resets every
 session.
 
 ## Command line

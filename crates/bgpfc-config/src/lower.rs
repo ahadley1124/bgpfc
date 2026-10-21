@@ -4,8 +4,9 @@
 //! [`validate`](crate::validate)'s job.
 //!
 //! Implements: RFC 4271 §4.2 (Hold Time 0 or ≥ 3; non-zero BGP
-//! Identifier), §10 (defaults); RFC 7607 §2 (AS 0 is never configurable);
-//! RFC 9687 §4.4 (`send-hold-time`).
+//! Identifier), §9.2.1.1 and §10 (`advertisement-interval`, the
+//! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
+//! is never configurable); RFC 9687 §4.4 (`send-hold-time`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -805,6 +806,7 @@ struct NeighborBuilder {
     passive: Once<bool>,
     allow_as_set: Once<bool>,
     collision: Once<bool>,
+    advertisement_interval: Once<Duration>,
 }
 
 impl NeighborBuilder {
@@ -823,6 +825,7 @@ impl NeighborBuilder {
             passive: Once::new("passive"),
             allow_as_set: Once::new("allow-as-set"),
             collision: Once::new("collision-detect-established"),
+            advertisement_interval: Once::new("advertisement-interval"),
         }
     }
 
@@ -895,6 +898,15 @@ impl NeighborBuilder {
                 let v = l.yes_no(t);
                 self.collision.set(l, t.pos, v);
             }
+            "advertisement-interval" => {
+                // RFC 4271 §10: "MAY allow the other timers to be
+                // configurable"; zero turns the RFC 4271 §9.2.1.1 pacing
+                // off.
+                let v = l
+                    .parse_arg::<u16>(t, "a number of seconds (0-65535)")
+                    .map(|s| Duration::from_secs(u64::from(s)));
+                self.advertisement_interval.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
     }
@@ -935,6 +947,7 @@ impl NeighborBuilder {
             passive: self.passive.value.unwrap_or(false),
             allow_as_set: self.allow_as_set.value.unwrap_or(false),
             collision_detect_established: self.collision.value.unwrap_or(false),
+            advertisement_interval: self.advertisement_interval.value,
         })
     }
 }
