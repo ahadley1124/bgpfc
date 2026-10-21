@@ -3,6 +3,10 @@
 //! (`kill(2)`), so a supervisor can ask for a graceful stop; std's
 //! [`Child::kill`](std::process::Child::kill) only sends `SIGKILL`.
 //!
+//! A helper thread can also wait for a child's exit without reaping it
+//! (`waitid(2)` with `WNOWAIT`), so the thread that owns the child stays
+//! the only one that reaps it and its signals cannot reach a reused id.
+//!
 //! Implements the process plumbing of the supervised RPKI relying-party
 //! sidecar (GitHub issues #26, #70, #71, #72).
 
@@ -207,6 +211,53 @@ fn single_process(pid: u32) -> io::Result<ffi::pid_t> {
     }
 }
 
+/// Block until the child `pid` has terminated, and leave it unreaped
+/// (`waitid(2)` with `P_PID` and `WEXITED | WNOWAIT`).
+///
+/// The child stays a zombie, so the kernel keeps its id, and a later
+/// [`Child::wait`](std::process::Child::wait) or
+/// [`Child::try_wait`](std::process::Child::try_wait) reaps it at once and
+/// returns its status. This lets a helper thread wait for the exit while
+/// the thread that owns the [`Child`](std::process::Child) goes on
+/// signalling it by id with [`send_signal`]: only the owner reaps, so
+/// until the owner has seen the exit, the id names this child and no
+/// newer process. Waiting with [`Child::wait`](std::process::Child::wait)
+/// on the helper thread instead would reap the child there, and a signal
+/// the owner sends before it hears of that could reach a process that
+/// reused the id.
+///
+/// Any thread may wait: by default `waitid` covers the children of every
+/// thread in the process. `EINTR` is retried.
+///
+/// # Errors
+/// `InvalidInput` for a `pid` that does not name a single process, before
+/// any system call; otherwise the `waitid` failure, such as `ECHILD` when
+/// `pid` is not a child of this process or was already reaped.
+#[allow(unsafe_code, reason = "waitid(2) with a local siginfo_t")]
+pub fn wait_for_exit(pid: u32) -> io::Result<()> {
+    let target = single_process(pid)?;
+    // `single_process` returned a positive `pid_t`, which fits `id_t`.
+    let id = target.unsigned_abs();
+    let mut info = ffi::siginfo_t {
+        opaque: [0; ffi::SI_MAX_SIZE / size_of::<c_ulong>()],
+    };
+    loop {
+        // SAFETY: `info` is a live, writable `siginfo_t` of the size and
+        // alignment `<asm-generic/siginfo.h>` gives it, and `waitid`
+        // writes nothing else. `P_PID` with a positive id names exactly
+        // one process. `WNOWAIT` leaves the child waitable, so this does
+        // not reap it and std's `Child` stays in charge of that.
+        let rc = unsafe { ffi::waitid(ffi::P_PID, id, &raw mut info, ffi::WEXITED | ffi::WNOWAIT) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +283,19 @@ mod tests {
         }
         assert_eq!(single_process(1).unwrap(), 1);
         assert_eq!(single_process(too_big - 1).unwrap(), i32::MAX);
+    }
+
+    /// `waitid(P_PID, 0)` would wait for any child of the process group;
+    /// such ids are refused before the system call, so this runs under
+    /// Miri too.
+    #[test]
+    fn wait_for_exit_refuses_anything_but_one_process() {
+        let too_big = u32::try_from(i32::MAX).unwrap() + 1;
+        for pid in [0, too_big, u32::MAX] {
+            let err = wait_for_exit(pid).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "pid {pid}");
+            assert_eq!(err.raw_os_error(), None, "pid {pid}: no syscall made");
+        }
     }
 
     #[cfg(not(miri))]
@@ -503,6 +567,55 @@ mod tests {
         #[test]
         fn parent_death_signal_overrides_an_ignored_signal() {
             parent_death_case(true);
+        }
+
+        /// `ECHILD` from `waitid(2)`, `<asm-generic/errno-base.h>`.
+        const ECHILD: i32 = 10;
+
+        /// The child is left a zombie: still there under its id, and
+        /// `Child::try_wait` then reaps it and gets its status.
+        #[test]
+        fn wait_for_exit_leaves_the_child_to_reap() {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+                .expect("spawn /bin/sh");
+            wait_for_exit(child.id()).unwrap();
+            let (state, _) = proc_stat(child.id()).expect("the zombie keeps its id");
+            assert_eq!(state, 'Z', "exited but not reaped");
+            // Waiting again sees the same unreaped exit.
+            wait_for_exit(child.id()).unwrap();
+            let status = child.try_wait().unwrap().expect("reaped at once");
+            assert_eq!(status.code(), Some(7));
+            let err = wait_for_exit(child.id()).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(ECHILD), "already reaped");
+        }
+
+        /// A thread blocks until the child ends, while the thread that
+        /// owns the `Child` signals it by id.
+        #[test]
+        fn wait_for_exit_blocks_until_the_child_ends() {
+            let mut child = sleep_30().spawn().expect("spawn /bin/sleep");
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || tx.send(wait_for_exit(pid)).unwrap());
+            let early = rx.recv_timeout(Duration::from_millis(200));
+            send_signal(pid, ChildSignal::Term).unwrap();
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            waiter.join().unwrap();
+            let status = wait_with_deadline(&mut child, Duration::from_secs(5));
+            assert!(early.is_err(), "returned while the child ran: {early:?}");
+            result
+                .expect("the waiter returns once the child ends")
+                .unwrap();
+            assert_eq!(status.signal(), Some(ChildSignal::Term.number()));
+        }
+
+        /// A process that is not a child of this one cannot be waited for.
+        #[test]
+        fn wait_for_exit_needs_a_child() {
+            let err = wait_for_exit(1).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(ECHILD));
         }
     }
 }

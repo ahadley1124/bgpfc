@@ -25,5 +25,6 @@ mod signal;
 pub use caps::{Capability, Effective};
 pub use netlink::NetlinkSocket;
 pub use privilege::{Identity, drop_to, is_root, lookup_group, lookup_user};
+pub use process::wait_for_exit;
 pub use process::{ChildSignal, send_signal, set_parent_death_signal};
 pub use signal::{Signal, Signals};
