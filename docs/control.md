@@ -99,6 +99,6 @@ Other Configuration Change and start again; neighbors whose import or
 export policy changed get a ROUTE-REFRESH and a re-export of the
 difference; a changed `advertisement-interval` applies to the running
 session without a reset; a changed `fib { mode }` is applied; a changed
-`log { level }` takes effect at once. `router-id` and `local-as` changes are refused, and
-`listen`, `control`, `fib { table }` and `fib { protocol }` changes are
-noted for the next restart.
+`log { level }` takes effect at once. `router-id` and `local-as` changes
+are refused, and `listen`, `control`, `fib { table }` and
+`fib { protocol }` changes are noted for the next restart.
