@@ -91,3 +91,6 @@ value-errors.conf:29:28: `65536` is not a number of seconds (0-65535)
 value-errors.conf:30:5: `advertisement-interval` is given more than once
       advertisement-interval 5;
       ^
+value-errors.conf:31:23: `ipv4` is not `yes` or `no`
+      extended-next-hop ipv4;
+                        ^

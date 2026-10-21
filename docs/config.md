@@ -92,6 +92,7 @@ neighbor-item
              | "send-hold-time" ( u16 | "off" ) ";"  (* default max(480, 2 * hold-time) *)
              | "advertisement-interval" u16 ";"      (* default 30 external, 5 internal; 0 off *)
              | "families" family { family } ";"      (* default both *)
+             | "extended-next-hop" yes-no ";"        (* default no *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -134,8 +135,9 @@ from (import) or is being sent to (export).
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
 session rewriting of RFC 4271 §5.1 (our AS is prepended after a policy's
-`as-path prepend`; the next hop of a route to an external peer is always
-our address). `next-hop self` is therefore only meaningful in export
+`as-path prepend`; the next hop of a route to an external peer is our
+address on the session, see `extended-next-hop` below for IPv4 routes on an
+IPv6 session). `next-hop self` is therefore only meaningful in export
 policies towards internal peers. A policy cannot advertise a route to the
 peer it came from, nor an internal route to another internal peer.
 
@@ -179,11 +181,26 @@ change at once. `allow-as-set yes` accepts `AS_SET` in received
 UPDATEs against RFC 9774 §3. `collision-detect-established yes` lets a new
 connection replace an Established session per RFC 4271 §6.8.
 
+`extended-next-hop yes` advertises the Extended Next Hop Encoding
+capability of RFC 8950 for IPv4 unicast, which must then be in `families`.
+When the neighbor advertises it too, IPv4 routes may carry an IPv6 next hop
+in both directions: received ones are accepted, and on a session over IPv6
+the IPv4 routes sent to an external neighbor, or through `set next-hop
+self`, carry our IPv6 address on the session (RFC 8950 §5). A route whose
+IPv6 next hop is passed on unchanged, as to an internal neighbor, keeps it.
+Without the capability on both sides, which is the default, IPv4 routes
+with an IPv6 next hop are never sent to the neighbor, and one received
+from it is malformed: IPv4 unicast is disabled for the session (RFC 7606
+§7.11). IPv4 routes sent over an IPv6 session without the capability keep
+the next hop they were received with. In the FIB, an IPv4 route via an
+IPv6 next hop is installed with `RTA_VIA`.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
-loopback address; timer constraints above.
+loopback address; timer constraints above; `extended-next-hop` only with
+`ipv4-unicast` in `families`.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If it
 fails, the running configuration stays and the errors are logged. Otherwise

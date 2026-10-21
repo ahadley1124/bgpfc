@@ -176,6 +176,13 @@ mod tests {
         assert_eq!(d.added, vec![addr("192.0.2.4")]);
         assert_eq!(d.global, vec![]);
         assert!(!d.is_empty());
+        // RFC 8950 §4: extended-next-hop changes the OPEN, so it is a
+        // session parameter.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; extended-next-hop yes;",
+        ));
+        assert_eq!(ConfigDiff::between(&a, &c).reset, vec![addr("192.0.2.3")]);
     }
 
     #[test]

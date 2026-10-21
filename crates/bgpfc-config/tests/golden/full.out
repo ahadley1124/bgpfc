@@ -212,6 +212,7 @@ Config {
             advertisement_interval: Some(
                 10s,
             ),
+            extended_next_hop: [],
         },
         Neighbor {
             pos: Pos {
@@ -248,6 +249,12 @@ Config {
             advertisement_interval: Some(
                 0ns,
             ),
+            extended_next_hop: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+            ],
         },
     ],
 }

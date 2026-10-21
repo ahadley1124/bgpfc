@@ -163,6 +163,7 @@ Config {
             allow_as_set: false,
             collision_detect_established: false,
             advertisement_interval: None,
+            extended_next_hop: [],
         },
     ],
 }

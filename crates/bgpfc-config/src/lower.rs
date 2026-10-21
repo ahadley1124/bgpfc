@@ -6,7 +6,8 @@
 //! Implements: RFC 4271 §4.2 (Hold Time 0 or ≥ 3; non-zero BGP
 //! Identifier), §9.2.1.1 and §10 (`advertisement-interval`, the
 //! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
-//! is never configurable); RFC 9687 §4.4 (`send-hold-time`).
+//! is never configurable); RFC 9687 §4.4 (`send-hold-time`); RFC 8950 §4
+//! (`extended-next-hop`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -807,6 +808,7 @@ struct NeighborBuilder {
     allow_as_set: Once<bool>,
     collision: Once<bool>,
     advertisement_interval: Once<Duration>,
+    extended_next_hop: Once<bool>,
 }
 
 impl NeighborBuilder {
@@ -826,6 +828,7 @@ impl NeighborBuilder {
             allow_as_set: Once::new("allow-as-set"),
             collision: Once::new("collision-detect-established"),
             advertisement_interval: Once::new("advertisement-interval"),
+            extended_next_hop: Once::new("extended-next-hop"),
         }
     }
 
@@ -907,6 +910,10 @@ impl NeighborBuilder {
                     .map(|s| Duration::from_secs(u64::from(s)));
                 self.advertisement_interval.set(l, t.pos, v);
             }
+            "extended-next-hop" => {
+                let v = l.yes_no(t);
+                self.extended_next_hop.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
     }
@@ -948,6 +955,13 @@ impl NeighborBuilder {
             allow_as_set: self.allow_as_set.value.unwrap_or(false),
             collision_detect_established: self.collision.value.unwrap_or(false),
             advertisement_interval: self.advertisement_interval.value,
+            // RFC 8950 §4 allows only IPv4 NLRI with an IPv6 next hop, and
+            // of those families bgpfc speaks IPv4 unicast.
+            extended_next_hop: if self.extended_next_hop.value.unwrap_or(false) {
+                vec![AddressFamily::IPV4_UNICAST]
+            } else {
+                Vec::new()
+            },
         })
     }
 }

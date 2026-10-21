@@ -282,6 +282,11 @@ pub struct Neighbor {
     /// default for the session type once it is known: 30 s external, 5 s
     /// internal.
     pub advertisement_interval: Option<Duration>,
+    /// `extended-next-hop`: the families listed in the Extended Next Hop
+    /// Encoding capability with an IPv6 next hop (RFC 8950 §4).
+    /// `extended-next-hop yes` gives IPv4 unicast, the one family RFC 8950
+    /// covers that bgpfc speaks; empty by default.
+    pub extended_next_hop: Vec<AddressFamily>,
 }
 
 impl Neighbor {
@@ -302,5 +307,6 @@ impl Neighbor {
             && self.passive == other.passive
             && self.allow_as_set == other.allow_as_set
             && self.collision_detect_established == other.collision_detect_established
+            && self.extended_next_hop == other.extended_next_hop
     }
 }
