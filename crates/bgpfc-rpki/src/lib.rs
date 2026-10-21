@@ -7,6 +7,11 @@
 //! gives each route its [`RovState`]. When the VRPs change,
 //! [`AffectedPrefixes`] says which routes need validating again.
 //!
+//! The RIB sees none of that. It asks a [`ValidationSource`] for verdicts
+//! and receives a [`ValidationChange`] (new source, affected routes) when
+//! they change; a producer sends those through a [`ValidationSink`].
+//! [`NullSource`] is the source when validation is off.
+//!
 //! Implements: RFC 6811 §2 (VRPs, the Route Origin ASN, Covered, Matched,
 //! the three validation states), §4 (re-validate the affected prefixes
 //! when VRPs change); RFC 6483 §2 (validation outcome),
@@ -20,6 +25,7 @@ pub mod affected;
 mod index;
 pub mod origin;
 pub mod set;
+pub mod source;
 pub mod state;
 pub mod vrp;
 
@@ -30,6 +36,7 @@ use bgpfc_wire::prefix::Prefix;
 pub use affected::{AffectedPrefixes, PrefixSet};
 pub use origin::RouteOrigin;
 pub use set::VrpSet;
+pub use source::{NullSource, ValidationChange, ValidationSink, ValidationSource};
 pub use state::{AspaState, RovState};
 pub use vrp::Vrp;
 
@@ -55,6 +62,8 @@ pub enum RpkiError {
     },
     /// Text that names no validation state.
     UnknownState(String),
+    /// The consumer of validation changes has gone away.
+    SinkClosed,
 }
 
 impl fmt::Display for RpkiError {
@@ -73,6 +82,9 @@ impl fmt::Display for RpkiError {
                 )
             }
             RpkiError::UnknownState(s) => write!(f, "unknown validation state {s:?}"),
+            RpkiError::SinkClosed => {
+                f.write_str("the consumer of validation changes has gone away")
+            }
         }
     }
 }

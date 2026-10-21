@@ -1,13 +1,19 @@
 //! Property tests: `VrpSet` against a naive model that follows the text of
 //! RFC 6811 §2 and the §2.1 pseudo-code literally, one VRP at a time; and
 //! `AffectedPrefixes` against the states that actually change (RFC 6811
-//! §4).
+//! §4); and a RIB-like consumer of `ValidationChange`s that validates only
+//! the affected routes against one that validates everything.
 #![cfg(not(miri))]
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
-use bgpfc_rpki::{AffectedPrefixes, PrefixSet, RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_rpki::{
+    AffectedPrefixes, AspaState, NullSource, PrefixSet, RouteOrigin, RovState, RpkiError,
+    ValidationChange, ValidationSink, ValidationSource, Vrp, VrpSet,
+};
+use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Asn;
 use proptest::prelude::*;
@@ -67,6 +73,71 @@ fn origin() -> impl Strategy<Value = RouteOrigin> {
 
 fn route() -> impl Strategy<Value = (Prefix, RouteOrigin)> {
     (prefix(), origin())
+}
+
+fn as_path() -> impl Strategy<Value = AsPath> {
+    let segment =
+        (1u8..=4, prop::collection::vec(0u32..4, 1..4)).prop_map(|(kind, asns)| AsPathSegment {
+            kind: SegmentType::from_u8(kind).unwrap(),
+            asns: asns.into_iter().map(|a| Asn(64_496 + a)).collect(),
+        });
+    prop::collection::vec(segment, 0..4).prop_map(|segments| AsPath { segments })
+}
+
+/// One step of a validation producer.
+#[derive(Clone, Debug)]
+enum Step {
+    /// Announce (`true`) or withdraw VRPs, as one RTR update would.
+    Delta(Vec<(bool, Vrp)>),
+    /// Turn validation off.
+    Disable,
+}
+
+fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        8 => prop::collection::vec((any::<bool>(), vrp()), 0..8).prop_map(Step::Delta),
+        1 => Just(Step::Disable),
+    ]
+}
+
+/// A producer in the manner of an RTR client: applies each step to its own
+/// working set and publishes a snapshot with the routes the step affects.
+fn produce(steps: &[Step], sink: &mut dyn ValidationSink) -> Result<(), RpkiError> {
+    let mut working = VrpSet::new();
+    let mut enabled = false;
+    for step in steps {
+        match step {
+            Step::Disable => {
+                enabled = false;
+                sink.publish(ValidationChange::disabled())?;
+            }
+            Step::Delta(ops) => {
+                let mut changed = Vec::new();
+                for (announce, vrp) in ops {
+                    let did = if *announce {
+                        working.insert(*vrp)
+                    } else {
+                        working.remove(*vrp)
+                    };
+                    if did {
+                        changed.push(*vrp);
+                    }
+                }
+                // Coming back from Disabled every route's state changes.
+                let affected = if enabled {
+                    AffectedPrefixes::from_vrps(changed)
+                } else {
+                    AffectedPrefixes::All
+                };
+                enabled = true;
+                sink.publish(ValidationChange {
+                    source: Arc::new(working.clone()),
+                    affected,
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Bit `i` of an address, most significant first.
@@ -229,6 +300,70 @@ proptest! {
                 prop_assert!(between.covers(route), "{}", route);
                 prop_assert!(from_delta.covers(route), "{}", route);
             }
+        }
+    }
+
+    #[test]
+    fn null_source_is_disabled_for_everything(
+        (prefix, origin) in route(),
+        path in as_path(),
+        vrps in prop::collection::vec(vrp(), 0..16),
+    ) {
+        let null: Arc<dyn ValidationSource> = Arc::new(NullSource);
+        prop_assert_eq!(null.rov(prefix, origin), RovState::Disabled);
+        prop_assert_eq!(null.aspa(&path), AspaState::Disabled);
+        let derived = RouteOrigin::from_as_path(&path, Asn(64_500));
+        prop_assert_eq!(null.rov(prefix, derived), RovState::Disabled);
+        // A VRP set never says Disabled for origins, and has no ASPA yet.
+        let set: Arc<dyn ValidationSource> = Arc::new(vrps.into_iter().collect::<VrpSet>());
+        prop_assert_ne!(set.rov(prefix, derived), RovState::Disabled);
+        prop_assert_eq!(set.aspa(&path), AspaState::Disabled);
+    }
+
+    #[test]
+    fn revalidating_affected_routes_matches_revalidating_all(
+        steps in prop::collection::vec(step(), 1..12),
+        routes in prop::collection::vec(route(), 1..48),
+    ) {
+        let mut changes = Vec::new();
+        let mut sink = |change: ValidationChange| {
+            changes.push(change);
+            Ok(())
+        };
+        produce(&steps, &mut sink).unwrap();
+
+        // A RIB-like consumer: starts with validation off, then applies
+        // each change by validating only the affected routes.
+        let mut source: Arc<dyn ValidationSource> = Arc::new(NullSource);
+        let mut states: Vec<RovState> = routes.iter().map(|(p, o)| source.rov(*p, *o)).collect();
+        let mut history = vec![states.clone()];
+        for change in &changes {
+            source = Arc::clone(&change.source);
+            for ((prefix, origin), state) in routes.iter().zip(&mut states) {
+                if change.affected.covers(*prefix) {
+                    *state = source.rov(*prefix, *origin);
+                }
+            }
+            for ((prefix, origin), state) in routes.iter().zip(&states) {
+                prop_assert_eq!(*state, source.rov(*prefix, *origin), "{} from {}", prefix, origin);
+            }
+            history.push(states.clone());
+        }
+
+        // A consumer that fell behind after `caught_up` changes applies the
+        // rest at once: the last source and the merged affected sets.
+        for caught_up in 0..changes.len() {
+            let mut lagging = history[caught_up].clone();
+            let mut affected = AffectedPrefixes::none();
+            for change in &changes[caught_up..] {
+                affected.merge(change.affected.clone());
+            }
+            for ((prefix, origin), state) in routes.iter().zip(&mut lagging) {
+                if affected.covers(*prefix) {
+                    *state = source.rov(*prefix, *origin);
+                }
+            }
+            prop_assert_eq!(&lagging, &states);
         }
     }
 }
