@@ -213,10 +213,13 @@ Config {
                 10s,
             ),
             extended_next_hop: [],
+            restart_limit: Some(
+                3,
+            ),
         },
         Neighbor {
             pos: Pos {
-                line: 54,
+                line: 55,
                 col: 1,
             },
             addr: 2001:db8::2,
@@ -255,6 +258,7 @@ Config {
                     safi: Unicast,
                 },
             ],
+            restart_limit: None,
         },
     ],
 }

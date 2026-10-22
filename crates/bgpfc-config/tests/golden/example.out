@@ -164,6 +164,9 @@ Config {
             collision_detect_established: false,
             advertisement_interval: None,
             extended_next_hop: [],
+            restart_limit: Some(
+                10,
+            ),
         },
     ],
 }

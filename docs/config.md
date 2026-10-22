@@ -93,6 +93,7 @@ neighbor-item
              | "advertisement-interval" u16 ";"      (* default 30 external, 5 internal; 0 off *)
              | "families" family { family } ";"      (* default both *)
              | "extended-next-hop" yes-no ";"        (* default no *)
+             | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -195,6 +196,23 @@ from it is malformed: IPv4 unicast is disabled for the session (RFC 7606
 the next hop they were received with. In the FIB, an IPv4 route via an
 IPv6 next hop is installed with `RTA_VIA`.
 
+`restart-limit` bounds the automatic restarts after failures, as RFC 4486
+§4 asks. Some failures damp the restart (RFC 4271 §8.2.2): a NOTIFICATION
+we send for an error, an expired timer or a local stop such as an output
+queue overrun; a NOTIFICATION received, or the connection lost after the
+OPENs were exchanged, before the session is up; and a Cease received while
+Established with Administrative Shutdown, Peer De-configured, Connection
+Rejected or Out of Resources (RFC 4486 §4). Each holds the neighbor Idle
+for 10 seconds, doubling with each such failure in a row up to 120
+seconds. After `restart-limit` restarts in a row, the next such failure
+leaves the neighbor Idle, refusing connections, until `bgpfcctl clear
+neighbor`, or a reload that resets it, starts it again; the daemon logs an
+error when that happens. A manual start ends the run of failures, and so
+does a session that stayed up for five minutes; a session torn down soon
+after it comes up keeps counting. A refused or timed-out connection does
+not damp: a neighbor that is simply down is retried without bound. `0`
+never restarts after a damped failure; `off` always does.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
@@ -207,7 +225,8 @@ fails, the running configuration stays and the errors are logged. Otherwise
 the daemon applies the difference: new neighbors start, removed ones stop
 with Cease / Peer De-configured, neighbors whose session parameters changed
 (anything but `description`, `import`, `export` and
-`advertisement-interval`) reset with Cease / Other Configuration Change, and
+`advertisement-interval`; `restart-limit` included) reset with Cease /
+Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed are
 re-evaluated without a reset, using route refresh where the peer supports it.
 A changed `advertisement-interval` applies to the running session at once,

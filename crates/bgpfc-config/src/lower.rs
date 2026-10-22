@@ -7,7 +7,7 @@
 //! Identifier), §9.2.1.1 and §10 (`advertisement-interval`, the
 //! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
 //! is never configurable); RFC 9687 §4.4 (`send-hold-time`); RFC 8950 §4
-//! (`extended-next-hop`).
+//! (`extended-next-hop`); RFC 4486 §4 (`restart-limit`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -19,8 +19,8 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::ast::{
-    Action, CommunityOp, Config, Control, Fib, FibMode, Http, Match, Neighbor, Policy, PrefixEntry,
-    PrefixList, SendHoldTime, SetAction, Term,
+    Action, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http, Match,
+    Neighbor, Policy, PrefixEntry, PrefixList, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -809,6 +809,7 @@ struct NeighborBuilder {
     collision: Once<bool>,
     advertisement_interval: Once<Duration>,
     extended_next_hop: Once<bool>,
+    restart_limit: Once<Option<u32>>,
 }
 
 impl NeighborBuilder {
@@ -829,6 +830,7 @@ impl NeighborBuilder {
             collision: Once::new("collision-detect-established"),
             advertisement_interval: Once::new("advertisement-interval"),
             extended_next_hop: Once::new("extended-next-hop"),
+            restart_limit: Once::new("restart-limit"),
         }
     }
 
@@ -914,6 +916,18 @@ impl NeighborBuilder {
                 let v = l.yes_no(t);
                 self.extended_next_hop.set(l, t.pos, v);
             }
+            "restart-limit" => {
+                // RFC 4486 §4: an upper bound on consecutive automatic
+                // retries; `off` for none.
+                let v = l.arg(t).and_then(|a| {
+                    if a.value == "off" {
+                        Some(None)
+                    } else {
+                        l.parse::<u32>(a, "a number of restarts or `off`").map(Some)
+                    }
+                });
+                self.restart_limit.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
     }
@@ -962,6 +976,10 @@ impl NeighborBuilder {
             } else {
                 Vec::new()
             },
+            restart_limit: self
+                .restart_limit
+                .value
+                .unwrap_or(Some(DEFAULT_RESTART_LIMIT)),
         })
     }
 }

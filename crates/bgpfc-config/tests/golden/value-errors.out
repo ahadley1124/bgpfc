@@ -94,3 +94,9 @@ value-errors.conf:30:5: `advertisement-interval` is given more than once
 value-errors.conf:31:23: `ipv4` is not `yes` or `no`
       extended-next-hop ipv4;
                         ^
+value-errors.conf:32:19: `never` is not a number of restarts or `off`
+      restart-limit never;
+                    ^
+value-errors.conf:33:5: `restart-limit` is given more than once
+      restart-limit 5;
+      ^

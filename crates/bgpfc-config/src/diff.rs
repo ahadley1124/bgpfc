@@ -183,6 +183,17 @@ mod tests {
             "remote-as 65002; extended-next-hop yes;",
         ));
         assert_eq!(ConfigDiff::between(&a, &c).reset, vec![addr("192.0.2.3")]);
+        // The RFC 4486 §4 restart limit is the FSM's, like the timers: a
+        // change resets the session, which also starts a peer it stopped.
+        let unbounded =
+            cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit off;"));
+        assert_eq!(
+            ConfigDiff::between(&a, &unbounded).reset,
+            vec![addr("192.0.2.3")]
+        );
+        // Spelling out the default is no change.
+        let explicit = cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit 10;"));
+        assert!(ConfigDiff::between(&a, &explicit).is_empty());
     }
 
     #[test]

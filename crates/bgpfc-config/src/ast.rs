@@ -287,7 +287,16 @@ pub struct Neighbor {
     /// `extended-next-hop yes` gives IPv4 unicast, the one family RFC 8950
     /// covers that bgpfc speaks; empty by default.
     pub extended_next_hop: Vec<AddressFamily>,
+    /// `restart-limit`: how many automatic restarts in a row after damped
+    /// failures before the peer stays Idle until a manual start
+    /// (RFC 4486 §4); `None` for `off`, no bound.
+    /// [`DEFAULT_RESTART_LIMIT`] when not given.
+    pub restart_limit: Option<u32>,
 }
+
+/// The `restart-limit` of a neighbor that sets none: the same figure as
+/// `bgpfc_fsm::DEFAULT_RESTART_LIMIT`, which this crate does not depend on.
+pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
@@ -308,5 +317,6 @@ impl Neighbor {
             && self.allow_as_set == other.allow_as_set
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
+            && self.restart_limit == other.restart_limit
     }
 }
