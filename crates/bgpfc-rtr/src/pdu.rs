@@ -1070,6 +1070,54 @@ mod tests {
     }
 
     #[test]
+    fn capture_vectors_decode_and_encode() {
+        // A version 0 session between a router and rpki.realmv6.org; see
+        // crate::capture for the source.
+        use crate::capture;
+        let v = Version::V0;
+        let mut cases: Vec<(&[u8], Pdu)> = vec![
+            (&capture::RESET_QUERY, Pdu::ResetQuery { version: v }),
+            (
+                &capture::SERIAL_QUERY,
+                Pdu::SerialQuery {
+                    version: v,
+                    session_id: capture::SESSION_ID,
+                    serial: capture::SERIAL,
+                },
+            ),
+            (
+                &capture::CACHE_RESPONSE,
+                Pdu::CacheResponse {
+                    version: v,
+                    session_id: capture::SESSION_ID,
+                },
+            ),
+            (
+                &capture::END_OF_DATA,
+                Pdu::EndOfData {
+                    session_id: capture::SESSION_ID,
+                    serial: capture::SERIAL,
+                    intervals: None,
+                },
+            ),
+        ];
+        for &(octets, prefix, max_len, asn) in &capture::PREFIXES {
+            let pdu = Pdu::Prefix {
+                version: v,
+                announce: true,
+                vrp: vrp(prefix, max_len, asn),
+            };
+            cases.push((octets, pdu));
+        }
+        for (octets, pdu) in cases {
+            assert_eq!(Pdu::decode(octets), Ok(pdu.clone()), "{pdu:?}");
+            assert_eq!(Pdu::decode_negotiated(octets, v), Ok(pdu.clone()));
+            // Both ends sent them canonically.
+            assert_eq!(pdu.encode(), octets, "{pdu:?}");
+        }
+    }
+
+    #[test]
     fn encode_into_appends() {
         let mut out = vec![0xff];
         Pdu::ResetQuery {
