@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bgpfc_rpki::{AspaState, RovState};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -22,6 +23,7 @@ use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
 mod adj_rib_in;
+mod validation;
 
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
@@ -97,6 +99,8 @@ fn candidate(info: &PeerInfo, a: PathAttrs) -> Candidate {
         router_id: info.router_id.to_u32(),
         remote_as: info.remote_as,
         attrs: Arc::new(a),
+        rov: RovState::Disabled,
+        aspa: AspaState::Disabled,
     }
 }
 
@@ -1246,10 +1250,24 @@ fn reexport_sends_only_the_difference() {
     use crate::{Policies, Verdict};
     struct DropOdd;
     impl Policies for DropOdd {
-        fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             Verdict::Accept
         }
-        fn export(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> Verdict {
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            p: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             if p == self::p("192.0.2.0/24") {
                 Verdict::Reject
             } else {
@@ -1309,14 +1327,28 @@ fn limit_hits(out: &[Output]) -> Vec<(IpAddr, AddressFamily, u32)> {
 struct RejectOne(Prefix);
 
 impl crate::Policies for RejectOne {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> crate::Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
         if p == self.0 {
             crate::Verdict::Reject
         } else {
             crate::Verdict::Accept
         }
     }
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> crate::Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
         crate::Verdict::Accept
     }
 }
@@ -1746,10 +1778,24 @@ fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
     /// Exports everything with a community.
     struct Tag;
     impl Policies for Tag {
-        fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             Verdict::Accept
         }
-        fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, a: &PathAttrs) -> Verdict {
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            a: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             let mut m = a.clone();
             m.communities = vec![Community::new(65_000, 42)];
             Verdict::Modified(m)

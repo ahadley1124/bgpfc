@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, Verdict};
+use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::prefix::Prefix;
@@ -61,7 +61,14 @@ fn rejected(i: u8) -> bool {
 struct RejectSome;
 
 impl Policies for RejectSome {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         if (0..12).any(|i| rejected(i) && prefix(i) == p) {
             Verdict::Reject
         } else {
@@ -69,7 +76,14 @@ impl Policies for RejectSome {
         }
     }
 
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 }

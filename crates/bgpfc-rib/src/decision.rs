@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use bgpfc_rpki::{AspaState, RovState};
 use bgpfc_wire::types::Asn;
 use bgpfc_wire::update::PeerKind;
 
@@ -24,6 +25,11 @@ pub struct Candidate {
     pub remote_as: Asn,
     /// The route's attributes.
     pub attrs: Arc<PathAttrs>,
+    /// The route's RFC 6811 §2 validation state, judged on the route as
+    /// received. Phase 2 does not use it.
+    pub rov: RovState,
+    /// The route's ASPA verdict (a placeholder until ASPA lands).
+    pub aspa: AspaState,
 }
 
 /// The `LOCAL_PREF` assumed for routes without one (external routes the

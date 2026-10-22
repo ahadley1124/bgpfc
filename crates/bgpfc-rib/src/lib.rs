@@ -17,7 +17,11 @@
 //! advertised and sent of the negotiated ones); RFC 2918 §4 (route refresh
 //! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
 //! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
-//! that ends the session, see [`Output::PrefixLimitExceeded`]).
+//! that ends the session, see [`Output::PrefixLimitExceeded`]);
+//! RFC 6811 §2 (every route received gets its validation state from a
+//! lookup, kept as a property of the route; the state never keeps a
+//! route out of the Adj-RIB-In or the decision process), §3 (policy sees
+//! the validation state, see [`Policies`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -38,12 +42,14 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bgpfc_rpki::{NullSource, RouteOrigin, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
+pub use bgpfc_rpki::{AspaState, RovState};
 pub use decision::Candidate;
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
@@ -63,15 +69,18 @@ pub enum Verdict {
 
 /// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
 /// policy, §9.1.3 export policy). `peer` is the peer the route came from
-/// on import and the peer it is going to on export.
+/// on import and the peer it is going to on export. `rov` is the route's
+/// validation state, which policy must be able to match (RFC 6811 §3).
 pub trait Policies: Send {
-    /// Decide whether and how a received route enters the Adj-RIB-In.
+    /// Decide whether and how a route held in the Adj-RIB-In becomes a
+    /// candidate for the decision process.
     fn import(
         &self,
         peer: &PeerInfo,
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        rov: RovState,
     ) -> Verdict;
 
     /// Decide whether and how a Loc-RIB route is advertised to `peer`,
@@ -82,6 +91,7 @@ pub trait Policies: Send {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        rov: RovState,
     ) -> Verdict;
 }
 
@@ -90,11 +100,25 @@ pub trait Policies: Send {
 pub struct AcceptAll;
 
 impl Policies for AcceptAll {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 }
@@ -164,6 +188,22 @@ pub struct BestRoute {
     pub peer: IpAddr,
     /// Its attributes.
     pub attrs: Arc<PathAttrs>,
+    /// Its RFC 6811 §2 validation state.
+    pub rov: RovState,
+    /// Its ASPA verdict (a placeholder until ASPA lands).
+    pub aspa: AspaState,
+}
+
+impl BestRoute {
+    /// The best route that `c` is.
+    fn of(c: &Candidate) -> BestRoute {
+        BestRoute {
+            peer: c.peer,
+            attrs: Arc::clone(&c.attrs),
+            rov: c.rov,
+            aspa: c.aspa,
+        }
+    }
 }
 
 /// A route in an Adj-RIB-In: what a peer advertised for a destination,
@@ -175,6 +215,12 @@ struct Received {
     peer: IpAddr,
     /// Its attributes as received, interned.
     attrs: Arc<PathAttrs>,
+    /// Its RFC 6811 §2 validation state under the current validation
+    /// source: a property of the route, not of its attributes, which
+    /// routes to other prefixes share.
+    rov: RovState,
+    /// Its ASPA verdict under the current validation source.
+    aspa: AspaState,
 }
 
 /// One destination: the route each peer sent for it, those import policy
@@ -253,6 +299,9 @@ pub struct Rib {
     /// policy made of them, and the best among those.
     tables: HashMap<AddressFamily, BTreeMap<Prefix, Destination>>,
     interner: Interner,
+    /// Where validation states come from (issue #56): [`NullSource`],
+    /// every route `Disabled`.
+    validation: Arc<dyn ValidationSource>,
     /// Pending wake-ups, earliest first. Each `AdjRibOut` knows the one
     /// live entry per destination; an entry an earlier one replaced stays
     /// until due and is then ignored, and those of a peer that went down
@@ -272,6 +321,7 @@ impl Rib {
     }
 
     /// An empty RIB for a speaker in `local_as` with the given policies.
+    /// Validation is off ([`NullSource`]: every route `Disabled`).
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
@@ -280,6 +330,7 @@ impl Rib {
             peers: HashMap::new(),
             tables: HashMap::new(),
             interner: Interner::default(),
+            validation: Arc::new(NullSource),
             deadlines: BinaryHeap::new(),
             clock: None,
             jitter: Jitter::new(0),
@@ -708,11 +759,24 @@ impl Rib {
                 }
                 continue;
             }
+            // RFC 6811 §2: "When a BGP speaker receives an UPDATE from a
+            // neighbor, it SHOULD perform a lookup as described above for
+            // each of the Routes in the UPDATE message", and "The
+            // validation state of the Route MUST be set to reflect the
+            // result of the lookup." The origin is that of the AS_PATH as
+            // received, which the decoder has already merged with AS4_PATH
+            // (RFC 6793 §4.2.3), so that a two-octet peer's route does not
+            // seem to come from AS_TRANS. Every route of this part of the
+            // UPDATE has the same path, and so the same origin.
+            let origin = RouteOrigin::from_as_path(&attrs.as_path, self.local_as);
+            let aspa = self.validation.aspa(&attrs.as_path);
             let limit = info.prefix_limit(family);
             for &prefix in prefixes {
                 let route = Received {
                     peer: addr,
                     attrs: Arc::clone(&attrs),
+                    rov: self.validation.rov(prefix, origin),
+                    aspa,
                 };
                 self.announce(&info, family, prefix, route, &mut dirty);
                 // RFC 4271 §6.7: "the number of address prefixes received
@@ -921,16 +985,19 @@ impl Rib {
             let Some(dest) = table.get_mut(&prefix) else {
                 continue;
             };
-            let new_best = decision::best(&dest.candidates).map(|i| BestRoute {
-                peer: dest.candidates[i].peer,
-                attrs: Arc::clone(&dest.candidates[i].attrs),
-            });
-            let changed = match (&dest.best, &new_best) {
-                (None, None) => false,
-                (Some(a), Some(b)) => a.peer != b.peer || !Arc::ptr_eq(&a.attrs, &b.attrs),
-                _ => true,
+            let new_best =
+                decision::best(&dest.candidates).map(|i| BestRoute::of(&dest.candidates[i]));
+            // Whether another route is chosen, and whether the chosen one
+            // has another validation state.
+            let (route_changed, state_changed) = match (&dest.best, &new_best) {
+                (None, None) => (false, false),
+                (Some(a), Some(b)) => (
+                    a.peer != b.peer || !Arc::ptr_eq(&a.attrs, &b.attrs),
+                    a.rov != b.rov || a.aspa != b.aspa,
+                ),
+                _ => (true, true),
             };
-            if !changed {
+            if !route_changed && !state_changed {
                 // A destination created and emptied before it was ever
                 // decided (a prefix limit drops the UPDATE's own routes).
                 if dest.is_unused() {
@@ -942,12 +1009,19 @@ impl Rib {
             if dest.is_unused() {
                 table.remove(&prefix);
             }
-            out.push(Output::Fib(FibChange {
-                family,
-                prefix,
-                next_hop: new_best.as_ref().map(|b| b.attrs.next_hop_addr()),
-            }));
-            // Phase 3: every peer's Adj-RIB-Out follows.
+            // RFC 4271 §9.3: the FIB follows the chosen route; its
+            // validation state alone changes nothing there.
+            if route_changed {
+                out.push(Output::Fib(FibChange {
+                    family,
+                    prefix,
+                    next_hop: new_best.as_ref().map(|b| b.attrs.next_hop_addr()),
+                }));
+            }
+            // Phase 3: every peer's Adj-RIB-Out follows. Export policy
+            // sees the validation state, so a new state alone runs it
+            // again; the pacing sends nothing to a peer whose route
+            // stays the same.
             let infos: Vec<PeerInfo> = self.peers.values().map(|p| p.info.clone()).collect();
             for info in infos {
                 let exported = new_best
@@ -1043,7 +1117,10 @@ impl Rib {
             return None;
         }
         let modified;
-        let attrs: &PathAttrs = match self.policies.export(to, family, prefix, &best.attrs) {
+        let verdict = self
+            .policies
+            .export(to, family, prefix, &best.attrs, best.rov);
+        let attrs: &PathAttrs = match verdict {
             Verdict::Reject => return None,
             Verdict::Accept => &best.attrs,
             Verdict::Modified(a) => {
@@ -1152,8 +1229,9 @@ fn push_one<T>(list: &mut Vec<T>, item: T) {
 
 /// RFC 4271 §9.1.1: import policy decides whether `route`, as the
 /// Adj-RIB-In holds it for `prefix` of `family`, is a candidate for
-/// Phase 2, and with which attributes. `candidates` gets the outcome in
-/// place of what it held for the route's peer; whether that changed them.
+/// Phase 2, and with which attributes; the candidate carries the route's
+/// validation state. `candidates` gets the outcome in place of what it
+/// held for the route's peer; whether that changed them.
 ///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
@@ -1165,7 +1243,7 @@ fn import(
     route: &Received,
     candidates: &mut Vec<Candidate>,
 ) -> bool {
-    let accepted = match policies.import(info, family, prefix, &route.attrs) {
+    let accepted = match policies.import(info, family, prefix, &route.attrs, route.rov) {
         Verdict::Accept => Some(Arc::clone(&route.attrs)),
         Verdict::Modified(a) => Some(interner.intern(a)),
         Verdict::Reject => None,
@@ -1179,11 +1257,13 @@ fn import(
         }
         (Some(attrs), Some(i)) => {
             let c = &mut candidates[i];
-            if Arc::ptr_eq(&c.attrs, &attrs) {
+            if Arc::ptr_eq(&c.attrs, &attrs) && c.rov == route.rov && c.aspa == route.aspa {
                 // An implicit re-announcement of the same route.
                 return false;
             }
             c.attrs = attrs;
+            c.rov = route.rov;
+            c.aspa = route.aspa;
             true
         }
         (Some(attrs), None) => {
@@ -1195,6 +1275,8 @@ fn import(
                     router_id: info.router_id.to_u32(),
                     remote_as: info.remote_as,
                     attrs,
+                    rov: route.rov,
+                    aspa: route.aspa,
                 },
             );
             true

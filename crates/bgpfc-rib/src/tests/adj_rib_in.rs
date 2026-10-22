@@ -10,7 +10,14 @@ use crate::{AcceptAll, Policies, Verdict};
 struct RejectOneRaiseRest(Prefix);
 
 impl Policies for RejectOneRaiseRest {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, a: &PathAttrs) -> Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        a: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         if p == self.0 {
             return Verdict::Reject;
         }
@@ -18,7 +25,14 @@ impl Policies for RejectOneRaiseRest {
         a.local_pref = Some(200);
         Verdict::Modified(a)
     }
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 }
@@ -27,14 +41,28 @@ impl Policies for RejectOneRaiseRest {
 struct Reject(Vec<Prefix>);
 
 impl Policies for Reject {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         if self.0.contains(&p) {
             Verdict::Reject
         } else {
             Verdict::Accept
         }
     }
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 }

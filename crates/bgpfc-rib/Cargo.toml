@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Adj-RIB-In, Loc-RIB, Adj-RIB-Out and the RFC 4271 §9 decision process"
 
 [dependencies]
+bgpfc-rpki.workspace = true
 bgpfc-wire.workspace = true
 
 [dev-dependencies]
