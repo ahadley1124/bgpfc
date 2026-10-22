@@ -141,15 +141,23 @@ pub fn check_compatible(found: &Version) -> Result<(), SidecarError> {
 /// it holds no version, or [`SidecarError::IncompatibleVersion`].
 pub fn check_version_output(stdout: &str) -> Result<Version, SidecarError> {
     let Some(version) = parse_version(stdout) else {
-        let trimmed = stdout.trim();
-        let mut output: String = trimmed.chars().take(EXCERPT_CHARS).collect();
-        if output.len() < trimmed.len() {
-            output.push_str("...");
-        }
-        return Err(SidecarError::UnrecognizedVersion { output });
+        return Err(SidecarError::UnrecognizedVersion {
+            output: excerpt(stdout),
+        });
     };
     check_compatible(&version)?;
     Ok(version)
+}
+
+/// The start of what a program printed, for an error message: trimmed,
+/// at most [`EXCERPT_CHARS`] characters, and `...` if there was more.
+pub(crate) fn excerpt(output: &str) -> String {
+    let trimmed = output.trim();
+    let mut excerpt: String = trimmed.chars().take(EXCERPT_CHARS).collect();
+    if excerpt.len() < trimmed.len() {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 #[cfg(test)]

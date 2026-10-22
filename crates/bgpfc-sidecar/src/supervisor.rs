@@ -1,7 +1,7 @@
 //! The supervision state machine. Pure: `(state, event, now) -> (state,
 //! actions)`. It never reads the clock, spawns or signals anything; the
-//! I/O shell in bgpfcd feeds it what happened and carries out the actions
-//! it returns.
+//! I/O shell, [`Sidecar`](crate::Sidecar), feeds it what happened and
+//! carries out the actions it returns.
 //!
 //! Implements: no RFC. The rules come from issue #70: a crashed validator
 //! is restarted with backoff, repeated failure raises an alarm instead of
