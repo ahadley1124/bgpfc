@@ -87,10 +87,21 @@ impl ChildSignal {
 /// is the choice that does not depend on the child's cooperation;
 /// [`ChildSignal::Term`] lets the child clean up first.
 ///
-/// The kernel clears the setting when the child executes a set-user-ID or
-/// set-group-ID program, or one with file capabilities (`prctl(2)`), so do
-/// not rely on it for those. Like any pre-exec hook, this makes std use
-/// `fork` and `execve` instead of `posix_spawn`.
+/// The kernel clears the setting, silently, when the child (`prctl(2)`):
+///
+/// - executes a set-user-ID or set-group-ID program, or one with file
+///   capabilities;
+/// - changes its effective or file-system user or group ID, as a program
+///   that drops root with `setuid` or `setgid` does, or gains a
+///   capability it did not have (`commit_creds` in `kernel/cred.c`).
+///
+/// So do not rely on it for a program that does either: run it as the
+/// user it should end up as instead
+/// ([`CommandExt::uid`](std::os::unix::process::CommandExt::uid) and
+/// [`gid`](std::os::unix::process::CommandExt::gid) take effect before
+/// this hook runs), and keep it from switching users itself. Like any
+/// pre-exec hook, this makes std use `fork` and `execve` instead of
+/// `posix_spawn`.
 #[allow(unsafe_code, reason = "getpid takes no arguments and cannot fail")]
 pub fn set_parent_death_signal(cmd: &mut Command, signal: ChildSignal) {
     // SAFETY: `getpid` has no preconditions and always succeeds.
