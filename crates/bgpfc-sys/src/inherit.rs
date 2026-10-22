@@ -1,18 +1,20 @@
 //! What a child inherits across `execve(2)` that std's
 //! [`Command`] leaves alone: the ambient capability set
-//! (`capabilities(7)`).
+//! (`capabilities(7)`) and the file descriptors that are not
+//! close-on-exec.
 //!
 //! A daemon granted capabilities as ambient ones, as systemd's
 //! `AmbientCapabilities=` does, passes them on to every unprivileged
 //! program it starts, which then holds them as effective capabilities.
-//! The hook here runs in the child between `fork` and `execve`, so the
-//! caller keeps its own.
+//! A descriptor opened without `O_CLOEXEC` stays open in every program it
+//! starts. The hooks here run in the child between `fork` and `execve`, so
+//! the caller keeps its own.
 //!
 //! Implements the process plumbing of the supervised RPKI relying-party
 //! sidecar (GitHub issues #26, #70): the validator parses data from the
 //! internet and needs no capability at all.
 
-use std::ffi::c_ulong;
+use std::ffi::{c_int, c_ulong};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -81,9 +83,75 @@ pub fn clear_ambient_capabilities(cmd: &mut Command) {
     }
 }
 
+/// The most descriptors a process may hold unless the administrator
+/// raised `fs.nr_open` (`sysctl_nr_open` in `fs/file.c`): the bound
+/// [`inherit_only_standard_streams`] uses if the soft limit is unknown.
+const DEFAULT_NR_OPEN: c_int = 1 << 20;
+
+/// Mark every file descriptor from 3 up close-on-exec in the child that
+/// `cmd` spawns (`fcntl(fd, F_SETFD, FD_CLOEXEC)`, `fcntl(2)`), so the
+/// program starts with standard input, output and error only.
+///
+/// std opens its own descriptors close-on-exec, but one made otherwise,
+/// such as the self-pipe of [`Signals`](crate::Signals), stays open in
+/// every program the process starts, and in what those start in turn,
+/// for as long as they run. A program that writes to that pipe makes
+/// [`Signals::wait`](crate::Signals::wait) report a signal nobody sent.
+///
+/// The descriptors are marked rather than closed, so the one std uses to
+/// report a failed `execve` to [`Command::spawn`] keeps working, and the
+/// standard streams std has already put on 0, 1 and 2 are left alone.
+/// Every number below the soft `RLIMIT_NOFILE` limit is marked, one
+/// system call each; the limit is read when this is called
+/// (`sysconf(_SC_OPEN_MAX)`, `sysconf(3)`). A soft limit of a million
+/// makes a spawn take a fraction of a second longer. A descriptor at or
+/// above the soft limit, which only a process that lowered its limit
+/// after opening it can hold, is not covered. `close_range(2)` with
+/// `CLOSE_RANGE_CLOEXEC` would mark them all in one call, but needs Linux
+/// 5.11 and glibc 2.34, and musl lacks it.
+///
+/// The caller's own descriptors keep their flags. Like any pre-exec hook,
+/// this makes std use `fork` and `execve` instead of `posix_spawn`.
+#[allow(
+    unsafe_code,
+    reason = "sysconf, and a pre-exec hook with the fcntl calls inside it"
+)]
+pub fn inherit_only_standard_streams(cmd: &mut Command) {
+    // SAFETY: `sysconf` takes an integer and has no preconditions. It runs
+    // here, in the parent, where it may do whatever it needs to.
+    let open_max = unsafe { ffi::sysconf(ffi::SC_OPEN_MAX) };
+    // -1 means unknown; the kernel bounds RLIMIT_NOFILE by `fs.nr_open`,
+    // which fits an `int`.
+    let end = match c_int::try_from(open_max) {
+        Ok(n) if n > 0 => n,
+        _ => DEFAULT_NR_OPEN,
+    };
+    let hook = move || -> io::Result<()> {
+        for fd in 3..end {
+            // SAFETY: `fcntl` is variadic in `<fcntl.h>` and F_SETFD reads
+            // one `int`, the descriptor flags. Integer arguments only: it
+            // changes a flag in this child's descriptor table, which `fork`
+            // copied, and fails harmlessly with EBADF for a number that is
+            // not open. The C library wrapper is a bare system call: no
+            // locks, no allocation.
+            unsafe { ffi::fcntl(fd, ffi::F_SETFD, ffi::FD_CLOEXEC) };
+        }
+        Ok(())
+    };
+    // SAFETY: `pre_exec` requires the hook to be safe to run in a child of
+    // a possibly multi-threaded process between `fork` and `execve`. It
+    // only calls `fcntl`, a bare system call, in a loop over integers; it
+    // captures one `c_int`, takes no locks, allocates nothing, and touches
+    // no memory shared with the parent. It never fails.
+    unsafe {
+        cmd.pre_exec(hook);
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{Output, Stdio};
 
     /// Set by [`ambient_case`] for the copy of this test binary that
@@ -197,5 +265,65 @@ mod tests {
         clear_ambient_capabilities(&mut cmd);
         let status = cmd.args(["-c", "exit 0"]).status().expect("spawn /bin/sh");
         assert!(status.success(), "{status}");
+    }
+
+    /// A pipe without `O_CLOEXEC`, as [`Signals`](crate::Signals) makes
+    /// one: its read and write ends.
+    #[allow(unsafe_code, reason = "pipe(2) for the test")]
+    fn inheritable_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds: [c_int; 2] = [-1, -1];
+        // SAFETY: `fds` is a writable array of two ints, as `pipe(2)` wants.
+        let rc = unsafe { ffi::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // SAFETY: both descriptors were just created by `pipe` and are
+        // owned by nobody else; wrapping them now closes them on drop.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    /// Which of `fds` are open in `/bin/sh` spawned by `cmd`, as the
+    /// shell sees its own descriptors, and whether its stdout works.
+    fn open_in_child(mut cmd: Command, fds: &[&OwnedFd]) -> Vec<String> {
+        let out = cmd
+            .args([
+                "-c",
+                "for n; do [ -e /proc/$$/fd/$n ] && echo $n; done; echo end",
+                "sh",
+            ])
+            .args(fds.iter().map(|fd| fd.as_raw_fd().to_string()))
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn /bin/sh");
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        assert_eq!(lines.pop().as_deref(), Some("end"), "stdout works");
+        lines
+    }
+
+    /// A pipe this process holds without `O_CLOEXEC` reaches a child
+    /// spawned without the hook, the control, and not one spawned with it.
+    #[test]
+    fn only_the_standard_streams_reach_the_child() {
+        let (reader, writer) = inheritable_pipe();
+        let numbers: Vec<String> = [&reader, &writer]
+            .iter()
+            .map(|fd| fd.as_raw_fd().to_string())
+            .collect();
+        let bare = open_in_child(Command::new("/bin/sh"), &[&reader, &writer]);
+        assert_eq!(bare, numbers, "the control inherits the pipe");
+        let mut hooked = Command::new("/bin/sh");
+        inherit_only_standard_streams(&mut hooked);
+        let hooked = open_in_child(hooked, &[&reader, &writer]);
+        assert_eq!(hooked, Vec::<String>::new(), "the hook left the pipe open");
+    }
+
+    /// The descriptor std uses to report a failed `execve` is marked, not
+    /// closed, so the failure still reaches `spawn`.
+    #[test]
+    fn a_failed_exec_is_still_reported() {
+        let mut cmd = Command::new("/nonexistent/bgpfc-test-program");
+        inherit_only_standard_streams(&mut cmd);
+        let err = cmd.spawn().expect_err("there is no such program");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     }
 }

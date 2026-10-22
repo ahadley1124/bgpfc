@@ -11,6 +11,7 @@
     reason = "C names, as in the headers they are cited from"
 )]
 
+use std::ffi::c_long;
 use std::ffi::{c_int, c_uint, c_ulong, c_ushort, c_void};
 
 /// `uid_t` / `gid_t`: `__kernel_uid32_t`, `<asm-generic/posix_types.h>`.
@@ -55,6 +56,11 @@ pub(crate) const EINVAL: c_int = 22;
 pub(crate) const PR_SET_PDEATHSIG: c_int = 1;
 pub(crate) const PR_CAP_AMBIENT: c_int = 47;
 pub(crate) const PR_CAP_AMBIENT_CLEAR_ALL: c_ulong = 4;
+// <asm-generic/fcntl.h>
+pub(crate) const F_SETFD: c_int = 2;
+pub(crate) const FD_CLOEXEC: c_int = 1;
+// `_SC_OPEN_MAX`: <bits/confname.h> in glibc, <unistd.h> in musl.
+pub(crate) const SC_OPEN_MAX: c_int = 4;
 // <linux/wait.h>
 pub(crate) const WEXITED: c_int = 0x0000_0004;
 pub(crate) const WNOWAIT: c_int = 0x0100_0000;
@@ -125,6 +131,11 @@ unsafe extern "C" {
     // <sys/prctl.h>, prctl(2): variadic there, so variadic here; callers
     // pass all four `unsigned long` arguments the C wrapper reads.
     pub(crate) fn prctl(option: c_int, ...) -> c_int;
+    // <fcntl.h>, fcntl(2): variadic there, so variadic here; F_SETFD
+    // reads an `int`.
+    pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    // <unistd.h>, sysconf(3)
+    pub(crate) fn sysconf(name: c_int) -> c_long;
     // <sys/wait.h>
     pub(crate) fn waitid(
         idtype: idtype_t,
