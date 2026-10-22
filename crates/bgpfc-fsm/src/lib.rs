@@ -14,7 +14,8 @@
 //! subcodes for administrative stops and collisions; damping after the
 //! Cease subcodes it names, and a bound on consecutive automatic
 //! restarts); RFC 5492 §5
-//! (Unsupported Capability); RFC 4760 §8 (families need both sides);
+//! (Unsupported Capability); RFC 4760 §8 (a family goes both ways when both
+//! sides advertised it; routes of every family we advertised are taken);
 //! RFC 6793 §3 (four-octet AS negotiation); RFC 8654 §4 (Extended Message
 //! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
 //! RFC 7607 §2 (never claim AS 0).
@@ -231,8 +232,15 @@ pub struct Session {
     /// The peer advertised Route Refresh (RFC 2918 §4).
     pub route_refresh: bool,
     /// Families both sides advertised (RFC 4760 §8), or IPv4 unicast alone
-    /// when neither side used the Multiprotocol capability.
+    /// when neither side used the Multiprotocol capability: they go both
+    /// ways. Only these are sent to the peer.
     pub families: Vec<AddressFamily>,
+    /// Families we advertised (RFC 4760 §8), or IPv4 unicast alone without
+    /// a Multiprotocol capability: the peer may send us routes of these,
+    /// whether or not it advertised them too, since a sender may use a
+    /// capability its receiver advertised (RFC 5492 §3). Includes
+    /// `families`.
+    pub receive_families: Vec<AddressFamily>,
     /// The families in `families` for which both sides advertised
     /// Extended Next Hop Encoding (RFC 8950 §4): their routes may carry an
     /// IPv6 next hop either way. Only IPv4 unicast with an IPv6 next hop

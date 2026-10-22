@@ -760,6 +760,11 @@ impl Fsm {
         // RFC 2918 §4: send ROUTE-REFRESH only if the peer advertised it.
         let route_refresh = open.has(&Capability::RouteRefresh);
         let families = negotiate_families(ours, &open.capabilities);
+        // RFC 4760 §8 asks both sides to advertise a family only for "a
+        // bi-directional exchange"; a sender may use a capability its
+        // receiver advertised (RFC 5492 §3), so the peer may send us routes
+        // of every family we advertised, whether it advertised it or not.
+        let receive_families = advertised_families(ours);
         // RFC 8950 §4: an IPv6 next hop for IPv4 unicast once both sides
         // listed the triple. The capability says nothing about whether the
         // family itself is used; the Multiprotocol capability alone decides
@@ -801,6 +806,7 @@ impl Fsm {
             extended_messages,
             route_refresh,
             families,
+            receive_families,
             extended_next_hop,
             peer_capabilities: open.capabilities.clone(),
         })
@@ -1028,26 +1034,31 @@ fn ipv4_unicast_via_ipv6(caps: &[Capability]) -> bool {
     next_hop_encodings(caps).any(|t| t == NextHopEncoding::IPV4_UNICAST_VIA_IPV6)
 }
 
-/// RFC 4760 §8: a family is usable only if both sides advertised it. A side
-/// with no Multiprotocol capability at all is an IPv4-unicast-only speaker.
-fn negotiate_families(ours: &[Capability], theirs: &[Capability]) -> Vec<AddressFamily> {
-    fn families(caps: &[Capability]) -> Vec<AddressFamily> {
-        let mut v: Vec<AddressFamily> = caps
-            .iter()
-            .filter_map(|c| match c {
-                Capability::Multiprotocol(f) => Some(*f),
-                _ => None,
-            })
-            .collect();
-        if v.is_empty() {
-            v.push(AddressFamily::IPV4_UNICAST);
-        }
-        v.sort();
-        v.dedup();
-        v
+/// The families a speaker advertised with the Multiprotocol capability
+/// (RFC 4760 §8), sorted. A speaker with none at all is an
+/// IPv4-unicast-only speaker.
+fn advertised_families(caps: &[Capability]) -> Vec<AddressFamily> {
+    let mut v: Vec<AddressFamily> = caps
+        .iter()
+        .filter_map(|c| match c {
+            Capability::Multiprotocol(f) => Some(*f),
+            _ => None,
+        })
+        .collect();
+    if v.is_empty() {
+        v.push(AddressFamily::IPV4_UNICAST);
     }
-    let theirs = families(theirs);
-    families(ours)
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// RFC 4760 §8: "To have a bi-directional exchange of routing information
+/// for a particular <AFI, SAFI> between a pair of BGP speakers, each such
+/// speaker MUST advertise to the other" the capability for it.
+fn negotiate_families(ours: &[Capability], theirs: &[Capability]) -> Vec<AddressFamily> {
+    let theirs = advertised_families(theirs);
+    advertised_families(ours)
         .into_iter()
         .filter(|f| theirs.contains(f))
         .collect()

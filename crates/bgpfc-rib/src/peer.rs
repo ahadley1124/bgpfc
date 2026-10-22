@@ -1,6 +1,6 @@
 //! What the RIB knows about a session.
 //!
-//! Implements: RFC 4760 §8 (negotiated families); RFC 8654 §4 (message
+//! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
 //! per-family prefix limit), §6.3 a) (our own address is no next hop).
 
@@ -26,8 +26,13 @@ pub struct PeerInfo {
     pub router_id: RouterId,
     /// Internal or external session.
     pub kind: PeerKind,
-    /// Families negotiated with the peer (RFC 4760 §8).
+    /// Families negotiated with the peer, which both sides advertised
+    /// (RFC 4760 §8): the ones whose routes it is sent.
     pub families: Vec<AddressFamily>,
+    /// Families we advertised to the peer (RFC 4760 §8): it may send routes
+    /// of these even when it did not advertise them itself (RFC 5492 §3).
+    /// Routes of a family in neither list are ignored.
+    pub receive_families: Vec<AddressFamily>,
     /// Both sides speak four-octet ASNs (RFC 6793 §3).
     pub four_octet_as: bool,
     /// Both sides accept 65535-octet messages (RFC 8654 §4).
@@ -61,10 +66,17 @@ impl PeerInfo {
         }
     }
 
-    /// Whether `family` was negotiated.
+    /// Whether `family` was negotiated: routes of it go to the peer.
     #[must_use]
     pub fn speaks(&self, family: AddressFamily) -> bool {
         self.families.contains(&family)
+    }
+
+    /// Whether routes of `family` are taken from the peer: we advertised
+    /// it, or it was negotiated (RFC 4760 §8, RFC 5492 §3).
+    #[must_use]
+    pub fn receives(&self, family: AddressFamily) -> bool {
+        self.receive_families.contains(&family) || self.speaks(family)
     }
 
     /// The prefix limit for `family`, if there is one (RFC 4271 §6.7).

@@ -25,6 +25,7 @@ fn peer(i: u8) -> PeerInfo {
         router_id: RouterId::new(u32::from(i)).unwrap(),
         kind: PeerKind::External,
         families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+        receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
         four_octet_as: true,
         extended_messages: false,
         extended_next_hop: Vec::new(),

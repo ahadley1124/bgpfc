@@ -72,6 +72,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
             PeerKind::External
         },
         families: vec![V4, V6],
+        receive_families: vec![V4, V6],
         four_octet_as: true,
         extended_messages: false,
         extended_next_hop: Vec::new(),
@@ -857,13 +858,13 @@ fn prefix_in_both_withdrawn_and_nlri_is_announced() {
 }
 
 #[test]
-fn routes_of_a_family_the_session_did_not_negotiate_are_ignored() {
-    // RFC 4760 §8: e1 negotiated IPv4 unicast only. Its IPv6 routes would
-    // reach the other peers, and outlive its session, since a session's
-    // routes go per negotiated family.
+fn routes_of_a_family_we_did_not_advertise_are_ignored() {
+    // RFC 4760 §8: we advertised IPv4 unicast only to e1, so IPv6 routes
+    // are not e1's to send.
     let mut rib = Rib::new(LOCAL_AS);
     let mut e1 = peer("10.0.0.1", 65_001, 1);
     e1.families = vec![V4];
+    e1.receive_families = vec![V4];
     let e2 = peer("10.0.0.2", 65_002, 2);
     rib.peer_up(e1.clone(), now());
     rib.peer_up(e2.clone(), now());
@@ -887,6 +888,60 @@ fn routes_of_a_family_the_session_did_not_negotiate_are_ignored() {
         rib.loc_rib(V6).all(|(_, b)| b.peer == e2.addr),
         "a route of e1 outlived its session"
     );
+}
+
+#[test]
+fn routes_of_a_family_only_we_advertised_are_taken_and_go_with_the_session() {
+    // RFC 4760 §8: e1 did not advertise IPv6 unicast, we did. Both sides
+    // must advertise a family only for a bi-directional exchange; our
+    // capability lets e1 send IPv6 routes (RFC 5492 §3), but e1 is sent
+    // none.
+    let mut rib = Rib::new(LOCAL_AS);
+    let mut e1 = peer("10.0.0.1", 65_001, 1);
+    e1.families = vec![V4];
+    e1.receive_families = vec![V4, V6];
+    e1.prefix_limits = vec![(V6, 2)];
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let v6 = announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1"));
+    let out = rib.update(e1.addr, &v6, now());
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sends(&out, e2.addr).len(), 1);
+    assert_eq!(sends(&out, e1.addr).len(), 0);
+    // e2's IPv6 routes do not go to e1.
+    let from_e2 = announce(&["2001:db8:2::/48"], &attrs(&[65_002], "2001:db8::2"));
+    let out = rib.update(e2.addr, &from_e2, now());
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sends(&out, e1.addr).len(), 0);
+    let stats = rib.peer_stats(e1.addr).unwrap();
+    assert_eq!(stats.received, vec![(V4, 0), (V6, 1)]);
+    assert_eq!(stats.advertised, vec![(V4, 0)]);
+    // The prefix limit counts them (RFC 4271 §6.7).
+    let more = announce(
+        &["2001:db8:3::/48", "2001:db8:4::/48"],
+        &attrs(&[65_001], "2001:db8::1"),
+    );
+    let out = rib.update(e1.addr, &more, now());
+    assert!(out.contains(&Output::PrefixLimitExceeded {
+        peer: e1.addr,
+        family: V6,
+        limit: 2
+    }));
+    assert!(rib.candidates(V6, p("2001:db8:1::/48")).is_empty());
+    // Withdrawn with the session, like any other: none outlives it.
+    rib.peer_up(e1.clone(), now());
+    rib.update(e1.addr, &v6, now());
+    let out = rib.peer_down(e1.addr, now());
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V6,
+            prefix: p("2001:db8:1::/48"),
+            next_hop: None
+        }]
+    );
+    assert!(rib.loc_rib(V6).all(|(_, b)| b.peer == e2.addr));
 }
 
 #[test]

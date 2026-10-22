@@ -255,6 +255,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         router_id: s.peer_router_id,
         kind: s.peer,
         families: s.families.clone(),
+        receive_families: s.receive_families.clone(),
         four_octet_as: s.four_octet_as,
         extended_messages: s.extended_messages,
         extended_next_hop: s.extended_next_hop.clone(),
@@ -451,6 +452,7 @@ mod tests {
             extended_messages: false,
             route_refresh: true,
             families: vec![AddressFamily::IPV4_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop: Vec::new(),
             peer_capabilities: Vec::new(),
         }

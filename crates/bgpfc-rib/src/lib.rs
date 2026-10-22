@@ -12,11 +12,11 @@
 //! §6.3 a) (a route whose next hop is our own address is ignored, see
 //! [`Output::InvalidNextHop`]);
 //! RFC 4760 §3, §5, §7, §8 (each NLRI field with its own next hop,
-//! per-family RIBs, family disable, only negotiated families); RFC 2918 §4
-//! (route refresh re-sends the
-//! Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6 next hop, see
-//! [`export`]); RFC 4271 §6.7 (a per-family prefix limit that ends the
-//! session, see [`Output::PrefixLimitExceeded`]).
+//! per-family RIBs, family disable, routes taken of the families we
+//! advertised and sent of the negotiated ones); RFC 2918 §4 (route refresh
+//! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
+//! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
+//! that ends the session, see [`Output::PrefixLimitExceeded`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -196,9 +196,9 @@ impl PeerState {
 /// Counters about one peer, for the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerStats {
-    /// Routes accepted from the peer, per family.
+    /// Routes accepted from the peer, per family it may send.
     pub received: Vec<(AddressFamily, usize)>,
-    /// Routes advertised to the peer, per family.
+    /// Routes advertised to the peer, per negotiated family.
     pub advertised: Vec<(AddressFamily, usize)>,
 }
 
@@ -299,18 +299,18 @@ impl Rib {
     }
 
     /// Remove the peer and every route it sent; the destinations whose
-    /// candidates changed.
+    /// candidates changed. Every family's table is searched, not only the
+    /// negotiated ones: the peer may have sent routes of any family we
+    /// advertised (RFC 4760 §8), and none may outlive the session.
     fn forget_peer(&mut self, addr: IpAddr) -> Vec<(AddressFamily, Prefix)> {
-        let Some(state) = self.peers.remove(&addr) else {
+        if self.peers.remove(&addr).is_none() {
             return Vec::new();
-        };
+        }
         let mut dirty: Vec<(AddressFamily, Prefix)> = Vec::new();
-        for family in &state.info.families {
-            if let Some(table) = self.tables.get_mut(family) {
-                for (prefix, dest) in table.iter_mut() {
-                    if remove_candidate(dest, addr) {
-                        dirty.push((*family, *prefix));
-                    }
+        for (family, table) in &mut self.tables {
+            for (prefix, dest) in table.iter_mut() {
+                if remove_candidate(dest, addr) {
+                    dirty.push((*family, *prefix));
                 }
             }
         }
@@ -595,8 +595,8 @@ impl Rib {
     /// announcements to the Adj-RIB-In, rerun the decision process for the
     /// destinations touched, and produce the FIB changes and UPDATEs that
     /// follow, after an [`Output::InvalidNextHop`] for each part of the
-    /// UPDATE whose routes were ignored. Routes of a family the session did
-    /// not negotiate are ignored (RFC 4760 §8).
+    /// UPDATE whose routes were ignored. Routes of a family we did not
+    /// advertise to the peer are ignored (RFC 4760 §8).
     pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate, now: Instant) -> Vec<Output> {
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
@@ -614,10 +614,13 @@ impl Rib {
             .get(&addr)
             .map(|s| s.disabled.clone())
             .unwrap_or_default();
-        // RFC 4760 §8: a family is exchanged only once both sides have
-        // advertised it. Routes of another are not the session's to give:
-        // they are ignored, as is a family disabled by RFC 4760 §7.
-        let unused = |family: AddressFamily| disabled.contains(&family) || !info.speaks(family);
+        // RFC 4760 §8 needs both sides to advertise a family only for a
+        // bi-directional exchange: our capability is what lets the peer
+        // send routes of one (RFC 5492 §3), so those of every family we
+        // advertised are taken, negotiated or not. Routes of a family we
+        // did not advertise are ignored, as are those of a family disabled
+        // by RFC 4760 §7.
+        let unused = |family: AddressFamily| disabled.contains(&family) || !info.receives(family);
         for (family, prefix) in update.withdrawals() {
             if unused(family) {
                 continue;
@@ -798,10 +801,21 @@ impl Rib {
     pub fn peer_stats(&self, addr: IpAddr) -> Option<PeerStats> {
         let p = self.peers.get(&addr)?;
         let mut stats = PeerStats::default();
-        for family in &p.info.families {
+        let mut taken: Vec<AddressFamily> = p
+            .info
+            .receive_families
+            .iter()
+            .chain(&p.info.families)
+            .copied()
+            .collect();
+        taken.sort();
+        taken.dedup();
+        for family in taken {
             stats
                 .received
-                .push((*family, p.adj_in_count.get(family).copied().unwrap_or(0)));
+                .push((family, p.adj_in_count.get(&family).copied().unwrap_or(0)));
+        }
+        for family in &p.info.families {
             stats
                 .advertised
                 .push((*family, p.adj_out.get(family).map_or(0, AdjRibOut::len)));

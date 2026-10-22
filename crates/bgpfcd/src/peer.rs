@@ -712,11 +712,14 @@ impl Peer {
                             error = d.error
                         );
                     }
-                    let negotiated = self.session.as_ref().map_or(&[][..], |s| &s.families);
-                    for family in unnegotiated(&decoded.message, negotiated) {
+                    let taken = self
+                        .session
+                        .as_ref()
+                        .map_or(&[][..], |s| &s.receive_families);
+                    for family in unadvertised(&decoded.message, taken) {
                         // RFC 4760 §8: the RIB ignores them.
                         bgpfc_log::warn!(
-                            "ignoring routes of a family the session did not negotiate",
+                            "ignoring routes of a family we did not advertise",
                             peer = self.cfg.addr,
                             family = family
                         );
@@ -808,8 +811,8 @@ fn close_with_cease(mut conn: Conn, subcode: CeaseSubcode) {
 }
 
 /// The families `m` carries routes of, announced or withdrawn, that are not
-/// among `negotiated` (RFC 4760 §8), each once.
-fn unnegotiated(m: &UpdateMessage, negotiated: &[AddressFamily]) -> Vec<AddressFamily> {
+/// among `taken`, the families we advertised (RFC 4760 §8), each once.
+fn unadvertised(m: &UpdateMessage, taken: &[AddressFamily]) -> Vec<AddressFamily> {
     let ipv4 =
         (!m.withdrawn.is_empty() || !m.nlri.is_empty()).then_some(AddressFamily::IPV4_UNICAST);
     let mut out = Vec::new();
@@ -818,7 +821,7 @@ fn unnegotiated(m: &UpdateMessage, negotiated: &[AddressFamily]) -> Vec<AddressF
         .chain(m.mp_reach.as_ref().map(|r| r.family))
         .chain(m.mp_unreach.as_ref().map(|u| u.family))
     {
-        if !negotiated.contains(&family) && !out.contains(&family) {
+        if !taken.contains(&family) && !out.contains(&family) {
             out.push(family);
         }
     }
@@ -831,7 +834,7 @@ mod tests {
     use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
 
     #[test]
-    fn families_not_negotiated_are_named_once() {
+    fn families_we_did_not_advertise_are_named_once() {
         let v4 = AddressFamily::IPV4_UNICAST;
         let v6 = AddressFamily::IPV6_UNICAST;
         let p = |s: &str| s.parse().unwrap();
@@ -851,12 +854,12 @@ mod tests {
             }),
             ..UpdateMessage::default()
         };
-        assert_eq!(unnegotiated(&m, &[v4]), vec![v6]);
-        assert_eq!(unnegotiated(&m, &[v6]), vec![v4]);
-        assert_eq!(unnegotiated(&m, &[v4, v6]), vec![]);
-        assert_eq!(unnegotiated(&m, &[]), vec![v4, v6]);
+        assert_eq!(unadvertised(&m, &[v4]), vec![v6]);
+        assert_eq!(unadvertised(&m, &[v6]), vec![v4]);
+        assert_eq!(unadvertised(&m, &[v4, v6]), vec![]);
+        assert_eq!(unadvertised(&m, &[]), vec![v4, v6]);
         m.withdrawn.clear();
-        assert_eq!(unnegotiated(&m, &[]), vec![v6]);
-        assert_eq!(unnegotiated(&UpdateMessage::default(), &[]), vec![]);
+        assert_eq!(unadvertised(&m, &[]), vec![v6]);
+        assert_eq!(unadvertised(&UpdateMessage::default(), &[]), vec![]);
     }
 }

@@ -840,6 +840,7 @@ mod tests {
             extended_messages: true,
             route_refresh: true,
             families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop: vec![AddressFamily::IPV4_UNICAST],
             peer_capabilities: Vec::new(),
         };
@@ -887,6 +888,7 @@ mod tests {
             router_id: RouterId::new(2).unwrap(),
             kind: bgpfc_wire::update::PeerKind::External,
             families: vec![v4, v6],
+            receive_families: vec![v4, v6],
             four_octet_as: true,
             extended_messages: false,
             extended_next_hop: Vec::new(),
@@ -912,6 +914,7 @@ mod tests {
                 extended_messages: false,
                 route_refresh: true,
                 families: vec![v4, v6],
+                receive_families: vec![v4, v6],
                 extended_next_hop: Vec::new(),
                 peer_capabilities: Vec::new(),
             }),

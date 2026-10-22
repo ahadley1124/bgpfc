@@ -51,6 +51,7 @@ fn peers() -> Vec<PeerInfo> {
                 PeerKind::Internal
             },
             families: vec![V4],
+            receive_families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
             extended_next_hop: Vec::new(),

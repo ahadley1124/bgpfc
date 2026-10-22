@@ -433,8 +433,13 @@ fn open_negotiation() {
     // RFC 8654 §4: only we advertised Extended Message.
     assert!(!s.extended_messages);
     assert!(s.route_refresh);
-    // RFC 4760 §8: only IPv4 unicast on both sides.
+    // RFC 4760 §8: only IPv4 unicast on both sides; we take IPv6 unicast
+    // routes too, since we advertised it.
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+    assert_eq!(
+        s.receive_families,
+        vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
+    );
     // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
     assert_eq!(s.extended_next_hop, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
@@ -473,6 +478,36 @@ fn internal_session_and_old_speaker() {
     assert!(!s.route_refresh);
     assert_eq!(s.hold_time, hold(90));
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+}
+
+#[test]
+fn routes_are_taken_for_every_family_we_advertised() {
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    let session = |ours: &[AddressFamily], theirs: &[AddressFamily]| {
+        let mut cfg = config();
+        cfg.capabilities = ours.iter().map(|f| Capability::Multiprotocol(*f)).collect();
+        let (mut f, now) = fsm_at(State::OpenSent, cfg);
+        let caps = theirs
+            .iter()
+            .map(|f| Capability::Multiprotocol(*f))
+            .collect();
+        f.handle(
+            Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+            now,
+        );
+        let s = f.session().unwrap();
+        (s.families.clone(), s.receive_families.clone())
+    };
+    // RFC 4760 §8: both ways only where both sides advertised the family;
+    // RFC 5492 §3: the peer may send what we advertised.
+    assert_eq!(session(&[v4, v6], &[v4, v6]), (vec![v4, v6], vec![v4, v6]));
+    assert_eq!(session(&[v4, v6], &[v6]), (vec![v6], vec![v4, v6]));
+    assert_eq!(session(&[v6], &[v4, v6]), (vec![v6], vec![v6]));
+    // No Multiprotocol capability means IPv4 unicast alone, on either side.
+    assert_eq!(session(&[], &[]), (vec![v4], vec![v4]));
+    assert_eq!(session(&[v4, v6], &[]), (vec![v4], vec![v4, v6]));
+    assert_eq!(session(&[], &[v4, v6]), (vec![v4], vec![v4]));
 }
 
 #[test]
