@@ -89,7 +89,8 @@ crates/
   bgpfcctl/             CLI binary.
 fuzz/                   cargo-fuzz crate, NOT a workspace member. Nightly allowed.
 interop/                dev-only crate: drives BIRD / FRR / GoBGP in network
-                        namespaces or containers. Not a workspace default-member.
+                        namespaces or containers, with RTR caches (StayRTR and
+                        a stub of its own). Not a workspace default-member.
 benches/ (per crate)    criterion benches as dev-dependencies.
 scripts/                check.sh, check-deps.sh, miri.sh, ...
 contrib/                bgpfcd.service, example configs.
@@ -275,16 +276,16 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-config` | Golden tests: input file → AST/debug output, and input file → error message snapshot. A fuzz target. |
 | `bgpfc-fib` | Netlink encode/decode tests against byte captures from `ip -d monitor` or strace. Miri on the pure parts. A reconcile-logic proptest. |
 | `bgpfc-sys` | Layout assertions. Real-socket tests where no privileges are needed. Mark tests that need privileges `#[ignore]`, and document how to run them. |
-| `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. No Miri and no fuzz target: the crate has no `unsafe` and decodes no bytes. |
-| `bgpfc-rtr` | Unit tests with PDU byte vectors built from RFC 8210 §5. `proptest` round-trips. A fuzz target for the PDU decoder. Miri. Table-driven session tests with injected time, including the RFC 8210 §7 version fallback and the §6 timers. Client tests against an in-process cache served from a std `TcpListener`. |
+| `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. Miri, since the RTR decoder fills its VRP set. No fuzz target: the crate decodes no bytes. |
+| `bgpfc-rtr` | Unit tests with PDU byte vectors laid out as in the figures of RFC 8210 §5 and RFC 6810 §5, and from a capture of a real version 0 session. `proptest` round-trips of the codec, and framer properties: the same PDUs, and the same error, however the stream is cut. Fuzz targets for the PDU decoder and framer and for the client session. Miri. Table-driven session tests with injected time: every PDU type and every transport and timer event in every state, then the RFC 8210 §8 sequences, the §7 version fallback, the §6 timers and stale data. A proptest of the session against a simulated cache that updates, restarts, goes away and runs out of data: every commit is a whole set the cache held, and the session ends in sync with it. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
-| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Uses network namespaces and needs root, so it runs in CI and on demand. |
+| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`; a stub cache of the crate's own stands in where StayRTR cannot. Uses network namespaces and needs root, so it runs in CI and on demand. |
 | benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation. Do not regress them without saying so in the PR. |
 
 Miri cannot run FFI. Put real syscalls behind
 `#[cfg(not(miri))]` and keep the encode/decode logic separate so Miri can cover
-it. The commit that creates `bgpfc-rtr` adds it to `scripts/miri.sh` and to
-the Miri line below.
+it. Besides the crates with `unsafe` or a byte decoder of their own,
+`scripts/miri.sh` runs `bgpfc-rpki`, whose VRP set the RTR decoder fills.
 
 ### Gates: all must pass before every commit
 
@@ -293,7 +294,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/check-deps.sh                                   # std-only enforcement
-cargo +nightly miri test -p bgpfc-wire -p bgpfc-sys -p bgpfc-fib   # via scripts/miri.sh
+cargo +nightly miri test -p bgpfc-wire -p bgpfc-sys -p bgpfc-fib \
+  -p bgpfc-rpki -p bgpfc-rtr                            # via scripts/miri.sh
 ```
 
 `scripts/check.sh` runs all five. If a gate fails, fix the cause. Never
@@ -389,10 +391,11 @@ Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
 Steps 0–9 are complete: they built v1. Their text stays as a record of what
-v1 covers. Steps 10 and 11 are complete as well, and their text stays as a
+v1 covers. Steps 10 to 12 are complete as well, and their text stays as a
 record of what they added; step 11 also did the part of step 13 that
-re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4). Work
-continues at step 12.
+re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4), and step
+12 the part that adds the `rpki` config, external caches or disabled. Work
+continues at step 13.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.

@@ -1,10 +1,10 @@
 //! Messages between the daemon's threads (AGENTS.md §3).
 //!
 //! Each peer thread owns one channel of [`PeerInput`]; connection reader
-//! threads and the coordinator write to it, and the control plane will
-//! once it exists. Peer threads send [`RibMsg`] to the RIB thread over a
-//! bounded channel so that a flooding peer blocks instead of growing
-//! memory, and so will a producer of validation changes.
+//! threads, the coordinator and the control plane write to it. Peer
+//! threads send [`RibMsg`] to the RIB thread over a bounded channel so
+//! that a flooding peer blocks instead of growing memory, and so does the
+//! RTR client with its validation changes.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
@@ -192,6 +192,16 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
 }
 
+/// What the coordinator reports about the `rpki` block.
+#[derive(Clone, Debug)]
+pub(crate) struct RpkiReport {
+    /// The running block.
+    pub(crate) config: bgpfc_config::ast::Rpki,
+    /// The RTR client's status, if one runs. Its VRPs are the data the
+    /// RIB validates with.
+    pub(crate) status: Option<bgpfc_rtr::client::Status>,
+}
+
 /// Each neighbor's configured `advertisement-interval` (RFC 4271
 /// §9.2.1.1); `None` takes the RFC 4271 §10 default for the session type.
 pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;
@@ -265,17 +275,10 @@ pub(crate) enum RibMsg {
         peer: IpAddr,
     },
     /// The validation source changed (issue #56): validate again the
-    /// routes the change affects (RFC 6811 §4). A producer sends it on the
-    /// same bounded channel as the peers, so it waits behind what is
-    /// queued and cannot outrun the RIB thread (AGENTS.md §3).
-    // AGENTS.md §9 step 11 asks for this command on the RIB thread's
-    // channel; its first producer is the RTR client of step 12, so until
-    // then only the tests send it. `expect` fails the build once a
-    // producer exists, so the attribute goes with that commit.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the RTR client of step 12 is the first sender")
-    )]
+    /// routes the change affects (RFC 6811 §4). The RTR client sends it on
+    /// the same bounded channel as the peers, so it waits behind what is
+    /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
+    /// coordinator when a reload turns validation off.
     Validation(bgpfc_rpki::ValidationChange),
 }
 

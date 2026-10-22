@@ -43,7 +43,8 @@ global       = "router-id" ipv4 ";"              (* required; not 0.0.0.0 *)
              | "log" "{" [ "level" level ";" ] "}"
              | "listen" "{" "address" ip ";" [ "port" u16 ";" ] "}"   (* repeatable *)
              | "fib" "{" { fib-item } "}"
-             | "control" "{" { control-item } "}" ;
+             | "control" "{" { control-item } "}"
+             | "rpki" "{" { rpki-item } "}" ;    (* none: disabled *)
 
 level        = "error" | "warn" | "info" | "debug" | "trace" ;    (* default info *)
 
@@ -55,6 +56,18 @@ control-item = "socket" path ";"
              | "http" "{" "listen" ip ":" u16 ";"     (* loopback only *)
                        [ "writes" yes-no ";" ]        (* default no *)
                        [ "token-file" path ";" ] "}" ;
+
+rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
+             | "cache" host { cache-option } ";"       (* repeatable; options once each *)
+             | "version" ( "0" | "1" ) ";"             (* default 1 *)
+             | "connect-timeout" u32 ";"              (* default 10 *)
+             | "response-timeout" u32 ";"             (* default 60 *)
+             | "reply-timeout" u32 ";"                (* default 1800 *)
+             | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
+             | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
+             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
+cache-option = "port" u16                              (* default 323; not 0 *)
+             | "preference" u32 ;                      (* default 0 *)
 
 prefix-list  = "prefix-list" name "{" { prefix-entry ";" } "}" ;
 prefix-entry = prefix [ "ge" u8 ] [ "le" u8 ] ;
@@ -107,6 +120,7 @@ Value syntax:
 |---|---|
 | `asn` | decimal, 1–4294967295 (RFC 6793 "asplain"; AS 0 is rejected, RFC 7607) |
 | `ipv4`, `ip` | dotted quad; `ip` also accepts an IPv6 address |
+| `host` | an `ip` (IPv6 without brackets), or a host name: dot-separated labels of letters, digits and hyphens, none starting or ending with a hyphen, the last not all digits (RFC 1123 §2.1), optionally ending in `.` |
 | `prefix` | `address/length`; host bits are zeroed |
 | `community` | `asn:value` with 16-bit halves, or `no-export`, `no-advertise`, `no-export-subconfed` |
 | `ext-community` | `as2:SUB:ASN:LOCAL`, `as4:SUB:ASN:LOCAL`, `ipv4:SUB:ADDR:LOCAL` (prefix the kind with `nt-` for non-transitive), or `0x` and 16 hex digits |
@@ -239,13 +253,107 @@ loses a collision (RFC 4271 §6.8), after which the session goes on with the
 other one; neither counts toward the limit or ends a run. `0` never
 restarts after a damped failure; `off` always does.
 
+**RPKI.** The `rpki` block says where the Validated ROA Payloads (VRPs)
+come from that give every route its RFC 6811 origin validation state
+(`docs/control.md`, "Validation state"). Without the block, or with `mode
+disabled`, there are none and every route is `disabled`. The block must
+state its `mode`; nothing else implies one. `mode external` takes the VRPs
+over the RPKI-to-Router protocol (RTR) from the caches listed with `cache`,
+of which there must be at least one; `mode disabled` keeps the cache list
+but uses none of it. The state is not yet acted on: it does not decide
+whether a route is accepted or which one is chosen.
+
+> **Keep the cache on the router or on a trusted network.** RTR runs over
+> plain TCP to port 323: nothing authenticates the cache to bgpfcd or
+> protects the VRPs on the way, so whoever can reach the session can change
+> which routes are `invalid`. RFC 8210 §9: "If unprotected TCP is the
+> transport, the cache and routers MUST be on the same trusted and
+> controlled network." Run the cache on the router itself (`cache
+> 127.0.0.1;`) or on a network only trusted hosts can reach, and filter
+> port 323 there. The protected transports of RFC 8210 §9 (SSH, TLS,
+> TCP-MD5, TCP-AO) are not supported.
+
+`cache` names a cache by address or host name, with its TCP `port`, 323
+(rpki-rtr, RFC 8210 §9) unless given, and its `preference`, lower values
+first (RFC 8210 §10); caches of equal preference are tried in file order.
+bgpfcd uses one cache at a time: the first in that order that answers.
+After a failure it tries the next, wrapping round to the first; when a
+cache it was in sync with goes away, it starts again from the first. In
+sync with a cache while more preferred ones are listed, it tries those
+again every Retry Interval the cache in use gives (600 seconds unless it
+says otherwise), and moves to the first that accepts a connection, so
+that a preferred cache that comes back after an outage takes its load
+back (RFC 8210 §4). The VRPs from the last cache stay in use until another
+cache has sent a full set, which replaces them, or until they expire (RFC
+8210 §10, §6). A cache listed twice, by the same address or the same name
+in any case, and the same port, is an error.
+
+A cache that restarts usually starts a new session, with a new Session ID
+(RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
+(§8.1), which such a cache should answer with an Error Report or a Cache
+Reset, after which bgpfcd loads the cache's data afresh. StayRTR 0.5.1 sends
+its Error Report but closes the connection at the same time, so the report
+is sometimes lost; bgpfcd then sees only the close and, like BIRD, keeps its
+VRPs and asks again until the report gets through, the VRPs expire, or
+another cache answers. List a second cache to have bgpfcd move on to it.
+
+`version 1`, the default, offers RTR version 1 (RFC 8210) and falls back to
+version 0 (RFC 6810) for a cache that answers in version 0 (RFC 8210 §7);
+`version 0` starts with version 0, for a cache that mishandles version 1.
+The timeouts are in seconds, each at least 1. `connect-timeout` bounds a
+connection attempt, the name lookup included where the resolver allows;
+a reload or a shutdown never waits for an attempt to end.
+`response-timeout` bounds the wait for the cache to start answering a
+query, and between two PDUs of an answer; it must be at least
+`connect-timeout`. `reply-timeout` bounds a whole answer, from the query to
+its End of Data, and must be at least `response-timeout`. A cache that
+breaks one of them is dropped and the next one tried.
+
+`max-expire` is the longest bgpfcd keeps using VRPs it cannot refresh.
+The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
+router MUST NOT retain the data past the time indicated by this
+parameter"), so the setting can only shorten it; it lies in 600–172800, the
+range §6 gives the Expire Interval, and the default leaves the cache's
+value. When the data expires, every route becomes `not-found`. `max-vrps`,
+at least 1, is the most VRPs an answer may leave bgpfcd holding; an answer
+that would exceed it is refused with an Internal Error (RFC 8210 §12) and
+the data before it stays in use. The default, four million, is several
+times what the whole RPKI holds.
+
+With `mode external`, bgpfcd looks every cache up as it starts and
+refuses to start, naming the cache, if one has no address: a typo must not
+leave every route unvalidated without a word (issue #60). `bgpfcd --check`
+looks nothing up; it judges the file alone, wherever it runs. The client
+looks a name up again at every connection attempt, so a cache whose address
+changes is followed. It starts before the neighbors, and every route is
+`disabled` until a cache has sent its VRPs; from then on the states follow
+the cache's data. The client logs with the rest of the daemon, at the `log`
+level: losing a cache is a warning, its return an info line, and VRPs that
+expire before a cache could refresh them an error.
+
+`backoff MIN MAX` paces reconnects. After a connection attempt fails, a
+connection ends before the cache has brought bgpfcd in sync, or a cache
+answers No Data Available, bgpfcd waits MIN seconds, doubling with
+each such failure in a row up to MAX, and then up to half as long again,
+by a jitter seeded from the `router-id`, so that routers that lost a cache
+together do not return together. Each bound lies in 1–7200, the range of
+the Retry Interval it stands in for, and MAX must not be below MIN. RFC
+8210 §6 says a router SHOULD NOT retry sooner than the cache's Retry
+Interval, 600 seconds by default; bgpfcd's default, `backoff 1 600`, does,
+so that a validator that restarts is picked up within seconds (issue #57),
+and reaches 600 seconds by the eleventh failure in a row. `backoff 600
+600` keeps to the RFC's default.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` only for a family in
-`families`.
+`families`; an `rpki` block has a `mode`, at least one `cache` with `mode
+external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
+its MIN.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
@@ -263,6 +371,16 @@ had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 `local-as` resets every session.
 
+A changed `rpki` block restarts the RTR client with the new settings. The
+VRPs the old client had stay in use until a cache of the new list has sent
+a full set, which then validates again only the routes it judges
+differently, or until they expire (RFC 8210 §10, §6). A change to `mode
+disabled` stops the client and makes every route `disabled` again. A block
+that differs only in spelling, such as a default written out or a cache
+written another way that names the same cache (see `cache` above), leaves
+the running client alone, and a new cache whose name does not resolve fails
+the reload as it fails the start.
+
 ## Command line
 
 ```
@@ -271,7 +389,8 @@ bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
 ```
 
 `--check` parses and validates the file (policies included), prints any
-errors, and exits with status 0 or 1 without starting anything.
+errors, and exits with status 0 or 1 without starting anything; it does not
+look up the names of `rpki` caches.
 `--log-level` and `--fib` override the corresponding settings in the file
 for this run. `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user

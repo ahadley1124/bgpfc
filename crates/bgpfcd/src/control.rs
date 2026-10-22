@@ -7,7 +7,10 @@
 //! route refresh); RFC 9003 §3 (a shutdown communication of at most 128
 //! octets); RFC 4486 §4 (Administrative Reset; whether the restart limit
 //! left a neighbor Idle); RFC 4271 §6.7 (routes received per family
-//! against the prefix limit).
+//! against the prefix limit); RFC 8210 §10 (the cache list, the cache
+//! whose data is in use, marked as to source, and the one the client talks
+//! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
+//! with the VRPs that Cover and Match it).
 
 use std::io::{BufRead as _, BufReader};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -17,18 +20,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
+use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, FibReport, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
+    FibMsg, FibReport, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport, RpkiReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -48,6 +52,8 @@ pub(crate) enum CoordMsg {
     Signal(bgpfc_sys::Signal),
     /// Reload the configuration; the reply is a summary or an error.
     Reload(SyncSender<Result<String, String>>),
+    /// Report the `rpki` block and its RTR client.
+    Rpki(SyncSender<RpkiReport>),
 }
 
 /// Everything a command needs.
@@ -76,6 +82,11 @@ pub(crate) enum Command {
     },
     ShowFib,
     ShowStatus,
+    ShowRpki,
+    ValidateRpki {
+        prefix: Prefix,
+        origin: Asn,
+    },
     ClearNeighbor {
         addr: IpAddr,
         soft: bool,
@@ -124,6 +135,11 @@ impl Command {
             }
             ["show", "fib"] => Ok(Command::ShowFib),
             ["show", "status"] => Ok(Command::ShowStatus),
+            ["show", "rpki"] => Ok(Command::ShowRpki),
+            ["show", "rpki", "validate", p, a] => Ok(Command::ValidateRpki {
+                prefix: p.parse().map_err(|_| format!("`{p}` is not a prefix"))?,
+                origin: parse_asn(a)?,
+            }),
             ["clear", "neighbor", a, rest @ ..] => {
                 let addr = parse_addr(a)?;
                 let (soft, rest) = match rest {
@@ -182,6 +198,17 @@ impl Command {
                 Ok(Command::ShowRoutes { family, prefix })
             }
             ("GET", ["v1", "fib"]) => Ok(Command::ShowFib),
+            ("GET", ["v1", "rpki"]) => Ok(Command::ShowRpki),
+            ("GET", ["v1", "rpki", "validate"]) => {
+                let (Some(p), Some(a)) = (r.param("prefix"), r.param("origin")) else {
+                    return Err((400, "needs prefix and origin".to_owned()));
+                };
+                let prefix = p
+                    .parse::<Prefix>()
+                    .map_err(|_| (400, format!("bad prefix {p}")))?;
+                let origin = parse_asn(a).map_err(|e| (400, e))?;
+                Ok(Command::ValidateRpki { prefix, origin })
+            }
             ("POST", ["v1", "reload"]) => Ok(Command::Reload),
             ("POST", ["v1", "neighbors", a, "clear"]) => {
                 let addr = parse_addr(a).map_err(|e| (400, e))?;
@@ -206,6 +233,18 @@ impl Command {
 
 fn parse_addr(a: &str) -> Result<IpAddr, String> {
     a.parse().map_err(|_| format!("`{a}` is not an IP address"))
+}
+
+/// An origin AS: `64496` or `AS64496`.
+fn parse_asn(a: &str) -> Result<Asn, String> {
+    let digits = a
+        .strip_prefix("AS")
+        .or_else(|| a.strip_prefix("as"))
+        .unwrap_or(a);
+    digits
+        .parse()
+        .map(Asn)
+        .map_err(|_| format!("`{a}` is not an AS number"))
 }
 
 fn check_communication(m: &str) -> Result<String, String> {
@@ -267,6 +306,10 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
             Ok(render_fib(&report))
         }
         Command::ShowStatus => status(ctx),
+        Command::ShowRpki => Ok(render_rpki(&rpki_report(ctx)?, Instant::now())),
+        Command::ValidateRpki { prefix, origin } => {
+            Ok(render_validation(&rpki_report(ctx)?, *prefix, *origin))
+        }
         Command::ClearNeighbor {
             addr,
             soft,
@@ -373,6 +416,273 @@ fn ok_reply(message: &str) -> Reply {
         .end_object();
     Reply {
         lines: vec![message.to_owned()],
+        json: j.finish(),
+    }
+}
+
+/// Ask the coordinator about the `rpki` block.
+fn rpki_report(ctx: &Ctx) -> Result<RpkiReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.coord
+        .send(CoordMsg::Rpki(tx))
+        .map_err(|_| "coordinator gone".to_owned())?;
+    rx.recv_timeout(QUERY_TIMEOUT)
+        .map_err(|_| "coordinator did not answer".to_owned())
+}
+
+/// Whole seconds from `earlier` to `later`; 0 if `later` is not later.
+fn seconds_between(earlier: Instant, later: Instant) -> u64 {
+    later.saturating_duration_since(earlier).as_secs()
+}
+
+/// `show rpki`: the block's mode and cache list, and where the client
+/// stands with the cache it uses (RFC 8210 §10).
+fn render_rpki(r: &RpkiReport, now: Instant) -> Reply {
+    let mut j = Json::new();
+    write_rpki(&mut j, r, now);
+    Reply {
+        lines: rpki_lines(r, now),
+        json: j.finish(),
+    }
+}
+
+/// Whether the RIB validates with VRPs from `cache`: RFC 8210 §10, the
+/// data of one cache of the list at a time, "marked as to source".
+fn in_use(
+    status: Option<&bgpfc_rtr::client::Status>,
+    cache: &bgpfc_config::ast::RpkiCache,
+) -> bool {
+    status
+        .and_then(|s| s.source.as_ref())
+        .is_some_and(|source| cache.is_at(&source.host, source.port))
+}
+
+/// Whether the client talks to `cache`: is connected to it, or tries it
+/// next. The `state` line is about that session. After a move it is
+/// another cache than the one [`in_use`] marks, until that cache has sent
+/// a full set (RFC 8210 §10).
+fn current(
+    status: Option<&bgpfc_rtr::client::Status>,
+    cache: &bgpfc_config::ast::RpkiCache,
+) -> bool {
+    status.is_some_and(|s| s.running && cache.is_at(&s.cache.host, s.cache.port))
+}
+
+fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
+    let status = r.status.as_ref();
+    let mut lines = vec![format!("mode {}", r.config.mode)];
+    for c in &r.config.caches {
+        lines.push(format!(
+            "cache {c} preference {}{}{}",
+            c.preference,
+            if in_use(status, c) { ", in use" } else { "" },
+            if current(status, c) { ", current" } else { "" }
+        ));
+    }
+    let Some(s) = status else {
+        return lines;
+    };
+    let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_owned());
+    lines.push(format!(
+        "state {}{}, version {}",
+        if s.running {
+            s.state.as_str()
+        } else {
+            "stopped"
+        },
+        if s.connected { ", connected" } else { "" },
+        s.version
+    ));
+    lines.push(format!(
+        "session-id {} serial {}",
+        dash(s.session_id.map(|v| v.to_string())),
+        dash(s.serial.map(|v| v.to_string()))
+    ));
+    lines.push(s.synced_at.map_or_else(
+        || "last sync never".to_owned(),
+        |at| format!("last sync {}s ago", seconds_between(at, now)),
+    ));
+    lines.push(if s.vrps.is_some() {
+        format!(
+            "vrps ipv4 {} ipv6 {}{}{}",
+            s.vrps_ipv4,
+            s.vrps_ipv6,
+            s.source
+                .as_ref()
+                .map_or(String::new(), |source| format!(" from {source}")),
+            s.expires_at.map_or(String::new(), |at| format!(
+                ", expire in {}s",
+                seconds_between(now, at)
+            ))
+        )
+    } else {
+        "vrps none yet: every route is disabled".to_owned()
+    });
+    lines.push(format!("failures {}", s.failures));
+    if let (Some(e), Some(at)) = (&s.last_error, s.last_error_at) {
+        lines.push(format!(
+            "last error {}s ago: {}",
+            seconds_between(at, now),
+            one_line(e)
+        ));
+    }
+    lines
+}
+
+/// `text` with its control characters escaped (`\n`, `\r`, `\t`,
+/// `\u{001b}`), for a line of a reply. The line protocol of
+/// `docs/control.md` ends a line at a newline and a reply at a line of a
+/// lone `.`, so text from outside the daemon, such as an Error Report a
+/// cache sent (RFC 8210 §5.11: any UTF-8), must neither end its line nor
+/// reach the operator's terminal as an escape sequence.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.into()
+}
+
+fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
+    let status = r.status.as_ref();
+    j.begin_object()
+        .field_display("mode", r.config.mode)
+        .key("caches")
+        .begin_array();
+    for c in &r.config.caches {
+        j.begin_object()
+            .field_str("host", &c.host)
+            .field_num("port", c.port)
+            .field_num("preference", c.preference)
+            .field_bool("in_use", in_use(status, c))
+            .field_bool("current", current(status, c))
+            .end_object();
+    }
+    j.end_array();
+    let Some(s) = status else {
+        // The same members without a client, so that a reader needs no
+        // second shape.
+        j.field_bool("running", false)
+            .field_opt("state", None::<&str>)
+            .field_bool("connected", false);
+        for key in [
+            "version",
+            "session_id",
+            "serial",
+            "synced_seconds_ago",
+            "expires_in_seconds",
+            "vrps",
+        ] {
+            j.key(key).null();
+        }
+        j.field_num("failures", 0)
+            .field_opt("last_error", None::<&str>)
+            .field_opt_num("last_error_seconds_ago", None::<u64>)
+            .end_object();
+        return;
+    };
+    j.field_bool("running", s.running)
+        .field_str("state", s.state.as_str())
+        .field_bool("connected", s.connected)
+        .field_num("version", s.version.to_u8())
+        .field_opt_num("session_id", s.session_id)
+        .field_opt_num("serial", s.serial)
+        .field_opt_num(
+            "synced_seconds_ago",
+            s.synced_at.map(|at| seconds_between(at, now)),
+        )
+        .field_opt_num(
+            "expires_in_seconds",
+            s.expires_at.map(|at| seconds_between(now, at)),
+        )
+        .key("vrps");
+    if s.vrps.is_some() {
+        j.begin_object()
+            .field_num("ipv4", u64::try_from(s.vrps_ipv4).unwrap_or(u64::MAX))
+            .field_num("ipv6", u64::try_from(s.vrps_ipv6).unwrap_or(u64::MAX))
+            .key("from");
+        if let Some(source) = &s.source {
+            j.begin_object()
+                .field_str("host", &source.host)
+                .field_num("port", source.port)
+                .end_object();
+        } else {
+            j.null();
+        }
+        j.end_object();
+    } else {
+        j.null();
+    }
+    j.field_num("failures", s.failures)
+        .field_opt("last_error", s.last_error.as_deref())
+        .field_opt_num(
+            "last_error_seconds_ago",
+            s.last_error_at.map(|at| seconds_between(at, now)),
+        )
+        .end_object();
+}
+
+/// Whether `vrp` Covers `route`: it is the route's prefix or less specific
+/// (RFC 6811 §2).
+fn covers(vrp: Prefix, route: Prefix) -> bool {
+    vrp.prefix_len() <= route.prefix_len()
+        && Prefix::new(route.addr(), vrp.prefix_len()) == Some(vrp)
+}
+
+/// `show rpki validate`: the RFC 6811 §2 state of a route to `prefix`
+/// from `origin` against the VRPs the RIB validates with, and the VRPs
+/// that Cover it, marked where they Match.
+fn render_validation(r: &RpkiReport, prefix: Prefix, origin: Asn) -> Reply {
+    let route = RouteOrigin::As(origin);
+    let vrps = r.status.as_ref().and_then(|s| s.vrps.as_deref());
+    let rov = vrps.map_or(RovState::Disabled, |v| v.validate(prefix, route));
+    let mut covering: Vec<(Vrp, bool)> = vrps
+        .into_iter()
+        .flat_map(VrpSet::iter)
+        .filter(|vrp| covers(vrp.prefix(), prefix))
+        .map(|vrp| {
+            // Matched as VrpSet::validate has it, one VRP at a time.
+            let one: VrpSet = [vrp].into_iter().collect();
+            (vrp, one.validate(prefix, route) == RovState::Valid)
+        })
+        .collect();
+    covering.sort_unstable();
+    let mut lines = vec![format!("{prefix} origin {origin}: {rov}")];
+    if vrps.is_none() {
+        lines.push("  no VRPs: validation is disabled or has no data yet".to_owned());
+    }
+    let mut j = Json::new();
+    j.begin_object()
+        .field_display("prefix", prefix)
+        .field_num("origin", origin.0)
+        .field_str("rov", rov.as_str())
+        .key("vrps")
+        .begin_array();
+    for (vrp, matches) in &covering {
+        lines.push(format!("  {vrp}{}", if *matches { " matches" } else { "" }));
+        j.begin_object()
+            .field_display("prefix", vrp.prefix())
+            .field_num("max_length", vrp.max_len())
+            .field_num("asn", vrp.asn().0)
+            .field_bool("matches", *matches)
+            .end_object();
+    }
+    j.end_array().end_object();
+    Reply {
+        lines,
         json: j.finish(),
     }
 }
@@ -1304,5 +1614,399 @@ mod tests {
         let put =
             http::Request::read_from(&mut "PUT /v1/reload HTTP/1.1\r\n\r\n".as_bytes()).unwrap();
         assert_eq!(Command::from_http(&put).unwrap_err().0, 405);
+    }
+
+    fn rpki_block(text: &str) -> bgpfc_config::ast::Rpki {
+        bgpfc_config::parse_str("t", &format!("router-id 192.0.2.1; local-as 65000; {text}"))
+            .unwrap()
+            .rpki
+    }
+
+    fn vrp(prefix: &str, max_len: u8, asn: u32) -> Vrp {
+        Vrp::new(prefix.parse().unwrap(), max_len, Asn(asn)).unwrap()
+    }
+
+    /// A client in sync with the cache of preference 10, `now` being the
+    /// moment of the report.
+    fn rpki_report(now: Instant, vrps: &[Vrp]) -> RpkiReport {
+        use bgpfc_rtr::client::{Cache, Status};
+        let set: VrpSet = vrps.iter().copied().collect();
+        RpkiReport {
+            config: rpki_block(
+                "rpki { mode external; cache 127.0.0.1 port 3323;
+                 cache rtr.example.net preference 10; }",
+            ),
+            status: Some(Status {
+                cache: Cache {
+                    preference: 10,
+                    ..Cache::new("rtr.example.net")
+                },
+                state: bgpfc_rtr::session::State::Idle,
+                connected: true,
+                version: bgpfc_rtr::Version::V1,
+                session_id: Some(4242),
+                serial: Some(17),
+                synced_at: now.checked_sub(Duration::from_secs(12)),
+                last_commit: now.checked_sub(Duration::from_secs(12)),
+                expires_at: Some(now + Duration::from_secs(7_188)),
+                vrps: Some(Arc::new(set)),
+                source: Some(Cache {
+                    preference: 10,
+                    ..Cache::new("rtr.example.net")
+                }),
+                vrps_ipv4: 2,
+                vrps_ipv6: 1,
+                failures: 0,
+                last_error: Some("rtr cache connection timed out cache=127.0.0.1:3323".to_owned()),
+                last_error_at: now.checked_sub(Duration::from_secs(30)),
+                running: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn rpki_status_renders_as_lines_and_json() {
+        let now = Instant::now();
+        let r = render_rpki(&rpki_report(now, &[]), now);
+        // RFC 8210 §10: the cache list, the one cache whose VRPs are in
+        // use, and the one the client talks to: the same, in sync.
+        assert_eq!(
+            r.lines,
+            [
+                "mode external",
+                "cache 127.0.0.1:3323 preference 0",
+                "cache rtr.example.net:323 preference 10, in use, current",
+                "state idle, connected, version 1",
+                "session-id 4242 serial 17",
+                "last sync 12s ago",
+                "vrps ipv4 2 ipv6 1 from rtr.example.net:323, expire in 7188s",
+                "failures 0",
+                "last error 30s ago: rtr cache connection timed out cache=127.0.0.1:3323",
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"mode":"external","caches":["#,
+                r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
+                r#""current":false},"#,
+                r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
+                r#""current":true}],"#,
+                r#""running":true,"state":"idle","connected":true,"version":1,"#,
+                r#""session_id":4242,"serial":17,"synced_seconds_ago":12,"#,
+                r#""expires_in_seconds":7188,"#,
+                r#""vrps":{"ipv4":2,"ipv6":1,"from":{"host":"rtr.example.net","port":323}},"#,
+                r#""failures":0,"#,
+                r#""last_error":"rtr cache connection timed out cache=127.0.0.1:3323","#,
+                r#""last_error_seconds_ago":30}"#
+            )
+        );
+    }
+
+    #[test]
+    fn rpki_status_before_any_data_and_without_a_client() {
+        let now = Instant::now();
+        let mut report = rpki_report(now, &[]);
+        if let Some(s) = &mut report.status {
+            s.connected = false;
+            s.state = bgpfc_rtr::session::State::Connecting;
+            (s.session_id, s.serial, s.synced_at, s.expires_at) = (None, None, None, None);
+            (s.vrps, s.source, s.last_error, s.last_error_at) = (None, None, None, None);
+            s.failures = 3;
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[3..],
+            [
+                "state connecting, version 1",
+                "session-id - serial -",
+                "last sync never",
+                "vrps none yet: every route is disabled",
+                "failures 3",
+            ]
+        );
+        assert!(
+            r.json.contains(
+                r#""session_id":null,"serial":null,"synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"failures":3,"last_error":null"#
+            ),
+            "{}",
+            r.json
+        );
+        // A client that stopped itself.
+        if let Some(s) = &mut report.status {
+            s.running = false;
+        }
+        assert_eq!(
+            render_rpki(&report, now).lines[3],
+            "state stopped, version 1"
+        );
+        // Disabled: the configured caches, nothing else, every member there.
+        let report = RpkiReport {
+            config: rpki_block("rpki { mode disabled; cache 192.0.2.10; }"),
+            status: None,
+        };
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines,
+            ["mode disabled", "cache 192.0.2.10:323 preference 0"]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"mode":"disabled","caches":[{"host":"192.0.2.10","port":323,"#,
+                r#""preference":0,"in_use":false,"current":false}],"#,
+                r#""running":false,"state":null,"#,
+                r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
+                r#""synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"#,
+                r#""failures":0,"last_error":null,"last_error_seconds_ago":null}"#
+            )
+        );
+        let none = RpkiReport {
+            config: bgpfc_config::ast::Rpki::default(),
+            status: None,
+        };
+        assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+    }
+
+    #[test]
+    fn the_cache_in_use_is_the_source_of_the_vrps() {
+        use bgpfc_rtr::client::Cache;
+        let now = Instant::now();
+        // The cache of preference 10 went away; the client tries the
+        // other, whose session has nothing yet. Its VRPs stay in use until
+        // the other has sent a full set (RFC 8210 §10).
+        let mut report = rpki_report(now, &[]);
+        if let Some(s) = &mut report.status {
+            s.cache = Cache {
+                port: 3323,
+                ..Cache::new("127.0.0.1")
+            };
+            s.state = bgpfc_rtr::session::State::Connecting;
+            s.connected = false;
+            (s.session_id, s.serial, s.synced_at) = (None, None, None);
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[1..7],
+            [
+                "cache 127.0.0.1:3323 preference 0, current",
+                "cache rtr.example.net:323 preference 10, in use",
+                "state connecting, version 1",
+                "session-id - serial -",
+                "last sync never",
+                "vrps ipv4 2 ipv6 1 from rtr.example.net:323, expire in 7188s",
+            ]
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
+                r#""current":true},{"host":"rtr.example.net","port":323,"#,
+                r#""preference":10,"in_use":true,"current":false}]"#
+            )),
+            "{}",
+            r.json
+        );
+        // A reload replaced the list: the VRPs held come from a cache it
+        // no longer has, which the vrps line names.
+        if let Some(s) = &mut report.status {
+            s.source = Some(Cache::new("192.0.2.99"));
+        }
+        let r = render_rpki(&report, now);
+        assert!(
+            r.lines.iter().all(|l| !l.contains("in use")),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(
+            r.lines[6],
+            "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
+        );
+        assert!(
+            r.json
+                .contains(r#""vrps":{"ipv4":2,"ipv6":1,"from":{"host":"192.0.2.99","port":323}}"#),
+            "{}",
+            r.json
+        );
+        // The list names the cache in use another way: still that cache.
+        let mut respelled = rpki_report(now, &[]);
+        respelled.config = rpki_block(
+            "rpki { mode external; cache 127.0.0.1 port 3323;
+             cache RTR.Example.NET. preference 10; }",
+        );
+        assert_eq!(
+            render_rpki(&respelled, now).lines[2],
+            "cache RTR.Example.NET.:323 preference 10, in use, current"
+        );
+        // Held data that expired is no cache's: every route not-found.
+        if let Some(s) = &mut report.status {
+            s.source = None;
+            s.vrps = Some(Arc::new(VrpSet::new()));
+            (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(r.lines[6], "vrps ipv4 0 ipv6 0");
+        assert!(
+            r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn text_from_a_cache_stays_on_its_line() {
+        // RFC 8210 §5.11: an Error Report's text is any UTF-8. A newline, a
+        // lone `.` after it or an escape sequence must neither end the reply
+        // early, nor add lines to it, nor reach the operator's terminal.
+        let now = Instant::now();
+        let mut report = rpki_report(now, &[]);
+        if let Some(s) = &mut report.status {
+            s.last_error = Some("rtr error text=boom\n.\nstate idle\u{1b}[2J\r\t".to_owned());
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines.last().map(String::as_str),
+            Some(r"last error 30s ago: rtr error text=boom\n.\nstate idle\u{001b}[2J\r\t")
+        );
+        assert!(r.lines.iter().all(|l| !l.chars().any(char::is_control)));
+        // Through the line protocol and back: every line, and no other.
+        let mut wire = Vec::new();
+        proto::Response::ok(r.lines.clone())
+            .write_to(&mut wire)
+            .unwrap();
+        let back = proto::Response::read_from(&mut wire.as_slice()).unwrap();
+        assert_eq!(back.lines, r.lines);
+        // JSON escapes it as RFC 8259 §7 has it.
+        assert!(
+            r.json
+                .contains(r#""last_error":"rtr error text=boom\n.\nstate idle\u001b[2J\r\t""#),
+            "{}",
+            r.json
+        );
+        // Text without control characters is left alone.
+        assert_eq!(one_line("a \"quoted\" \\ value"), "a \"quoted\" \\ value");
+    }
+
+    #[test]
+    fn a_route_is_validated_against_the_vrps_in_use() {
+        let now = Instant::now();
+        let report = rpki_report(
+            now,
+            &[
+                vrp("192.0.0.0/16", 24, 64_511),
+                vrp("192.0.2.0/24", 24, 64_496),
+                vrp("192.0.2.0/23", 23, 64_496),
+                vrp("198.51.100.0/24", 24, 64_496),
+                vrp("2001:db8::/32", 48, 64_496),
+            ],
+        );
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        // RFC 6811 §2: Valid when a VRP Matches; the others that Cover the
+        // route are listed too. A VRP too short for the route's length
+        // Covers it without Matching.
+        let r = render_validation(&report, p("192.0.2.0/24"), Asn(64_496));
+        assert_eq!(
+            r.lines,
+            [
+                "192.0.2.0/24 origin AS64496: valid",
+                "  192.0.0.0/16-24 AS64511",
+                "  192.0.2.0/23-23 AS64496",
+                "  192.0.2.0/24-24 AS64496 matches",
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"prefix":"192.0.2.0/24","origin":64496,"rov":"valid","vrps":["#,
+                r#"{"prefix":"192.0.0.0/16","max_length":24,"asn":64511,"matches":false},"#,
+                r#"{"prefix":"192.0.2.0/23","max_length":23,"asn":64496,"matches":false},"#,
+                r#"{"prefix":"192.0.2.0/24","max_length":24,"asn":64496,"matches":true}]}"#
+            )
+        );
+        // Covered and not Matched: Invalid.
+        let r = render_validation(&report, p("192.0.2.0/24"), Asn(64_497));
+        assert_eq!(r.lines[0], "192.0.2.0/24 origin AS64497: invalid");
+        assert_eq!(r.lines.len(), 4);
+        // Not Covered: NotFound, nothing listed.
+        let r = render_validation(&report, p("203.0.113.0/24"), Asn(64_496));
+        assert_eq!(r.lines, ["203.0.113.0/24 origin AS64496: not-found"]);
+        assert!(
+            r.json.ends_with(r#""rov":"not-found","vrps":[]}"#),
+            "{}",
+            r.json
+        );
+        let r = render_validation(&report, p("2001:db8:1::/48"), Asn(64_496));
+        assert_eq!(
+            r.lines,
+            [
+                "2001:db8:1::/48 origin AS64496: valid",
+                "  2001:db8::/32-48 AS64496 matches",
+            ]
+        );
+        // No VRPs: what the RIB has, `disabled`.
+        let off = RpkiReport {
+            config: bgpfc_config::ast::Rpki::default(),
+            status: None,
+        };
+        let r = render_validation(&off, p("192.0.2.0/24"), Asn(64_496));
+        assert_eq!(
+            r.lines,
+            [
+                "192.0.2.0/24 origin AS64496: disabled",
+                "  no VRPs: validation is disabled or has no data yet",
+            ]
+        );
+        assert!(
+            r.json.contains(r#""rov":"disabled","vrps":[]"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn parses_rpki_commands() {
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        assert_eq!(Command::parse(&words("show rpki")), Ok(Command::ShowRpki));
+        for asn in ["64496", "AS64496", "as64496"] {
+            assert_eq!(
+                Command::parse(&words(&format!("show rpki validate 192.0.2.0/24 {asn}"))),
+                Ok(Command::ValidateRpki {
+                    prefix: p("192.0.2.0/24"),
+                    origin: Asn(64_496)
+                })
+            );
+        }
+        for bad in [
+            "show rpki validate",
+            "show rpki validate 192.0.2.0/24",
+            "show rpki validate 192.0.2.0/33 64496",
+            "show rpki validate 192.0.2.0/24 ASX",
+            "show rpki validate 192.0.2.0/24 4294967296",
+            "show rpki status",
+        ] {
+            assert!(Command::parse(&words(bad)).is_err(), "{bad}");
+        }
+        assert!(!Command::ShowRpki.is_write());
+        let get = |path: &str| {
+            http::Request::read_from(&mut format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+                .unwrap()
+        };
+        assert_eq!(Command::from_http(&get("/v1/rpki")), Ok(Command::ShowRpki));
+        assert_eq!(
+            Command::from_http(&get(
+                "/v1/rpki/validate?prefix=2001:db8::/48&origin=AS64496"
+            )),
+            Ok(Command::ValidateRpki {
+                prefix: p("2001:db8::/48"),
+                origin: Asn(64_496)
+            })
+        );
+        for bad in [
+            "/v1/rpki/validate",
+            "/v1/rpki/validate?prefix=192.0.2.0/24",
+            "/v1/rpki/validate?prefix=x&origin=1",
+            "/v1/rpki/validate?prefix=192.0.2.0/24&origin=x",
+        ] {
+            assert_eq!(Command::from_http(&get(bad)).unwrap_err().0, 400, "{bad}");
+        }
     }
 }
