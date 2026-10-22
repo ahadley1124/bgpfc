@@ -1382,6 +1382,8 @@ fn a_silent_cache_times_out_and_the_serial_is_kept() {
 #[test]
 fn the_response_timer_restarts_with_each_pdu() {
     let mut h = receiving_reset();
+    h.now += Duration::from_secs(50);
+    assert_eq!(tags(&h.pdu(router_key())), NONE);
     for vrp in [a(), b(), c()] {
         h.now += Duration::from_secs(50);
         assert_eq!(tags(&h.pdu(announce(V1, vrp))), NONE);
@@ -1389,6 +1391,42 @@ fn the_response_timer_restarts_with_each_pdu() {
     }
     assert_eq!(tags(&h.wait(60)), ["close"]);
     assert!(h.s.vrps().is_none(), "half a reply is never committed");
+    // The Cache Response is the first PDU of the answer.
+    let mut h = querying_cold();
+    h.now += Duration::from_secs(50);
+    h.pdu(response(V1, SID));
+    assert_eq!(tags(&h.wait(59)), NONE);
+    assert_eq!(tags(&h.wait(1)), ["close"]);
+}
+
+#[test]
+fn serial_notifies_do_not_hold_off_the_response_timer() {
+    // RFC 8210 §5.2: a Serial Notify is no part of an answer, and §8.2
+    // lets a cache send one a minute ("rate-limit Serial Notifies to no
+    // more frequently than one per minute"). One that keeps notifying and
+    // never answers still times out, so that the client can move on.
+    for (name, setup) in [
+        ("querying-cold", querying_cold as fn() -> H),
+        ("querying-serial", querying_serial),
+        ("receiving-reset", receiving_reset),
+        ("receiving-serial", receiving_serial),
+    ] {
+        let mut h = setup();
+        let notify = notify(V1, SID, 9);
+        h.now += Duration::from_secs(30);
+        assert_eq!(tags(&h.pdu(notify.clone())), NONE, "{name}");
+        h.now += Duration::from_secs(29);
+        assert_eq!(tags(&h.pdu(notify.clone())), NONE, "{name}");
+        let actions = h.wait(1);
+        assert_eq!(tags(&actions), ["close"], "{name}");
+        assert!(
+            logs(&actions)
+                .iter()
+                .any(|l| l.message == "rtr cache stopped answering"),
+            "{name}"
+        );
+        assert_eq!(h.s.state(), State::Disconnected, "{name}");
+    }
 }
 
 #[test]
