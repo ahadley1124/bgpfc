@@ -792,3 +792,69 @@ fn a_change_that_moves_every_route_is_one_report() {
         vec![(e1.addr, RovState::Valid), (e2.addr, RovState::Invalid)]
     );
 }
+
+#[test]
+fn a_held_route_no_state_can_admit_any_more_goes_when_validated_again() {
+    // Between a change of policy and the ROUTE-REFRESH that follows it, a
+    // route held for its state may be one the new policy rejects whatever
+    // its state. Once its state changes it is put to that policy, and
+    // dropped like any route it rejects: no longer held or counted.
+    struct RejectAll;
+    impl Policies for RejectAll {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
+            Verdict::Reject
+        }
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
+            Verdict::Accept
+        }
+    }
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectInvalidTagValid));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    rib.peer_up(e1.clone(), now());
+    rib.validation_changed(all(vrps(&[("192.0.2.0/24", 24, 64_497)])), now());
+    rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+        now(),
+    );
+    assert_eq!(
+        held(&rib, V4, "192.0.2.0/24"),
+        vec![(e1.addr, RovState::Invalid)]
+    );
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 1), (V6, 0)]
+    );
+    rib.set_policies(Box::new(RejectAll));
+    let out = rib.validation_changed(ValidationChange::disabled(), now());
+    let invalid_disabled = [(RovState::Invalid, RovState::Disabled, 1)];
+    assert_eq!(
+        out,
+        vec![Output::Revalidated(revalidation(
+            1,
+            &invalid_disabled,
+            &["192.0.2.0/24"],
+            0
+        ))]
+    );
+    assert_eq!(held(&rib, V4, "192.0.2.0/24"), vec![]);
+    assert!(rib.tables.values().all(BTreeMap::is_empty));
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 0), (V6, 0)]
+    );
+}

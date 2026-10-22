@@ -1,9 +1,10 @@
 //! The RFC 4271 §6.7 prefix limit against a naive model: whatever the
 //! sequence of announcements, re-announcements, looped routes and
 //! withdrawals, the RIB ends the session exactly at the first UPDATE after
-//! which the peer holds more routes in the Adj-RIB-In than its limit,
-//! those import policy rejects included, and until then it counts exactly
-//! the routes the model holds.
+//! which the peer holds more routes in the Adj-RIB-In than its limit, and
+//! until then it counts exactly the routes the model holds: those import
+//! policy accepts and those it rejects for their validation state alone
+//! (RFC 6811 §2), not those it rejects whatever their state.
 #![cfg(not(miri))]
 
 use std::collections::BTreeSet;
@@ -52,12 +53,20 @@ fn prefix(i: u8) -> Prefix {
     Prefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, i, 0)), 24).unwrap()
 }
 
-/// Whether import policy rejects the route for `prefix(i)`.
+/// Whether import policy rejects the route for `prefix(i)` whatever its
+/// validation state.
 fn rejected(i: u8) -> bool {
     i.is_multiple_of(3)
 }
 
-/// Import policy that rejects the prefixes [`rejected`] names.
+/// Whether import policy rejects the route for `prefix(i)` while it is
+/// `disabled`, as every route is here, and would take it otherwise.
+fn unvalidated(i: u8) -> bool {
+    i % 3 == 1
+}
+
+/// Import policy that rejects the prefixes [`rejected`] and
+/// [`unvalidated`] name.
 struct RejectSome;
 
 impl Policies for RejectSome {
@@ -67,9 +76,10 @@ impl Policies for RejectSome {
         _: AddressFamily,
         p: Prefix,
         _: &PathAttrs,
-        _: RovState,
+        rov: RovState,
     ) -> Verdict {
-        if (0..12).any(|i| rejected(i) && prefix(i) == p) {
+        let named = |by: fn(u8) -> bool| (0..12).any(|i| by(i) && prefix(i) == p);
+        if named(rejected) || (named(unvalidated) && rov == RovState::Disabled) {
             Verdict::Reject
         } else {
             Verdict::Accept
@@ -139,7 +149,8 @@ proptest! {
         for op in &ops {
             // The model: routes held after the UPDATE, one prefix at a
             // time in NLRI order, stopping at the first one over. What
-            // import policy rejects is held and counted like the rest.
+            // import policy rejects for its state alone is held and
+            // counted like the rest.
             let mut over = false;
             match op {
                 Op::Withdraw(ps) => {
@@ -149,9 +160,9 @@ proptest! {
                 }
                 Op::Announce { prefixes, looped } => {
                     for p in prefixes {
-                        if *looped {
-                            // A looped re-announcement replaces, and so
-                            // removes, the route held before.
+                        if *looped || rejected(*p) {
+                            // A re-announcement that is not kept replaces,
+                            // and so removes, the route held before.
                             model.remove(p);
                         } else {
                             model.insert(*p);
@@ -184,7 +195,7 @@ proptest! {
             let loc: BTreeSet<Prefix> = rib.loc_rib(V4).map(|(p, _)| p).collect();
             let expected: BTreeSet<Prefix> = model
                 .iter()
-                .filter(|i| !rejected(**i))
+                .filter(|i| !unvalidated(**i))
                 .map(|i| prefix(*i))
                 .collect();
             prop_assert_eq!(loc, expected);

@@ -23,7 +23,9 @@ use bgpfc_rpki::{
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::{Destination, Interner, Output, PeerState, Policies, Rib, import};
+use crate::{
+    Destination, Interner, Judged, Output, PeerState, Policies, Rib, judge, set_candidate,
+};
 
 /// A table walks its affected destinations in one pass, rather than one
 /// range query per range, once it has fewer than this many destinations
@@ -119,13 +121,15 @@ impl Rib {
     /// now on, and validate again every route held in an Adj-RIB-In that
     /// `change.affected` covers (RFC 6811 §4), in place. Each route whose
     /// state changed goes through import policy again, which sees the new
-    /// state, and its destination through the decision process. What
+    /// state, and its destination through the decision process; the
+    /// Adj-RIB-In keeps it whatever policy now says of it, as it did
+    /// before, since policy accepts it with some state (see `judge`). What
     /// follows comes out as it does for an UPDATE, after one
     /// [`Output::Revalidated`] that counts the changes, if any route's
     /// state changed: FIB changes, and UPDATEs sent or held back by the
-    /// RFC 4271 §9.2.1.1 pacing. Routes import policy rejected are
-    /// validated again too, since the new state may make policy accept
-    /// them.
+    /// RFC 4271 §9.2.1.1 pacing. Routes import policy rejected for their
+    /// state are validated again too, since the new state may make policy
+    /// accept them.
     ///
     /// Changes must be given in the order the producer made them; a run
     /// of them may be given as one, with the last source and every
@@ -164,7 +168,7 @@ impl Rib {
                 family,
                 local_as: self.local_as,
                 source: &*self.validation,
-                peers: &self.peers,
+                peers: &mut self.peers,
                 policies: &*self.policies,
                 interner: &mut self.interner,
                 tally: &mut tally,
@@ -205,7 +209,7 @@ struct Pass<'a> {
     family: AddressFamily,
     local_as: Asn,
     source: &'a dyn ValidationSource,
-    peers: &'a HashMap<IpAddr, PeerState>,
+    peers: &'a mut HashMap<IpAddr, PeerState>,
     policies: &'a dyn Policies,
     interner: &'a mut Interner,
     tally: &'a mut Tally,
@@ -219,7 +223,8 @@ impl Pass<'_> {
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let mut changed = false;
         let mut restated = false;
-        for i in 0..dest.received.len() {
+        let mut i = 0;
+        while i < dest.received.len() {
             self.tally.routes += 1;
             let route = &mut dest.received[i];
             // RFC 6811 §2, on the route as received, as on its arrival.
@@ -227,6 +232,7 @@ impl Pass<'_> {
             let rov = self.source.rov(prefix, origin);
             let aspa = self.source.aspa(&route.attrs.as_path);
             if rov == route.rov && aspa == route.aspa {
+                i += 1;
                 continue;
             }
             if rov != route.rov {
@@ -237,17 +243,39 @@ impl Pass<'_> {
             route.aspa = aspa;
             // Always found: the Adj-RIBs-In hold routes only of peers
             // that are up, as a peer's routes go with it.
-            let Some(peer) = self.peers.get(&dest.received[i].peer) else {
+            let Some(peer) = self.peers.get_mut(&route.peer) else {
+                i += 1;
                 continue;
             };
-            changed |= import(
+            let judged = judge(
                 self.policies,
                 self.interner,
                 &peer.info,
                 (self.family, prefix),
-                &dest.received[i],
-                &mut dest.candidates,
+                &route.attrs,
+                rov,
             );
+            let accepted = match judged {
+                Judged::Accepted(attrs) => Some(attrs),
+                Judged::Held => None,
+                // Policy accepted the route with some state when it was
+                // held, so only a change of policy since, before the
+                // ROUTE-REFRESH that follows one, can leave none.
+                Judged::Dropped => {
+                    let gone = dest.received.remove(i);
+                    let n = peer.adj_in_count.entry(self.family).or_insert(0);
+                    *n = n.saturating_sub(1);
+                    changed |= set_candidate(&mut dest.candidates, &peer.info, &gone, None);
+                    continue;
+                }
+            };
+            changed |= set_candidate(
+                &mut dest.candidates,
+                &peer.info,
+                &dest.received[i],
+                accepted,
+            );
+            i += 1;
         }
         if restated {
             self.tally.destinations += 1;
@@ -255,7 +283,9 @@ impl Pass<'_> {
                 self.tally.sample.push(prefix);
             }
         }
-        if changed {
+        // One left with nothing goes in the decision process, which
+        // removes it.
+        if changed || dest.is_unused() {
             self.dirty.push((self.family, prefix));
         }
     }

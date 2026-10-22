@@ -2,8 +2,9 @@
 //! (AGENTS.md §3, "RIB thread": the only owner of all RIB state, driven
 //! by messages, no I/O).
 //!
-//! Implements: RFC 4271 §3.2 (the three RIBs; the Adj-RIBs-In hold routes
-//! as received, before import policy), §9.1 (the decision
+//! Implements: RFC 4271 §3.2 (the three RIBs; the Adj-RIBs-In hold the
+//! routes import policy accepts, as received, and those it rejects for
+//! their validation state alone), §9.1 (the decision
 //! process: Phase 1 degree of preference, Phase 2 route selection,
 //! Phase 3 route dissemination), §9.1.2 (AS loop exclusion), §9.1.4
 //! (overlapping routes are independent destinations), §9.2 (update
@@ -20,7 +21,8 @@
 //! that ends the session, see [`Output::PrefixLimitExceeded`]);
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
-//! route out of the Adj-RIB-In or the decision process), §3 (policy sees
+//! route out of the Adj-RIB-In: one import policy rejects for its state
+//! alone is kept), §3 (policy sees
 //! the validation state, see [`Policies`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]).
@@ -218,7 +220,7 @@ impl BestRoute {
 
 /// A route in an Adj-RIB-In: what a peer advertised for a destination,
 /// before import policy (RFC 4271 §3.2: "unprocessed routing
-/// information").
+/// information"), with its validation verdicts.
 #[derive(Clone, Debug)]
 struct Received {
     /// The peer that sent it.
@@ -233,13 +235,15 @@ struct Received {
     aspa: AspaState,
 }
 
-/// One destination: the route each peer sent for it, those import policy
-/// accepted, and the chosen one.
+/// One destination: the routes peers sent for it that the Adj-RIBs-In
+/// hold, those import policy accepted, and the chosen one.
 #[derive(Debug, Default)]
 struct Destination {
-    /// The Adj-RIBs-In for this destination: at most one route per peer,
-    /// kept whatever import policy makes of it, so that policy can run
-    /// again on what the peer sent.
+    /// The Adj-RIBs-In for this destination, at most one route per peer,
+    /// as received, so that import policy can run again on what the peer
+    /// sent when the route's validation state changes. A route import
+    /// policy rejects is held only when another validation state would
+    /// make policy accept it (see [`judge`]).
     received: Vec<Received>,
     /// What import policy accepted of `received`, with the attributes it
     /// gave them: the routes Phase 2 chooses from (RFC 4271 §9.1.1).
@@ -263,9 +267,8 @@ struct PeerState {
     /// Adj-RIB-Out: what the peer was last told, per family, with the
     /// RFC 4271 §9.2.1.1 pacing state.
     adj_out: HashMap<AddressFamily, AdjRibOut>,
-    /// Routes of each family in the Adj-RIB-In, accepted by import policy
-    /// or not: what [`PeerStats::received`] reports and the RFC 4271 §6.7
-    /// limit counts.
+    /// Routes of each family in the Adj-RIB-In: what
+    /// [`PeerStats::received`] reports and the RFC 4271 §6.7 limit counts.
     adj_in_count: HashMap<AddressFamily, usize>,
 }
 
@@ -281,9 +284,10 @@ impl PeerState {
 /// Counters about one peer, for the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerStats {
-    /// Routes the peer sent that the Adj-RIB-In holds, per family it may
-    /// send, whether import policy accepted them or not: what the
-    /// RFC 4271 §6.7 limit counts.
+    /// Routes accepted from the peer, per family it may send, with those
+    /// import policy rejects for their validation state alone, which the
+    /// Adj-RIB-In holds too (RFC 6811 §2): what the RFC 4271 §6.7 limit
+    /// counts.
     pub received: Vec<(AddressFamily, usize)>,
     /// Routes advertised to the peer, per negotiated family.
     pub advertised: Vec<(AddressFamily, usize)>,
@@ -793,18 +797,17 @@ impl Rib {
                 self.announce(&info, family, prefix, route, &mut dirty);
                 // RFC 4271 §6.7: "the number of address prefixes received
                 // from the neighbor exceeds the locally-configured, upper
-                // bound". Counted are the routes the Adj-RIB-In holds,
-                // whether import policy accepted them or not: every route
-                // the peer advertises and has not withdrawn, less those
-                // the loop checks above drop. The Adj-RIB-In keeps what
-                // import policy rejects, so that policy can run again when
-                // its input changes, and those routes take the memory the
-                // limit is there to bound. Counted this way, only the
-                // peer's UPDATEs move the count: a change of policy never
-                // ends a session.
-                // NOTE(interop): BIRD's `receive limit` counts the same
-                // routes; BIRD's `import limit` and FRR's `maximum-prefix`
-                // without `force` count only those import policy accepts.
+                // bound". Counted are the routes the Adj-RIB-In holds after
+                // the loop checks and import policy, the ones "the speaker
+                // is willing to accept" (§6.7): a route import policy
+                // rejects is not kept, so counting it would take the
+                // memory the limit is there to bound. One rejected for its
+                // validation state alone is kept (RFC 6811 §2, see
+                // `judge`) and counted; whether a route is kept does not
+                // depend on its state, so a change of validation state
+                // never moves the count.
+                // NOTE(interop): FRR's `maximum-prefix` without `force`
+                // and BIRD's `import limit` count accepted routes too.
                 if let Some(limit) = limit
                     && self.received(addr, family) > u64::from(limit)
                 {
@@ -861,10 +864,11 @@ impl Rib {
         leftmost_ok && !attrs.as_path.contains(self.local_as)
     }
 
-    /// `route`, announced by `info`'s peer for `prefix`, into the
-    /// Adj-RIB-In in place of any route the peer sent for it before, and
-    /// through import policy into the candidates; `dirty` gets the
-    /// destination if its candidates changed.
+    /// `route`, announced by `info`'s peer for `prefix`, through import
+    /// policy into the candidates and, unless policy rejects it whatever
+    /// its validation state, into the Adj-RIB-In, in place of any route
+    /// the peer sent for it before; `dirty` gets the destination if its
+    /// candidates changed.
     fn announce(
         &mut self,
         info: &PeerInfo,
@@ -874,6 +878,24 @@ impl Rib {
         dirty: &mut Vec<(AddressFamily, Prefix)>,
     ) {
         let peer = route.peer;
+        let judged = judge(
+            &*self.policies,
+            &mut self.interner,
+            info,
+            (family, prefix),
+            &route.attrs,
+            route.rov,
+        );
+        let accepted = match judged {
+            Judged::Accepted(attrs) => Some(attrs),
+            Judged::Held => None,
+            // Not kept, and one the peer sent before for the prefix goes
+            // too: the new announcement replaced it.
+            Judged::Dropped => {
+                self.remove_route(peer, family, prefix, dirty);
+                return;
+            }
+        };
         let dest = self
             .tables
             .entry(family)
@@ -887,14 +909,7 @@ impl Rib {
             push_one(&mut dest.received, route);
             (dest.received.len() - 1, true)
         };
-        if import(
-            &*self.policies,
-            &mut self.interner,
-            info,
-            (family, prefix),
-            &dest.received[held],
-            &mut dest.candidates,
-        ) {
+        if set_candidate(&mut dest.candidates, info, &dest.received[held], accepted) {
             dirty.push((family, prefix));
         }
         if fresh {
@@ -1245,27 +1260,71 @@ fn push_one<T>(list: &mut Vec<T>, item: T) {
     list.push(item);
 }
 
-/// RFC 4271 §9.1.1: import policy decides whether `route`, as the
-/// Adj-RIB-In holds it for `prefix` of `family`, is a candidate for
-/// Phase 2, and with which attributes; the candidate carries the route's
-/// validation state. `candidates` gets the outcome in place of what it
-/// held for the route's peer; whether that changed them.
+/// What import policy makes of a route (see [`judge`]).
+enum Judged {
+    /// A candidate for Phase 2, with these attributes.
+    Accepted(Arc<PathAttrs>),
+    /// Rejected with the route's validation state, accepted with another:
+    /// held in the Adj-RIB-In, and no candidate.
+    Held,
+    /// Rejected whatever the route's validation state: not kept.
+    Dropped,
+}
+
+/// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
+/// sent for `prefix` of `family`, with `attrs` as received and validation
+/// state `rov`, is a candidate for Phase 2, and with which attributes.
+///
+/// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
+/// Adj-RIB-In ... as a side effect of its validation state, unless
+/// explicitly configured to do so", and §4 runs the decision process
+/// again when the state changes. So a route policy rejects is put to it
+/// again with each other state, and is held when one of them would make
+/// policy accept it: once its state changes it is taken without a
+/// ROUTE-REFRESH. A route policy rejects whatever its state is dropped,
+/// as rejected routes were before validation existed: no change of state
+/// can bring it back, and holding it would let a filtered peer fill
+/// memory, past any `maximum-prefix`, with routes nothing uses.
 ///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
-fn import(
+fn judge(
     policies: &dyn Policies,
     interner: &mut Interner,
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
-    route: &Received,
+    attrs: &Arc<PathAttrs>,
+    rov: RovState,
+) -> Judged {
+    match policies.import(info, family, prefix, attrs, rov) {
+        Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
+        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+        Verdict::Reject => {
+            let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
+                !matches!(
+                    policies.import(info, family, prefix, attrs, s),
+                    Verdict::Reject
+                )
+            });
+            if admitted {
+                Judged::Held
+            } else {
+                Judged::Dropped
+            }
+        }
+    }
+}
+
+/// Put what import policy made of `route`, held in the Adj-RIB-In, among
+/// `candidates` in place of what they held for its peer: a candidate
+/// with the `accepted` attributes and the route's validation state, or
+/// none when policy rejected it; whether that changed them.
+fn set_candidate(
     candidates: &mut Vec<Candidate>,
+    info: &PeerInfo,
+    route: &Received,
+    accepted: Option<Arc<PathAttrs>>,
 ) -> bool {
-    let accepted = match policies.import(info, family, prefix, &route.attrs, route.rov) {
-        Verdict::Accept => Some(Arc::clone(&route.attrs)),
-        Verdict::Modified(a) => Some(interner.intern(a)),
-        Verdict::Reject => None,
-    };
     let held = candidates.iter().position(|c| c.peer == route.peer);
     match (accepted, held) {
         (None, None) => false,
