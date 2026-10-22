@@ -532,7 +532,8 @@ fn render_neighbors(
             "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
             r.addr,
             r.remote_as.0,
-            r.state,
+            // `State` writes itself without the padding a width asks for.
+            r.state.to_string(),
             r.since.as_secs(),
             received,
             advertised
@@ -624,12 +625,14 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
     for r in routes {
         let a = &r.attrs;
         let path: Vec<String> = a.as_path.asns().map(|x| x.0.to_string()).collect();
+        // `Prefix` and `Origin` write themselves without the padding a
+        // width asks for, so they are padded as strings.
         lines.push(format!(
             "{}{:<43} {:<40} {:<8} {:>5} {:>7} {} via {}",
             if r.best { "*" } else { " " },
-            r.prefix,
+            r.prefix.to_string(),
             a.next_hop_addr(),
-            a.origin,
+            a.origin.to_string(),
             a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
             a.med.map_or("-".to_owned(), |v| v.to_string()),
             if path.is_empty() {
@@ -678,9 +681,10 @@ fn render_fib(f: &FibReport) -> Reply {
         .begin_array();
     for (prefix, gateway) in &f.desired {
         let installed = f.installed.get(prefix) == Some(gateway);
+        // `Prefix` writes itself without the padding a width asks for.
         lines.push(format!(
             "{:<44} via {:<40} {}",
-            prefix,
+            prefix.to_string(),
             gateway,
             if installed { "installed" } else { "pending" }
         ));
@@ -692,7 +696,10 @@ fn render_fib(f: &FibReport) -> Reply {
     }
     for (prefix, gateway) in &f.installed {
         if !f.desired.contains_key(prefix) {
-            lines.push(format!("{prefix:<44} via {gateway:<40} stale"));
+            lines.push(format!(
+                "{:<44} via {gateway:<40} stale",
+                prefix.to_string()
+            ));
             j.begin_object()
                 .field_display("prefix", prefix)
                 .field_display("gateway", gateway)
@@ -1019,6 +1026,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn neighbors_and_fib_render_in_columns() {
+        let report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Idle,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbors(&[report], &[]);
+        assert_eq!(
+            r.lines[1],
+            format!(
+                "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
+                "192.0.2.2", "65001", "Idle", "5", "0", "0"
+            )
+        );
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        let gw: IpAddr = "198.51.100.1".parse().unwrap();
+        let report = FibReport {
+            mode: Mode::Install,
+            desired: [(p("192.0.2.0/24"), gw), (p("198.51.100.0/24"), gw)].into(),
+            installed: [(p("192.0.2.0/24"), gw), (p("203.0.113.0/24"), gw)].into(),
+        };
+        let r = render_fib(&report);
+        assert_eq!(
+            r.lines[1..],
+            [
+                format!(
+                    "{:<44} via {:<40} installed",
+                    "192.0.2.0/24", "198.51.100.1"
+                ),
+                format!(
+                    "{:<44} via {:<40} pending",
+                    "198.51.100.0/24", "198.51.100.1"
+                ),
+                format!("{:<44} via {:<40} stale", "203.0.113.0/24", "198.51.100.1"),
+            ]
+        );
+    }
+
     /// A route to `prefix` from `peer`, through AS 64511 from AS 64496.
     fn route(
         prefix: &str,
@@ -1058,6 +1110,24 @@ mod tests {
             route("192.0.2.0/24", "198.51.100.1", Some(100), None, true),
             route("192.0.2.0/24", "198.51.100.2", None, Some(50), false),
         ]);
+        // Every column starts where its header does; `*` marks the best.
+        assert_eq!(
+            r.lines,
+            [
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} path",
+                    "prefix", "next-hop", "origin", "lpref", "med"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} 64511 64496 via 198.51.100.1",
+                    "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} 64511 64496 via 198.51.100.2",
+                    " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50"
+                ),
+            ]
+        );
         // docs/control.md: `local_pref` and `med` are numbers, or null.
         assert_eq!(
             r.json,
