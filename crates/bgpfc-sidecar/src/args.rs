@@ -42,6 +42,10 @@ pub(crate) const BUNDLED_TALS: [&str; 9] = [
 const TALS: &str = "bgpfcd derives the TAL options from the TAL settings";
 const FOREIGN_RTR: &str = "it would serve RTR on a listener bgpfcd does not control";
 const EXITS: &str = "Routinator would print and exit instead of serving";
+/// Routinator 0.15 spells the option `--systemd-listen` (`ServerArgs` in
+/// `src/config.rs` at v0.15.2); its manual page says `--listen-systemd`,
+/// which clap rejects.
+const SYSTEMD: &str = "Routinator would take its RTR listener from systemd, and bgpfcd passes it none, so it would fail at every start";
 
 /// Long options the escape hatch may not carry, because bgpfcd sets them
 /// itself or because they defeat supervision or the loopback-only RTR
@@ -63,7 +67,7 @@ const RESERVED_LONG: [(&str, &str); 12] = [
         "bgpfcd passes --rtr; RTR is served on the configured loopback address only",
     ),
     ("rtr-tls", FOREIGN_RTR),
-    ("listen-systemd", FOREIGN_RTR),
+    ("systemd-listen", SYSTEMD),
     (
         "refresh",
         "bgpfcd passes --refresh from the refresh setting",
@@ -440,6 +444,9 @@ mod tests {
             (b"--version", true),
             (b"--rtr-tcp-keepalive=60", false),
             (b"--rtr-client-metrics", false),
+            (b"--systemd-listen", true),
+            // The manual page's spelling, which clap refuses by itself.
+            (b"--listen-systemd", false),
             (b"--tals", false),
             (b"--rt", false),
             (b"--", false),

@@ -184,7 +184,7 @@ impl Sidecar {
     /// port is taken, Routinator fails to bind and exits, which the
     /// supervisor reports as failures and then as the
     /// [`SidecarState::Failed`] alarm, never silently. Handing Routinator
-    /// the bound socket instead (`--listen-systemd`) would need
+    /// the bound socket instead (`--systemd-listen`) would need
     /// `LISTEN_PID` set to the child's own id, which only the child knows,
     /// after `fork`, where nothing may allocate. Configure a fixed port to
     /// avoid the race.

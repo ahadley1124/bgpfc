@@ -578,6 +578,15 @@ mod tests {
                 ),
             ),
             (
+                // The spelling of Routinator 0.15's clap setup.
+                "systemd sockets",
+                |c| c.extra_server_args = args(&["--systemd-listen"]),
+                reserved(
+                    "--systemd-listen",
+                    "Routinator would take its RTR listener from systemd, and bgpfcd passes it none, so it would fail at every start",
+                ),
+            ),
+            (
                 "detach",
                 |c| c.extra_server_args = args(&["-d"]),
                 reserved("-d", "a detached Routinator leaves bgpfcd's supervision"),
