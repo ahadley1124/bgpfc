@@ -4,8 +4,7 @@
 //! threads and the coordinator write to it, and the control plane will
 //! once it exists. Peer threads send [`RibMsg`] to the RIB thread over a
 //! bounded channel so that a flooding peer blocks instead of growing
-//! memory, and so does a producer of validation changes, through
-//! [`crate::rib::RibSink`].
+//! memory, and so will a producer of validation changes.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
@@ -266,8 +265,17 @@ pub(crate) enum RibMsg {
         peer: IpAddr,
     },
     /// The validation source changed (issue #56): validate again the
-    /// routes the change affects (RFC 6811 §4). Sent through
-    /// [`crate::rib::RibSink`].
+    /// routes the change affects (RFC 6811 §4). A producer sends it on the
+    /// same bounded channel as the peers, so it waits behind what is
+    /// queued and cannot outrun the RIB thread (AGENTS.md §3).
+    // AGENTS.md §9 step 11 asks for this command on the RIB thread's
+    // channel; its first producer is the RTR client of step 12, so until
+    // then only the tests send it. `expect` fails the build once a
+    // producer exists, so the attribute goes with that commit.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the RTR client of step 12 is the first sender")
+    )]
     Validation(bgpfc_rpki::ValidationChange),
 }
 

@@ -154,7 +154,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 
     // No validation source yet (issue #56): every route is `disabled`
-    // until a producer publishes one through a `rib::RibSink`.
+    // until a producer sends one as a `RibMsg::Validation`.
     let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
     // RFC 4271 §10: the advertisement intervals are jittered too.
     rib.set_jitter_seed(wiring::jitter_seed(&"rib"));

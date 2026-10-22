@@ -9,11 +9,11 @@
 //! validation source did to the routes' RFC 6811 states, in one line per
 //! change.
 //!
-//! Changes of the validation source arrive on the same channel, from
-//! whoever holds a [`RibSink`], and go the way an UPDATE goes (RFC 6811
-//! §4): the RIB validates the affected routes again, and what follows
-//! is delivered like any other output. The RIB starts with no source
-//! (every route `disabled`) and keeps it until a change says otherwise.
+//! Changes of the validation source arrive on the same channel, as
+//! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
+//! the RIB validates the affected routes again, and what follows is
+//! delivered like any other output. The RIB starts with no source (every
+//! route `disabled`) and keeps it until a change says otherwise.
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
 use bgpfc_rib::{Output, PeerInfo, Revalidation, Rib};
-use bgpfc_rpki::{AffectedPrefixes, RpkiError, ValidationChange, ValidationSink};
+use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::PeerKind;
@@ -68,43 +68,6 @@ fn run(
         // that a busy channel cannot starve the deadlines.
         outputs.extend(rib.flush(now));
         deliver(outputs, peers, fib);
-    }
-}
-
-/// The [`ValidationSink`] a producer of validation changes, such as the
-/// RTR client thread, is given (issue #56). Each change goes to the RIB
-/// thread as a [`RibMsg::Validation`] on its bounded channel, in order and
-/// behind the messages already queued, and is applied by the path an
-/// UPDATE takes: import policy, the decision process, the Adj-RIBs-Out and
-/// their RFC 4271 §9.2.1.1 pacing. `publish` blocks while the channel is
-/// full, so a producer cannot outrun the RIB (AGENTS.md §3,
-/// backpressure), and fails with [`RpkiError::SinkClosed`] once the RIB
-/// thread is gone.
-#[derive(Clone, Debug)]
-pub(crate) struct RibSink {
-    tx: SyncSender<RibMsg>,
-}
-
-impl RibSink {
-    /// A sink onto the RIB thread's channel.
-    // Nothing produces validation changes before the RTR client
-    // (AGENTS.md §9, step 12), the producer this sink is for. Once that
-    // client calls it the expectation is no longer met, which fails the
-    // build, so the attribute cannot outlive its reason.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the RTR client of step 12 is the first producer")
-    )]
-    pub(crate) fn new(tx: SyncSender<RibMsg>) -> RibSink {
-        RibSink { tx }
-    }
-}
-
-impl ValidationSink for RibSink {
-    fn publish(&mut self, change: ValidationChange) -> Result<(), RpkiError> {
-        self.tx
-            .send(RibMsg::Validation(change))
-            .map_err(|_| RpkiError::SinkClosed)
     }
 }
 
@@ -544,6 +507,7 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use bgpfc_rib::RovState;
+    use bgpfc_rpki::ValidationChange;
 
     use bgpfc_wire::types::{Asn, HoldTime, RouterId};
 
@@ -1078,11 +1042,11 @@ mod tests {
     }
 
     #[test]
-    fn validation_changes_from_the_sink_validate_the_routes_again() {
-        // RFC 6811 §4 through the RIB thread's channel: a change published
-        // through the sink is a message `handle` applies, and the states
-        // of the affected routes follow it in place. The invalid route
-        // stays in the Loc-RIB (RFC 6811 §2).
+    fn validation_changes_on_the_channel_validate_the_routes_again() {
+        // RFC 6811 §4 through the RIB thread's channel: a change sent on
+        // it is a message `handle` applies, and the states of the affected
+        // routes follow it in place. The invalid route stays in the
+        // Loc-RIB (RFC 6811 §2).
         use RovState::{Disabled, Invalid, NotFound, Valid};
         let now = Instant::now();
         let mut rib = Rib::new(Asn(65_000));
@@ -1104,9 +1068,8 @@ mod tests {
             ]
         );
         let (tx, rx) = sync_channel(4);
-        let mut sink = RibSink::new(tx);
         let mut apply = |rib: &mut Rib, change| {
-            sink.publish(change).unwrap();
+            tx.send(RibMsg::Validation(change)).unwrap();
             handle(rib, &mut settings, rx.try_recv().unwrap(), now)
         };
         // Validation on: AS 65001 may originate the first prefix, and only
@@ -1162,42 +1125,6 @@ mod tests {
     }
 
     #[test]
-    fn the_validation_sink_waits_for_room_and_fails_once_the_rib_is_gone() {
-        use std::sync::atomic::AtomicBool;
-        let (tx, rx) = sync_channel(1);
-        let mut sink = RibSink::new(tx.clone());
-        // An UPDATE fills the queue: the change waits behind it (AGENTS.md
-        // §3, backpressure) and comes after it.
-        tx.send(routes("192.0.2.1", 65_001, &["198.51.100.0/24"]))
-            .unwrap();
-        let published = std::sync::Arc::new(AtomicBool::new(false));
-        let producer = {
-            let published = std::sync::Arc::clone(&published);
-            thread::spawn(move || {
-                let result = sink.publish(ValidationChange::disabled());
-                published.store(true, Ordering::SeqCst);
-                result
-            })
-        };
-        thread::sleep(Duration::from_millis(50));
-        assert!(!published.load(Ordering::SeqCst), "did not wait for room");
-        assert!(matches!(rx.recv(), Ok(RibMsg::Update { .. })));
-        assert!(matches!(
-            rx.recv(),
-            Ok(RibMsg::Validation(change)) if change.affected == AffectedPrefixes::All
-        ));
-        assert_eq!(producer.join().unwrap(), Ok(()));
-        // The RIB thread gone, its receiver with it: the producer is told
-        // to stop.
-        drop(rx);
-        let mut sink = RibSink::new(tx);
-        assert_eq!(
-            sink.publish(ValidationChange::disabled()),
-            Err(RpkiError::SinkClosed)
-        );
-    }
-
-    #[test]
     fn the_rib_thread_applies_validation_changes_in_order_with_updates() {
         // The thread itself: changes interleave with UPDATEs and queries
         // on one channel and take effect in the order they were sent.
@@ -1226,15 +1153,14 @@ mod tests {
                 other => panic!("expected routes, got {other:?}"),
             }
         };
-        let mut sink = RibSink::new(tx.clone());
         tx.send(up("192.0.2.1", 65_001, PeerKind::External))
             .unwrap();
         // Validation is on before the routes arrive: they get their state
         // as they arrive.
-        sink.publish(all(&[
+        tx.send(RibMsg::Validation(all(&[
             vrp("198.51.100.0/24", 24, 65_001),
             vrp("203.0.113.0/24", 24, 64_496),
-        ]))
+        ])))
         .unwrap();
         tx.send(routes(
             "192.0.2.1",
@@ -1247,7 +1173,8 @@ mod tests {
             query(&tx),
             [s("198.51.100.0/24", Valid), s("203.0.113.0/24", Invalid)]
         );
-        sink.publish(ValidationChange::disabled()).unwrap();
+        tx.send(RibMsg::Validation(ValidationChange::disabled()))
+            .unwrap();
         assert_eq!(
             query(&tx),
             [
