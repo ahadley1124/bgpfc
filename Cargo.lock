@@ -120,6 +120,7 @@ dependencies = [
  "bgpfc-log",
  "bgpfc-policy",
  "bgpfc-rib",
+ "bgpfc-rpki",
  "bgpfc-sys",
  "bgpfc-wire",
 ]

@@ -15,6 +15,7 @@ bgpfc-fsm.workspace = true
 bgpfc-log.workspace = true
 bgpfc-policy.workspace = true
 bgpfc-rib.workspace = true
+bgpfc-rpki.workspace = true
 bgpfc-sys.workspace = true
 bgpfc-wire.workspace = true
 

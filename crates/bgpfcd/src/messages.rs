@@ -4,7 +4,8 @@
 //! threads and the coordinator write to it, and the control plane will
 //! once it exists. Peer threads send [`RibMsg`] to the RIB thread over a
 //! bounded channel so that a flooding peer blocks instead of growing
-//! memory.
+//! memory, and so does a producer of validation changes, through
+//! [`crate::rib::RibSink`].
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
@@ -264,6 +265,10 @@ pub(crate) enum RibMsg {
         /// Peer address.
         peer: IpAddr,
     },
+    /// The validation source changed (issue #56): validate again the
+    /// routes the change affects (RFC 6811 §4). Sent through
+    /// [`crate::rib::RibSink`].
+    Validation(bgpfc_rpki::ValidationChange),
 }
 
 /// A policy set on its way to the RIB thread (`dyn Policies` has no

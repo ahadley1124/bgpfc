@@ -7,6 +7,12 @@
 //! end its session. Routes the RIB ignored for a semantically incorrect
 //! next hop are logged (RFC 4271 §6.3), as is every change of a route's
 //! RFC 6811 validation state (issue #59).
+//!
+//! Changes of the validation source arrive on the same channel, from
+//! whoever holds a [`RibSink`], and go the way an UPDATE goes (RFC 6811
+//! §4): the RIB validates the affected routes again, and what follows
+//! is delivered like any other output. The RIB starts with no source
+//! (every route `disabled`) and keeps it until a change says otherwise.
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -16,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
 use bgpfc_rib::{Output, PeerInfo, Rib, RouteOrigin, RovState};
+use bgpfc_rpki::{AffectedPrefixes, RpkiError, ValidationChange, ValidationSink};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::PeerKind;
@@ -60,6 +67,43 @@ fn run(
         // that a busy channel cannot starve the deadlines.
         outputs.extend(rib.flush(now));
         deliver(outputs, peers, fib);
+    }
+}
+
+/// The [`ValidationSink`] a producer of validation changes, such as the
+/// RTR client thread, is given (issue #56). Each change goes to the RIB
+/// thread as a [`RibMsg::Validation`] on its bounded channel, in order and
+/// behind the messages already queued, and is applied by the path an
+/// UPDATE takes: import policy, the decision process, the Adj-RIBs-Out and
+/// their RFC 4271 §9.2.1.1 pacing. `publish` blocks while the channel is
+/// full, so a producer cannot outrun the RIB (AGENTS.md §3,
+/// backpressure), and fails with [`RpkiError::SinkClosed`] once the RIB
+/// thread is gone.
+#[derive(Clone, Debug)]
+pub(crate) struct RibSink {
+    tx: SyncSender<RibMsg>,
+}
+
+impl RibSink {
+    /// A sink onto the RIB thread's channel.
+    // Nothing produces validation changes before the RTR client
+    // (AGENTS.md §9, step 12), the producer this sink is for. Once that
+    // client calls it the expectation is no longer met, which fails the
+    // build, so the attribute cannot outlive its reason.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the RTR client of step 12 is the first producer")
+    )]
+    pub(crate) fn new(tx: SyncSender<RibMsg>) -> RibSink {
+        RibSink { tx }
+    }
+}
+
+impl ValidationSink for RibSink {
+    fn publish(&mut self, change: ValidationChange) -> Result<(), RpkiError> {
+        self.tx
+            .send(RibMsg::Validation(change))
+            .map_err(|_| RpkiError::SinkClosed)
     }
 }
 
@@ -169,6 +213,22 @@ fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) 
             }
             out
         }
+        RibMsg::Validation(change) => {
+            bgpfc_log::debug!(
+                "rib: validation change",
+                affected = describe_affected(&change.affected)
+            );
+            rib.validation_changed(change, now)
+        }
+    }
+}
+
+/// `all`, or how many changed VRP prefixes name the affected routes, for
+/// a log line.
+fn describe_affected(affected: &AffectedPrefixes) -> String {
+    match affected {
+        AffectedPrefixes::All => "all".to_owned(),
+        AffectedPrefixes::CoveredBy(prefixes) => prefixes.len().to_string(),
     }
 }
 
@@ -963,6 +1023,233 @@ mod tests {
         drop(tx);
         assert!(matches!(next(&rx, None), Err(Closed)));
         assert!(matches!(next(&rx, later), Err(Closed)));
+    }
+
+    fn vrp(prefix: &str, max_len: u8, asn: u32) -> bgpfc_rpki::Vrp {
+        bgpfc_rpki::Vrp::new(prefix.parse().unwrap(), max_len, Asn(asn)).unwrap()
+    }
+
+    /// Validation on, from `vrps`: every route affected.
+    fn all(vrps: &[bgpfc_rpki::Vrp]) -> ValidationChange {
+        let set: bgpfc_rpki::VrpSet = vrps.iter().copied().collect();
+        ValidationChange {
+            source: std::sync::Arc::new(set),
+            affected: AffectedPrefixes::All,
+        }
+    }
+
+    /// The IPv4 Loc-RIB, as the control plane is told it: each route with
+    /// its validation state.
+    fn states(rib: &Rib) -> Vec<(String, RovState)> {
+        let q = RibQuery::Routes {
+            family: V4,
+            prefix: None,
+        };
+        match answer(rib, &q) {
+            RibReply::Routes(routes) => routes
+                .iter()
+                .map(|r| (r.prefix.to_string(), r.rov))
+                .collect(),
+            RibReply::Peers(_) => panic!("asked for routes"),
+        }
+    }
+
+    /// The validation state changes among `out`.
+    fn rov_changes(out: &[Output]) -> Vec<(String, RovState, RovState)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::RovStateChanged {
+                    prefix, from, to, ..
+                } => Some((prefix.to_string(), *from, *to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validation_changes_from_the_sink_validate_the_routes_again() {
+        // RFC 6811 §4 through the RIB thread's channel: a change published
+        // through the sink is a message `handle` applies, and the states
+        // of the affected routes follow it in place. The invalid route
+        // stays in the Loc-RIB (RFC 6811 §2).
+        use RovState::{Disabled, Invalid, NotFound, Valid};
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let s = |p: &str, rov| (p.to_owned(), rov);
+        assert_eq!(
+            states(&rib),
+            [
+                s("198.51.100.0/24", Disabled),
+                s("203.0.113.0/24", Disabled)
+            ]
+        );
+        let (tx, rx) = sync_channel(4);
+        let mut sink = RibSink::new(tx);
+        let mut apply = |change| {
+            sink.publish(change).unwrap();
+            handle(&mut rib, &mut settings, rx.try_recv().unwrap(), now)
+        };
+        // Validation on: AS 65001 may originate the first prefix, and only
+        // AS 64496 the second.
+        let gone = vrp("203.0.113.0/24", 24, 64_496);
+        let out = apply(all(&[vrp("198.51.100.0/24", 24, 65_001), gone]));
+        let c = |p: &str, from, to| (p.to_owned(), from, to);
+        assert_eq!(
+            rov_changes(&out),
+            [
+                c("198.51.100.0/24", Disabled, Valid),
+                c("203.0.113.0/24", Disabled, Invalid)
+            ]
+        );
+        // A delta: the VRP that made the second route invalid goes, and
+        // only that route is validated again.
+        let out = apply(ValidationChange {
+            source: std::sync::Arc::new(
+                [vrp("198.51.100.0/24", 24, 65_001)]
+                    .into_iter()
+                    .collect::<bgpfc_rpki::VrpSet>(),
+            ),
+            affected: AffectedPrefixes::from_vrps([gone]),
+        });
+        assert_eq!(rov_changes(&out), [c("203.0.113.0/24", Invalid, NotFound)]);
+        // Off again.
+        let out = apply(ValidationChange::disabled());
+        assert_eq!(
+            rov_changes(&out),
+            [
+                c("198.51.100.0/24", Valid, Disabled),
+                c("203.0.113.0/24", NotFound, Disabled)
+            ]
+        );
+        assert_eq!(
+            states(&rib),
+            [
+                s("198.51.100.0/24", Disabled),
+                s("203.0.113.0/24", Disabled)
+            ]
+        );
+        // The best routes stayed the same, so the FIB hears nothing; the
+        // changes are only logged.
+        let (fib_tx, fib_rx) = sync_channel(4);
+        deliver(out, &PeerTable::default(), &fib_tx);
+        assert!(fib_rx.try_recv().is_err());
+        assert_eq!(describe_affected(&AffectedPrefixes::All), "all");
+        assert_eq!(describe_affected(&AffectedPrefixes::from_vrps([gone])), "1");
+    }
+
+    #[test]
+    fn the_validation_sink_waits_for_room_and_fails_once_the_rib_is_gone() {
+        use std::sync::atomic::AtomicBool;
+        let (tx, rx) = sync_channel(1);
+        let mut sink = RibSink::new(tx.clone());
+        // An UPDATE fills the queue: the change waits behind it (AGENTS.md
+        // §3, backpressure) and comes after it.
+        tx.send(routes("192.0.2.1", 65_001, &["198.51.100.0/24"]))
+            .unwrap();
+        let published = std::sync::Arc::new(AtomicBool::new(false));
+        let producer = {
+            let published = std::sync::Arc::clone(&published);
+            thread::spawn(move || {
+                let result = sink.publish(ValidationChange::disabled());
+                published.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!published.load(Ordering::SeqCst), "did not wait for room");
+        assert!(matches!(rx.recv(), Ok(RibMsg::Update { .. })));
+        assert!(matches!(
+            rx.recv(),
+            Ok(RibMsg::Validation(change)) if change.affected == AffectedPrefixes::All
+        ));
+        assert_eq!(producer.join().unwrap(), Ok(()));
+        // The RIB thread gone, its receiver with it: the producer is told
+        // to stop.
+        drop(rx);
+        let mut sink = RibSink::new(tx);
+        assert_eq!(
+            sink.publish(ValidationChange::disabled()),
+            Err(RpkiError::SinkClosed)
+        );
+    }
+
+    #[test]
+    fn the_rib_thread_applies_validation_changes_in_order_with_updates() {
+        // The thread itself: changes interleave with UPDATEs and queries
+        // on one channel and take effect in the order they were sent.
+        use RovState::{Disabled, Invalid, Valid};
+        let (tx, rx) = sync_channel(16);
+        let (fib_tx, fib_rx) = sync_channel(16);
+        spawn(
+            Rib::new(Asn(65_000)),
+            RibSettings::default(),
+            rx,
+            PeerTable::default(),
+            fib_tx,
+        );
+        let query = |tx: &SyncSender<RibMsg>| {
+            let (reply, answer) = sync_channel(1);
+            let q = RibQuery::Routes {
+                family: V4,
+                prefix: None,
+            };
+            tx.send(RibMsg::Query(q, reply)).unwrap();
+            match answer.recv_timeout(Duration::from_secs(10)) {
+                Ok(RibReply::Routes(routes)) => routes
+                    .iter()
+                    .map(|r| (r.prefix.to_string(), r.rov))
+                    .collect::<Vec<_>>(),
+                other => panic!("expected routes, got {other:?}"),
+            }
+        };
+        let mut sink = RibSink::new(tx.clone());
+        tx.send(up("192.0.2.1", 65_001, PeerKind::External))
+            .unwrap();
+        // Validation is on before the routes arrive: they get their state
+        // as they arrive.
+        sink.publish(all(&[
+            vrp("198.51.100.0/24", 24, 65_001),
+            vrp("203.0.113.0/24", 24, 64_496),
+        ]))
+        .unwrap();
+        tx.send(routes(
+            "192.0.2.1",
+            65_001,
+            &["198.51.100.0/24", "203.0.113.0/24"],
+        ))
+        .unwrap();
+        let s = |p: &str, rov| (p.to_owned(), rov);
+        assert_eq!(
+            query(&tx),
+            [s("198.51.100.0/24", Valid), s("203.0.113.0/24", Invalid)]
+        );
+        sink.publish(ValidationChange::disabled()).unwrap();
+        assert_eq!(
+            query(&tx),
+            [
+                s("198.51.100.0/24", Disabled),
+                s("203.0.113.0/24", Disabled)
+            ]
+        );
+        // Both routes reached the FIB, the invalid one too: nothing acts
+        // on the state yet. Turning validation off changed no best route.
+        let installed: Vec<_> = fib_rx
+            .try_iter()
+            .map(|m| match m {
+                FibMsg::Change(c) => c.prefix.to_string(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(installed, ["198.51.100.0/24", "203.0.113.0/24"]);
     }
 
     #[test]
