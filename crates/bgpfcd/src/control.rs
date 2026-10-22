@@ -439,6 +439,7 @@ fn write_neighbor(
         .field_display("state", r.state)
         .field_num("since_seconds", r.since.as_secs())
         .field_bool("admin_down", r.admin_down)
+        .field_bool("restart_limit_reached", r.restart_limit_reached)
         .field_num("updates_in", r.updates_in)
         .field_num("updates_out", r.updates_out)
         .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
@@ -513,6 +514,10 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
     ];
     if r.admin_down {
         lines.push("  administratively down".to_owned());
+    }
+    if r.restart_limit_reached {
+        // RFC 4486 §4: no more automatic retries until the operator acts.
+        lines.push("  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned());
     }
     if let Some(s) = &r.session {
         lines.push(format!("  router-id {}", s.peer_router_id));
@@ -803,6 +808,7 @@ mod tests {
             updates_in: 0,
             updates_out: 0,
             admin_down: false,
+            restart_limit_reached: false,
         };
         let r = render_neighbor(&report, &[]);
         assert!(
@@ -822,6 +828,43 @@ mod tests {
         let r = render_neighbor(&report, &[]);
         assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
         assert!(r.json.contains(r#""extended_next_hop":[]"#), "{}", r.json);
+    }
+
+    #[test]
+    fn neighbor_detail_says_when_the_restart_limit_stopped_it() {
+        let mut report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Idle,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbor(&report, &[]);
+        assert!(!r.lines.iter().any(|l| l.contains("restart limit")));
+        assert!(
+            r.json.contains(r#""restart_limit_reached":false"#),
+            "{}",
+            r.json
+        );
+        // RFC 4486 §4: the operator must act, and is told how.
+        report.restart_limit_reached = true;
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines.contains(
+                &"  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""restart_limit_reached":true"#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use bgpfc_config::ast::{self, Neighbor};
-use bgpfc_fsm::{Config, SendHoldTime};
+use bgpfc_fsm::{Config, Damping, SendHoldTime};
 use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::types::{Afi, Asn, RouterId};
 
@@ -18,6 +18,12 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
     fsm.connect_retry_time = n.connect_retry_time;
     fsm.passive = n.passive;
     fsm.collision_detect_established = n.collision_detect_established;
+    // RFC 4486 §4: the bound on consecutive automatic restarts, with the
+    // RFC 4271 §8.1.1 damping it applies to.
+    fsm.damping = Some(Damping {
+        restart_limit: n.restart_limit,
+        ..Damping::default()
+    });
     fsm.send_hold_time = match n.send_hold_time {
         ast::SendHoldTime::Default => SendHoldTime::Default,
         ast::SendHoldTime::Off => SendHoldTime::Disabled,
@@ -95,7 +101,7 @@ mod tests {
                  remote-as 65001; port 1179; hold-time 30; keepalive-time 5;
                  connect-retry-time 7; send-hold-time 120; families ipv6-unicast;
                  import A; export A; passive yes; allow-as-set yes;
-                 collision-detect-established yes;
+                 collision-detect-established yes; restart-limit 3;
              }
              neighbor 192.0.2.3 { remote-as 65001; import A; export A; send-hold-time off; }",
         )
@@ -115,6 +121,7 @@ mod tests {
         );
         assert!(p.fsm.passive);
         assert!(p.fsm.collision_detect_established);
+        assert_eq!(p.fsm.damping.and_then(|d| d.restart_limit), Some(3));
         assert_eq!(
             p.fsm.capabilities,
             vec![
@@ -126,6 +133,12 @@ mod tests {
         assert_ne!(p.fsm.jitter_seed, 0);
         let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
         assert_eq!(q.fsm.send_hold_time, SendHoldTime::Disabled);
+        // The config crate's default is the FSM's.
+        assert_eq!(
+            bgpfc_config::ast::DEFAULT_RESTART_LIMIT,
+            bgpfc_fsm::DEFAULT_RESTART_LIMIT
+        );
+        assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
     }

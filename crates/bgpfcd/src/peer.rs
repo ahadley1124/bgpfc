@@ -380,6 +380,7 @@ impl Peer {
                     updates_in: self.updates_in,
                     updates_out: self.updates_out,
                     admin_down: self.fsm.is_admin_down(),
+                    restart_limit_reached: !self.fsm.automatic_start_allowed(),
                 });
             }
         }

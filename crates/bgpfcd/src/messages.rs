@@ -113,6 +113,8 @@ pub(crate) struct PeerReport {
     pub(crate) updates_out: u64,
     /// Administratively stopped (a `ManualStop` with no restart).
     pub(crate) admin_down: bool,
+    /// Left Idle by the restart limit (RFC 4486 §4) until cleared.
+    pub(crate) restart_limit_reached: bool,
 }
 
 /// What the RIB thread tells the FIB thread, and what the control plane
