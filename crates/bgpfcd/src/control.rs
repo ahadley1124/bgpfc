@@ -474,12 +474,8 @@ fn write_neighbor(
             .field_display("family", family)
             .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
             .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX))
-            .key("limit");
-        match limit {
-            Some(l) => j.number(l),
-            None => j.null(),
-        };
-        j.end_object();
+            .field_opt_num("limit", limit)
+            .end_object();
     }
     j.end_array();
     j.key("session");
@@ -647,8 +643,8 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
             .field_display("prefix", r.prefix)
             .field_display("next_hop", a.next_hop_addr())
             .field_display("origin", a.origin)
-            .field_opt("local_pref", a.local_pref)
-            .field_opt("med", a.med)
+            .field_opt_num("local_pref", a.local_pref)
+            .field_opt_num("med", a.med)
             .field_display("peer", r.peer)
             .field_bool("best", r.best)
             .key("as_path")
@@ -1020,6 +1016,59 @@ mod tests {
             r.json.contains(r#""restart_limit_reached":true"#),
             "{}",
             r.json
+        );
+    }
+
+    /// A route to `prefix` from `peer`, through AS 64511 from AS 64496.
+    fn route(
+        prefix: &str,
+        peer: &str,
+        local_pref: Option<u32>,
+        med: Option<u32>,
+        best: bool,
+    ) -> RouteReport {
+        use bgpfc_wire::as_path::AsPath;
+        use bgpfc_wire::attribute::Origin;
+        use bgpfc_wire::community::Community;
+        use bgpfc_wire::mp::NextHop;
+        let peer: std::net::Ipv4Addr = peer.parse().unwrap();
+        RouteReport {
+            prefix: prefix.parse().unwrap(),
+            peer: IpAddr::V4(peer),
+            attrs: Arc::new(bgpfc_rib::PathAttrs {
+                origin: Origin::Igp,
+                as_path: AsPath::sequence(&[Asn(64_511), Asn(64_496)]),
+                next_hop: NextHop::Ipv4(peer),
+                med,
+                local_pref,
+                atomic_aggregate: false,
+                aggregator: None,
+                communities: vec![Community(0xFBFF_0064)],
+                ext_communities: Vec::new(),
+                large_communities: Vec::new(),
+                unknown: Vec::new(),
+            }),
+            best,
+        }
+    }
+
+    #[test]
+    fn routes_render_as_lines_and_json() {
+        let r = render_routes(&[
+            route("192.0.2.0/24", "198.51.100.1", Some(100), None, true),
+            route("192.0.2.0/24", "198.51.100.2", None, Some(50), false),
+        ]);
+        // docs/control.md: `local_pref` and `med` are numbers, or null.
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
+                r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
+                r#""as_path":[64511,64496],"communities":["64511:100"],"large_communities":[]},"#,
+                r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
+                r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
+                r#""as_path":[64511,64496],"communities":["64511:100"],"large_communities":[]}]"#
+            )
         );
     }
 
