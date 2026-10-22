@@ -852,6 +852,93 @@ mod net {
         assert!(client.status().last_error.unwrap().contains("expired"));
     }
 
+    fn no_data() -> Pdu {
+        Pdu::ErrorReport(ErrorReport::new(
+            V1,
+            ErrorCode::NoDataAvailable,
+            &RESET_V1.encode(),
+            "still loading",
+        ))
+    }
+
+    #[test]
+    fn a_cache_without_data_is_left_for_the_next() {
+        // RFC 8210 §8.4: "the router SHOULD attempt to connect to any other
+        // caches in its cache list, in preference order."
+        let first = TestCache::new();
+        let second = TestCache::new();
+        let (client, rx) = start(vec![first.entry(0), second.entry(1)]);
+        let mut router = first.accept();
+        assert_eq!(router.recv(), RESET_V1);
+        router.send(&[no_data()]);
+        router.expect_close();
+        let mut router = second.accept();
+        router.serve_reset(SID, 1, &[a()]);
+        let change = next_change(&rx);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Valid);
+        eventually("the second cache in sync", || {
+            let status = client.status();
+            status.cache == second.entry(1) && status.synced_at.is_some()
+        });
+    }
+
+    #[test]
+    fn the_only_cache_without_data_is_asked_again_after_the_back_off() {
+        // RFC 8210 §8.4: "If no other caches are available, the router MUST
+        // issue periodic Reset Queries", here after the back-off rather
+        // than ten minutes, so that a validator still loading is picked up
+        // soon after it has data.
+        let cache = TestCache::new();
+        let (client, rx) = start(vec![cache.entry(0)]);
+        let mut router = cache.accept();
+        for failures in 1..=3 {
+            assert_eq!(router.recv(), RESET_V1, "on the same connection");
+            router.send(&[no_data()]);
+            eventually("the No Data counted", || {
+                client.status().failures == failures
+            });
+        }
+        assert!(rx.try_recv().is_err());
+        router.serve_reset(SID, 1, &[a()]);
+        next_change(&rx);
+        eventually("in sync", || {
+            let status = client.status();
+            status.synced_at.is_some() && status.failures == 0
+        });
+    }
+
+    #[test]
+    fn a_cache_reset_sends_the_client_to_a_more_preferred_cache() {
+        let first = TestCache::new();
+        let second = TestCache::new();
+        let (client, rx) = start(vec![first.entry(0), second.entry(1)]);
+        // The most preferred cache is away at first.
+        drop(first.accept());
+        let mut router = second.accept();
+        router.serve_reset(SID, 1, &[a(), b()]);
+        next_change(&rx);
+        eventually("the second cache in sync", || {
+            client.status().synced_at.is_some()
+        });
+        router.send(&[notify(SID, 2)]);
+        assert_eq!(router.recv(), serial_query(SID, 1));
+        // RFC 8210 §8.3: "the router SHOULD attempt to connect to any
+        // more-preferred caches in its cache list."
+        router.send(&[Pdu::CacheReset { version: V1 }]);
+        router.expect_close();
+        let mut router = first.accept();
+        assert_eq!(router.recv(), RESET_V1);
+        // The second cache's data stays in use until then (§10).
+        assert!(rx.try_recv().is_err());
+        assert_eq!(client.status().vrps.as_deref(), Some(&set(&[a(), b()])));
+        router.send(&[response(V1, 9), announce(V1, a()), eod(9, 1)]);
+        let change = next_change(&rx);
+        assert!(covers(&change, "2001:db8::/32") && !covers(&change, "192.0.2.0/24"));
+        eventually("the first cache in use", || {
+            client.status().cache == first.entry(0)
+        });
+    }
+
     #[test]
     fn stop_closes_the_connection_and_joins_the_thread() {
         let cache = TestCache::new();

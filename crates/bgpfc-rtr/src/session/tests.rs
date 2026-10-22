@@ -184,6 +184,7 @@ fn tags(actions: &[Action]) -> Vec<String> {
                         format!("commit {} ~{}", c.vrps.len(), p.len())
                     }
                 },
+                Action::Fallback(why) => format!("fallback {why}"),
                 Action::Log(_) => return None,
             })
         })
@@ -289,7 +290,7 @@ fn no_data() -> H {
     let mut h = querying_cold();
     assert_eq!(
         tags(&h.pdu(report(V1, ErrorCode::NoDataAvailable))),
-        ["negotiated v1"]
+        ["negotiated v1", "fallback no-data"]
     );
     h
 }
@@ -425,6 +426,9 @@ fn check_table(name: &str, setup: fn() -> H, table: &[Row]) {
 
 /// Corrupt Data, then the session is dropped (RFC 8210 §12).
 const ERR: &[&str] = &["report v1 code 0", "close"];
+/// No Data Available: other caches first, if the shell has them (RFC 8210
+/// §8.4); the session stays.
+const NO_DATA: &[&str] = &["fallback no-data"];
 const NONE: &[&str] = &[];
 const NO_ACTIONS: Vec<Action> = Vec::new();
 const NO_COMMITS: Vec<&Commit> = Vec::new();
@@ -509,7 +513,11 @@ fn table_querying_cold() {
             // RFC 8210 §5.9: a Cache Reset answers a Serial Query only.
             ("cache-reset", D, NEG_ERR),
             ("router-key", D, NEG_ERR),
-            ("no-data", State::Idle, &["negotiated v1"]),
+            (
+                "no-data",
+                State::Idle,
+                &["negotiated v1", "fallback no-data"],
+            ),
             ("error-report", D, &["close"]),
         ],
     );
@@ -537,7 +545,7 @@ fn table_receiving_reset() {
             ("end-of-data", State::Idle, &["commit 0 all"]),
             ("cache-reset", D, ERR),
             ("router-key", R, NONE),
-            ("no-data", State::Idle, NONE),
+            ("no-data", State::Idle, NO_DATA),
             ("error-report", D, &["close"]),
         ],
     );
@@ -563,7 +571,7 @@ fn table_idle() {
             ("end-of-data", D, ERR),
             ("cache-reset", D, ERR),
             ("router-key", D, ERR),
-            ("no-data", I, NONE),
+            ("no-data", I, NO_DATA),
             ("error-report", D, &["close"]),
         ],
     );
@@ -588,10 +596,14 @@ fn table_querying_serial() {
             ("ipv4-prefix", D, ERR),
             ("ipv6-prefix", D, ERR),
             ("end-of-data", D, ERR),
-            // RFC 8210 §8.3.
-            ("cache-reset", Q, &["reset-query v1"]),
+            // RFC 8210 §8.3: other caches first, if the shell has them.
+            (
+                "cache-reset",
+                Q,
+                &["fallback cache-reset", "reset-query v1"],
+            ),
             ("router-key", D, ERR),
-            ("no-data", State::Idle, NONE),
+            ("no-data", State::Idle, NO_DATA),
             ("error-report", D, &["close"]),
         ],
     );
@@ -618,7 +630,7 @@ fn table_receiving_serial() {
             ("end-of-data", State::Idle, NONE),
             ("cache-reset", D, ERR),
             ("router-key", R, NONE),
-            ("no-data", State::Idle, NONE),
+            ("no-data", State::Idle, NO_DATA),
             ("error-report", D, &["close"]),
         ],
     );
@@ -645,7 +657,7 @@ fn table_no_data() {
             ("end-of-data", D, ERR),
             ("cache-reset", D, ERR),
             ("router-key", D, ERR),
-            ("no-data", I, NONE),
+            ("no-data", I, NO_DATA),
             ("error-report", D, &["close"]),
         ],
     );
@@ -692,7 +704,7 @@ fn first_commit_affects_every_route_even_when_empty() {
     h.wait(3_600);
     assert_eq!(
         tags(&h.pdu(Pdu::CacheReset { version: V1 })),
-        ["reset-query v1"]
+        ["fallback cache-reset", "reset-query v1"]
     );
     assert_eq!(tags(&h.pdus(&[response(V1, SID), eod(SID, 2)])), NONE);
     assert_eq!(h.s.serial(), Some(2));
@@ -804,7 +816,7 @@ fn cache_reset_reloads_and_commits_the_diff() {
     let mut h = querying_serial();
     assert_eq!(
         tags(&h.pdu(Pdu::CacheReset { version: V1 })),
-        ["reset-query v1"]
+        ["fallback cache-reset", "reset-query v1"]
     );
     // §5.5: a reply to a Reset Query may bring a new Session ID.
     let actions = h.pdus(&[
@@ -829,16 +841,22 @@ fn cache_reset_reloads_and_commits_the_diff() {
 fn no_data_keeps_the_data_and_polls_with_reset_queries() {
     let mut h = querying_serial();
     let actions = h.pdu(report(V1, ErrorCode::NoDataAvailable));
-    assert!(tags(&actions).is_empty(), "not fatal: the session stays up");
+    // Not fatal: the session stays up, and says that other caches, if
+    // there are any, come first (§8.4).
+    assert_eq!(tags(&actions), NO_DATA);
     assert!(logs(&actions).iter().any(|l| l.level == Level::Warn
         && field_of(l, "serving_vrps") == Some("2")
-        && field_of(l, "text") == Some("from the cache")));
+        && field_of(l, "text") == Some("from the cache")
+        && field_of(l, "retry_in") == Some("600s")));
     assert_eq!(h.s.state(), State::Idle);
     assert_eq!(h.vrps(), set(&[a(), b()]));
     // §8.4: periodic Reset Queries, every Retry Interval (§6).
     assert_eq!(tags(&h.wait(599)), NONE);
     assert_eq!(tags(&h.wait(1)), ["reset-query v1"]);
-    assert_eq!(tags(&h.pdu(report(V1, ErrorCode::NoDataAvailable))), NONE);
+    assert_eq!(
+        tags(&h.pdu(report(V1, ErrorCode::NoDataAvailable))),
+        NO_DATA
+    );
     assert_eq!(tags(&h.wait(600)), ["reset-query v1"]);
     let actions = h.pdus(&[response(V1, SID), announce(V1, a()), eod(SID, 9)]);
     assert_eq!(tags(&actions), ["commit 1 ~1"]);
@@ -1055,7 +1073,10 @@ fn unsupported_version_in_version_1_downgrades() {
 fn no_data_in_version_0_downgrades_and_stays_connected() {
     let mut h = querying_cold();
     let actions = h.pdu(report(V0, ErrorCode::NoDataAvailable));
-    assert_eq!(tags(&actions), ["downgrade v0", "negotiated v0"]);
+    assert_eq!(
+        tags(&actions),
+        ["downgrade v0", "negotiated v0", "fallback no-data"]
+    );
     assert_eq!(h.s.state(), State::Idle);
     assert_eq!(tags(&h.wait(600)), ["reset-query v0"]);
 }
@@ -1315,14 +1336,22 @@ fn the_shell_delay_applies_to_every_kind_of_failure() {
 }
 
 #[test]
-fn no_data_keeps_the_retry_interval_whatever_the_shell_delay() {
+fn no_data_polls_after_the_shell_delay() {
+    // RFC 8210 §8.4: periodic Reset Queries on the open connection, after
+    // the Retry Interval (§6) or the delay of a shell that paces its
+    // retries (the client's back-off).
     let mut h = querying_cold();
     h.s.set_retry_delay(Some(Duration::from_secs(1)));
-    h.pdu(report(V1, ErrorCode::NoDataAvailable));
+    assert_eq!(
+        tags(&h.pdu(report(V1, ErrorCode::NoDataAvailable))),
+        ["negotiated v1", "fallback no-data"]
+    );
     assert_eq!(h.s.state(), State::Idle);
-    // RFC 8210 §8.4: periodic Reset Queries on the open connection, at the
-    // Retry Interval (§6).
-    assert_eq!(h.s.next_deadline(), Some(h.secs(600)));
+    assert_eq!(h.s.next_deadline(), Some(h.secs(1)));
+    h.s.set_retry_delay(Some(Duration::from_secs(2)));
+    assert_eq!(tags(&h.wait(1)), ["reset-query v1"]);
+    h.pdu(report(V1, ErrorCode::NoDataAvailable));
+    assert_eq!(h.s.next_deadline(), Some(h.secs(2)));
 }
 
 #[test]
@@ -1853,7 +1882,7 @@ fn expiry_while_a_serial_query_is_out_reloads() {
     h.wait(50);
     assert_eq!(
         tags(&h.pdu(Pdu::CacheReset { version: V1 })),
-        ["reset-query v1"]
+        ["fallback cache-reset", "reset-query v1"]
     );
 }
 

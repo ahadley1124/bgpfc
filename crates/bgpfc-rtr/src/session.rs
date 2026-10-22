@@ -23,8 +23,9 @@
 //!    [`Commit::into_change`].
 //!
 //! After a failure the session reconnects when the cache's Retry Interval
-//! has run out (RFC 8210 §6), unless the shell paces reconnects itself
-//! with [`Session::set_retry_delay`].
+//! has run out (RFC 8210 §6), unless the shell paces reconnects, and the
+//! Reset Queries to a cache without data, itself with
+//! [`Session::set_retry_delay`].
 //!
 //! # What the RIB sees
 //!
@@ -53,9 +54,10 @@
 //!
 //! A session talks to one cache. RFC 8210 §8.3 and §8.4 say a router
 //! SHOULD try more-preferred, or other, caches after a Cache Reset or a
-//! No Data Available; with a single configured cache, this session does
-//! what the RFC requires when there are none: a Reset Query after a
-//! Cache Reset, and periodic Reset Queries while there is no data.
+//! No Data Available. The session does what the RFC requires when there
+//! are none, a Reset Query after a Cache Reset and periodic Reset Queries
+//! while there is no data, and says so with [`Action::Fallback`] before
+//! it does: a shell with other caches leaves this one for them.
 //!
 //! Implements: RFC 8210 §4 (Serial Notify is a hint; the router's
 //! serial is the one in End of Data), §5.1 (a Session ID mismatch drops
@@ -231,6 +233,46 @@ pub enum Action {
     Commit(Commit),
     /// Write this line to the log.
     Log(LogLine),
+    /// The cache cannot serve the router for now; RFC 8210 says what the
+    /// router SHOULD try first if it has other caches. The session goes
+    /// on as a router with no other cache must, and a shell that moves to
+    /// another cache closes the connection and drops the session, with
+    /// any query that follows in the same step.
+    Fallback(Fallback),
+}
+
+/// Why a cache cannot serve the router for now: what an
+/// [`Action::Fallback`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fallback {
+    /// A Cache Reset (RFC 8210 §8.3): "the router SHOULD attempt to
+    /// connect to any more-preferred caches in its cache list. If there
+    /// are no more-preferred caches, it MUST issue a Reset Query", which
+    /// the session sends next.
+    CacheReset,
+    /// No Data Available (RFC 8210 §8.4): "the router SHOULD attempt to
+    /// connect to any other caches in its cache list, in preference
+    /// order. If no other caches are available, the router MUST issue
+    /// periodic Reset Queries", which the session sends after the Retry
+    /// Interval, or the shell's delay ([`Session::set_retry_delay`]).
+    NoData,
+}
+
+impl Fallback {
+    /// The name logs print: `cache-reset` or `no-data`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Fallback::CacheReset => "cache-reset",
+            Fallback::NoData => "no-data",
+        }
+    }
+}
+
+impl fmt::Display for Fallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A complete VRP set to validate with from now on, and the routes to
@@ -410,8 +452,8 @@ pub struct Session {
     reply_deadline: Option<Instant>,
     /// The serial of a Serial Notify that arrived while a query was out.
     notified: Option<u32>,
-    /// The shell's delay before reconnecting after a failure, in place of
-    /// the Retry Interval (see [`Session::set_retry_delay`]).
+    /// The shell's delay after a failure, in place of the Retry Interval
+    /// (see [`Session::set_retry_delay`]).
     retry_delay: Option<Duration>,
 }
 
@@ -453,17 +495,17 @@ impl Session {
         }
     }
 
-    /// Wait `delay` after a failure before the next [`Action::Connect`],
-    /// in place of the Retry Interval; `None`, the default, goes back to
-    /// the Retry Interval (RFC 8210 §6).
+    /// Wait `delay` after a failure, in place of the Retry Interval:
+    /// before the next [`Action::Connect`], and before the next of the
+    /// periodic Reset Queries to a cache with No Data Available (RFC 8210
+    /// §8.4). `None`, the default, goes back to the Retry Interval (§6).
     ///
-    /// This is for an I/O shell that paces its reconnects itself, with a
+    /// This is for an I/O shell that paces its retries itself, with a
     /// back-off, say. It sets the delay before each step, so that
     /// [`Session::next_deadline`] and the `retry_in` of the session's log
     /// lines follow its schedule. A failure the session has already
-    /// handled keeps the time it got.
-    /// Queries on an open connection, such as the periodic Reset Queries
-    /// after No Data Available (§8.4), still wait the Retry Interval.
+    /// handled keeps the time it got. The other queries on an open
+    /// connection keep the cache's Refresh Interval.
     pub fn set_retry_delay(&mut self, delay: Option<Duration>) {
         self.retry_delay = delay;
     }
@@ -702,8 +744,8 @@ impl Session {
         self.deadline = after(now, self.reconnect_delay());
     }
 
-    /// How long to wait after a failure before connecting again: the
-    /// shell's delay, or the Retry Interval (RFC 8210 §6).
+    /// How long to wait after a failure before connecting or querying
+    /// again: the shell's delay, or the Retry Interval (RFC 8210 §6).
     fn reconnect_delay(&self) -> Duration {
         self.retry_delay
             .unwrap_or_else(|| secs(self.intervals.retry))
@@ -992,20 +1034,24 @@ impl Session {
     fn no_data(&mut self, report: &ErrorReport, now: Instant, out: &mut Vec<Action>) {
         // RFC 8210 §8.4: "If no other caches are available, the router MUST
         // issue periodic Reset Queries until it gets a new usable load from
-        // the cache." The period is the Retry Interval (§6), and the data
-        // held stays in use until it expires.
+        // the cache." The period is the Retry Interval (§6: the wait before
+        // "retrying a failed Serial Query or Reset Query"), or the shell's
+        // delay, and the data held stays in use until it expires.
         self.position = None;
         self.notified = None;
         self.phase = Phase::Idle;
-        self.deadline = after(now, secs(self.intervals.retry));
+        self.deadline = after(now, self.reconnect_delay());
         let mut fields = self.stale_fields(now);
         fields.push(field("text", report.text()));
+        fields.push(field("retry_in", Secs(self.reconnect_delay())));
         log(
             out,
             Level::Warn,
             "rtr cache has no data available; serving the last data until it expires",
             fields,
         );
+        // §8.4: other caches first, where the shell has them.
+        out.push(Action::Fallback(Fallback::NoData));
     }
 
     fn on_serial_notify(
@@ -1098,15 +1144,18 @@ impl Session {
     }
 
     fn on_cache_reset(&mut self, now: Instant, out: &mut Vec<Action>) {
-        // RFC 8210 §8.3: "If there are no more-preferred caches, it MUST
-        // issue a Reset Query and get an entire new load from the cache."
-        // The data in use stays until the new load replaces it (§10).
+        // RFC 8210 §8.3: "the router SHOULD attempt to connect to any
+        // more-preferred caches in its cache list", where the shell has
+        // them. "If there are no more-preferred caches, it MUST issue a
+        // Reset Query and get an entire new load from the cache." The data
+        // in use stays until the new load replaces it (§10).
         log(
             out,
             Level::Info,
             "rtr cache cannot update incrementally; reloading",
             Vec::new(),
         );
+        out.push(Action::Fallback(Fallback::CacheReset));
         self.position = None;
         self.send_query(now, out);
     }
