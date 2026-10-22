@@ -44,6 +44,11 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)).
+- An RFC 6811 origin validation state on every route, from VRPs fetched over
+  RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
+  with failover in order of preference; `bgpfcctl show rpki` reports the
+  client, and interop tests run it against StayRTR. Nothing acts on the
+  state yet.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -84,21 +89,21 @@ Only single best path, with no ECMP. Linux only.
 
 ### Next: RPKI route origin validation
 
-In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). The plumbing for
-the validation state has landed (step 11): every route carries its RFC 6811
-origin validation state, which the RIB validates again in place when the
-validation source changes, and which `bgpfcctl show routes` and the HTTP API
-show. bgpfcd has no validation source yet, so every route reads `disabled`,
-and nothing acts on the state.
+In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). Every route
+carries its RFC 6811 origin validation state (step 11), which the RIB
+validates again in place when the VRPs change, and which `bgpfcctl show
+routes` and the HTTP API show. The VRPs come over RTR (step 12): RFC 8210,
+falling back to version 0 (RFC 6810), from the external caches of an
+`rpki { mode external; ... }` block, with failover in order of preference, a
+reconnect back-off, and the last VRPs kept while no cache answers, until they
+expire. Without the block every route reads `disabled`. RTR runs over plain
+TCP only (RFC 8210 §9), so the cache belongs on loopback or a trusted network.
 
-The RTR client and enforcement come next. The client will fetch VRPs over
-RTR (RFC 8210, falling back to version 0, RFC 6810), either from external
-caches or from an optional Routinator that bgpfcd starts and supervises as a
-child process. Routinator is a separate program; bgpfc neither bundles nor
-links it. Enforcement will drop Invalid routes by default, offer a
+Enforcement comes next: it will drop Invalid routes by default, offer a
 non-enforcing prefer-valid mode, and let policy match on the validation
-state (RFC 6811 §3). RTR will run over plain TCP only (RFC 8210 §9), so the
-cache belongs on loopback or a trusted network.
+state (RFC 6811 §3). Then bgpfcd will be able to start and supervise an
+optional Routinator as a child process. Routinator is a separate program;
+bgpfc neither bundles nor links it.
 
 ### Later
 
@@ -123,6 +128,7 @@ crates/
   bgpfc-log      leveled stderr logger
   bgpfc-control  Unix-socket protocol, HTTP/1.1 server, JSON writer
   bgpfc-rpki     VRP set, RFC 6811 origin validation, validation sources (no I/O)
+  bgpfc-rtr      RTR (RFC 8210/6810): PDU codec, session machine, client thread
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
