@@ -103,7 +103,8 @@ pub struct Config {
     /// Interval lets the data lapse between two polls, and is logged.
     pub max_expire: Duration,
     /// How long to wait for the transport to connect, for the cache to
-    /// start answering a query, and between two PDUs of an answer.
+    /// start answering a query, and between two PDUs of an answer. A
+    /// Serial Notify is part of no answer and does not restart it.
     /// RFC 8210 sets no such limit, but without one a cache that accepts a
     /// query and never answers would stall the session until the data
     /// expired. [`Session::new`] raises it to at least one second.
@@ -125,8 +126,8 @@ impl Config {
 
     /// The default [`Config::response_timeout`]. No RFC gives one. A
     /// minute leaves a busy cache time to start answering, and since the
-    /// timer restarts with every PDU, a full load over a slow link does not
-    /// trip it.
+    /// timer restarts with every PDU of the answer, a full load over a slow
+    /// link does not trip it.
     pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 }
 
@@ -722,9 +723,6 @@ impl Session {
             // Left over from a connection the session has let go of.
             return;
         }
-        if matches!(self.phase, Phase::Querying(_) | Phase::Receiving(_)) {
-            self.deadline = after(now, self.config.response_timeout);
-        }
         match self.negotiated {
             None => {
                 if !self.negotiate(pdu, now, out) {
@@ -767,7 +765,9 @@ impl Session {
             // RFC 8210 §5.10: Router Keys serve path validation (RFC 8205),
             // which is out of scope. They are part of a reply like any
             // payload PDU, and are accepted and dropped.
-            Pdu::RouterKey(_) if matches!(self.phase, Phase::Receiving(_)) => {}
+            Pdu::RouterKey(_) if matches!(self.phase, Phase::Receiving(_)) => {
+                self.answer_goes_on(now);
+            }
             Pdu::EndOfData {
                 session_id,
                 serial,
@@ -1018,6 +1018,15 @@ impl Session {
             session_id,
             staging,
         });
+        self.answer_goes_on(now);
+    }
+
+    /// The cache sent a PDU of its answer, and the next may take another
+    /// [`Config::response_timeout`]. Only the answer's own PDUs restart the
+    /// timer: a Serial Notify is part of none, and a cache that sends them
+    /// and never answers still times out.
+    fn answer_goes_on(&mut self, now: Instant) {
+        self.deadline = after(now, self.config.response_timeout);
     }
 
     fn on_cache_reset(&mut self, now: Instant, out: &mut Vec<Action>) {
@@ -1045,17 +1054,20 @@ impl Session {
         let Phase::Receiving(reply) = &mut self.phase else {
             return;
         };
-        if let Err(rejected) = reply
+        match reply
             .staging
             .apply(announce, vrp, self.committed.as_deref())
         {
-            // RFC 8210 §12: codes 6 and 7 are fatal, like code 0. The reply
-            // is dropped whole and the data stays as it was; §5.1 says of
-            // such a discrepancy that "a router will detect the error and
-            // reset the session", which the Reset Query of the next
-            // connection does.
-            let text = format!("{}: {vrp}", rejected.reason);
-            self.protocol_error(rejected.code, pdu, &text, now, out);
+            Ok(()) => self.answer_goes_on(now),
+            Err(rejected) => {
+                // RFC 8210 §12: codes 6 and 7 are fatal, like code 0. The
+                // reply is dropped whole and the data stays as it was; §5.1
+                // says of such a discrepancy that "a router will detect the
+                // error and reset the session", which the Reset Query of the
+                // next connection does.
+                let text = format!("{}: {vrp}", rejected.reason);
+                self.protocol_error(rejected.code, pdu, &text, now, out);
+            }
         }
     }
 
