@@ -66,8 +66,9 @@ This keeps the trusted code base small and auditable, and every byte on the wire
 is produced by code in this repository.
 
 Test, fuzzing, benchmark, and interop tooling (`proptest`, `cargo-fuzz`,
-`criterion`, and real BIRD, FRR, and GoBGP daemons) are allowed, but only as
-dev-dependencies or in separate crates that the daemon never links against.
+`criterion`, and real BIRD, FRR, GoBGP, and StayRTR daemons) are allowed, but
+only as dev-dependencies or in separate crates that the daemon never links
+against.
 
 ## Scope
 
@@ -92,18 +93,20 @@ Only single best path, with no ECMP. Linux only.
 In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). Every route
 carries its RFC 6811 origin validation state (step 11), which the RIB
 validates again in place when the VRPs change, and which `bgpfcctl show
-routes` and the HTTP API show. The VRPs come over RTR (step 12): RFC 8210,
-falling back to version 0 (RFC 6810), from the external caches of an
-`rpki { mode external; ... }` block, with failover in order of preference, a
-reconnect back-off, and the last VRPs kept while no cache answers, until they
-expire. Without the block every route reads `disabled`. RTR runs over plain
-TCP only (RFC 8210 §9), so the cache belongs on loopback or a trusted network.
+routes` and the HTTP API show. With an `rpki { mode external; ... }` block
+the states are real (step 12): each route reads `valid`, `invalid` or
+`not-found` against the VRPs bgpfcd fetches over RTR, RFC 8210 falling back
+to version 0 (RFC 6810), from the block's external caches, with failover in
+order of preference, a reconnect back-off, and the last VRPs kept while no
+cache answers, until they expire. Without the block, or with `mode
+disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
+8210 §9), so the cache belongs on loopback or a trusted network.
 
-Enforcement comes next: it will drop Invalid routes by default, offer a
-non-enforcing prefer-valid mode, and let policy match on the validation
-state (RFC 6811 §3). Then bgpfcd will be able to start and supervise an
-optional Routinator as a child process. Routinator is a separate program;
-bgpfc neither bundles nor links it.
+Enforcement comes next. Nothing acts on the state yet; step 13 will drop
+Invalid routes by default, offer a non-enforcing prefer-valid mode, and let
+policy match on the validation state (RFC 6811 §3). Then bgpfcd will be
+able to start and supervise an optional Routinator as a child process.
+Routinator is a separate program; bgpfc neither bundles nor links it.
 
 ### Later
 
@@ -132,7 +135,7 @@ crates/
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
-interop/         tests against BIRD / FRR / GoBGP (dev-only)
+interop/         tests against BIRD / FRR / GoBGP and the StayRTR cache (dev-only)
 ```
 
 ## Build
