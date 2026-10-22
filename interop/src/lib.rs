@@ -1,6 +1,8 @@
 //! Interoperability test harness. Drives BIRD, FRR and `GoBGP` in network
 //! namespaces and peers them with `bgpfcd`, and serves it VRPs over RTR
-//! from `StayRTR`. Nothing in this crate is shipped (AGENTS.md §1.2).
+//! from `StayRTR`, or from this crate's stub cache (`src/bin/rtr-stub.rs`)
+//! where `StayRTR` cannot be used. Nothing in this crate is shipped
+//! (AGENTS.md §1.2).
 //!
 //! Needs root, `iproute2` and the daemon under test:
 //!
@@ -799,6 +801,9 @@ impl StayRtr {
             // namespace.
             "-metrics.addr",
             "",
+            // Every PDU received, for the tests to check what bgpfcd asked.
+            "-loglevel",
+            "debug",
         ]);
         let cache = StayRtr {
             daemon: Daemon::start(cmd, lab.dir.join(format!("stayrtr-{ns}-{port}.log"))),
@@ -841,4 +846,74 @@ impl StayRtr {
         .expect("vrps file");
         fs::rename(&tmp, path).expect("vrps file");
     }
+}
+
+/// This crate's stub RTR cache, `rtr-stub` (`src/bin/rtr-stub.rs`): the
+/// VRPs it is given, as serial 1 of a Session ID of the test's choosing,
+/// and a Cache Reset for any other Serial Query (RFC 8210 §8.3). It stands
+/// in for `StayRTR` where a cache must restart and bring `bgpfcd` back in
+/// sync; see the binary's documentation.
+pub struct RtrStub {
+    /// The process.
+    pub daemon: Daemon,
+}
+
+impl RtrStub {
+    /// Start the stub in namespace `ns`, listening on `bind` (such as
+    /// `127.0.0.1:3323`) and serving `vrps`, (prefix, max length, origin
+    /// AS), under `session_id`. Its log is
+    /// `rtr-stub-<ns>-<port>-<session_id>.log`, so a restart with another
+    /// Session ID writes a log of its own.
+    ///
+    /// # Panics
+    /// If the binary is missing or the stub does not start listening.
+    #[must_use]
+    pub fn start(
+        lab: &Lab,
+        ns: &str,
+        bind: &str,
+        session_id: u16,
+        vrps: &[(&str, u8, u32)],
+    ) -> RtrStub {
+        let port = bind.rsplit(':').next().unwrap_or(bind);
+        let mut cmd = lab.exec(ns, rtr_stub_path().to_str().expect("path"));
+        cmd.arg(bind).arg(session_id.to_string());
+        for (prefix, max_len, asn) in vrps {
+            cmd.arg(format!("{prefix}-{max_len}-{asn}"));
+        }
+        let stub = RtrStub {
+            daemon: Daemon::start(
+                cmd,
+                lab.dir
+                    .join(format!("rtr-stub-{ns}-{port}-{session_id}.log")),
+            ),
+        };
+        assert!(
+            wait_for(Duration::from_secs(10), || stub
+                .daemon
+                .log_text()
+                .contains("listening on")),
+            "rtr-stub did not start:\n{}",
+            stub.daemon.log_text()
+        );
+        stub
+    }
+}
+
+/// Path to `rtr-stub`. Cargo builds a package's binaries for its
+/// integration tests and puts them in `target/<profile>/`, beside the
+/// `deps/` directory the test binary runs from.
+fn rtr_stub_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current exe");
+    let path = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("target profile dir")
+        .join("rtr-stub");
+    assert!(
+        path.exists(),
+        "{} is missing; run the tests with `cargo test -p interop`",
+        path.display()
+    );
+    path
 }

@@ -4,6 +4,10 @@
 //! (AGENTS.md §9, step 13), so every route is accepted and relayed
 //! whatever its state.
 //!
+//! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
+//! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
+//! 0.5.1 cannot do (see `a_restarted_cache_brings_bgpfcd_back_in_sync`).
+//!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`,
 //! `curl` and `stayrtr` on `PATH`, and a built `bgpfcd`. CI runs them with
 //! `--include-ignored` under sudo.
@@ -14,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use interop::{
-    BgpfcdOpts, Bird, BirdOpts, Daemon, Lab, NeighborOpts, StayRtr, start_bgpfcd, wait_for,
+    BgpfcdOpts, Bird, BirdOpts, Daemon, Lab, NeighborOpts, RtrStub, StayRtr, start_bgpfcd, wait_for,
 };
 
 const BGPFC_AS: u32 = 65_000;
@@ -84,11 +88,19 @@ const DISABLED: [(&str, &str); 4] = [
     ("203.0.113.0/24", "disabled"),
 ];
 
-/// What a scenario runs.
-struct Opts {
+/// The caches of a scenario.
+#[derive(Clone, Copy)]
+enum Caches {
     /// This many `StayRTR` caches, at the first [`CACHES`], in that order
     /// of preference.
-    caches: usize,
+    StayRtr(usize),
+    /// One `rtr-stub` at the first of the [`CACHES`], Session ID 1.
+    Stub,
+}
+
+/// What a scenario runs.
+struct Opts {
+    caches: Caches,
     /// The `mode` of the `rpki` block.
     mode: &'static str,
     /// Whether a second BIRD, in C, takes the routes from bgpfcd.
@@ -101,6 +113,8 @@ struct Opts {
 struct Setup {
     /// The `StayRTR` caches, in order of preference.
     caches: Vec<StayRtr>,
+    /// The stub cache, for [`Caches::Stub`].
+    stub: Option<RtrStub>,
     bgpfcd: Daemon,
     bird: Bird,
     relay: Option<Bird>,
@@ -114,11 +128,21 @@ impl Setup {
     fn start(tag: &str, subnet: u8, opts: &Opts, vrps: &[(&str, u8, u32)]) -> Setup {
         let mut lab = Lab::new(tag, subnet);
         let ns_a = lab.a.clone();
-        let binds = &CACHES[..opts.caches];
-        let caches = binds
-            .iter()
-            .map(|bind| StayRtr::start(&lab, &ns_a, bind, vrps))
-            .collect();
+        let (caches, stub, binds) = match opts.caches {
+            Caches::StayRtr(n) => (
+                CACHES[..n]
+                    .iter()
+                    .map(|bind| StayRtr::start(&lab, &ns_a, bind, vrps))
+                    .collect(),
+                None,
+                &CACHES[..n],
+            ),
+            Caches::Stub => (
+                Vec::new(),
+                Some(RtrStub::start(&lab, &ns_a, CACHES[0], 1, vrps)),
+                &CACHES[..1],
+            ),
+        };
         let relay = opts.relay.then(|| {
             let ns_c = lab.add_c();
             Bird::start(
@@ -186,6 +210,7 @@ impl Setup {
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &bgpfcd_opts);
         Setup {
             caches,
+            stub,
             bgpfcd,
             bird,
             relay,
@@ -275,9 +300,32 @@ impl Setup {
         self.count(&format!("msg=\"rib: update\" peer={} ", self.lab.b_addr))
     }
 
+    /// Wait up to `timeout` for `show rpki` to say that bgpfcd lost its
+    /// cache: no connection, failures counted and the last one named,
+    /// and the last VRPs still in use. Returns what it said.
+    fn wait_for_lost_cache(&self, timeout: Duration) -> String {
+        let lost = |out: &str| {
+            !out.contains(", connected")
+                && !out.contains("failures 0")
+                && out.contains("last error")
+                && out.contains("vrps ipv4 2 ipv6 0, expire in")
+        };
+        let mut out = String::new();
+        assert!(
+            wait_for(timeout, || {
+                out = self.ctl(&["show", "rpki"]).0;
+                lost(&out)
+            }),
+            "{out}\n{}",
+            self.report()
+        );
+        out
+    }
+
     /// Everything a failed assertion needs.
     fn report(&self) -> String {
-        let caches: Vec<String> = self.caches.iter().map(|c| c.daemon.log_text()).collect();
+        let mut caches: Vec<String> = self.caches.iter().map(|c| c.daemon.log_text()).collect();
+        caches.extend(self.stub.iter().map(|s| s.daemon.log_text()));
         format!(
             "{:?}\n--- bgpfcd ---\n{}\n--- cache ---\n{}\n--- bird ---\n{}",
             self.states(),
@@ -286,6 +334,15 @@ impl Setup {
             self.bird.daemon.log_text()
         )
     }
+}
+
+/// The `session-id ... serial ...` line of `show rpki`.
+fn session_line(show_rpki: &str) -> String {
+    show_rpki
+        .lines()
+        .find(|l| l.starts_with("session-id "))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// BIRD's routes come out valid, invalid (by length and by origin) and
@@ -298,7 +355,7 @@ impl Setup {
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
     let opts = Opts {
-        caches: 1,
+        caches: Caches::StayRtr(1),
         mode: "external",
         relay: true,
     };
@@ -367,13 +424,144 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
     assert!(relayed(), "{}", relay.birdc(&s.lab, &["show", "route"]));
 }
 
+/// The only cache, `StayRTR`, goes away and comes back: bgpfcd keeps its
+/// VRPs, says what happened in `show rpki`, and connects to the cache
+/// again by itself (issue #57).
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn the_vrps_outlive_a_restarted_stayrtr() {
+    let opts = Opts {
+        caches: Caches::StayRtr(1),
+        mode: "external",
+        relay: false,
+    };
+    let mut s = Setup::start("k", 16, &opts, &FIRST);
+    s.wait_for_states(ESTABLISH, &VALIDATED);
+    let session = session_line(&s.ctl(&["show", "rpki"]).0);
+    assert!(session.starts_with("session-id "), "{}", s.report());
+
+    s.caches[0].daemon.kill();
+    s.wait_for_log(
+        RECONNECT,
+        "WARN  msg=\"rtr lost the cache; serving the last data while reconnecting\"",
+    );
+    let out = s.wait_for_lost_cache(RECONNECT);
+    assert_eq!(session_line(&out), session, "{out}");
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+
+    // StayRTR again, on the same port with the same file: bgpfcd connects
+    // and resumes its session with a Serial Query (RFC 8210 §8.1).
+    let ns_a = s.lab.a.clone();
+    let cache = StayRtr::start(&s.lab, &ns_a, CACHES[0], &FIRST);
+    s.caches[0] = cache;
+    let id = session.split_whitespace().nth(1).unwrap_or_default();
+    let query = format!("Received PDU Serial Query v1 (session: {id})");
+    assert!(
+        wait_for(RECONNECT, || s.caches[0].daemon.log_text().contains(&query)),
+        "no `{query}`:\n{}",
+        s.report()
+    );
+    // NOTE(interop): StayRTR 0.5.1 has a new Session ID now and closes the
+    // connection on that query, without the Error Report (RFC 8210 §5.1)
+    // or the Cache Reset (§8.3) that would have bgpfcd load its data
+    // afresh. So bgpfcd, like BIRD 2.14, keeps its VRPs and asks again
+    // until they expire (§6). `a_restarted_cache_brings_bgpfcd_back_in_sync`
+    // shows the rest against a cache that answers.
+    let refused = format!("Invalid request (client asked for session {id} but server is at");
+    assert!(
+        wait_for(RECONNECT, || s.caches[0]
+            .daemon
+            .log_text()
+            .contains(&refused)),
+        "{}",
+        s.report()
+    );
+    let out = s.wait_for_lost_cache(RECONNECT);
+    assert_eq!(session_line(&out), session, "{out}");
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+}
+
+/// A cache that restarts, under a new Session ID, answers bgpfcd's Serial
+/// Query for the old session with a Cache Reset; bgpfcd then loads the
+/// whole data set with a Reset Query (RFC 8210 §8.3) and is in sync again
+/// without the operator (issue #57). The VRPs are the same as before, so
+/// no route changes state at any point.
+///
+/// The cache is this crate's `rtr-stub`: `StayRTR` 0.5.1 answers that
+/// Serial Query by closing the connection (see
+/// `the_vrps_outlive_a_restarted_stayrtr`).
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_restarted_cache_brings_bgpfcd_back_in_sync() {
+    let opts = Opts {
+        caches: Caches::Stub,
+        mode: "external",
+        relay: false,
+    };
+    let mut s = Setup::start("s", 17, &opts, &FIRST);
+    s.wait_for_states(ESTABLISH, &VALIDATED);
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains("state idle, connected, version 1")
+            && out.contains("session-id 1 serial 1"),
+        "{out}"
+    );
+    let revalidations = s.count("msg=\"rib: validation states changed\"");
+
+    if let Some(stub) = &mut s.stub {
+        stub.daemon.kill();
+    }
+    s.wait_for_log(
+        RECONNECT,
+        "WARN  msg=\"rtr lost the cache; serving the last data while reconnecting\"",
+    );
+    let out = s.wait_for_lost_cache(RECONNECT);
+    assert!(out.contains("session-id 1 serial 1"), "{out}");
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+
+    let ns_a = s.lab.a.clone();
+    let stub = RtrStub::start(&s.lab, &ns_a, CACHES[0], 2, &FIRST);
+    s.stub = Some(stub);
+    s.wait_for_log(RECONNECT, "INFO  msg=\"rtr cache reachable again\"");
+    s.wait_for_log(
+        Duration::ZERO,
+        "msg=\"rtr cache cannot update incrementally; reloading\"",
+    );
+    let log = s
+        .stub
+        .as_ref()
+        .map(|t| t.daemon.log_text())
+        .unwrap_or_default();
+    assert!(
+        log.contains("Serial Query v1 session 1 serial 1: Cache Reset")
+            && log.contains("Reset Query v1: Cache Response, 2 VRPs, End of Data session 2"),
+        "{log}"
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    for line in [
+        "state idle, connected, version 1",
+        "session-id 2 serial 1",
+        "vrps ipv4 2 ipv6 0",
+        "failures 0",
+    ] {
+        assert!(ok && out.contains(line), "{line}:\n{out}");
+    }
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+    assert_eq!(
+        s.count("msg=\"rib: validation states changed\""),
+        revalidations,
+        "{}",
+        s.report()
+    );
+}
+
 /// With `mode disabled` every route reads `disabled`, and bgpfcd never
 /// connects to the cache the block still lists.
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn with_mode_disabled_no_cache_is_asked() {
     let opts = Opts {
-        caches: 1,
+        caches: Caches::StayRtr(1),
         mode: "disabled",
         relay: false,
     };
@@ -415,7 +603,7 @@ fn with_mode_disabled_no_cache_is_asked() {
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn the_vrps_outlive_their_cache_and_follow_a_reload() {
     let opts = Opts {
-        caches: 2,
+        caches: Caches::StayRtr(2),
         mode: "external",
         relay: false,
     };

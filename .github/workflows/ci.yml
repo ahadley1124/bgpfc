@@ -70,7 +70,8 @@ jobs:
 
   interop:
     # Drives BIRD, FRR and GoBGP in network namespaces and peers them with
-    # bgpfcd, which takes VRPs from StayRTR; needs root for the namespaces.
+    # bgpfcd, which takes VRPs from StayRTR and from interop's own stub
+    # cache (rtr-stub); needs root for the namespaces.
     name: interop (BIRD, FRR, GoBGP, StayRTR)
     runs-on: ubuntu-latest
     steps:
