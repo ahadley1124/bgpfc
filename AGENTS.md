@@ -389,9 +389,10 @@ Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
 Steps 0–9 are complete: they built v1. Their text stays as a record of what
-v1 covers. Step 11 is complete as well, and its text stays as a record of
-what it added; it also did the part of step 13 that re-evaluates only the
-prefixes a VRP delta affects (RFC 6811 §4). Work continues at step 12.
+v1 covers. Steps 10 and 11 are complete as well, and their text stays as a
+record of what they added; step 11 also did the part of step 13 that
+re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4). Work
+continues at step 12.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.
