@@ -103,6 +103,7 @@ fn announce(prefixes: &[&str], a: &PathAttrs) -> DecodedUpdate {
         message,
         treated_as_withdraw: None,
         discarded: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 
@@ -120,6 +121,7 @@ fn withdraw(prefixes: &[&str]) -> DecodedUpdate {
         message,
         treated_as_withdraw: None,
         discarded: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 
@@ -914,37 +916,90 @@ fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     assert_eq!(rib.refresh(ip("10.9.9.9"), V4, now()).len(), 0);
 }
 
+/// `d` as decoded with an incorrect MP attribute for `family` in it
+/// (RFC 4760 §7).
+fn disabling(family: AddressFamily, mut d: DecodedUpdate) -> DecodedUpdate {
+    d.disabled.push(bgpfc_wire::update::DisabledFamily {
+        family,
+        error: bgpfc_wire::error::DecodeError::update(
+            bgpfc_wire::error::UpdateSubcode::OptionalAttributeError,
+            Vec::new(),
+        ),
+    });
+    d
+}
+
 #[test]
-fn family_disable_drops_that_family_only() {
+fn an_incorrect_mp_attribute_disables_its_family_for_the_session() {
+    // RFC 4760 §7: every route of the family from the peer goes, and the
+    // family is ignored until the session ends; the rest of the UPDATE and
+    // the other families are used as usual.
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
     rib.peer_up(e1.clone(), now());
-    rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
-        now(),
+    rib.peer_up(e2.clone(), now());
+    let v4 = |prefix: &str| announce(&[prefix], &attrs(&[65_001], "10.0.0.1"));
+    let v6 = |prefixes: &[&str]| announce(prefixes, &attrs(&[65_001], "2001:db8::1"));
+    rib.update(e1.addr, &v4("192.0.2.0/24"), now());
+    rib.update(e1.addr, &v6(&["2001:db8:1::/48", "2001:db8:2::/48"]), now());
+    let backup = attrs(&[65_002, 9], "2001:db8::2");
+    rib.update(e2.addr, &announce(&["2001:db8:1::/48"], &backup), now());
+    assert_eq!(rib.loc_rib(V6).count(), 2);
+    // The UPDATE that disables IPv6 announces an IPv4 route too.
+    let out = rib.update(e1.addr, &disabling(V6, v4("198.51.100.0/24")), now());
+    let changes = fib(&out);
+    assert_eq!(changes.len(), 3, "{changes:?}");
+    for (prefix, next_hop) in [
+        ("2001:db8:1::/48", Some(ip("2001:db8::2"))),
+        ("2001:db8:2::/48", None),
+        ("198.51.100.0/24", Some(ip("10.0.0.1"))),
+    ] {
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.prefix == p(prefix) && c.next_hop == next_hop),
+            "{prefix}: {changes:?}"
+        );
+    }
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 2), (V6, 0)]
     );
-    rib.update(
-        e1.addr,
-        &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
-        now(),
+    // Later IPv6 announcements are ignored; IPv4 goes on.
+    assert_eq!(
+        rib.update(e1.addr, &v6(&["2001:db8:3::/48"]), now()),
+        vec![]
     );
-    let out = rib.family_disabled(e1.addr, V6, now());
-    assert_eq!(fib(&out).len(), 1);
-    assert_eq!(rib.loc_rib(V6).count(), 0);
-    assert_eq!(rib.loc_rib(V4).count(), 1);
-    // Later IPv6 announcements are ignored.
-    let out = rib.update(
-        e1.addr,
-        &announce(&["2001:db8:2::/48"], &attrs(&[65_001], "2001:db8::1")),
-        now(),
+    assert_eq!(
+        fib(&rib.update(e1.addr, &v4("203.0.113.0/24"), now())).len(),
+        1
     );
-    assert_eq!(out.len(), 0);
+    // Disabling it again, or a family the RIB holds nothing of, changes
+    // nothing.
+    let vpn = AddressFamily {
+        afi: bgpfc_wire::types::Afi::Ipv4,
+        safi: bgpfc_wire::types::Safi::Unknown(128),
+    };
+    for family in [V6, vpn] {
+        let out = rib.update(e1.addr, &disabling(family, DecodedUpdate::default()), now());
+        assert_eq!(out, vec![]);
+    }
+    // For the duration of the session only: a new one takes IPv6 again.
+    rib.peer_down(e1.addr, now());
+    rib.peer_up(e1.clone(), now());
+    assert_eq!(
+        fib(&rib.update(e1.addr, &v6(&["2001:db8:3::/48"]), now())).len(),
+        1
+    );
     // Unknown peers are ignored everywhere.
-    let out = rib.update(ip("10.9.9.9"), &withdraw(&["192.0.2.0/24"]), now());
+    let out = rib.update(
+        ip("10.9.9.9"),
+        &disabling(V4, withdraw(&["192.0.2.0/24"])),
+        now(),
+    );
     assert_eq!(out.len(), 0);
     assert_eq!(rib.peer_down(ip("10.9.9.9"), now()).len(), 0);
-    assert_eq!(rib.family_disabled(ip("10.9.9.9"), V4, now()).len(), 0);
 }
 
 #[test]

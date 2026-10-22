@@ -47,6 +47,6 @@ pub use prefix::Prefix;
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
 pub use update::{
-    DecodeContext, DecodedUpdate, DiscardReason, DiscardedAttribute, EncodeContext, ErrorAction,
+    DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason, DiscardedAttribute, EncodeContext,
     PeerKind, UpdateError, UpdateMessage,
 };

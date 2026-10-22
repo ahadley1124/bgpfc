@@ -74,6 +74,7 @@ fn update(op: &Op) -> DecodedUpdate {
         message,
         treated_as_withdraw: None,
         discarded: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 

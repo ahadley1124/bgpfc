@@ -490,7 +490,8 @@ proptest! {
     fn ipv6_next_hop_for_ipv4_only_when_negotiated(m in update_message(true)) {
         // RFC 8950 §4 on send, RFC 7606 §7.11 on receipt: without the
         // capability an IPv4 MP_REACH_NLRI with an IPv6 next hop is
-        // neither encoded nor accepted; everything else is unaffected.
+        // neither encoded nor accepted, and IPv4 unicast is disabled (RFC
+        // 4760 §7); the rest of the message is unaffected.
         let v6_for_v4 = m.mp_reach.as_ref().is_some_and(|r| {
             r.family.afi == Afi::Ipv4 && matches!(r.next_hop, NextHop::Ipv6 { .. })
         });
@@ -503,10 +504,19 @@ proptest! {
                 m.encode(&plain),
                 Err(bgpfc_wire::error::EncodeError::NextHopNotNegotiated(AddressFamily::IPV4_UNICAST))
             );
+            let d = d.unwrap();
             prop_assert_eq!(
-                d.unwrap_err().action,
-                bgpfc_wire::update::ErrorAction::AfiSafiDisable(AddressFamily::IPV4_UNICAST)
+                d.disabled.iter().map(|x| x.family).collect::<Vec<_>>(),
+                vec![AddressFamily::IPV4_UNICAST]
             );
+            prop_assert_eq!(&d.message, &UpdateMessage { mp_reach: None, ..m.clone() });
+            prop_assert_eq!(d.announcements().count(), 0);
+            let v6_withdrawn = m
+                .mp_unreach
+                .as_ref()
+                .filter(|u| u.family == AddressFamily::IPV6_UNICAST)
+                .map_or(0, |u| u.withdrawn.len());
+            prop_assert_eq!(d.withdrawals().count(), v6_withdrawn);
         } else {
             prop_assert_eq!(m.encode(&plain).unwrap(), wire);
             prop_assert_eq!(d.unwrap().message, m);

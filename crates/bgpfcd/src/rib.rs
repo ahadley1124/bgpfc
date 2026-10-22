@@ -115,10 +115,6 @@ fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) 
             log_update(peer, &update);
             rib.update(peer, &update, now)
         }
-        RibMsg::FamilyDisabled { peer, family } => {
-            bgpfc_log::warn!("rib: family disabled", peer = peer, family = family);
-            rib.family_disabled(peer, family, now)
-        }
         RibMsg::RouteRefresh { peer, family } => {
             bgpfc_log::info!("rib: route refresh", peer = peer, family = family);
             rib.refresh(peer, family, now)
@@ -545,6 +541,7 @@ mod tests {
                 message,
                 treated_as_withdraw: None,
                 discarded: Vec::new(),
+                disabled: Vec::new(),
             },
         }
     }
@@ -809,6 +806,93 @@ mod tests {
             limit: 1000,
         })
         .unwrap();
+        h.tx.send(PeerInput::Stop(
+            bgpfc_wire::error::CeaseSubcode::AdministrativeShutdown,
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_incorrect_mp_attribute_disables_its_family_and_keeps_the_session() {
+        // RFC 4760 §7 through a real peer thread on loopback: an UPDATE
+        // with an IPv4 route in its NLRI field and an MP_REACH_NLRI whose
+        // next hop length is wrong for IPv6 (RFC 7606 §7.11). The RIB gets
+        // the IPv4 route with IPv6 disabled, and no NOTIFICATION is sent.
+        use bgpfc_wire::as_path::AsPath;
+        use bgpfc_wire::attribute::{Origin, PathAttribute};
+        use bgpfc_wire::header::{MessageType, frame};
+        use bgpfc_wire::update::{EncodeContext, UpdateMessage};
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ip("127.0.0.1");
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        fsm.capabilities = vec![bgpfc_wire::capability::Capability::Multiprotocol(V4)];
+        let cfg = crate::peer::PeerConfig {
+            addr,
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+        };
+        let (rib_tx, rib_rx) = sync_channel(64);
+        let (h, peer) = crate::peer::prepare(cfg, rib_tx);
+        peer.start();
+        let mut conn = establish(&listener, &rib_rx);
+        let route: bgpfc_wire::prefix::Prefix = "198.51.100.0/24".parse().unwrap();
+        let m = UpdateMessage {
+            nlri: vec![route],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+                PathAttribute::NextHop("192.0.2.7".parse().unwrap()),
+            ],
+            ..UpdateMessage::default()
+        };
+        let enc = EncodeContext {
+            four_octet_as: true,
+            extended_next_hop: false,
+        };
+        let mut body = m.encode(&enc).unwrap();
+        let bad_reach = [0x80, 14, 9, 0, 2, 1, 4, 1, 2, 3, 4, 0];
+        body[3] += 12;
+        body.splice(4..4, bad_reach);
+        conn.write_all(&frame(MessageType::Update, &body).unwrap())
+            .unwrap();
+        match rib_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(RibMsg::Update { peer, update }) => {
+                assert_eq!(peer, addr);
+                assert_eq!(update.disabled.len(), 1);
+                assert!(update.disables(AddressFamily::IPV6_UNICAST));
+                assert_eq!(update.treated_as_withdraw, None, "{update:?}");
+                assert_eq!(update.announcements().collect::<Vec<_>>(), [(V4, route)]);
+            }
+            other => panic!("expected the UPDATE, got {other:?}"),
+        }
+        // What bgpfcd sends from here on (the KEEPALIVE that completed
+        // the session among it) holds no NOTIFICATION, and the session
+        // does not end.
+        conn.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            let mut header = [0u8; 19];
+            match conn.read_exact(&mut header) {
+                Ok(()) => {
+                    assert_ne!(header[18], MessageType::Notification as u8);
+                    let len = usize::from(u16::from_be_bytes([header[16], header[17]]));
+                    let mut body = vec![0u8; len - 19];
+                    conn.read_exact(&mut body).unwrap();
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("the session ended: {e:?}"),
+            }
+        }
+        assert!(rib_rx.try_recv().is_err());
         h.tx.send(PeerInput::Stop(
             bgpfc_wire::error::CeaseSubcode::AdministrativeShutdown,
         ))

@@ -6,7 +6,8 @@
 //! - **session reset**: the message cannot be trusted at all; the caller
 //!   sends the NOTIFICATION in [`UpdateError`] and closes the session;
 //! - **AFI/SAFI disable**: a multiprotocol attribute is unusable; the caller
-//!   drops that family's routes from this peer (RFC 4760 §7);
+//!   drops that family's routes from this peer (RFC 4760 §7) and uses the
+//!   rest of the message ([`DecodedUpdate::disabled`]);
 //! - **treat-as-withdraw**: every route the message announces is withdrawn
 //!   instead ([`DecodedUpdate::treated_as_withdraw`]);
 //! - **attribute discard**: the attribute is dropped and the rest of the
@@ -212,9 +213,9 @@ impl UpdateMessage {
     /// Decode a body (the octets after the header, at least four).
     ///
     /// # Errors
-    /// [`UpdateError`] when RFC 7606 calls for a session reset or an
-    /// AFI/SAFI disable. Treat-as-withdraw and attribute discard are not
-    /// errors; see [`DecodedUpdate`].
+    /// [`UpdateError`] when RFC 7606 calls for a session reset. AFI/SAFI
+    /// disable, treat-as-withdraw and attribute discard are not errors:
+    /// the rest of the message is still decoded; see [`DecodedUpdate`].
     pub fn decode(body: &[u8], ctx: &DecodeContext) -> Result<DecodedUpdate, UpdateError> {
         let (withdrawn_bytes, attr_bytes, nlri_bytes) = split_fields(body)?;
         // RFC 7606 §3 i) and §5.3: both prefix fields are checked for syntax,
@@ -238,22 +239,27 @@ impl UpdateMessage {
             attributes: std::mem::take(&mut st.attributes),
         };
         check_mandatory(&message, &mut st);
-        // RFC 7606 §5.2: with no reachable NLRI and attributes other than
-        // MP_UNREACH_NLRI, a non-discard error cannot be handled as a
-        // withdraw, so the session is reset.
-        if let Some(e) = &st.withdraw
-            && !message.has_reachable()
-            && !message.attributes.is_empty()
+        // RFC 7606 §5.2: an UPDATE that "does contain path attributes other
+        // than MP_UNREACH_NLRI and doesn't encode any reachable NLRI" cannot
+        // be trusted to have had its NLRI parsed, so any error there that is
+        // not attribute discard resets the session. An MP_REACH_NLRI encodes
+        // reachable NLRI even when it was too broken to decode.
+        let reachable = message.has_reachable() || st.reach;
+        if !reachable
+            && st.other_attributes
+            && let Some(notification) = st
+                .disabled
+                .first()
+                .map(|d| d.error.clone())
+                .or_else(|| st.withdraw.clone())
         {
-            return Err(UpdateError {
-                action: ErrorAction::SessionReset,
-                notification: e.clone(),
-            });
+            return Err(UpdateError { notification });
         }
         Ok(DecodedUpdate {
             message,
             treated_as_withdraw: st.withdraw,
             discarded: st.discarded,
+            disabled: st.disabled,
         })
     }
 }
@@ -312,6 +318,13 @@ struct State {
     /// have the same strength, so the first is reported).
     withdraw: Option<DecodeError>,
     discarded: Vec<DiscardedAttribute>,
+    /// Families of incorrect MP attributes (RFC 4760 §7), each once.
+    disabled: Vec<DisabledFamily>,
+    /// An `MP_REACH_NLRI` was present, decoded or not (RFC 7606 §5.2).
+    reach: bool,
+    /// Something other than `MP_UNREACH_NLRI` was in the attribute field
+    /// (RFC 7606 §5.2), unparseable octets included.
+    other_attributes: bool,
 }
 
 impl State {
@@ -331,6 +344,12 @@ impl State {
     fn discard(&mut self, code: u8, reason: DiscardReason) {
         self.discarded.push(DiscardedAttribute { code, reason });
     }
+
+    fn disable(&mut self, d: DisabledFamily) {
+        if !self.disabled.iter().any(|x| x.family == d.family) {
+            self.disabled.push(d);
+        }
+    }
 }
 
 /// What one attribute turned out to be.
@@ -342,6 +361,8 @@ enum Outcome {
     Ignore,
     Discard(DiscardReason),
     Withdraw(DecodeError),
+    /// An incorrect MP attribute: its family is disabled (RFC 4760 §7).
+    Disable(DisabledFamily),
 }
 
 /// Decode the path attributes into `st`. `nlri_field`: the NLRI field
@@ -362,8 +383,11 @@ fn decode_attributes(
                 UpdateSubcode::MalformedAttributeList,
                 Vec::new(),
             ));
+            st.other_attributes = true;
             break;
         };
+        st.reach |= raw.code == code::MP_REACH_NLRI;
+        st.other_attributes |= raw.code != code::MP_UNREACH_NLRI;
         if st.mark_seen(raw.code) {
             // RFC 7606 §3 g): a repeated MP attribute resets; any other
             // repeat is discarded after the first occurrence.
@@ -392,13 +416,18 @@ fn decode_attributes(
             Outcome::Ignore => {}
             Outcome::Discard(reason) => st.discard(raw.code, reason),
             Outcome::Withdraw(e) => st.withdraw(e),
+            // RFC 7606 §3 h) and j): AFI/SAFI disable for that family; the
+            // rest of the message is still decoded, so that a second
+            // incorrect MP attribute disables its family too and the other
+            // families' routes are not lost with the message.
+            Outcome::Disable(d) => st.disable(d),
         }
     }
     Ok(())
 }
 
-/// Classify and decode one attribute. `Err` is a session reset or an
-/// AFI/SAFI disable; everything milder is an [`Outcome`].
+/// Classify and decode one attribute. `Err` is a session reset; everything
+/// milder is an [`Outcome`].
 fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, UpdateError> {
     let Some(expected) = expected_flags(raw.code) else {
         return unknown_attribute(raw);
@@ -413,7 +442,7 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
             code::ATOMIC_AGGREGATE | code::AGGREGATOR | code::AS4_PATH | code::AS4_AGGREGATOR => {
                 Outcome::Discard(DiscardReason::Malformed(e))
             }
-            code::MP_REACH_NLRI | code::MP_UNREACH_NLRI => return Err(mp_failure(raw, None)),
+            code::MP_REACH_NLRI | code::MP_UNREACH_NLRI => mp_failure(raw, None)?,
             _ => Outcome::Withdraw(e),
         });
     }
@@ -472,11 +501,11 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
         },
         code::MP_REACH_NLRI => match MpReach::decode(v, ctx.extended_next_hop) {
             Ok(m) => Outcome::Keep(PathAttribute::MpReach(m)),
-            Err(e) => return Err(mp_failure(raw, e.family())),
+            Err(e) => mp_failure(raw, e.family())?,
         },
         code::MP_UNREACH_NLRI => match MpUnreach::decode(v) {
             Ok(m) => Outcome::Keep(PathAttribute::MpUnreach(m)),
-            Err(e) => return Err(mp_failure(raw, e.family())),
+            Err(e) => mp_failure(raw, e.family())?,
         },
         // RFC 7606 §7.14.
         code::EXTENDED_COMMUNITIES => match decode_extended_communities(v) {
@@ -610,17 +639,19 @@ fn decode_aggregator(v: &[u8], four_octet: bool) -> Option<Aggregator> {
 }
 
 /// An MP attribute that cannot be used: AFI/SAFI disable when the family is
-/// known, else a session reset, in both cases with the NOTIFICATION RFC 4760
-/// §7 names (UPDATE Message Error / Optional Attribute Error).
-fn mp_failure(raw: &RawAttribute<'_>, family: Option<AddressFamily>) -> UpdateError {
-    let notification = DecodeError::update(UpdateSubcode::OptionalAttributeError, raw.raw.to_vec());
-    let action = match family.or_else(|| family_of(raw.value)) {
-        Some(f) => ErrorAction::AfiSafiDisable(f),
-        None => ErrorAction::SessionReset,
-    };
-    UpdateError {
-        action,
-        notification,
+/// known (RFC 4760 §7, RFC 7606 §3 j), else a session reset, in both cases
+/// with the NOTIFICATION RFC 4760 §7 names (UPDATE Message Error / Optional
+/// Attribute Error).
+fn mp_failure(
+    raw: &RawAttribute<'_>,
+    family: Option<AddressFamily>,
+) -> Result<Outcome, UpdateError> {
+    let error = DecodeError::update(UpdateSubcode::OptionalAttributeError, raw.raw.to_vec());
+    match family.or_else(|| family_of(raw.value)) {
+        Some(family) => Ok(Outcome::Disable(DisabledFamily { family, error })),
+        None => Err(UpdateError {
+            notification: error,
+        }),
     }
 }
 
@@ -680,30 +711,17 @@ fn check_mandatory(m: &UpdateMessage, st: &mut State) {
     }
 }
 
-/// What a session-level UPDATE error requires of the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorAction {
-    /// Send the NOTIFICATION and close the session (RFC 7606 §2).
-    SessionReset,
-    /// Drop every route of this family learned from the peer and ignore the
-    /// family for the rest of the session (RFC 4760 §7); the session MAY be
-    /// reset instead with the same NOTIFICATION.
-    AfiSafiDisable(AddressFamily),
-}
-
-/// An UPDATE that cannot be processed even as a withdraw.
+/// An UPDATE that cannot be processed even as a withdraw: the caller sends
+/// the NOTIFICATION and closes the session (RFC 7606 §2 "session reset").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateError {
-    /// Required reaction.
-    pub action: ErrorAction,
-    /// The NOTIFICATION to send if the session is reset.
+    /// The NOTIFICATION to send.
     pub notification: DecodeError,
 }
 
 impl UpdateError {
     fn reset(subcode: UpdateSubcode, data: Vec<u8>) -> UpdateError {
         UpdateError {
-            action: ErrorAction::SessionReset,
             notification: DecodeError::update(subcode, data),
         }
     }
@@ -711,13 +729,22 @@ impl UpdateError {
 
 impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.action {
-            ErrorAction::SessionReset => write!(f, "session reset: {}", self.notification),
-            ErrorAction::AfiSafiDisable(fam) => {
-                write!(f, "disable {fam}: {}", self.notification)
-            }
-        }
+        write!(f, "session reset: {}", self.notification)
     }
+}
+
+/// A family to disable for the rest of the session because the UPDATE's
+/// `MP_REACH_NLRI` or `MP_UNREACH_NLRI` for it was incorrect (RFC 4760 §7,
+/// RFC 7606 §2 "AFI/SAFI disable"): the receiver drops every route of the
+/// family it has from the peer and ignores the family from then on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisabledFamily {
+    /// The family the attribute named.
+    pub family: AddressFamily,
+    /// UPDATE Message Error / Optional Attribute Error with the attribute
+    /// as data: what RFC 4760 §7 has sent should the receiver reset the
+    /// session instead, which it MAY. For the log.
+    pub error: DecodeError,
 }
 
 impl std::error::Error for UpdateError {}
@@ -745,20 +772,36 @@ pub struct DiscardedAttribute {
 }
 
 /// A successfully decoded UPDATE and what RFC 7606 made of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The approaches combine as RFC 7606 §3 h) has the strongest win: the
+/// receiver first disables the families in `disabled`, whose routes the
+/// rest of the message no longer counts, then applies the message, as a
+/// withdrawal of everything it announces when `treated_as_withdraw` is set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecodedUpdate {
-    /// The message as received, after attribute discards and `AS4_*` merging.
+    /// The message as received, after attribute discards and `AS4_*`
+    /// merging. An incorrect MP attribute is not in it.
     pub message: UpdateMessage,
     /// Set when the message must be treated as a withdrawal of everything it
     /// announces (RFC 7606 §2 "treat-as-withdraw"); the error is for the log.
     pub treated_as_withdraw: Option<DecodeError>,
     /// Attributes dropped from `message`.
     pub discarded: Vec<DiscardedAttribute>,
+    /// Families an incorrect MP attribute disabled (RFC 4760 §7), each
+    /// once.
+    pub disabled: Vec<DisabledFamily>,
 }
 
 impl DecodedUpdate {
+    /// Whether this UPDATE disabled `family` (RFC 4760 §7).
+    #[must_use]
+    pub fn disables(&self, family: AddressFamily) -> bool {
+        self.disabled.iter().any(|d| d.family == family)
+    }
+
     /// Every route the receiver must withdraw: the withdrawn fields, plus
-    /// the announced routes when treated as withdraw.
+    /// the announced routes when treated as withdraw; none of a disabled
+    /// family, which goes as a whole.
     pub fn withdrawals(&self) -> impl Iterator<Item = (AddressFamily, Prefix)> + '_ {
         let m = &self.message;
         let v4 = AddressFamily::IPV4_UNICAST;
@@ -778,10 +821,11 @@ impl DecodedUpdate {
                     .filter(move |_| taw)
                     .flat_map(|r| r.nlri.iter().map(move |p| (r.family, *p))),
             )
+            .filter(move |(f, _)| !self.disables(*f))
     }
 
     /// Every route the receiver may install with `message.attributes`;
-    /// empty when treated as withdraw.
+    /// empty when treated as withdraw, and none of a disabled family.
     pub fn announcements(&self) -> impl Iterator<Item = (AddressFamily, Prefix)> + '_ {
         let m = &self.message;
         let keep = self.treated_as_withdraw.is_none();
@@ -795,6 +839,7 @@ impl DecodedUpdate {
                     .filter(move |_| keep)
                     .flat_map(|r| r.nlri.iter().map(move |p| (r.family, *p))),
             )
+            .filter(move |(f, _)| !self.disables(*f))
     }
 }
 
@@ -906,7 +951,6 @@ mod tests {
             &[0][..],
         ] {
             let e = UpdateMessage::decode(body, &EBGP4).unwrap_err();
-            assert_eq!(e.action, ErrorAction::SessionReset);
             assert_eq!(
                 e.notification.subcode,
                 UpdateSubcode::MalformedAttributeList as u8
@@ -921,7 +965,6 @@ mod tests {
         let mut bad = ANNOUNCE.to_vec();
         bad[31] = 33;
         let e = UpdateMessage::decode(&bad, &EBGP2).unwrap_err();
-        assert_eq!(e.action, ErrorAction::SessionReset);
         assert_eq!(
             e.notification.subcode,
             UpdateSubcode::InvalidNetworkField as u8
@@ -1178,7 +1221,6 @@ mod tests {
         // Well-known unrecognised: session reset (RFC 4271 §6.3).
         wire[at] = 0x40;
         let e = UpdateMessage::decode(&wire, &EBGP2).unwrap_err();
-        assert_eq!(e.action, ErrorAction::SessionReset);
         assert_eq!(
             e.notification.subcode,
             UpdateSubcode::UnrecognizedWellKnownAttribute as u8
@@ -1240,7 +1282,6 @@ mod tests {
         wire.extend_from_slice(&attr);
         wire[3] *= 2;
         let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
-        assert_eq!(e.action, ErrorAction::SessionReset);
         assert_eq!(
             e.notification.subcode,
             UpdateSubcode::MalformedAttributeList as u8
@@ -1306,7 +1347,6 @@ mod tests {
         let mut wire = m.encode(&ENC4).unwrap();
         wire[7] = 9; // undefined ORIGIN
         let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
-        assert_eq!(e.action, ErrorAction::SessionReset);
         assert_eq!(e.notification.subcode, UpdateSubcode::InvalidOrigin as u8);
     }
 
@@ -1470,39 +1510,167 @@ mod tests {
         let attr = [0x80, 14, 9, 0, 2, 1, 4, 1, 2, 3, 4, 0];
         wire.extend_from_slice(&attr);
         wire[3] = 12;
-        let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
         assert_eq!(
-            e.action,
-            ErrorAction::AfiSafiDisable(AddressFamily::IPV6_UNICAST)
+            d.disabled,
+            vec![DisabledFamily {
+                family: AddressFamily::IPV6_UNICAST,
+                error: DecodeError::update(UpdateSubcode::OptionalAttributeError, attr.to_vec()),
+            }]
         );
-        assert_eq!(
-            e.notification.subcode,
-            UpdateSubcode::OptionalAttributeError as u8
-        );
-        assert_eq!(e.notification.data, attr);
+        assert_eq!(d.message, UpdateMessage::default());
+        assert_eq!(d.treated_as_withdraw, None);
         // Unsupported family: disabled too.
         let mut wire = vec![0, 0, 0, 7, 0x80, 15, 4, 0, 1, 128, 0];
-        let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
         assert_eq!(
-            e.action,
-            ErrorAction::AfiSafiDisable(AddressFamily {
+            disabled(&wire),
+            vec![AddressFamily {
                 afi: Afi::Ipv4,
                 safi: Safi::Unknown(128)
-            })
+            }]
         );
         // Too short to name a family: session reset.
         wire.truncate(9);
         wire[3] = 5;
         wire[6] = 2;
         let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
-        assert_eq!(e.action, ErrorAction::SessionReset);
+        assert_eq!(
+            e.notification.subcode,
+            UpdateSubcode::OptionalAttributeError as u8
+        );
         // Wrong flags on an MP attribute (RFC 7606 §5.3).
         let wire = [0, 0, 0, 7, 0xc0, 15, 4, 0, 2, 1, 0];
+        assert_eq!(disabled(&wire), vec![AddressFamily::IPV6_UNICAST]);
+    }
+
+    /// The families an UPDATE disables, decoded on an eBGP four-octet
+    /// session.
+    fn disabled(wire: &[u8]) -> Vec<AddressFamily> {
+        let d = UpdateMessage::decode(wire, &EBGP4).unwrap();
+        d.disabled.iter().map(|x| x.family).collect()
+    }
+
+    /// `wire` with `attr` put first in its path attributes.
+    fn with_first_attribute(wire: &[u8], attr: &[u8]) -> Vec<u8> {
+        let w = usize::from(u16::from_be_bytes([wire[0], wire[1]]));
+        let at = 2 + w;
+        let len = u16::from_be_bytes([wire[at], wire[at + 1]]) + u16::try_from(attr.len()).unwrap();
+        let mut out = wire.to_vec();
+        out[at..at + 2].copy_from_slice(&len.to_be_bytes());
+        out.splice(at + 2..at + 2, attr.iter().copied());
+        out
+    }
+
+    #[test]
+    fn the_rest_of_an_update_survives_an_incorrect_mp_attribute() {
+        // RFC 4760 §7 disables the MP attribute's family only: the IPv4
+        // routes in the RFC 4271 fields of the same UPDATE still count, so
+        // that none is lost with the message (RFC 7606 §6: discarding an
+        // UPDATE "could cause invalid routes to be kept").
+        let bad_v6_reach = [0x80, 14, 9, 0, 2, 1, 4, 1, 2, 3, 4, 0];
+        let mut m = announce();
+        m.withdrawn = vec![p("10.1.0.0/16")];
+        let wire = with_first_attribute(&m.encode(&ENC2).unwrap(), &bad_v6_reach);
+        let d = UpdateMessage::decode(&wire, &EBGP2).unwrap();
+        assert_eq!(d.disabled.len(), 1);
+        assert!(d.disables(AddressFamily::IPV6_UNICAST));
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.message, m);
+        assert_eq!(
+            d.announcements().collect::<Vec<_>>(),
+            vec![(AddressFamily::IPV4_UNICAST, p("10.0.0.0/8"))]
+        );
+        assert_eq!(
+            d.withdrawals().collect::<Vec<_>>(),
+            vec![(AddressFamily::IPV4_UNICAST, p("10.1.0.0/16"))]
+        );
+        // A second incorrect MP attribute disables its family as well, and
+        // that family's routes elsewhere in the message no longer count.
+        let bad_v4_unreach = [0x80, 15, 4, 0, 1, 1, 33];
+        let wire = with_first_attribute(&wire, &bad_v4_unreach);
+        let d = UpdateMessage::decode(&wire, &EBGP2).unwrap();
+        assert_eq!(
+            d.disabled.iter().map(|x| x.family).collect::<Vec<_>>(),
+            vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
+        );
+        assert_eq!(d.announcements().count(), 0);
+        assert_eq!(d.withdrawals().count(), 0);
+        // Both attributes of one family disable it once.
+        let bad_v6_unreach = [0x80, 15, 4, 0, 2, 1, 129];
+        let wire = with_first_attribute(&m.encode(&ENC2).unwrap(), &bad_v6_reach);
+        let wire = with_first_attribute(&wire, &bad_v6_unreach);
+        let d = UpdateMessage::decode(&wire, &EBGP2).unwrap();
+        assert_eq!(d.disabled.len(), 1);
+        assert_eq!(d.announcements().count(), 1);
+        // Other errors still apply to what is left (RFC 7606 §3 h).
+        let mut broken = with_first_attribute(&ANNOUNCE, &bad_v6_reach);
+        let origin = broken.len() - 2 - 27 + 3;
+        assert_eq!(broken[origin - 2], code::ORIGIN);
+        broken[origin] = 7;
+        let d = UpdateMessage::decode(&broken, &EBGP2).unwrap();
+        assert!(d.disables(AddressFamily::IPV6_UNICAST));
+        assert_eq!(
+            d.treated_as_withdraw.unwrap().subcode,
+            UpdateSubcode::InvalidOrigin as u8
+        );
+        // A session reset outranks it: an MP attribute repeated after an
+        // incorrect one (RFC 7606 §3 g).
+        let twice = with_first_attribute(
+            &with_first_attribute(&ANNOUNCE, &bad_v6_reach),
+            &[0x80, 14, 5, 0, 2, 1, 0, 0],
+        );
+        let e = UpdateMessage::decode(&twice, &EBGP2).unwrap_err();
+        assert_eq!(
+            e.notification.subcode,
+            UpdateSubcode::MalformedAttributeList as u8
+        );
+    }
+
+    #[test]
+    fn an_incorrect_mp_unreach_among_other_attributes_resets() {
+        // RFC 7606 §5.2: no reachable NLRI but attributes other than
+        // MP_UNREACH_NLRI, so an error that is not attribute discard resets
+        // the session; AFI/SAFI disable is such an error.
+        let bad_v6_unreach = [0x80, 15, 4, 0, 2, 1, 129];
+        let m = UpdateMessage {
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+            ],
+            ..UpdateMessage::default()
+        };
+        let wire = with_first_attribute(&m.encode(&ENC4).unwrap(), &bad_v6_unreach);
         let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
         assert_eq!(
-            e.action,
-            ErrorAction::AfiSafiDisable(AddressFamily::IPV6_UNICAST)
+            e.notification,
+            DecodeError::update(
+                UpdateSubcode::OptionalAttributeError,
+                bad_v6_unreach.to_vec()
+            )
         );
+        // Alone, it is AFI/SAFI disable.
+        let mut alone = vec![0, 0, 0, 7];
+        alone.extend_from_slice(&bad_v6_unreach);
+        assert_eq!(disabled(&alone), vec![AddressFamily::IPV6_UNICAST]);
+        // An incorrect MP_REACH_NLRI encodes reachable NLRI, so with the
+        // same attributes it is AFI/SAFI disable too.
+        let bad_v6_reach = [0x80, 14, 9, 0, 2, 1, 4, 1, 2, 3, 4, 0];
+        let wire = with_first_attribute(&m.encode(&ENC4).unwrap(), &bad_v6_reach);
+        assert_eq!(disabled(&wire), vec![AddressFamily::IPV6_UNICAST]);
+        // Octets that cannot be parsed after an MP_UNREACH_NLRI are not
+        // known to be MP_UNREACH_NLRI either.
+        let mut tail = vec![0, 0, 0, 0];
+        let unreach = [0x80, 15, 8, 0, 2, 1, 32, 0x20, 0x01, 0x0d, 0xb8];
+        let tail_attrs = [&unreach[..], &[0x40]].concat();
+        tail[3] = u8::try_from(tail_attrs.len()).unwrap();
+        tail.extend_from_slice(&tail_attrs);
+        let e = UpdateMessage::decode(&tail, &EBGP4).unwrap_err();
+        assert_eq!(
+            e.notification.subcode,
+            UpdateSubcode::MalformedAttributeList as u8
+        );
+        // An End-of-RIB (RFC 4724) is fine.
+        assert!(UpdateMessage::decode(&[0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1], &EBGP4).is_ok());
     }
 
     #[test]
@@ -1602,16 +1770,15 @@ mod tests {
         // Not negotiated: the next hop length is not the expected one, the
         // attribute is malformed and IPv4 unicast is disabled (RFC 7606
         // §7.11, RFC 4760 §7), with the attribute as NOTIFICATION data.
-        let e = UpdateMessage::decode(&wire, &EBGP4).unwrap_err();
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
         assert_eq!(
-            e.action,
-            ErrorAction::AfiSafiDisable(AddressFamily::IPV4_UNICAST)
+            d.disabled,
+            vec![DisabledFamily {
+                family: AddressFamily::IPV4_UNICAST,
+                error: DecodeError::update(UpdateSubcode::OptionalAttributeError, attr),
+            }]
         );
-        assert_eq!(
-            e.notification.subcode,
-            UpdateSubcode::OptionalAttributeError as u8
-        );
-        assert_eq!(e.notification.data, attr);
+        assert_eq!(d.announcements().count(), 0);
         // An IPv4 next hop in MP_REACH_NLRI needs nothing, and IPv6 NLRI
         // is not affected by the flag.
         let mut v4 = m.clone();

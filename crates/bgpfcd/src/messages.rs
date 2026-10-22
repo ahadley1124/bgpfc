@@ -219,20 +219,13 @@ pub(crate) enum RibMsg {
         /// Negotiated parameters.
         session: Session,
     },
-    /// A decoded UPDATE (announcements, withdrawals, or treat-as-withdraw).
+    /// A decoded UPDATE (announcements, withdrawals, treat-as-withdraw, and
+    /// the families an incorrect MP attribute disabled, RFC 4760 §7).
     Update {
         /// Peer address.
         peer: IpAddr,
         /// The decoded message.
         update: DecodedUpdate,
-    },
-    /// An UPDATE's multiprotocol attribute was unusable (RFC 4760 §7): drop
-    /// the family's routes from this peer and ignore it from now on.
-    FamilyDisabled {
-        /// Peer address.
-        peer: IpAddr,
-        /// The family.
-        family: AddressFamily,
     },
     /// The peer asked for its Adj-RIB-Out of a family again (RFC 2918 §4).
     RouteRefresh {

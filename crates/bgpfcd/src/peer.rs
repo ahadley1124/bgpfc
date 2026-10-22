@@ -25,7 +25,7 @@ use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::AddressFamily;
-use bgpfc_wire::update::{DecodeContext, ErrorAction, PeerKind, UpdateMessage};
+use bgpfc_wire::update::{DecodeContext, PeerKind, UpdateMessage};
 
 use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
 use crate::reader;
@@ -702,6 +702,16 @@ impl Peer {
                 self.event(Event::UpdateMsg, now);
                 if established {
                     self.updates_in += 1;
+                    for d in &decoded.disabled {
+                        // RFC 4760 §7: the RIB drops the family and the
+                        // session stays; the rest of the UPDATE is used.
+                        bgpfc_log::warn!(
+                            "disabling address family after malformed update",
+                            peer = self.cfg.addr,
+                            family = d.family,
+                            error = d.error
+                        );
+                    }
                     if let Some(e) = &decoded.treated_as_withdraw {
                         bgpfc_log::warn!(
                             "update treated as withdraw",
@@ -723,23 +733,8 @@ impl Peer {
                     });
                 }
             }
-            Err(e) => match e.action {
-                ErrorAction::SessionReset => self.event(Event::UpdateMsgErr(e.notification), now),
-                ErrorAction::AfiSafiDisable(family) => {
-                    // RFC 4760 §7: drop the family, keep the session.
-                    bgpfc_log::warn!(
-                        "disabling address family after malformed update",
-                        peer = self.cfg.addr,
-                        family = family,
-                        error = e.notification
-                    );
-                    self.event(Event::UpdateMsg, now);
-                    self.rib_send(RibMsg::FamilyDisabled {
-                        peer: self.cfg.addr,
-                        family,
-                    });
-                }
-            },
+            // RFC 7606 §2: session reset.
+            Err(e) => self.event(Event::UpdateMsgErr(e.notification), now),
         }
     }
 

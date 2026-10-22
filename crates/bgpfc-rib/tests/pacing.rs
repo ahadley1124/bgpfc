@@ -101,6 +101,7 @@ fn update(step: &Step, info: &PeerInfo) -> DecodedUpdate {
         message,
         treated_as_withdraw: None,
         discarded: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 

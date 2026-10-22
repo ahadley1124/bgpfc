@@ -173,8 +173,8 @@ struct Destination {
 
 struct PeerState {
     info: PeerInfo,
-    /// Families disabled after a malformed multiprotocol attribute
-    /// (RFC 4760 §7); no more routes are accepted for them.
+    /// Families disabled after an incorrect multiprotocol attribute
+    /// (RFC 4760 §7); no more routes are accepted for them this session.
     disabled: HashSet<AddressFamily>,
     /// Adj-RIB-Out: what the peer was last told, per family, with the
     /// RFC 4271 §9.2.1.1 pacing state.
@@ -365,20 +365,26 @@ impl Rib {
         out
     }
 
-    /// Stop accepting `family` from `addr` and drop what it sent
-    /// (RFC 4760 §7).
-    pub fn family_disabled(
+    /// RFC 4760 §7: an incorrect MP attribute from `addr` for `family`.
+    /// The speaker "MUST delete all the BGP routes received from that
+    /// neighbor whose AFI/SAFI is the same", and "SHOULD ignore all the
+    /// subsequent routes with that AFI/SAFI received over that session":
+    /// the family stays disabled until the peer goes down. `dirty` gets the
+    /// destinations that lost a route.
+    fn disable_family(
         &mut self,
         addr: IpAddr,
         family: AddressFamily,
-        now: Instant,
-    ) -> Vec<Output> {
+        dirty: &mut Vec<(AddressFamily, Prefix)>,
+    ) {
         let Some(state) = self.peers.get_mut(&addr) else {
-            return Vec::new();
+            return;
         };
-        state.disabled.insert(family);
+        if !state.disabled.insert(family) {
+            // Already disabled: nothing of it is held.
+            return;
+        }
         state.adj_in_count.insert(family, 0);
-        let mut dirty = Vec::new();
         if let Some(table) = self.tables.get_mut(&family) {
             for (prefix, dest) in table.iter_mut() {
                 if remove_candidate(dest, addr) {
@@ -386,7 +392,6 @@ impl Rib {
                 }
             }
         }
-        self.reconsider(&dirty, now)
     }
 
     /// The peer asked for `family` again (RFC 2918 §4): resend the
@@ -584,8 +589,9 @@ impl Rib {
         self.peers.get(&addr).map(|p| &p.info)
     }
 
-    /// An UPDATE from `addr`: apply its withdrawals and announcements to
-    /// the Adj-RIB-In, rerun the decision process for the destinations
+    /// An UPDATE from `addr`: disable the families its incorrect MP
+    /// attributes named (RFC 4760 §7), apply its withdrawals and
+    /// announcements to the Adj-RIB-In, rerun the decision process for the destinations
     /// touched, and produce the FIB changes and UPDATEs that follow, after
     /// an [`Output::InvalidNextHop`] for each part of the UPDATE whose
     /// routes were ignored.
@@ -594,8 +600,18 @@ impl Rib {
             return Vec::new();
         };
         let info = state.info.clone();
-        let disabled = state.disabled.clone();
         let mut dirty = Vec::new();
+        // RFC 4760 §7, before anything else in the UPDATE, so that none of
+        // the disabled family's routes in it counts either (RFC 7606 §3 h:
+        // the strongest approach wins).
+        for d in &update.disabled {
+            self.disable_family(addr, d.family, &mut dirty);
+        }
+        let disabled = self
+            .peers
+            .get(&addr)
+            .map(|s| s.disabled.clone())
+            .unwrap_or_default();
         for (family, prefix) in update.withdrawals() {
             if disabled.contains(&family) {
                 continue;

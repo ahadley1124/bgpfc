@@ -98,6 +98,7 @@ fn updates(n: u32, v6: bool, peer_as: u32, origin: u32) -> Vec<DecodedUpdate> {
             message,
             treated_as_withdraw: None,
             discarded: Vec::new(),
+            disabled: Vec::new(),
         });
         i += 200;
     }
