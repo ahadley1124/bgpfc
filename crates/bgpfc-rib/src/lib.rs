@@ -996,6 +996,13 @@ impl Rib {
         let mut out = Vec::new();
         let mut batches: HashMap<(IpAddr, AddressFamily), Batch> = HashMap::new();
         let mut seen = HashSet::new();
+        // The peers do not change while the decision runs: taken once,
+        // not once per destination.
+        let infos: Vec<PeerInfo> = if dirty.is_empty() {
+            Vec::new()
+        } else {
+            self.peers.values().map(|p| p.info.clone()).collect()
+        };
         for &(family, prefix) in dirty {
             if !seen.insert((family, prefix)) {
                 continue;
@@ -1043,11 +1050,10 @@ impl Rib {
             // sees the validation state, so a new state alone runs it
             // again; the pacing sends nothing to a peer whose route
             // stays the same.
-            let infos: Vec<PeerInfo> = self.peers.values().map(|p| p.info.clone()).collect();
-            for info in infos {
+            for info in &infos {
                 let exported = new_best
                     .as_ref()
-                    .and_then(|b| self.exported(family, prefix, b, &info));
+                    .and_then(|b| self.exported(family, prefix, b, info));
                 let batch = batches.entry((info.addr, family)).or_default();
                 self.offer(info.addr, family, prefix, exported, now, batch);
             }
