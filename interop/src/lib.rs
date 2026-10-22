@@ -442,6 +442,9 @@ pub struct BirdOpts {
     /// More options for the BGP `ipv4` channel, such as
     /// `extended next hop on;`.
     pub channel: String,
+    /// More options for the BGP protocol itself, such as
+    /// `error wait time 1, 2;`.
+    pub protocol: String,
 }
 
 impl Bird {
@@ -475,6 +478,7 @@ impl Bird {
                  \x20   neighbor {neighbor} port {neighbor_port} as {remote_as};\n\
                  \x20   hold time {hold};\n\
                  {passive}\
+                 \x20   {protocol}\n\
                  \x20   ipv4 {{ import all; export all; {channel} }};\n\
                  }}\n",
                 local = opts.local,
@@ -485,6 +489,7 @@ impl Bird {
                 remote_as = opts.remote_as,
                 hold = opts.hold_time,
                 channel = opts.channel,
+                protocol = opts.protocol,
             ),
         )
         .expect("bird config");

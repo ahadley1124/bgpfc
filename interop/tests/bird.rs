@@ -24,6 +24,7 @@ fn bird_opts(lab: &Lab, passive: bool, statics: &[&str]) -> BirdOpts {
         passive,
         statics: statics.iter().map(|s| (*s).to_owned()).collect(),
         channel: String::new(),
+        protocol: String::new(),
     }
 }
 
@@ -175,6 +176,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             passive: true,
             statics: Vec::new(),
             channel: String::new(),
+            protocol: String::new(),
         },
     );
     // The scenario re-announces the statics seconds after the first
@@ -285,6 +287,7 @@ fn export_policy_filters_and_sets() {
             passive: true,
             statics: Vec::new(),
             channel: String::new(),
+            protocol: String::new(),
         },
     );
     let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
@@ -661,6 +664,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
         &lab.b.clone(),
         &BirdOpts {
             channel: "extended next hop on; next hop address 2001:db8::1;".to_owned(),
+            protocol: String::new(),
             ..bird_opts(lab, true, &["192.0.2.0/24"])
         },
     );
@@ -678,6 +682,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             passive: true,
             statics: vec!["203.0.113.0/24".to_owned()],
             channel: "extended next hop on;".to_owned(),
+            protocol: String::new(),
         },
     );
     let socket = lab.dir.join("ctl.sock");
@@ -743,4 +748,100 @@ fn assert_extended_next_hop_off_towards_c(
     assert!(ok, "{}\n{}", route_c(), bgpfcd.log_text());
     let (out, _) = ctl(&["show", "routes", "192.0.2.0/24"]);
     assert!(out.contains("2001:db8::1"), "{out}");
+}
+
+/// RFC 4271 §6.7 and RFC 4486 §4 against BIRD: BIRD sends three routes to
+/// a neighbor whose `maximum-prefix` is two. bgpfcd ends the session with
+/// Cease / Maximum Number of Prefixes Reached carrying AFI 1, SAFI 1 and
+/// the limit, keeps none of BIRD's routes, retries once (`restart-limit
+/// 1`) and then stays Idle. A reload raising the limit applies without a
+/// reset, and `bgpfcctl clear neighbor` is the manual start that brings
+/// the session back for good.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn prefix_limit_and_restart_limit_with_bird() {
+    use std::fs;
+    let lab = Lab::new("l", 14);
+    let mut b = bird_opts(
+        &lab,
+        true,
+        &["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"],
+    );
+    // BIRD refuses connections for its `error wait time` (60 s at first)
+    // after a session ends in an error; keep its retries quick.
+    b.protocol = "error wait time 1, 2;".to_owned();
+    let bird = Bird::start(&lab, &lab.b.clone(), &b);
+    let socket = lab.dir.join("ctl.sock");
+    let mut opts = bgpfcd_opts(&lab, false);
+    opts.neighbors[0].extra =
+        "connect-retry-time 5; maximum-prefix ipv4-unicast 2; restart-limit 1;".to_owned();
+    opts.extra = format!("control {{ socket {}; }}", socket.display());
+    let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
+    let b_addr = lab.b_addr.to_string();
+
+    // Over the limit: the Cease, logged on both sides.
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().contains("maximum prefixes reached")
+    });
+    assert!(ok, "no prefix limit:\n{}", bgpfcd.log_text());
+    let log = bgpfcd.log_text();
+    assert!(log.contains("family=ipv4-unicast limit=2"), "{log}");
+    assert!(
+        log.contains("Cease/Maximum Number of Prefixes Reached"),
+        "{log}"
+    );
+    // RFC 4486 §4 Figure 1 as BIRD logs the data: AFI, SAFI, upper bound.
+    let ok = wait_for(Duration::from_secs(10), || {
+        bird.daemon
+            .log_text()
+            .contains("Received: Maximum number of prefixes reached: 00010100000002")
+    });
+    assert!(ok, "bird log:\n{}", bird.daemon.log_text());
+
+    // RFC 4486 §4: one automatic retry, which fails the same way, then no
+    // more until the operator acts.
+    let ok = wait_for(Duration::from_secs(60), || {
+        bgpfcd.log_text().contains("restart limit reached")
+    });
+    assert!(ok, "no restart limit:\n{}", bgpfcd.log_text());
+    let log = bgpfcd.log_text();
+    assert_eq!(log.matches("maximum prefixes reached").count(), 2, "{log}");
+    assert!(log.contains("damped_failures=2 restart_limit=1"), "{log}");
+    let (out, ok) = ctl(&["show", "neighbor", &b_addr]);
+    assert!(ok && out.contains("state Idle"), "{out}");
+    assert!(out.contains("restart limit reached"), "{out}");
+    let (out, _) = ctl(&["show", "routes"]);
+    assert!(!out.contains("192.0.2.0/24"), "{out}");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        bgpfcd.log_text().matches("session established").count(),
+        2,
+        "{}",
+        bgpfcd.log_text()
+    );
+
+    // A higher limit applies without a reset; the clear starts the peer.
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
+    let cfg = fs::read_to_string(&cfg_path).unwrap().replace(
+        "maximum-prefix ipv4-unicast 2;",
+        "maximum-prefix ipv4-unicast 10;",
+    );
+    fs::write(&cfg_path, cfg).unwrap();
+    let (out, ok) = ctl(&["reload"]);
+    assert!(
+        ok && out.contains("reset 0") && out.contains("limit 1"),
+        "{out}"
+    );
+    let (out, ok) = ctl(&["clear", "neighbor", &b_addr]);
+    assert!(ok, "{out}");
+    let ok = wait_for(ESTABLISH, || {
+        let (out, _) = ctl(&["show", "neighbor", &b_addr]);
+        out.contains("ipv4-unicast received 3 advertised 0 maximum-prefix 10")
+    });
+    let (out, _) = ctl(&["show", "neighbor", &b_addr]);
+    assert!(ok, "{out}\n{}", bgpfcd.log_text());
+    assert!(!out.contains("restart limit reached"), "{out}");
+    let (out, _) = ctl(&["show", "routes"]);
+    assert!(out.contains("203.0.113.0/24"), "{out}");
 }

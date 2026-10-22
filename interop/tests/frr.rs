@@ -47,6 +47,7 @@ fn frr_session_prefixes_both_ways_withdraw_and_refresh() {
             passive: true,
             statics: vec!["203.0.113.0/24".to_owned()],
             channel: String::new(),
+            protocol: String::new(),
         },
     );
     let bgpfcd = start_bgpfcd(
