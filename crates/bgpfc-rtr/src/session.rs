@@ -8,8 +8,9 @@
 //!
 //! 1. Wait until the socket is readable or [`Session::next_deadline`]
 //!    passes. On a timeout, call `step(Event::Tick, now)`.
-//! 2. Feed what was read to the framer and hand each PDU it gives out to
-//!    `step(Event::Pdu(pdu), now)`. A framer error goes in as
+//! 2. Feed what was read to the framer and hand each PDU it gives out,
+//!    with its octets ([`Framer::next_received`]), to
+//!    `step(Event::Pdu(received), now)`. A framer error goes in as
 //!    [`Event::DecodeError`] with [`Framer::erroneous_pdu`]. End of stream
 //!    or a transport error is [`Event::Disconnected`].
 //! 3. Carry out the actions of each step before taking the next PDU from
@@ -68,6 +69,7 @@
 //!
 //! [`Framer`]: crate::Framer
 //! [`Framer::erroneous_pdu`]: crate::Framer::erroneous_pdu
+//! [`Framer::next_received`]: crate::Framer::next_received
 //! [`Framer::set_version`]: crate::Framer::set_version
 
 mod staging;
@@ -84,6 +86,7 @@ use bgpfc_log::{Field, Level};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
 
 use crate::error::{ErrorCode, RtrError};
+use crate::framer::Received;
 use crate::pdu::{ErrorReport, Intervals, Pdu, Version};
 use staging::Staging;
 
@@ -147,15 +150,18 @@ impl Default for Config {
 ///
 /// Every step first runs the timers that are due at `now`, so
 /// [`Event::Tick`] is all the shell sends when only time has passed.
+/// The octets an event borrows are needed only during the step.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<'a> {
     /// Time passed; only the timers run.
     Tick,
     /// The transport connection to the cache is up.
     Connected,
-    /// A PDU from the cache, as [`Framer::next_pdu`](crate::Framer::next_pdu)
-    /// handed it out.
-    Pdu(Pdu),
+    /// A PDU from the cache, with its octets, as
+    /// [`Framer::next_received`](crate::Framer::next_received) handed it
+    /// out. An Error Report about it carries those octets (RFC 8210
+    /// §5.11).
+    Pdu(Received<'a>),
     /// The framer failed on the cache's byte stream. Every such error is
     /// fatal (RFC 8210 §12): the session sends an Error Report if it may,
     /// and drops the connection.
@@ -164,7 +170,7 @@ pub enum Event {
         error: RtrError,
         /// [`Framer::erroneous_pdu`](crate::Framer::erroneous_pdu): the
         /// octets for the Error Report.
-        erroneous_pdu: Vec<u8>,
+        erroneous_pdu: &'a [u8],
     },
     /// The transport connection closed or failed, or an attempt to open
     /// one failed.
@@ -517,18 +523,18 @@ impl Session {
     /// expiry of data whose End of Data gave an Expire Interval of 0. So
     /// after a step, [`Session::next_deadline`] is later than `now`
     /// unless a delay of zero was set.
-    pub fn step(&mut self, event: Event, now: Instant) -> Vec<Action> {
+    pub fn step(&mut self, event: Event<'_>, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         self.run_timers(now, &mut out);
         match event {
             Event::Tick => {}
             Event::Connected => self.on_connected(now, &mut out),
             Event::Disconnected => self.on_disconnected(now, &mut out),
-            Event::Pdu(pdu) => self.on_pdu(&pdu, now, &mut out),
+            Event::Pdu(received) => self.on_pdu(&received, now, &mut out),
             Event::DecodeError {
                 error,
                 erroneous_pdu,
-            } => self.on_decode_error(&error, &erroneous_pdu, now, &mut out),
+            } => self.on_decode_error(&error, erroneous_pdu, now, &mut out),
         }
         self.run_timers(now, &mut out);
         out
@@ -718,14 +724,15 @@ impl Session {
 
     // -------------------------------------------------------------- PDUs
 
-    fn on_pdu(&mut self, pdu: &Pdu, now: Instant, out: &mut Vec<Action>) {
+    fn on_pdu(&mut self, received: &Received<'_>, now: Instant, out: &mut Vec<Action>) {
         if !self.is_connected() {
             // Left over from a connection the session has let go of.
             return;
         }
+        let pdu = &received.pdu;
         match self.negotiated {
             None => {
-                if !self.negotiate(pdu, now, out) {
+                if !self.negotiate(received, now, out) {
                     return;
                 }
             }
@@ -741,7 +748,13 @@ impl Session {
                     pdu.pdu_type(),
                     pdu.version()
                 );
-                self.protocol_error(ErrorCode::UnexpectedProtocolVersion, pdu, &text, now, out);
+                self.protocol_error(
+                    ErrorCode::UnexpectedProtocolVersion,
+                    received,
+                    &text,
+                    now,
+                    out,
+                );
                 return;
             }
             Some(_) => {}
@@ -750,9 +763,9 @@ impl Session {
             Pdu::ErrorReport(report) => self.on_error_report(report, now, out),
             Pdu::SerialNotify {
                 session_id, serial, ..
-            } => self.on_serial_notify(*session_id, *serial, pdu, now, out),
+            } => self.on_serial_notify(*session_id, *serial, received, now, out),
             Pdu::CacheResponse { session_id, .. } if matches!(self.phase, Phase::Querying(_)) => {
-                self.on_cache_response(*session_id, pdu, now, out);
+                self.on_cache_response(*session_id, received, now, out);
             }
             Pdu::CacheReset { .. }
                 if matches!(self.phase, Phase::Querying(Query::Serial { .. })) =>
@@ -760,7 +773,7 @@ impl Session {
                 self.on_cache_reset(now, out);
             }
             Pdu::Prefix { announce, vrp, .. } if matches!(self.phase, Phase::Receiving(_)) => {
-                self.on_prefix(*announce, *vrp, pdu, now, out);
+                self.on_prefix(*announce, *vrp, received, now, out);
             }
             // RFC 8210 §5.10: Router Keys serve path validation (RFC 8205),
             // which is out of scope. They are part of a reply like any
@@ -773,15 +786,16 @@ impl Session {
                 serial,
                 intervals,
             } if matches!(self.phase, Phase::Receiving(_)) => {
-                self.on_end_of_data(*session_id, *serial, *intervals, pdu, now, out);
+                self.on_end_of_data(*session_id, *serial, *intervals, received, now, out);
             }
-            _ => self.unexpected(pdu, now, out),
+            _ => self.unexpected(received, now, out),
         }
     }
 
     /// RFC 8210 §7 for a PDU that arrives before the connection's version
     /// is settled. Returns whether to go on and handle the PDU.
-    fn negotiate(&mut self, pdu: &Pdu, now: Instant, out: &mut Vec<Action>) -> bool {
+    fn negotiate(&mut self, received: &Received<'_>, now: Instant, out: &mut Vec<Action>) -> bool {
+        let pdu = &received.pdu;
         if let Pdu::SerialNotify { .. } = pdu {
             // RFC 8210 §7: "The router MUST ignore any Serial Notify PDUs
             // it might receive from the cache during this initial startup
@@ -822,7 +836,13 @@ impl Session {
                     pdu.pdu_type(),
                     self.version
                 );
-                self.protocol_error(ErrorCode::UnexpectedProtocolVersion, pdu, &text, now, out);
+                self.protocol_error(
+                    ErrorCode::UnexpectedProtocolVersion,
+                    received,
+                    &text,
+                    now,
+                    out,
+                );
                 return false;
             }
         }
@@ -951,7 +971,7 @@ impl Session {
         &mut self,
         session_id: u16,
         serial: u32,
-        pdu: &Pdu,
+        received: &Received<'_>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
@@ -961,7 +981,7 @@ impl Session {
             // RFC 8210 §5.2: the Session ID "reassures the router that the
             // Serial Numbers are commensurate"; a different one is a
             // mismatch (§5.1).
-            self.session_mismatch(current, session_id, pdu, now, out);
+            self.session_mismatch(current, session_id, received, now, out);
             return;
         }
         match self.phase {
@@ -985,7 +1005,7 @@ impl Session {
     fn on_cache_response(
         &mut self,
         session_id: u16,
-        pdu: &Pdu,
+        received: &Received<'_>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
@@ -999,7 +1019,7 @@ impl Session {
                 // Numbers are commensurate"; a different one is a mismatch
                 // (§5.1).
                 if session_id != position.session_id {
-                    self.session_mismatch(position.session_id, session_id, pdu, now, out);
+                    self.session_mismatch(position.session_id, session_id, received, now, out);
                     return;
                 }
                 if stale {
@@ -1047,7 +1067,7 @@ impl Session {
         &mut self,
         announce: bool,
         vrp: Vrp,
-        pdu: &Pdu,
+        received: &Received<'_>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
@@ -1066,7 +1086,7 @@ impl Session {
                 // error and reset the session", which the Reset Query of the
                 // next connection does.
                 let text = format!("{}: {vrp}", rejected.reason);
-                self.protocol_error(rejected.code, pdu, &text, now, out);
+                self.protocol_error(rejected.code, received, &text, now, out);
             }
         }
     }
@@ -1076,7 +1096,7 @@ impl Session {
         session_id: u16,
         serial: u32,
         intervals: Option<Intervals>,
-        pdu: &Pdu,
+        received: &Received<'_>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
@@ -1088,7 +1108,7 @@ impl Session {
             // the same as that of the corresponding Cache Response"; a
             // different Session ID is a mismatch (§5.1). The version was
             // checked against the negotiated one already.
-            self.session_mismatch(reply.session_id, session_id, pdu, now, out);
+            self.session_mismatch(reply.session_id, session_id, received, now, out);
             return;
         }
         match reply.staging {
@@ -1254,21 +1274,25 @@ impl Session {
         &mut self,
         expected: u16,
         got: u16,
-        pdu: &Pdu,
+        received: &Received<'_>,
         now: Instant,
         out: &mut Vec<Action>,
     ) {
         let text = format!("Session ID {got} where {expected} was expected");
-        self.protocol_error(ErrorCode::CorruptData, pdu, &text, now, out);
+        self.protocol_error(ErrorCode::CorruptData, received, &text, now, out);
         self.flush(out);
     }
 
     /// A PDU that fits no sequence of RFC 8210 §8 in the current state.
     /// RFC 8210 §12 has no code for that, so it is Corrupt Data: "corrupt
     /// in a manner not specified by another error code".
-    fn unexpected(&mut self, pdu: &Pdu, now: Instant, out: &mut Vec<Action>) {
-        let text = format!("unexpected {} PDU while {}", pdu.pdu_type(), self.state());
-        self.protocol_error(ErrorCode::CorruptData, pdu, &text, now, out);
+    fn unexpected(&mut self, received: &Received<'_>, now: Instant, out: &mut Vec<Action>) {
+        let text = format!(
+            "unexpected {} PDU while {}",
+            received.pdu.pdu_type(),
+            self.state()
+        );
+        self.protocol_error(ErrorCode::CorruptData, received, &text, now, out);
     }
 
     /// The router found `pdu` in error: report it, unless it is an Error
@@ -1276,7 +1300,7 @@ impl Session {
     fn protocol_error(
         &mut self,
         code: ErrorCode,
-        pdu: &Pdu,
+        received: &Received<'_>,
         text: &str,
         now: Instant,
         out: &mut Vec<Action>,
@@ -1288,11 +1312,10 @@ impl Session {
             vec![field("code", code), field("error", text)],
         );
         // RFC 8210 §5.11: "An Error Report PDU MUST NOT be sent for an
-        // Error Report PDU." For any other PDU, the canonical re-encoding
-        // stands for the octets received: the decoder accepted them, and
-        // they differ at most in reserved bits.
-        if !matches!(pdu, Pdu::ErrorReport(_)) {
-            let report = ErrorReport::new(self.report_version(), code, &pdu.encode(), text);
+        // Error Report PDU." For any other PDU, the Erroneous PDU field is
+        // that PDU as it arrived, not as it would be encoded again.
+        if !matches!(received.pdu, Pdu::ErrorReport(_)) {
+            let report = ErrorReport::new(self.report_version(), code, received.octets, text);
             out.push(Action::Send(Pdu::ErrorReport(report)));
         }
         // RFC 8210 §12: every code but No Data Available is fatal and

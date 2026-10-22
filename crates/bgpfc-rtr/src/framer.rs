@@ -17,11 +17,26 @@ use bgpfc_wire::reader::Reader;
 use crate::error::RtrError;
 use crate::pdu::{HEADER_LEN, Header, MAX_PDU_USIZE, Pdu, PduType, Version, decode_pdu};
 
+/// A PDU as the cache sent it: decoded, with the octets it was decoded
+/// from.
+///
+/// The decoder ignores reserved fields and clears address bits beyond a
+/// prefix's length, so [`Pdu::encode`] can differ from what arrived. An
+/// Error Report about the PDU carries [`Received::octets`]: RFC 8210
+/// §5.11 makes the Erroneous PDU field the PDU in error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Received<'a> {
+    /// The PDU.
+    pub pdu: Pdu,
+    /// Its octets, header included, as they arrived.
+    pub octets: &'a [u8],
+}
+
 /// Cuts a byte stream from a cache into PDUs.
 ///
 /// Give it the octets the transport delivers with [`Framer::feed`], then
-/// call [`Framer::next_pdu`] (or [`Framer::next_frame`]) until it returns
-/// `Ok(None)`. Once drained, it holds less than one PDU, so reading the
+/// call [`Framer::next_received`] (or [`Framer::next_pdu`] or
+/// [`Framer::next_frame`]) until it returns `Ok(None)`. Once drained, it holds less than one PDU, so reading the
 /// socket into a fixed-size buffer and draining after every read keeps
 /// the framer under [`MAX_PDU_LEN`](crate::pdu::MAX_PDU_LEN) octets plus
 /// that buffer, whatever the cache sends.
@@ -88,18 +103,34 @@ impl Framer {
     /// The next PDU, decoded. `Ok(None)` if not all of it has arrived.
     ///
     /// # Errors
+    /// As [`Framer::next_received`].
+    pub fn next_pdu(&mut self) -> Result<Option<Pdu>, RtrError> {
+        Ok(self.next_received()?.map(|received| received.pdu))
+    }
+
+    /// The next PDU, decoded, with its octets. `Ok(None)` if not all of
+    /// it has arrived.
+    ///
+    /// # Errors
     /// As [`Framer::next_frame`], and the errors of
     /// [`Pdu::decode_negotiated`] (or [`Pdu::decode`] before the version
     /// is set) for the PDU it frames.
-    pub fn next_pdu(&mut self) -> Result<Option<Pdu>, RtrError> {
+    pub fn next_received(&mut self) -> Result<Option<Received<'_>>, RtrError> {
         let version = self.version;
-        let Some(frame) = self.next_frame()? else {
+        let Some(length) = self.next_length()? else {
             return Ok(None);
         };
-        match decode_pdu(frame, version) {
-            Ok(pdu) => Ok(Some(pdu)),
+        let start = self.start;
+        match decode_pdu(frame_at(&self.buf, start, length), version) {
+            Ok(pdu) => {
+                self.start += length;
+                Ok(Some(Received {
+                    pdu,
+                    octets: frame_at(&self.buf, start, length),
+                }))
+            }
             Err(error) => {
-                let octets = frame.to_vec();
+                let octets = frame_at(&self.buf, start, length).to_vec();
                 self.fail(error.clone(), octets);
                 Err(error)
             }
@@ -201,6 +232,14 @@ impl Framer {
         self.buf = Vec::new();
         self.start = 0;
     }
+}
+
+/// The `length` octets at `start` in `buf`, as many as there are. The
+/// framer calls it for a PDU [`Framer::next_length`] saw all of, so it
+/// never runs short.
+fn frame_at(buf: &[u8], start: usize, length: usize) -> &[u8] {
+    let pending = buf.get(start..).unwrap_or_default();
+    Reader::new(pending).take(length).unwrap_or(pending)
 }
 
 #[cfg(test)]
@@ -341,6 +380,34 @@ mod tests {
         }
         let expected: Vec<Vec<u8>> = pdus().iter().map(Pdu::encode).collect();
         assert_eq!(frames, expected);
+    }
+
+    #[test]
+    fn received_pdus_keep_their_octets() {
+        // An IPv4 Prefix with a reserved field, reserved Flags bits, the
+        // zero octet and an address bit beyond its /24 set: it decodes to
+        // the canonical PDU, and keeps the octets that arrived, which an
+        // Error Report about it carries (RFC 8210 §5.11).
+        let noisy = [
+            1, 4, 0x12, 0x34, 0, 0, 0, 20, 0x81, 24, 24, 0x56, 192, 0, 2, 7, 0, 0, 0xfb, 0xf0,
+        ];
+        let canonical = Pdu::Prefix {
+            version: Version::V1,
+            announce: true,
+            vrp: vrp("192.0.2.0/24", 24, 64_496),
+        };
+        let mut f = Framer::new();
+        let s = stream(&pdus()[..1]);
+        f.feed(&s);
+        f.feed(&noisy);
+        let first = f.next_received().unwrap().unwrap();
+        assert_eq!((first.pdu, first.octets), (pdus()[0].clone(), s.as_slice()));
+        let second = f.next_received().unwrap().unwrap();
+        assert_eq!(second.pdu, canonical);
+        assert_eq!(second.octets, noisy);
+        assert_ne!(canonical.encode(), noisy);
+        assert_eq!(f.next_received(), Ok(None));
+        assert_eq!(f.buffered(), 0);
     }
 
     #[test]
