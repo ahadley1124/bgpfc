@@ -1157,6 +1157,81 @@ fn refresh_and_retry_follow_the_cache() {
 }
 
 #[test]
+fn a_shell_can_pace_reconnects_itself() {
+    let mut h = idle();
+    // The delay set before a step applies to the failure in that step,
+    // and shows in the log line about it.
+    h.s.set_retry_delay(Some(Duration::from_secs(2)));
+    let actions = h.step(Event::Disconnected);
+    assert!(
+        logs(&actions)
+            .iter()
+            .any(|l| l.message == "rtr cache connection lost"
+                && field_of(l, "retry_in") == Some("2s"))
+    );
+    assert_eq!(h.s.next_deadline(), Some(h.secs(2)));
+    assert_eq!(tags(&h.wait(1)), NONE);
+    assert_eq!(tags(&h.wait(1)), ["connect"]);
+    // A new delay does not move a failure already handled.
+    h.step(Event::Disconnected);
+    h.s.set_retry_delay(Some(Duration::from_secs(60)));
+    assert_eq!(h.s.next_deadline(), Some(h.secs(2)));
+    assert_eq!(tags(&h.wait(2)), ["connect"]);
+    // The serial survives: the delay changes only the timing.
+    assert_eq!(tags(&h.step(Event::Connected)), ["serial-query v1 7/5"]);
+    // None goes back to the Retry Interval (RFC 8210 §6).
+    h.s.set_retry_delay(None);
+    let actions = h.step(Event::Disconnected);
+    assert!(
+        logs(&actions)
+            .iter()
+            .any(|l| field_of(l, "retry_in") == Some("600s"))
+    );
+    assert_eq!(h.s.next_deadline(), Some(h.secs(600)));
+}
+
+#[test]
+fn the_shell_delay_applies_to_every_kind_of_failure() {
+    // A protocol error.
+    let mut h = idle();
+    h.s.set_retry_delay(Some(Duration::from_secs(3)));
+    h.pdu(eod(SID, 6));
+    assert_eq!(h.s.state(), State::Disconnected);
+    assert_eq!(h.s.next_deadline(), Some(h.secs(3)));
+    // A connection attempt that times out.
+    let mut h = connecting();
+    h.s.set_retry_delay(Some(Duration::from_secs(3)));
+    assert_eq!(tags(&h.wait(60)), ["close"]);
+    assert_eq!(h.s.next_deadline(), Some(h.secs(3)));
+    // A cache that stops answering.
+    let mut h = querying_cold();
+    h.s.set_retry_delay(Some(Duration::from_secs(3)));
+    assert_eq!(tags(&h.wait(60)), ["close"]);
+    assert_eq!(h.s.next_deadline(), Some(h.secs(3)));
+}
+
+#[test]
+fn no_data_keeps_the_retry_interval_whatever_the_shell_delay() {
+    let mut h = querying_cold();
+    h.s.set_retry_delay(Some(Duration::from_secs(1)));
+    h.pdu(report(V1, ErrorCode::NoDataAvailable));
+    assert_eq!(h.s.state(), State::Idle);
+    // RFC 8210 §8.4: periodic Reset Queries on the open connection, at the
+    // Retry Interval (§6).
+    assert_eq!(h.s.next_deadline(), Some(h.secs(600)));
+}
+
+#[test]
+fn the_first_connection_can_wait() {
+    let now = Instant::now();
+    let later = now + Duration::from_secs(5);
+    let mut s = Session::new(Config::default(), later);
+    assert_eq!(s.next_deadline(), Some(later));
+    assert_eq!(tags(&s.step(Event::Tick, now)), NONE);
+    assert_eq!(tags(&s.step(Event::Tick, later)), ["connect"]);
+}
+
+#[test]
 fn intervals_out_of_range_are_ignored() {
     // §6: Refresh 1..=86400, Retry 1..=7200, Expire 600..=172800 and
     // larger than both.
