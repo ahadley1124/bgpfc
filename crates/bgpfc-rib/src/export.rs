@@ -8,8 +8,9 @@
 //! size); RFC 1997 (`NO_EXPORT`, `NO_ADVERTISE`); RFC 4360 §6
 //! (non-transitive extended communities stay in the AS); RFC 2545 §3
 //! (IPv6 next hops); RFC 8654 §4 (65535-octet UPDATEs); RFC 8950 §4 (an
-//! IPv6 next hop for IPv4 NLRI only where negotiated), §5 (our own address
-//! is of the session's protocol; a next hop passed on keeps its encoding).
+//! IPv6 next hop for IPv4 NLRI only to a peer that advertised it), §5 (our
+//! own address is of the session's protocol; a next hop passed on keeps
+//! its encoding).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -88,7 +89,8 @@ pub fn export(
             // RFC 4271 §5.1.3: the next hop is our address on the session
             // when it is of the NLRI's family (RFC 2545 §3 for IPv6). RFC
             // 8950 §5: on a session over IPv6 our own address is an IPv6
-            // one, which IPv4 NLRI may carry once RFC 8950 §4 negotiated it.
+            // one, which IPv4 NLRI may carry to a peer that advertised RFC
+            // 8950 §4 Extended Next Hop Encoding, where we did too.
             // NOTE(interop): otherwise, for a family the session address
             // does not belong to (IPv4 routes over an IPv6 session), the
             // next hop is left as received, as BIRD does without RFC 8950.

@@ -99,8 +99,8 @@ fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) 
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
-                extended_next_hop = session
-                    .extended_next_hop
+                extended_next_hop_send = session
+                    .extended_next_hop_send
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
@@ -258,7 +258,9 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         receive_families: s.receive_families.clone(),
         four_octet_as: s.four_octet_as,
         extended_messages: s.extended_messages,
-        extended_next_hop: s.extended_next_hop.clone(),
+        // RFC 8950 §4: what the RIB needs is what may be sent; what may
+        // be received is the decoder's business.
+        extended_next_hop: s.extended_next_hop_send.clone(),
         advertisement_interval: interval,
         prefix_limits: Vec::new(),
     }
@@ -453,7 +455,8 @@ mod tests {
             route_refresh: true,
             families: vec![AddressFamily::IPV4_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST],
-            extended_next_hop: Vec::new(),
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
             peer_capabilities: Vec::new(),
         }
     }

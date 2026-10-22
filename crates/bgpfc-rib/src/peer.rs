@@ -37,9 +37,10 @@ pub struct PeerInfo {
     pub four_octet_as: bool,
     /// Both sides accept 65535-octet messages (RFC 8654 §4).
     pub extended_messages: bool,
-    /// Families whose routes may carry an IPv6 next hop to and from this
-    /// peer, because both sides advertised Extended Next Hop Encoding for
-    /// them (RFC 8950 §4): IPv4 unicast or nothing.
+    /// Families whose routes may go to this peer with an IPv6 next hop,
+    /// because it advertised Extended Next Hop Encoding for them, and so
+    /// did we (RFC 8950 §4): IPv4 unicast or nothing. Which next hops are
+    /// taken from the peer is the decoder's business.
     pub extended_next_hop: Vec<AddressFamily>,
     /// The `MinRouteAdvertisementIntervalTimer` (RFC 4271 §9.2.1.1): the
     /// least time between two advertisements of a destination to this

@@ -58,8 +58,9 @@ pub struct DecodeContext {
     /// Accept `AS_SET` segments. RFC 9774 §3 deprecates them and requires
     /// treat-as-withdraw unless an operator explicitly configures otherwise.
     pub allow_as_set: bool,
-    /// Both sides advertised Extended Next Hop Encoding for IPv4 unicast
-    /// with an IPv6 next hop (RFC 8950 §4): an IPv4 unicast
+    /// We advertised Extended Next Hop Encoding for IPv4 unicast with an
+    /// IPv6 next hop (RFC 8950 §4), which tells the peer we take one,
+    /// whether or not it advertised the capability too: an IPv4 unicast
     /// `MP_REACH_NLRI` may carry a 16- or 32-octet IPv6 next hop (§3).
     /// Without it four octets are the only length expected, and any other
     /// makes the attribute malformed (RFC 7606 §7.11).
@@ -73,10 +74,10 @@ pub struct EncodeContext {
     /// `AS_PATH` and AGGREGATOR are two-octet with `AS_TRANS` and the
     /// `AS4_*` attributes are generated as RFC 6793 §4.2.2 requires.
     pub four_octet_as: bool,
-    /// Both sides advertised Extended Next Hop Encoding for IPv4 unicast
-    /// (RFC 8950 §4). When false, IPv4 NLRI with an IPv6 next hop is an
-    /// [`EncodeError`], so the peer is never sent what it did not agree
-    /// to take.
+    /// The peer advertised Extended Next Hop Encoding for IPv4 unicast
+    /// (RFC 8950 §4), and we may send it IPv4 NLRI with an IPv6 next hop.
+    /// When false, such NLRI is an [`EncodeError`], so the peer is never
+    /// sent what it did not agree to take.
     pub extended_next_hop: bool,
 }
 
@@ -151,8 +152,8 @@ impl UpdateMessage {
     ///
     /// # Errors
     /// [`EncodeError`] if a field exceeds its length field, an `AS_PATH`
-    /// segment cannot be encoded, or IPv4 NLRI has an IPv6 next hop
-    /// without RFC 8950 negotiated.
+    /// segment cannot be encoded, or IPv4 NLRI has an IPv6 next hop for a
+    /// peer that did not advertise RFC 8950 Extended Next Hop Encoding.
     pub fn encode(&self, ctx: &EncodeContext) -> Result<Vec<u8>, EncodeError> {
         let mut withdrawn = Vec::new();
         encode_prefixes(&self.withdrawn, &mut withdrawn);
@@ -1767,9 +1768,9 @@ mod tests {
             d.announcements().collect::<Vec<_>>(),
             vec![(AddressFamily::IPV4_UNICAST, p("192.0.2.0/24"))]
         );
-        // Not negotiated: the next hop length is not the expected one, the
-        // attribute is malformed and IPv4 unicast is disabled (RFC 7606
-        // §7.11, RFC 4760 §7), with the attribute as NOTIFICATION data.
+        // Not advertised by us: the next hop length is not the expected
+        // one, the attribute is malformed and IPv4 unicast is disabled (RFC
+        // 7606 §7.11, RFC 4760 §7), with the attribute as NOTIFICATION data.
         let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
         assert_eq!(
             d.disabled,

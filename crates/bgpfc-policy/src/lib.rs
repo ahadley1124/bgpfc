@@ -92,8 +92,9 @@ pub struct Route<'a> {
     pub neighbor: IpAddr,
     /// Our address on that peer's session; what `set next-hop self` uses.
     pub local_addr: IpAddr,
-    /// The session negotiated Extended Next Hop Encoding for the route's
-    /// family (RFC 8950 §4), so an IPv4 route may take an IPv6
+    /// Routes of the route's family may go to the peer with an IPv6 next
+    /// hop, since it advertised Extended Next Hop Encoding for the family,
+    /// and so did we (RFC 8950 §4): an IPv4 route may take an IPv6
     /// `local_addr` as its next hop.
     pub extended_next_hop: bool,
 }

@@ -765,15 +765,32 @@ impl Fsm {
         // receiver advertised (RFC 5492 §3), so the peer may send us routes
         // of every family we advertised, whether it advertised it or not.
         let receive_families = advertised_families(ours);
-        // RFC 8950 §4: an IPv6 next hop for IPv4 unicast once both sides
-        // listed the triple. The capability says nothing about whether the
-        // family itself is used; the Multiprotocol capability alone decides
-        // that, hence the check against `families`.
-        let extended_next_hop = if families.contains(&AddressFamily::IPV4_UNICAST)
+        // RFC 8950 §4: each triple "indicates that the NLRI of <NLRI AFI /
+        // NLRI SAFI> may be advertised with a next-hop address belonging to
+        // the network-layer protocol of Nexthop AFI", to the speaker that
+        // listed it. The capability works one way: ours tells the peer it
+        // may send us an IPv6 next hop for IPv4 unicast, the peer's tells us
+        // we may send it one. It says nothing about whether the family is
+        // used; the Multiprotocol capability alone decides that (RFC 4760
+        // §8), hence the checks against the families.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let extended_next_hop_receive =
+            if receive_families.contains(&v4) && ipv4_unicast_via_ipv6(ours) {
+                vec![v4]
+            } else {
+                Vec::new()
+            };
+        // RFC 8950 §4: "A BGP speaker MUST only advertise the IPv4 ... NLRI
+        // with an IPv6 next hop to a BGP peer if the BGP speaker has first
+        // ascertained via the BGP Capability Advertisement that the BGP
+        // peer supports the Extended Next Hop Encoding capability". Only
+        // where we advertised it too, so that the configuration turns the
+        // extension on or off as a whole.
+        let extended_next_hop_send = if families.contains(&v4)
             && ipv4_unicast_via_ipv6(ours)
             && ipv4_unicast_via_ipv6(&open.capabilities)
         {
-            vec![AddressFamily::IPV4_UNICAST]
+            vec![v4]
         } else {
             Vec::new()
         };
@@ -807,7 +824,8 @@ impl Fsm {
             route_refresh,
             families,
             receive_families,
-            extended_next_hop,
+            extended_next_hop_receive,
+            extended_next_hop_send,
             peer_capabilities: open.capabilities.clone(),
         })
     }

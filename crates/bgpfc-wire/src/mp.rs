@@ -73,15 +73,16 @@ impl NextHop {
     }
 
     /// Decode `len` octets of next hop for NLRI of family `afi`
-    /// (RFC 4760 §3; RFC 2545 §3; RFC 8950 §3). `extended_next_hop`: RFC
-    /// 8950 §4 was negotiated for IPv4 unicast.
+    /// (RFC 4760 §3; RFC 2545 §3; RFC 8950 §3). `extended_next_hop`: we
+    /// advertised RFC 8950 §4 Extended Next Hop Encoding for IPv4 unicast.
     fn decode(r: &mut Reader<'_>, afi: Afi, len: u8, extended_next_hop: bool) -> Option<NextHop> {
         match (afi, len) {
             (Afi::Ipv4, 4) => Some(NextHop::Ipv4(Ipv4Addr::from(r.array::<4>().ok()?))),
             // RFC 2545 §3 for IPv6 NLRI. RFC 8950 §3 for IPv4 NLRI, but only
-            // once negotiated: RFC 7606 §7.11 judges the length against the
-            // AFI/SAFI "potentially modified by any extensions in use", so
-            // without RFC 8950 four octets are the only length expected.
+            // once we advertised it (§4): RFC 7606 §7.11 judges the length
+            // against the AFI/SAFI "potentially modified by any extensions
+            // in use", so without RFC 8950 four octets are the only length
+            // expected.
             (Afi::Ipv4 | Afi::Ipv6, 16 | 32) if afi == Afi::Ipv6 || extended_next_hop => {
                 let global = Ipv6Addr::from(r.array::<16>().ok()?);
                 let link_local = if len == 32 {
@@ -185,9 +186,9 @@ fn supported(family: AddressFamily) -> bool {
 }
 
 impl MpReach {
-    /// Decode an attribute value. `extended_next_hop`: both sides
-    /// negotiated Extended Next Hop Encoding for IPv4 unicast (RFC 8950
-    /// §4), so its next hop may be IPv6 (§3).
+    /// Decode an attribute value. `extended_next_hop`: we advertised
+    /// Extended Next Hop Encoding for IPv4 unicast (RFC 8950 §4), so its
+    /// next hop may be IPv6 (§3).
     ///
     /// # Errors
     /// [`MpError`] when the attribute is incorrect per RFC 7606 §5.3 and

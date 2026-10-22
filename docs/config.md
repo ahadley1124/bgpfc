@@ -185,17 +185,20 @@ connection replace an Established session per RFC 4271 §6.8.
 
 `extended-next-hop yes` advertises the Extended Next Hop Encoding
 capability of RFC 8950 for IPv4 unicast, which must then be in `families`.
-When the neighbor advertises it too, IPv4 routes may carry an IPv6 next hop
-in both directions: received ones are accepted, and on a session over IPv6
-the IPv4 routes sent to an external neighbor, or through `set next-hop
-self`, carry our IPv6 address on the session (RFC 8950 §5). A route whose
-IPv6 next hop is passed on unchanged, as to an internal neighbor, keeps it.
-Without the capability on both sides, which is the default, IPv4 routes
-with an IPv6 next hop are never sent to the neighbor, and one received
-from it is malformed: IPv4 unicast is disabled for the session (RFC 7606
-§7.11). IPv4 routes sent over an IPv6 session without the capability keep
-the next hop they were received with. In the FIB, an IPv4 route via an
-IPv6 next hop is installed with `RTA_VIA`.
+The capability tells the neighbor that we take IPv4 routes with an IPv6
+next hop, so such routes from it are accepted whether or not it advertises
+the capability too. When it does, IPv4 routes sent to it may carry an IPv6
+next hop as well: on a session over IPv6 the IPv4 routes sent to an
+external neighbor, or through `set next-hop self`, carry our IPv6 address
+on the session (RFC 8950 §5), and a route whose IPv6 next hop is passed on
+unchanged, as to an internal neighbor, keeps it. A neighbor that did not
+advertise the capability is never sent an IPv4 route with an IPv6 next hop
+(RFC 8950 §4). Without `extended-next-hop yes`, which is the default, the
+extension is used neither way: an IPv4 route received with an IPv6 next
+hop is malformed, and IPv4 unicast is disabled for the session (RFC 7606
+§7.11); IPv4 routes sent over an IPv6 session keep the next hop they were
+received with. In the FIB, an IPv4 route via an IPv6 next hop is installed
+with `RTA_VIA`.
 
 `maximum-prefix ipv4-unicast 1000;` ends the session once the neighbor has
 more than 1000 IPv4 unicast routes in the RIB (RFC 4271 §6.7): bgpfcd

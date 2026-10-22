@@ -30,7 +30,7 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families that may carry an IPv6 next hop under RFC 8950), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
 | `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*` |
 | `show fib` | FIB mode and every desired route with `installed`, `pending` or `stale` |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
@@ -83,7 +83,8 @@ Example objects:
               {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
-             "families":["ipv4-unicast","ipv6-unicast"],"extended_next_hop":[]}}]
+             "families":["ipv4-unicast","ipv6-unicast"],
+             "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
   "peer":"198.51.100.1","best":true,"as_path":[64511],"communities":[],"large_communities":[]}]

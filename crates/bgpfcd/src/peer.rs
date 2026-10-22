@@ -605,25 +605,6 @@ impl Peer {
         }
     }
 
-    fn decode_context(&self) -> DecodeContext {
-        match &self.session {
-            Some(s) => DecodeContext {
-                four_octet_as: s.four_octet_as,
-                peer: s.peer,
-                allow_as_set: self.cfg.allow_as_set,
-                // RFC 8950 §4 as negotiated; without it RFC 7606 §7.11
-                // expects four octets of next hop for IPv4 unicast.
-                extended_next_hop: s.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
-            },
-            None => DecodeContext {
-                four_octet_as: false,
-                peer: PeerKind::External,
-                allow_as_set: self.cfg.allow_as_set,
-                extended_next_hop: false,
-            },
-        }
-    }
-
     /// A message (or framing error) on the FSM's connection.
     fn primary_message(&mut self, message: Result<Inbound, DecodeError>, now: Instant) {
         match message {
@@ -695,7 +676,7 @@ impl Peer {
     }
 
     fn update(&mut self, body: &[u8], now: Instant) {
-        let ctx = self.decode_context();
+        let ctx = decode_context(self.session.as_ref(), self.cfg.allow_as_set);
         match UpdateMessage::decode(body, &ctx) {
             Ok(decoded) => {
                 let established = self.fsm.state() == State::Established;
@@ -810,6 +791,29 @@ fn close_with_cease(mut conn: Conn, subcode: CeaseSubcode) {
     let _ = conn.stream.shutdown(Shutdown::Both);
 }
 
+/// How to decode UPDATEs on `session`.
+fn decode_context(session: Option<&Session>, allow_as_set: bool) -> DecodeContext {
+    match session {
+        Some(s) => DecodeContext {
+            four_octet_as: s.four_octet_as,
+            peer: s.peer,
+            allow_as_set,
+            // RFC 8950 §3, §4: once we advertised the capability, whether
+            // or not the peer did; without it RFC 7606 §7.11 expects four
+            // octets of next hop for IPv4 unicast.
+            extended_next_hop: s
+                .extended_next_hop_receive
+                .contains(&AddressFamily::IPV4_UNICAST),
+        },
+        None => DecodeContext {
+            four_octet_as: false,
+            peer: PeerKind::External,
+            allow_as_set,
+            extended_next_hop: false,
+        },
+    }
+}
+
 /// The families `m` carries routes of, announced or withdrawn, that are not
 /// among `taken`, the families we advertised (RFC 4760 §8), each once.
 fn unadvertised(m: &UpdateMessage, taken: &[AddressFamily]) -> Vec<AddressFamily> {
@@ -831,6 +835,7 @@ fn unadvertised(m: &UpdateMessage, taken: &[AddressFamily]) -> Vec<AddressFamily
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bgpfc_wire::capability::Capability;
     use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
 
     #[test]
@@ -861,5 +866,78 @@ mod tests {
         m.withdrawn.clear();
         assert_eq!(unadvertised(&m, &[]), vec![v6]);
         assert_eq!(unadvertised(&UpdateMessage::default(), &[]), vec![]);
+    }
+
+    /// The session an FSM advertising `ours` negotiates with a peer
+    /// advertising `theirs`.
+    fn negotiated(ours: Vec<Capability>, theirs: Vec<Capability>) -> Session {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.capabilities = ours;
+        let mut fsm = Fsm::new(cfg);
+        let now = Instant::now();
+        fsm.handle(Event::ManualStart, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            theirs,
+        );
+        fsm.handle(Event::BgpOpen(open), now);
+        fsm.session().cloned().unwrap()
+    }
+
+    #[test]
+    fn ipv6_next_hops_for_ipv4_routes_are_taken_once_we_advertised_rfc8950() {
+        use bgpfc_wire::as_path::AsPath;
+        use bgpfc_wire::attribute::Origin;
+        use bgpfc_wire::capability::NextHopEncoding;
+        use bgpfc_wire::types::Asn;
+        use bgpfc_wire::update::EncodeContext;
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let enh = Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6]);
+        let mp = Capability::Multiprotocol(v4);
+        let attrs = bgpfc_rib::PathAttrs {
+            origin: Origin::Igp,
+            as_path: AsPath::sequence(&[Asn(65_001)]),
+            next_hop: NextHop::Ipv6 {
+                global: "2001:db8::1".parse().unwrap(),
+                link_local: None,
+            },
+            med: None,
+            local_pref: None,
+            atomic_aggregate: false,
+            aggregator: None,
+            communities: Vec::new(),
+            ext_communities: Vec::new(),
+            large_communities: Vec::new(),
+            unknown: Vec::new(),
+        };
+        let body = attrs
+            .to_update(v4, vec!["192.0.2.0/24".parse().unwrap()])
+            .encode(&EncodeContext {
+                four_octet_as: true,
+                extended_next_hop: true,
+            })
+            .unwrap();
+        let decode = |s: &Session| UpdateMessage::decode(&body, &decode_context(Some(s), false));
+        // RFC 8950 §4: our triple tells the peer it may send us an IPv6
+        // next hop, whether or not it listed one itself (§3: the length
+        // says which protocol the next hop is of).
+        for theirs in [vec![mp.clone()], vec![mp.clone(), enh.clone()]] {
+            let s = negotiated(vec![mp.clone(), enh.clone()], theirs);
+            let d = decode(&s).unwrap();
+            assert!(d.disabled.is_empty(), "{:?}", d.disabled);
+            assert_eq!(d.message.mp_reach.unwrap().next_hop, attrs.next_hop);
+        }
+        // Without ours, only four octets are expected (RFC 7606 §7.11), even
+        // when the peer listed the triple.
+        let s = negotiated(vec![mp.clone()], vec![mp, enh]);
+        let d = decode(&s).unwrap();
+        assert_eq!(
+            d.disabled.iter().map(|x| x.family).collect::<Vec<_>>(),
+            vec![v4]
+        );
     }
 }

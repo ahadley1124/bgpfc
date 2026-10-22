@@ -441,7 +441,8 @@ fn open_negotiation() {
         vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
     );
     // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
-    assert_eq!(s.extended_next_hop, vec![]);
+    assert_eq!(s.extended_next_hop_receive, vec![]);
+    assert_eq!(s.extended_next_hop_send, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
     assert_eq!(
         f.timer(TimerKind::Keepalive).deadline(),
@@ -510,45 +511,63 @@ fn routes_are_taken_for_every_family_we_advertised() {
     assert_eq!(session(&[], &[v4, v6]), (vec![v4], vec![v4]));
 }
 
+fn enh(triples: &[NextHopEncoding]) -> Capability {
+    Capability::ExtendedNextHop(triples.to_vec())
+}
+
+/// RFC 8950 §4 between `config()` with `ours` added and a peer advertising
+/// `theirs`: (families taking an IPv6 next hop from the peer, families
+/// sending one to it, families both ways).
+fn negotiated_enh(
+    ours: Vec<Capability>,
+    theirs: Vec<Capability>,
+) -> (Vec<AddressFamily>, Vec<AddressFamily>, Vec<AddressFamily>) {
+    let mut cfg = config();
+    cfg.capabilities.extend(ours);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    (
+        s.extended_next_hop_receive.clone(),
+        s.extended_next_hop_send.clone(),
+        s.families.clone(),
+    )
+}
+
 #[test]
-fn extended_next_hop_needs_both_sides_and_ipv4_unicast() {
-    let enh = |triples: &[NextHopEncoding]| Capability::ExtendedNextHop(triples.to_vec());
+fn extended_next_hop_is_taken_once_we_advertise_it_and_sent_once_both_do() {
     let v4_via_v6 = NextHopEncoding::IPV4_UNICAST_VIA_IPV6;
-    let negotiated = |ours: Vec<Capability>, theirs: Vec<Capability>| {
-        let mut cfg = config();
-        cfg.capabilities.extend(ours);
-        let (mut f, now) = fsm_at(State::OpenSent, cfg);
-        f.handle(
-            Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
-            now,
-        );
-        let s = f.session().unwrap();
-        (s.extended_next_hop.clone(), s.families.clone())
-    };
+    let negotiated = negotiated_enh;
     let v4 = || vec![AddressFamily::IPV4_UNICAST];
-    let mp = |f| Capability::Multiprotocol(f);
-    // RFC 8950 §4: both sides list <1, 1, 2>.
+    let mp = Capability::Multiprotocol;
+    // RFC 8950 §4: both sides list <1, 1, 2>: IPv6 next hops both ways.
     assert_eq!(
         negotiated(
             vec![enh(&[v4_via_v6])],
             vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
         ),
-        (v4(), v4())
+        (v4(), v4(), v4())
     );
-    // One side only, either way: not negotiated.
+    // Only we list it: the peer may send us IPv6 next hops, since our
+    // triple says we take them, but is sent none.
     assert_eq!(
         negotiated(
             vec![enh(&[v4_via_v6])],
             vec![mp(AddressFamily::IPV4_UNICAST)]
         ),
-        (vec![], v4())
+        (v4(), vec![], v4())
     );
+    // Only the peer lists it: we did not ask for the extension, so it is
+    // used neither way.
     assert_eq!(
         negotiated(
             vec![],
             vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
         ),
-        (vec![], v4())
+        (vec![], vec![], v4())
     );
     // Other triples do not stand in for <1, 1, 2>: VPN-IPv4 (§6.2), an
     // IPv4 next hop, a SAFI that does not fit one octet.
@@ -571,7 +590,14 @@ fn extended_next_hop_needs_both_sides_and_ipv4_unicast() {
             vec![enh(&[v4_via_v6])],
             vec![mp(AddressFamily::IPV4_UNICAST), enh(&others)]
         ),
-        (vec![], v4())
+        (v4(), vec![], v4())
+    );
+    assert_eq!(
+        negotiated(
+            vec![enh(&others)],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (vec![], vec![], v4())
     );
     // RFC 5492 §4: the triple may come in a second instance.
     assert_eq!(
@@ -583,22 +609,49 @@ fn extended_next_hop_needs_both_sides_and_ipv4_unicast() {
                 enh(&[v4_via_v6])
             ]
         ),
-        (v4(), v4())
-    );
-    // RFC 8950 §4: the capability does not make IPv4 unicast usable; only
-    // the Multiprotocol capability does (RFC 4760 §8).
-    assert_eq!(
-        negotiated(
-            vec![enh(&[v4_via_v6])],
-            vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])]
-        ),
-        (vec![], vec![AddressFamily::IPV6_UNICAST])
+        (v4(), v4(), v4())
     );
     // A peer without any Multiprotocol capability speaks IPv4 unicast
     // implicitly (RFC 4760 §8), so the triple applies.
     assert_eq!(
         negotiated(vec![enh(&[v4_via_v6])], vec![enh(&[v4_via_v6])]),
-        (v4(), v4())
+        (v4(), v4(), v4())
+    );
+}
+
+#[test]
+fn extended_next_hop_follows_the_ipv4_unicast_family() {
+    let v4_via_v6 = NextHopEncoding::IPV4_UNICAST_VIA_IPV6;
+    let negotiated = negotiated_enh;
+    let v4 = || vec![AddressFamily::IPV4_UNICAST];
+    let mp = Capability::Multiprotocol;
+    // RFC 8950 §4: the capability does not make IPv4 unicast usable; only
+    // the Multiprotocol capability does (RFC 4760 §8). We advertised IPv4
+    // unicast, so the peer may still send it to us, with IPv6 next hops.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (v4(), vec![], vec![AddressFamily::IPV6_UNICAST])
+    );
+    // Nor when we did not advertise IPv4 unicast.
+    let mut cfg = config();
+    cfg.capabilities = vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])];
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let theirs = vec![
+        mp(AddressFamily::IPV4_UNICAST),
+        mp(AddressFamily::IPV6_UNICAST),
+        enh(&[v4_via_v6]),
+    ];
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(
+        (&s.extended_next_hop_receive, &s.extended_next_hop_send),
+        (&vec![], &vec![])
     );
 }
 

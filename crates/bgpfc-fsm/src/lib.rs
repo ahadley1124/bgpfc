@@ -241,11 +241,17 @@ pub struct Session {
     /// capability its receiver advertised (RFC 5492 §3). Includes
     /// `families`.
     pub receive_families: Vec<AddressFamily>,
-    /// The families in `families` for which both sides advertised
-    /// Extended Next Hop Encoding (RFC 8950 §4): their routes may carry an
-    /// IPv6 next hop either way. Only IPv4 unicast with an IPv6 next hop
-    /// is ever advertised, so this is that family or nothing.
-    pub extended_next_hop: Vec<AddressFamily>,
+    /// The families in `receive_families` whose routes the peer may send us
+    /// with an IPv6 next hop (RFC 8950 §3): we advertised Extended Next Hop
+    /// Encoding for them, which tells the peer we take one (§4), whether or
+    /// not the peer advertised it too. Only IPv4 unicast with an IPv6 next
+    /// hop is ever advertised, so this is that family or nothing.
+    pub extended_next_hop_receive: Vec<AddressFamily>,
+    /// The families in `families` whose routes we may send the peer with
+    /// an IPv6 next hop: the peer advertised Extended Next Hop Encoding for
+    /// them (RFC 8950 §4), and so did we. Within
+    /// `extended_next_hop_receive`.
+    pub extended_next_hop_send: Vec<AddressFamily>,
     /// Capabilities the peer advertised, verbatim.
     pub peer_capabilities: Vec<Capability>,
 }

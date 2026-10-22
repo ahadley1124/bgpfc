@@ -497,12 +497,21 @@ fn write_neighbor(
             for f in &s.families {
                 j.display(f);
             }
-            // RFC 8950 §4: families that may carry an IPv6 next hop.
-            j.end_array().key("extended_next_hop").begin_array();
-            for f in &s.extended_next_hop {
+            // RFC 8950 §4: families that may carry an IPv6 next hop, from
+            // the peer and to it.
+            j.end_array()
+                .key("extended_next_hop")
+                .begin_object()
+                .key("receive")
+                .begin_array();
+            for f in &s.extended_next_hop_receive {
                 j.display(f);
             }
-            j.end_array().end_object();
+            j.end_array().key("send").begin_array();
+            for f in &s.extended_next_hop_send {
+                j.display(f);
+            }
+            j.end_array().end_object().end_object();
         }
         None => {
             j.null();
@@ -574,14 +583,22 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
             "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
             s.four_octet_as, s.extended_messages, s.route_refresh
         ));
-        if !s.extended_next_hop.is_empty() {
+        if !s.extended_next_hop_receive.is_empty() || !s.extended_next_hop_send.is_empty() {
+            let list = |families: &[AddressFamily]| {
+                if families.is_empty() {
+                    "none".to_owned()
+                } else {
+                    families
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            };
             lines.push(format!(
-                "  extended-next-hop {}",
-                s.extended_next_hop
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                "  extended-next-hop receive {} send {}",
+                list(&s.extended_next_hop_receive),
+                list(&s.extended_next_hop_send)
             ));
         }
         lines.push(format!(
@@ -841,7 +858,8 @@ mod tests {
             route_refresh: true,
             families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
-            extended_next_hop: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop_send: vec![AddressFamily::IPV4_UNICAST],
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -858,21 +876,44 @@ mod tests {
         let r = render_neighbor(&report, &[]);
         assert!(
             r.lines
-                .contains(&"  extended-next-hop ipv4-unicast".to_owned()),
+                .contains(&"  extended-next-hop receive ipv4-unicast send ipv4-unicast".to_owned()),
             "{:?}",
             r.lines
         );
         assert!(
-            r.json.contains(r#""extended_next_hop":["ipv4-unicast"]"#),
+            r.json.contains(
+                r#""extended_next_hop":{"receive":["ipv4-unicast"],"send":["ipv4-unicast"]}"#
+            ),
             "{}",
             r.json
         );
-        // RFC 8950 §4 not negotiated: no line, an empty list.
-        session.extended_next_hop.clear();
+        // RFC 8950 §4 advertised by us alone: taken, not sent.
+        session.extended_next_hop_send.clear();
+        report.session = Some(session.clone());
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  extended-next-hop receive ipv4-unicast send none".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}"#),
+            "{}",
+            r.json
+        );
+        // Not at all: no line, empty lists.
+        session.extended_next_hop_receive.clear();
         report.session = Some(session);
         let r = render_neighbor(&report, &[]);
         assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
-        assert!(r.json.contains(r#""extended_next_hop":[]"#), "{}", r.json);
+        assert!(
+            r.json
+                .contains(r#""extended_next_hop":{"receive":[],"send":[]}"#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]
@@ -915,7 +956,8 @@ mod tests {
                 route_refresh: true,
                 families: vec![v4, v6],
                 receive_families: vec![v4, v6],
-                extended_next_hop: Vec::new(),
+                extended_next_hop_receive: Vec::new(),
+                extended_next_hop_send: Vec::new(),
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,
