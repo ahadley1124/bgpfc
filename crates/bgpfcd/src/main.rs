@@ -436,12 +436,9 @@ impl Coordinator<'_> {
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown) and remove our routes from the kernel.
+    /// Shutdown), remove our routes from the kernel, then stop the RTR
+    /// client.
     fn shutdown(&mut self) {
-        // First, while the RIB thread still takes what the client may be
-        // waiting to publish (see `rpki`), and so that no thread outlives
-        // the coordinator.
-        self.rpki.stop();
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
                 let _ = handle
@@ -458,6 +455,9 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
+        // Last: neither the Ceases nor the FIB cleanup need it, and it may
+        // first have to hand the RIB thread a change (see `rpki`).
+        self.rpki.stop();
         bgpfc_log::info!("bgpfcd stopped");
     }
 }

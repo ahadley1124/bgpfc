@@ -295,7 +295,8 @@ until they expire. List a second cache to have bgpfcd move on to it then.
 version 0 (RFC 6810) for a cache that answers in version 0 (RFC 8210 §7);
 `version 0` starts with version 0, for a cache that mishandles version 1.
 The timeouts are in seconds, each at least 1. `connect-timeout` bounds a
-connection attempt, the name lookup included where the resolver allows.
+connection attempt, the name lookup included where the resolver allows;
+a reload or a shutdown never waits for an attempt to end.
 `response-timeout` bounds the wait for the cache to start answering a
 query, and between two PDUs of an answer; it must be at least
 `connect-timeout`. `reply-timeout` bounds a whole answer, from the query to

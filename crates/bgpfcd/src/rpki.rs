@@ -20,11 +20,14 @@
 //! so that every route is `disabled` again. A reload that leaves the block
 //! alone leaves the client alone.
 //!
-//! [`Rpki::stop`] joins the client thread, which may be waiting for room
-//! on the RIB channel. The RIB thread makes that room as long as it runs,
-//! and it runs until the process exits, so the coordinator stops the
-//! client first at shutdown, and nothing the RIB thread waits for waits
-//! for the client in turn.
+//! Stopping the client, at a reload or at shutdown, joins its thread,
+//! which a stop wakes from its sleep, its reads and writes, and its wait
+//! for a connection attempt (see [`Client::stop`]): a cache that does not
+//! answer holds up neither. The thread may still be waiting for room on
+//! the RIB channel; the RIB thread makes that room, as it runs until the
+//! process exits, and waits for nothing that waits for the client. At
+//! shutdown the coordinator stops the client last, after the Ceases and
+//! the FIB cleanup, which do not need it.
 //!
 //! The client logs through `bgpfc_log`, so the daemon's `log { level }`
 //! applies to it: a lost cache is a warning, its return an info line,
@@ -678,5 +681,73 @@ mod tests {
             matches!(&messages[1..], [RibMsg::Validation(_)]),
             "{messages:?}"
         );
+    }
+
+    /// A port where a connection attempt hangs until its timeout, like one
+    /// to a cache whose host is gone: a listener that never accepts, with
+    /// its accept queue full, so that the kernel drops a new SYN.
+    fn unanswered() -> (TcpListener, Vec<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut queued = Vec::new();
+        loop {
+            match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Ok(stream) => queued.push(stream),
+                Err(e) if e.kind() == ErrorKind::TimedOut => return (listener, queued),
+                Err(e) => panic!("filling the accept queue: {e}"),
+            }
+            assert!(queued.len() < 4_096, "the accept queue never filled");
+        }
+    }
+
+    #[test]
+    fn a_cache_that_never_answers_holds_up_neither_reload_nor_stop() {
+        let (listener, _queued) = unanswered();
+        let hanging = config(&format!(
+            "rpki {{ mode external; cache 127.0.0.1 port {};
+             connect-timeout 30; response-timeout 60; }}",
+            listener.local_addr().unwrap().port()
+        ));
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&hanging.rpki, hanging.router_id, tx).unwrap();
+        let connecting = |rpki: &Rpki| {
+            rpki.status()
+                .is_some_and(|s| s.state == bgpfc_rtr::session::State::Connecting)
+        };
+        eventually("the attempt", || connecting(&rpki));
+        thread::sleep(Duration::from_millis(100));
+        // A reload to another cache while the attempt lasts: the old client
+        // stops at once, and the new one takes over.
+        let cache = StubCache::new();
+        let working = config(&cache.block());
+        let reloading = Instant::now();
+        assert_eq!(
+            rpki.reconfigure(&hanging.rpki, &working.rpki),
+            Ok("rpki: rtr client restarted")
+        );
+        assert!(
+            reloading.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            reloading.elapsed()
+        );
+        let _conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
+        // Back to the cache that never answers, then shutdown during the
+        // attempt.
+        assert_eq!(
+            rpki.reconfigure(&working.rpki, &hanging.rpki),
+            Ok("rpki: rtr client restarted")
+        );
+        eventually("the attempt", || connecting(&rpki));
+        thread::sleep(Duration::from_millis(100));
+        let stopping = Instant::now();
+        rpki.stop();
+        assert!(
+            stopping.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            stopping.elapsed()
+        );
+        assert!(rpki.status().is_none());
+        assert!(rx.try_recv().is_err());
     }
 }
