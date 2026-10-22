@@ -13,8 +13,9 @@ One row per MUST / SHOULD / MAY in each in-scope RFC (AGENTS.md §6).
   `crates/bgpfc-rib/src/` ("rib tests" are `crates/bgpfc-rib/src/tests.rs`),
   `policy/` is `crates/bgpfc-policy/src/` ("policy tests" are
   `crates/bgpfc-policy/src/tests.rs`), `fib/` is `crates/bgpfc-fib/src/`,
-  `sys/` is `crates/bgpfc-sys/src/`, and "interop" names a test in
-  `interop/tests/bird.rs`.
+  `sys/` is `crates/bgpfc-sys/src/`, `rpki/` is `crates/bgpfc-rpki/src/`
+  ("rpki properties" are `crates/bgpfc-rpki/tests/properties.rs`), and
+  "interop" names a test in `interop/tests/bird.rs`.
 
 The README must not claim compliance with an RFC until every MUST row for it
 is `done`.
@@ -330,3 +331,23 @@ is `done`.
 | 9072 §2 | Non-Ext OP Type 255 on send; 255 on receipt selects extended | MUST | done | wire/open.rs | open.rs `extended_parameters_are_chosen_when_needed_and_accepted_always` |
 | 9072 §3 | Type 255 elsewhere is an unrecognised parameter | MUST | done | wire/open.rs `decode_parameters` | open.rs `parameter_errors` |
 | 6286 §2.1 | BGP Identifier is any non-zero 4-octet value | MUST | done | wire/types.rs `RouterId::new` | types.rs `router_id_rejects_zero_only` |
+
+## RFC 6811 — BGP Prefix Origin Validation
+
+The RIB validates every route and keeps its state; nothing acts on the
+state yet (AGENTS.md §9, step 13), and until the RTR client (step 12)
+bgpfcd's only validation source is the null one, so every route is
+`disabled`.
+
+| RFC § | Requirement (short) | Level | Status | Code | Test |
+|---|---|---|---|---|---|
+| 2 | Route Origin ASN: rightmost AS of a final `AS_SEQUENCE`; own AS for an empty `AS_PATH` or a final `AS_CONFED_SEQUENCE` / `AS_CONFED_SET`; NONE otherwise, which no VRP matches | MUST | done (from the `AS_PATH` as received, which the decoder has merged with `AS4_PATH`, RFC 6793 §4.2.3) | rpki/origin.rs `RouteOrigin::from_as_path`, rib/lib.rs `Rib::update`, rib/validation.rs | origin.rs `rightmost_as_of_a_final_sequence`, `local_as_for_an_empty_path_or_a_final_confed_segment`, `none_for_any_other_final_segment`, rib/tests/validation.rs `states_are_set_on_arrival_from_the_source` |
+| 2 | On receipt of an UPDATE, look up each of its routes | SHOULD | done (every route the Adj-RIB-In keeps, against the RIB's `ValidationSource`) | rib/lib.rs `Rib::update` | rib/tests/validation.rs `states_are_set_on_arrival_from_the_source`, `without_a_validation_source_every_route_is_disabled` |
+| 2 | Also look up routes redistributed into BGP from another source | SHOULD | n/a (bgpfc originates and redistributes nothing) | | |
+| 2 | Configuration options to control which routes are looked up | MAY | todo (the `rpki` configuration, AGENTS.md §9 step 13) | | |
+| 2 | The route's validation state is set to the result of the lookup: Valid if a VRP Matches it, Invalid if one Covers it and none Matches, NotFound if none Covers it; no VRP with ASN 0 Matches (also RFC 7607 §2); the result does not depend on the order VRPs are visited | MUST | done (a property of the route, beside its interned attributes, on the routes held in the Adj-RIBs-In, the candidates and the best routes) | rpki/set.rs `VrpSet::validate`, rib/lib.rs `Received`, rib/decision.rs `Candidate`, rib/lib.rs `BestRoute` | set.rs `single_roa_outcomes`, `max_len_edges`, `as0_never_matches`, `origin_none_never_matches`, `one_matching_vrp_among_several_suffices`, rpki properties `validate_follows_the_rfc_procedure`, rib/tests/validation.rs `states_are_set_on_arrival_from_the_source` |
+| 2 | A route not validated is initialized to NotFound | SHOULD | deviates (it is `disabled`, a state of its own, so that operators can tell "not checked" from "no VRP covers it" (issue #52); `RovState::as_rfc6811` reads it as NotFound where RFC 6811 semantics are wanted) | rpki/state.rs `RovState`, rpki/source.rs `NullSource` | state.rs `disabled_is_not_not_found`, rib/tests/validation.rs `without_a_validation_source_every_route_is_disabled` |
+| 2 | The validation state never excludes a route from the Adj-RIB-In or the decision process unless configured to | MUST | done (the Adj-RIBs-In keep every route as received, before import policy; Phase 2 does not read the state; only a configured policy can act on it) | rib/lib.rs `Destination`, rib/decision.rs `best` | rib/tests/validation.rs `all_validates_every_route_again`, order.rs `loc_rib_follows_the_validation_source_in_any_interleaving` |
+| 3 | Route policy can match and set the validation state | MUST | partial (import and export policy are given each route's state, and a route rejected for its state is held and given to import policy again when the state changes, without a ROUTE-REFRESH; no clause matches or sets it yet, AGENTS.md §9 step 13) | rib/lib.rs `Policies`, `import`, rib/validation.rs, policy/lib.rs `Engine` | rib/tests/validation.rs `policy_is_told_the_validation_state`, `a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows`, `a_new_state_of_the_best_route_alone_runs_export_policy_again`, policy tests `engine_applies_each_neighbors_policies` |
+| 3 | Support four-octet AS numbers | MUST | done | rpki/origin.rs, rpki/vrp.rs, wire/as_path.rs | origin.rs `rightmost_as_of_a_final_sequence`, rib/tests/validation.rs `states_are_set_on_arrival_from_the_source` |
+| 4 | When a mapping is added or deleted, re-validate the affected prefixes and run the decision process if needed | MUST | done (a `ValidationChange` names the new source and the routes it may judge differently, every route its changed VRP prefixes cover, wider than §4's wording so that a VRP that turns a route Invalid without matching it counts; the RIB validates those again in place, found with a range query per changed prefix, and a route whose state changed goes through import policy, the decision process and the paced Adj-RIBs-Out as for an UPDATE; each change of state is logged at info, issue #59) | rpki/affected.rs `AffectedPrefixes`, rpki/source.rs `ValidationChange`, rib/validation.rs `Rib::validation_changed`, bgpfcd/rib.rs `deliver` | affected.rs `a_vrp_that_can_never_match_still_affects_what_it_covers`, rpki properties `affected_prefixes_cover_every_route_that_changes_state`, rib/tests/validation.rs `only_the_affected_routes_are_validated_again_in_place`, `a_small_delta_against_a_large_table_finds_exactly_its_routes`, `validation_changes_are_paced_like_updates`, rib/validation.rs `walks_visit_exactly_the_covered_destinations`, order.rs `loc_rib_follows_the_validation_source_in_any_interleaving`, bgpfcd/rib.rs `a_validation_state_change_is_one_info_line` |
