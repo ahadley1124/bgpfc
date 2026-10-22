@@ -57,6 +57,7 @@ fn peers() -> Vec<PeerInfo> {
             // Unpaced, so the Adj-RIBs-Out are final after the last step;
             // tests/pacing.rs covers the paced case.
             advertisement_interval: Duration::ZERO,
+            prefix_limits: Vec::new(),
         })
         .collect()
 }

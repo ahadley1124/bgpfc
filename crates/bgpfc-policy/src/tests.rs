@@ -247,6 +247,7 @@ fn engine_applies_each_neighbors_policies() {
         extended_messages: false,
         extended_next_hop: Vec::new(),
         advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
@@ -287,6 +288,7 @@ fn engine_tells_next_hop_self_what_the_session_negotiated() {
         extended_messages: false,
         extended_next_hop: Vec::new(),
         advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();

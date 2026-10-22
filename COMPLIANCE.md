@@ -54,7 +54,7 @@ is `done`.
 | 6.5 | Hold Timer Expired NOTIFICATION, then close | MUST | done | wire/notification.rs `hold_timer_expired`, fsm/machine.rs (event 10) | fsm tests state tables |
 | 6.6 | FSM errors use Error Code Finite State Machine Error | MUST | done | fsm/machine.rs `fsm_error` | fsm tests state tables, `fsm_error_data_names_the_unexpected_message` |
 | 6.7 | Cease only in the absence of a fatal error | MUST | done (Cease only for stops and collisions) | fsm/machine.rs | fsm tests state tables |
-| 6.7 | May impose a prefix limit and Cease when reached | MAY | todo (RIB) | | |
+| 6.7 | May impose a prefix limit and Cease when reached | MAY | partial (the RIB counts each peer's accepted routes per family, drops them all once a limit is exceeded and reports it; not yet configurable, no Cease yet) | rib/lib.rs `Rib::update`, `prefix_limit_exceeded`, `set_prefix_limits` | rib tests `prefix_limit_counts_accepted_routes_and_ends_the_session`, `prefix_limit_crossed_inside_one_update_passes_nothing_on`, `prefix_limits_follow_a_reload`; rib/tests/prefix_limit.rs |
 
 | 4.3 | UPDATE: withdrawn routes length/field, total path attribute length/field, NLRI | MUST | done | wire/update.rs `encode`, `split_fields` | update.rs `announce_round_trips`, `withdraw_only_and_empty_updates` |
 | 4.3 | Prefix `<length, prefix>` with minimal octets; length 0 is the default route; trailing bits irrelevant | MUST | done | wire/prefix.rs | prefix.rs `encoding_uses_the_minimum_octets`, `trailing_bits_are_ignored_on_decode` |

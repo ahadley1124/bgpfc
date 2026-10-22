@@ -78,6 +78,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         // Pacing off: these tests are about what is sent; the RFC 4271
         // §9.2.1.1 tests below are about when.
         advertisement_interval: Duration::ZERO,
+        prefix_limits: Vec::new(),
     }
 }
 
@@ -954,6 +955,217 @@ fn reexport_sends_only_the_difference() {
     assert!(rib.peer(e2.addr).is_some());
     assert!(rib.peer(ip("10.9.9.9")).is_none());
     assert_eq!(rib.reexport(ip("10.9.9.9"), V4, now()).len(), 0);
+}
+
+// --- RFC 4271 §6.7 prefix limit -------------------------------------------
+
+fn limited(mut info: PeerInfo, family: AddressFamily, limit: u32) -> PeerInfo {
+    info.prefix_limits.push((family, limit));
+    info
+}
+
+fn limit_hits(out: &[Output]) -> Vec<(IpAddr, AddressFamily, u32)> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::PrefixLimitExceeded {
+                peer,
+                family,
+                limit,
+            } => Some((*peer, *family, *limit)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Import policy that rejects one prefix.
+struct RejectOne(Prefix);
+
+impl crate::Policies for RejectOne {
+    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> crate::Verdict {
+        if p == self.0 {
+            crate::Verdict::Reject
+        } else {
+            crate::Verdict::Accept
+        }
+    }
+    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> crate::Verdict {
+        crate::Verdict::Accept
+    }
+}
+
+#[test]
+fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOne(p("192.0.2.128/25"))));
+    let e1 = limited(peer("10.0.0.1", 65_001, 1), V4, 2);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    assert_eq!(e1.prefix_limit(V4), Some(2));
+    assert_eq!(e1.prefix_limit(V6), None);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let a = attrs(&[65_001], "10.0.0.1");
+    // Up to the limit is fine: RFC 4271 §6.7 acts when it is exceeded.
+    let out = rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+        now(),
+    );
+    assert_eq!(limit_hits(&out), vec![]);
+    // Not counted: a replacement, routes the RIB does not keep (import
+    // policy rejects, an AS loop, a leftmost AS that is not the peer's),
+    // and another family's routes.
+    let routes: [(&str, &[u32]); 4] = [
+        ("192.0.2.0/24", &[65_001, 9]),
+        ("192.0.2.128/25", &[65_001]),
+        ("203.0.113.0/24", &[65_001, LOCAL_AS.0]),
+        ("203.0.113.0/24", &[65_009]),
+    ];
+    for (prefix, path) in routes {
+        let out = rib.update(
+            e1.addr,
+            &announce(&[prefix], &attrs(path, "10.0.0.1")),
+            now(),
+        );
+        assert_eq!(limit_hits(&out), vec![], "{prefix} {path:?}");
+    }
+    let v6 = attrs(&[65_001], "2001:db8::1");
+    let v6_prefixes = ["2001:db8:1::/48", "2001:db8:2::/48", "2001:db8:3::/48"];
+    rib.update(e1.addr, &announce(&v6_prefixes, &v6), now());
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 2), (V6, 3)]
+    );
+    // A withdrawal makes room again.
+    rib.update(e1.addr, &withdraw(&["198.51.100.0/24"]), now());
+    let out = rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now());
+    assert_eq!(limit_hits(&out), vec![]);
+    // One route over: the session ends (RFC 4271 §6.7 (b)), which is
+    // reported first, and every route from e1 goes at once, in both
+    // families, from the FIB and from e2.
+    let out = rib.update(e1.addr, &announce(&["203.0.113.0/24"], &a), now());
+    assert_eq!(limit_hits(&out), vec![(e1.addr, V4, 2)]);
+    assert!(matches!(out[0], Output::PrefixLimitExceeded { .. }));
+    let f = fib(&out);
+    assert_eq!(f.len(), 5);
+    assert!(f.iter().all(|c| c.next_hop.is_none()));
+    let to_e2 = sends(&out, e2.addr);
+    assert_eq!(to_e2.len(), 2);
+    let m = decode_sent(to_e2[0], &e2);
+    assert_eq!(
+        m[0].withdrawn,
+        vec![p("192.0.2.0/24"), p("198.51.100.0/24")]
+    );
+    let m = decode_sent(to_e2[1], &e2);
+    assert_eq!(m[0].mp_unreach.as_ref().unwrap().withdrawn.len(), 3);
+    assert_eq!(rib.loc_rib(V4).count(), 0);
+    assert_eq!(rib.loc_rib(V6).count(), 0);
+    assert_eq!(rib.candidates(V4, p("203.0.113.0/24")).len(), 0);
+    assert!(rib.peer(e1.addr).is_none());
+    assert_eq!(rib.peer_stats(e1.addr), None);
+    // What e1 sends until its session is down is ignored, and the end of
+    // the session has nothing left to remove.
+    let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), now());
+    assert_eq!(out, vec![]);
+    assert_eq!(rib.peer_down(e1.addr, now()), vec![]);
+    // The next session starts counting from zero.
+    rib.peer_up(e1.clone(), now());
+    let out = rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+        now(),
+    );
+    assert_eq!(limit_hits(&out), vec![]);
+    assert_eq!(rib.loc_rib(V4).count(), 2);
+}
+
+#[test]
+fn prefix_limit_crossed_inside_one_update_passes_nothing_on() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = limited(peer("10.0.0.1", 65_001, 1), V4, 2);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let e3 = peer("10.0.0.3", 65_003, 3);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    rib.peer_up(e3.clone(), now());
+    // e2 already has a route to one of the destinations.
+    rib.update(
+        e2.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_002, 7, 7], "10.0.0.2")),
+        now(),
+    );
+    // e1's UPDATE carries three routes against a limit of two, with a
+    // better path to e2's destination: none of them may reach the
+    // Loc-RIB, the FIB or another peer, even for a moment.
+    let out = rib.update(
+        e1.addr,
+        &announce(
+            &["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"],
+            &attrs(&[65_001], "10.0.0.1"),
+        ),
+        now(),
+    );
+    assert_eq!(
+        out,
+        vec![Output::PrefixLimitExceeded {
+            peer: e1.addr,
+            family: V4,
+            limit: 2
+        }]
+    );
+    let loc: Vec<_> = rib.loc_rib(V4).map(|(p, b)| (p, b.peer)).collect();
+    assert_eq!(loc, vec![(p("192.0.2.0/24"), e2.addr)]);
+    for prefix in ["198.51.100.0/24", "203.0.113.0/24"] {
+        assert_eq!(rib.candidates(V4, p(prefix)).len(), 0, "{prefix}");
+    }
+    assert_eq!(rib.adj_rib_out(e3.addr, V4).count(), 1);
+}
+
+#[test]
+fn prefix_limits_follow_a_reload() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    rib.peer_up(e1.clone(), now());
+    rib.update(
+        e1.addr,
+        &announce(
+            &["192.0.2.0/24", "198.51.100.0/24"],
+            &attrs(&[65_001], "10.0.0.1"),
+        ),
+        now(),
+    );
+    rib.update(
+        e1.addr,
+        &announce(
+            &["2001:db8:1::/48", "2001:db8:2::/48", "2001:db8:3::/48"],
+            &attrs(&[65_001], "2001:db8::1"),
+        ),
+        now(),
+    );
+    // At or above the count: nothing happens, and the limit is kept.
+    let out = rib.set_prefix_limits(e1.addr, vec![(V4, 2), (V6, 10)], now());
+    assert_eq!(out, vec![]);
+    assert_eq!(rib.peer(e1.addr).unwrap().prefix_limit(V4), Some(2));
+    let out = rib.update(
+        e1.addr,
+        &announce(&["203.0.113.0/24"], &attrs(&[65_001], "10.0.0.1")),
+        now(),
+    );
+    assert_eq!(limit_hits(&out), vec![(e1.addr, V4, 2)]);
+    // Below the count: as if the limit had just been exceeded.
+    rib.peer_up(e1.clone(), now());
+    rib.update(
+        e1.addr,
+        &announce(
+            &["2001:db8:1::/48", "2001:db8:2::/48", "2001:db8:3::/48"],
+            &attrs(&[65_001], "2001:db8::1"),
+        ),
+        now(),
+    );
+    let out = rib.set_prefix_limits(e1.addr, vec![(V4, 2), (V6, 2)], now());
+    assert_eq!(limit_hits(&out), vec![(e1.addr, V6, 2)]);
+    assert_eq!(fib(&out).len(), 3);
+    assert!(rib.peer(e1.addr).is_none());
+    // An unknown peer: nothing.
+    assert_eq!(rib.set_prefix_limits(ip("10.9.9.9"), vec![], now()), vec![]);
 }
 
 // --- RFC 4271 §9.2.1.1 MinRouteAdvertisementIntervalTimer -------------

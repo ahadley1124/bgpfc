@@ -1,7 +1,8 @@
 //! What the RIB knows about a session.
 //!
 //! Implements: RFC 4760 §8 (negotiated families); RFC 8654 §4 (message
-//! size); RFC 8950 §4 (which next hops a peer takes).
+//! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
+//! per-family prefix limit).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -41,6 +42,11 @@ pub struct PeerInfo {
     /// [`default_interval`](crate::pacing::default_interval) gives the
     /// RFC 4271 §10 default.
     pub advertisement_interval: Duration,
+    /// The upper bound on the routes of each listed family the peer may
+    /// have in the Adj-RIB-In (RFC 4271 §6.7); exceeding it ends the
+    /// session (see [`Output::PrefixLimitExceeded`](crate::Output)).
+    /// Families not listed have none.
+    pub prefix_limits: Vec<(AddressFamily, u32)>,
 }
 
 impl PeerInfo {
@@ -59,6 +65,15 @@ impl PeerInfo {
     #[must_use]
     pub fn speaks(&self, family: AddressFamily) -> bool {
         self.families.contains(&family)
+    }
+
+    /// The prefix limit for `family`, if there is one (RFC 4271 §6.7).
+    #[must_use]
+    pub fn prefix_limit(&self, family: AddressFamily) -> Option<u32> {
+        self.prefix_limits
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, l)| *l)
     }
 
     /// Whether a route of `family` may go to this peer with `next_hop`:

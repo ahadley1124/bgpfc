@@ -200,6 +200,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         extended_messages: s.extended_messages,
         extended_next_hop: s.extended_next_hop.clone(),
         advertisement_interval: interval,
+        prefix_limits: Vec::new(),
     }
 }
 
@@ -234,6 +235,18 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
             }
             Output::EncodeFailed { peer, error } => {
                 bgpfc_log::error!("rib: cannot encode update", peer = peer, error = error);
+            }
+            Output::PrefixLimitExceeded {
+                peer,
+                family,
+                limit,
+            } => {
+                bgpfc_log::error!(
+                    "rib: prefix limit exceeded",
+                    peer = peer,
+                    family = family,
+                    limit = limit
+                );
             }
         }
     }

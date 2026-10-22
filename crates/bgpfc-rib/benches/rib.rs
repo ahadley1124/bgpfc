@@ -29,6 +29,7 @@ fn peer(i: u8) -> PeerInfo {
         extended_messages: false,
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
+        prefix_limits: Vec::new(),
     }
 }
 
@@ -36,6 +37,7 @@ fn peer(i: u8) -> PeerInfo {
 fn paced_peer(i: u8) -> PeerInfo {
     PeerInfo {
         advertisement_interval: Duration::from_secs(30),
+        prefix_limits: Vec::new(),
         ..peer(i)
     }
 }

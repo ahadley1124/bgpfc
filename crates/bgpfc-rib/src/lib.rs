@@ -12,7 +12,8 @@
 //! RFC 4760 §3, §5, §7 (each NLRI field with its own next hop, per-family
 //! RIBs, family disable); RFC 2918 §4 (route refresh re-sends the
 //! Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6 next hop, see
-//! [`export`]).
+//! [`export`]); RFC 4271 §6.7 (a per-family prefix limit that ends the
+//! session, see [`Output::PrefixLimitExceeded`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -123,6 +124,19 @@ pub enum Output {
         /// Why.
         error: bgpfc_wire::error::EncodeError,
     },
+    /// The peer has more routes of `family` than its prefix limit allows
+    /// (RFC 4271 §6.7). The RIB has already dropped every route the peer
+    /// sent and forgotten the peer, so nothing it sends from now on is
+    /// used; the caller ends the session with a Cease / Maximum Number of
+    /// Prefixes Reached carrying `family` and `limit` (RFC 4486 §4).
+    PrefixLimitExceeded {
+        /// The peer.
+        peer: IpAddr,
+        /// The family over its limit.
+        family: AddressFamily,
+        /// The limit.
+        limit: u32,
+    },
 }
 
 /// The best route to a destination.
@@ -151,6 +165,15 @@ struct PeerState {
     adj_out: HashMap<AddressFamily, AdjRibOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: HashMap<AddressFamily, usize>,
+}
+
+impl PeerState {
+    /// Routes of `family` in the Adj-RIB-In.
+    fn received(&self, family: AddressFamily) -> u64 {
+        self.adj_in_count
+            .get(&family)
+            .map_or(0, |n| u64::try_from(*n).unwrap_or(u64::MAX))
+    }
 }
 
 /// Counters about one peer, for the control plane.
@@ -254,6 +277,13 @@ impl Rib {
 
     /// The session left Established: forget the peer and its routes.
     pub fn peer_down(&mut self, addr: IpAddr, now: Instant) -> Vec<Output> {
+        let dirty = self.forget_peer(addr);
+        self.reconsider(&dirty, now)
+    }
+
+    /// Remove the peer and every route it sent; the destinations whose
+    /// candidates changed.
+    fn forget_peer(&mut self, addr: IpAddr) -> Vec<(AddressFamily, Prefix)> {
         let Some(state) = self.peers.remove(&addr) else {
             return Vec::new();
         };
@@ -267,7 +297,56 @@ impl Rib {
                 }
             }
         }
-        self.reconsider(&dirty, now)
+        dirty
+    }
+
+    /// Change the prefix limits of peer `addr` (RFC 4271 §6.7), as a reload
+    /// does. A family already over its new limit is handled as if the
+    /// limit had just been exceeded.
+    pub fn set_prefix_limits(
+        &mut self,
+        addr: IpAddr,
+        limits: Vec<(AddressFamily, u32)>,
+        now: Instant,
+    ) -> Vec<Output> {
+        let Some(state) = self.peers.get_mut(&addr) else {
+            return Vec::new();
+        };
+        state.info.prefix_limits = limits;
+        let over = state
+            .info
+            .prefix_limits
+            .iter()
+            .copied()
+            .find(|(f, l)| state.received(*f) > u64::from(*l));
+        match over {
+            Some((family, limit)) => {
+                self.prefix_limit_exceeded(addr, family, limit, Vec::new(), now)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// RFC 4271 §6.7 (b): the speaker "terminates the BGP connection with
+    /// the neighbor". The routes the peer sent go at once, those of the
+    /// UPDATE that crossed the limit included, so none of them is passed
+    /// on; the caller sends the Cease (RFC 4486 §4).
+    fn prefix_limit_exceeded(
+        &mut self,
+        addr: IpAddr,
+        family: AddressFamily,
+        limit: u32,
+        mut dirty: Vec<(AddressFamily, Prefix)>,
+        now: Instant,
+    ) -> Vec<Output> {
+        dirty.extend(self.forget_peer(addr));
+        let mut out = vec![Output::PrefixLimitExceeded {
+            peer: addr,
+            family,
+            limit,
+        }];
+        out.extend(self.reconsider(&dirty, now));
+        out
     }
 
     /// Stop accepting `family` from `addr` and drop what it sent
@@ -520,11 +599,31 @@ impl Rib {
             let attrs = self
                 .interner
                 .intern(PathAttrs::from_update(&update.message, next_hop));
+            let limit = info.prefix_limit(family);
             for &prefix in prefixes {
                 self.announce(addr, &info, family, prefix, &attrs, &mut dirty);
+                // RFC 4271 §6.7: "the number of address prefixes received
+                // from the neighbor exceeds the locally-configured, upper
+                // bound". Counted are the routes the Adj-RIB-In holds after
+                // the loop checks and import policy, the ones "the speaker
+                // is willing to accept" (§6.7): a rejected route is not
+                // stored, so counting it would take the memory the limit
+                // is there to bound.
+                // NOTE(interop): FRR's `maximum-prefix` without `force`
+                // and BIRD's `import limit` count accepted routes too.
+                if let Some(limit) = limit
+                    && self.received(addr, family) > u64::from(limit)
+                {
+                    return self.prefix_limit_exceeded(addr, family, limit, dirty, now);
+                }
             }
         }
         self.reconsider(&dirty, now)
+    }
+
+    /// Routes of `family` from `addr` in the Adj-RIB-In.
+    fn received(&self, addr: IpAddr, family: AddressFamily) -> u64 {
+        self.peers.get(&addr).map_or(0, |s| s.received(family))
     }
 
     /// One announced route from `addr` into the Adj-RIB-In, after the loop
@@ -688,6 +787,11 @@ impl Rib {
                 _ => true,
             };
             if !changed {
+                // A destination created and emptied before it was ever
+                // decided (a prefix limit drops the UPDATE's own routes).
+                if dest.candidates.is_empty() {
+                    table.remove(&prefix);
+                }
                 continue;
             }
             dest.best.clone_from(&new_best);
