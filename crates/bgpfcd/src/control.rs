@@ -617,8 +617,8 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
 
 fn render_routes(routes: &[RouteReport]) -> Reply {
     let mut lines = vec![format!(
-        "{:<44} {:<40} {:<8} {:>5} {:>7} path",
-        "prefix", "next-hop", "origin", "lpref", "med"
+        "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} path",
+        "prefix", "next-hop", "origin", "lpref", "med", "rov"
     )];
     let mut j = Json::new();
     j.begin_array();
@@ -628,13 +628,14 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
         // `Prefix` and `Origin` write themselves without the padding a
         // width asks for, so they are padded as strings.
         lines.push(format!(
-            "{}{:<43} {:<40} {:<8} {:>5} {:>7} {} via {}",
+            "{}{:<43} {:<40} {:<8} {:>5} {:>7} {:<9} {} via {}",
             if r.best { "*" } else { " " },
             r.prefix.to_string(),
             a.next_hop_addr(),
             a.origin.to_string(),
             a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
             a.med.map_or("-".to_owned(), |v| v.to_string()),
+            r.rov.as_str(),
             if path.is_empty() {
                 "-".to_owned()
             } else {
@@ -650,6 +651,7 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
             .field_opt_num("med", a.med)
             .field_display("peer", r.peer)
             .field_bool("best", r.best)
+            .field_str("rov", r.rov.as_str())
             .key("as_path")
             .begin_array();
         for asn in a.as_path.asns() {
@@ -842,6 +844,7 @@ fn http_respond(ctx: &Ctx, req: &http::Request) -> http::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bgpfc_rib::RovState;
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
@@ -1071,25 +1074,27 @@ mod tests {
         );
     }
 
-    /// A route to `prefix` from `peer`, through AS 64511 from AS 64496.
+    /// A route to `prefix` from `peer` along `path`, not the best, and
+    /// not validated.
     fn route(
         prefix: &str,
         peer: &str,
+        path: &[u32],
         local_pref: Option<u32>,
         med: Option<u32>,
-        best: bool,
     ) -> RouteReport {
         use bgpfc_wire::as_path::AsPath;
         use bgpfc_wire::attribute::Origin;
         use bgpfc_wire::community::Community;
         use bgpfc_wire::mp::NextHop;
         let peer: std::net::Ipv4Addr = peer.parse().unwrap();
+        let path: Vec<Asn> = path.iter().map(|&a| Asn(a)).collect();
         RouteReport {
             prefix: prefix.parse().unwrap(),
             peer: IpAddr::V4(peer),
             attrs: Arc::new(bgpfc_rib::PathAttrs {
                 origin: Origin::Igp,
-                as_path: AsPath::sequence(&[Asn(64_511), Asn(64_496)]),
+                as_path: AsPath::sequence(&path),
                 next_hop: NextHop::Ipv4(peer),
                 med,
                 local_pref,
@@ -1100,46 +1105,77 @@ mod tests {
                 large_communities: Vec::new(),
                 unknown: Vec::new(),
             }),
-            best,
+            best: false,
+            rov: RovState::Disabled,
         }
     }
 
     #[test]
     fn routes_render_as_lines_and_json() {
-        let r = render_routes(&[
-            route("192.0.2.0/24", "198.51.100.1", Some(100), None, true),
-            route("192.0.2.0/24", "198.51.100.2", None, Some(50), false),
-        ]);
+        // Two routes to one destination, from different origin ASes: a
+        // VRP for AS 64496 makes one valid and the other invalid. The
+        // invalid one stays a candidate (RFC 6811 §2).
+        let mut best = route(
+            "192.0.2.0/24",
+            "198.51.100.1",
+            &[64_511, 64_496],
+            Some(100),
+            None,
+        );
+        best.best = true;
+        best.rov = RovState::Valid;
+        let mut other = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, Some(50));
+        other.rov = RovState::Invalid;
+        let r = render_routes(&[best, other]);
         // Every column starts where its header does; `*` marks the best.
         assert_eq!(
             r.lines,
             [
                 format!(
-                    "{:<44} {:<40} {:<8} {:>5} {:>7} path",
-                    "prefix", "next-hop", "origin", "lpref", "med"
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} path",
+                    "prefix", "next-hop", "origin", "lpref", "med", "rov"
                 ),
                 format!(
-                    "{:<44} {:<40} {:<8} {:>5} {:>7} 64511 64496 via 198.51.100.1",
-                    "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-"
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64511 64496 via 198.51.100.1",
+                    "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-", "valid"
                 ),
                 format!(
-                    "{:<44} {:<40} {:<8} {:>5} {:>7} 64511 64496 via 198.51.100.2",
-                    " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50"
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2",
+                    " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50", "invalid"
                 ),
             ]
         );
-        // docs/control.md: `local_pref` and `med` are numbers, or null.
+        // docs/control.md: `local_pref` and `med` are numbers, or null;
+        // `rov` is the state's name.
         assert_eq!(
             r.json,
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
                 r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
-                r#""as_path":[64511,64496],"communities":["64511:100"],"large_communities":[]},"#,
+                r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
+                r#""large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
                 r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
-                r#""as_path":[64511,64496],"communities":["64511:100"],"large_communities":[]}]"#
+                r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
+                r#""large_communities":[]}]"#
             )
         );
+        // Every state, by its name, both ways.
+        for rov in RovState::ALL {
+            let mut r = route("2001:db8::/32", "198.51.100.1", &[], None, None);
+            r.rov = rov;
+            let out = render_routes(&[r]);
+            assert!(
+                out.lines[1].contains(&format!(" {:<9} - via ", rov.as_str())),
+                "{:?}",
+                out.lines
+            );
+            assert!(
+                out.json.contains(&format!(r#""rov":"{rov}""#)),
+                "{}",
+                out.json
+            );
+        }
     }
 
     #[test]

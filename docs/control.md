@@ -31,7 +31,7 @@ failure, 2 on a usage error.
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received counts the routes the neighbor sent, before the import policy: what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*` |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed`, `pending` or `stale` |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
@@ -87,10 +87,37 @@ Example objects:
              "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","best":true,"as_path":[64511],"communities":[],"large_communities":[]}]
+  "peer":"198.51.100.1","best":true,"rov":"disabled","as_path":[64511],"communities":[],
+  "large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 ```
+
+## Validation state
+
+Every route carries its RFC 6811 origin validation state, which `show
+routes` prints in the `rov` column and `GET /v1/routes` as the `rov`
+member:
+
+| `rov` | Meaning |
+|---|---|
+| `valid` | a VRP matches the route: it covers the prefix, allows its length, and names its origin AS (RFC 6811 §2) |
+| `invalid` | at least one VRP covers the prefix, but none matches the route |
+| `not-found` | no VRP covers the prefix |
+| `disabled` | origin validation is not performed |
+
+`disabled` is kept apart from `not-found`, which RFC 6811 §2 suggests for
+a route that was not validated, so that a route nobody checked can be told
+from one that no VRP covers (issue #52). bgpfcd cannot be given a
+validation source yet, so for now every route is `disabled`.
+
+The state is judged on the route as the neighbor sent it, before import
+policy, and follows the validation source when it changes. It is shown
+for information only: it does not yet change whether a route is used or
+which one is chosen.
+
+Routes also carry an ASPA verdict. Until ASPA verification exists, its
+only value is `disabled`, so it is not shown.
 
 ## Reload
 

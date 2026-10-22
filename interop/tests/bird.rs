@@ -460,6 +460,8 @@ fn control_plane_commands() {
         ok && out.contains("*192.0.2.0/24") && out.contains("65001"),
         "{out}"
     );
+    // No validation source: the route is not validated (issue #52).
+    assert!(out.contains(" disabled "), "{out}");
     let (out, ok) = ctl(&["show", "fib"]);
     assert!(ok && out.starts_with("mode dry-run"), "{out}");
     let (out, ok) = ctl(&["show", "status"]);
@@ -486,7 +488,9 @@ fn control_plane_commands() {
     assert!(r.contains("\"state\":\"Established\""), "{r}");
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/routes?family=ipv4"]);
     assert!(
-        r.contains("\"prefix\":\"192.0.2.0/24\"") && r.contains("\"as_path\":[65001]"),
+        r.contains("\"prefix\":\"192.0.2.0/24\"")
+            && r.contains("\"as_path\":[65001]")
+            && r.contains("\"rov\":\"disabled\""),
         "{r}"
     );
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/nope"]);

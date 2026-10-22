@@ -178,6 +178,9 @@ pub(crate) struct RouteReport {
     pub(crate) attrs: std::sync::Arc<bgpfc_rib::PathAttrs>,
     /// Whether it is the chosen route.
     pub(crate) best: bool,
+    /// Its RFC 6811 §2 origin validation state, judged on the route as
+    /// received; `Disabled` while there is no validation source.
+    pub(crate) rov: bgpfc_rib::RovState,
 }
 
 /// The RIB's answer.

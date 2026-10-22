@@ -447,6 +447,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                             peer: c.peer,
                             attrs: std::sync::Arc::clone(&c.attrs),
                             best: best == Some(c.peer),
+                            rov: c.rov,
                         })
                         .collect(),
                 )
@@ -458,6 +459,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         peer: b.peer,
                         attrs: std::sync::Arc::clone(&b.attrs),
                         best: true,
+                        rov: b.rov,
                     })
                     .collect(),
             ),
