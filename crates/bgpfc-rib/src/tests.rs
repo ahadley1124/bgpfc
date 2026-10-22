@@ -410,6 +410,57 @@ fn ipv6_next_hop_self_and_v4_over_v6_session() {
     assert_eq!(e.next_hop, a4.next_hop);
 }
 
+#[test]
+fn link_local_next_hops_are_never_passed_on() {
+    // RFC 2545 §3: a link-local address only where we share a subnet with
+    // the next hop and the peer, which bgpfc cannot tell; §3 lets it go
+    // towards an internal peer.
+    let from = peer("2001:db8::1", 65_001, 1);
+    let src = Source {
+        peer: from.addr,
+        kind: from.kind,
+    };
+    let mut a = attrs(&[65_001], "2001:db8::1");
+    a.next_hop = v6_next_hop("2001:db8:1::1", "fe80::1");
+    let global = NextHop::Ipv6 {
+        global: "2001:db8:1::1".parse().unwrap(),
+        link_local: None,
+    };
+    // To an internal peer, whatever its session.
+    for to in [
+        peer("2001:db8::5", LOCAL_AS.0, 5),
+        peer("10.0.0.6", LOCAL_AS.0, 6),
+    ] {
+        let e = export(LOCAL_AS, V6, src, &a, &to).unwrap();
+        assert_eq!(e.next_hop, global, "{}", to.addr);
+    }
+    // An IPv6 route to an external peer over IPv4 keeps its next hop
+    // (RFC 4271 §5.1.3 has no address of ours to put there), without the
+    // link-local address.
+    let e = export(LOCAL_AS, V6, src, &a, &peer("10.0.0.4", 65_004, 4)).unwrap();
+    assert_eq!(e.next_hop, global);
+    // Over IPv6 it is our own global address.
+    let e = export(LOCAL_AS, V6, src, &a, &peer("2001:db8::3", 65_003, 3)).unwrap();
+    assert_eq!(
+        e.next_hop,
+        NextHop::Ipv6 {
+            global: "2001:db8::fe".parse().unwrap(),
+            link_local: None
+        }
+    );
+    // End to end: what an internal peer is sent carries 16 octets of
+    // next hop.
+    let mut rib = Rib::new(LOCAL_AS);
+    let int = peer("2001:db8::5", LOCAL_AS.0, 5);
+    rib.peer_up(from.clone(), now());
+    rib.peer_up(int.clone(), now());
+    let out = rib.update(from.addr, &announce(&["2001:db8:9::/48"], &a), now());
+    let sent = decode_sent(sends(&out, int.addr)[0], &int);
+    assert_eq!(sent[0].mp_reach.as_ref().unwrap().next_hop, global);
+    // The FIB still gets the global address.
+    assert_eq!(fib(&out)[0].next_hop, Some(ip("2001:db8:1::1")));
+}
+
 /// `info` with RFC 8950 extended next hop negotiated for IPv4 unicast.
 fn enh(mut info: PeerInfo) -> PeerInfo {
     info.extended_next_hop = vec![V4];
@@ -452,10 +503,17 @@ fn rfc8950_export_rules() {
     // External over IPv6 without RFC 8950: we have no next hop it may
     // take, so the route is not advertised (§4).
     assert_eq!(export(LOCAL_AS, V4, src, &a, &ext6), None);
-    // Internal: the next hop is passed on unchanged with its encoding,
-    // and only to a peer that takes it (§5).
+    // Internal: the next hop is passed on with its encoding, and only to
+    // a peer that takes it (§5); its link-local address stays behind (RFC
+    // 2545 §3).
     let e = export(LOCAL_AS, V4, src, &a, &int_enh).unwrap();
-    assert_eq!(e.next_hop, a.next_hop);
+    assert_eq!(
+        e.next_hop,
+        NextHop::Ipv6 {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: None
+        }
+    );
     assert_eq!(export(LOCAL_AS, V4, src, &a, &int), None);
     // An IPv4 next hop: with RFC 8950 on an IPv6 session our own address
     // is the IPv6 one (§5); without it the received one stays.

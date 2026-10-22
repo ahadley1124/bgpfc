@@ -10,17 +10,19 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > **Status:** v1 feature-complete and exercised against BIRD, FRR and GoBGP in
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
-> row is `done` for RFC 4760, 2545, 8950, 5492, 6793, 2918, 7606, 8654, 1997,
-> 4360, 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five
-> rows open. Two need the host's interfaces and routes, which bgpfc does not
-> track, so the kernel's verdict is logged instead: next-hop resolvability
-> (§9.1.2), and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is
-> partial: a received next hop is checked against our own address on that
-> session, not against every address of the host (§6.3 a). Two are deliberate
-> deviations: a NOTIFICATION received in OpenSent closes the connection without
-> an FSM error in reply, as BIRD and FRR do (§8.2.2), and the
-> MinRouteAdvertisementInterval timer paces announcements but never holds back
-> a withdrawal (§9.2.1.1). Nothing else is claimed.
+> row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five rows
+> open. Two need the host's interfaces and routes, which bgpfc does not track,
+> so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
+> and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
+> a received next hop is checked against our own address on that session, not
+> against every address of the host (§6.3 a). Two are deliberate deviations: a
+> NOTIFICATION received in OpenSent closes the connection without an FSM error
+> in reply, as BIRD and FRR do (§8.2.2), and the MinRouteAdvertisementInterval
+> timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
+> 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
+> link-local next hop, which §3 asks for where it shares a subnet with the next
+> hop and the peer. Nothing else is claimed.
 
 ### What works
 

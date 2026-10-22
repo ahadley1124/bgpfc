@@ -7,10 +7,11 @@
 //! §9.2 (no internal-to-internal redistribution), §9.2 and §4.1 (message
 //! size); RFC 1997 (`NO_EXPORT`, `NO_ADVERTISE`); RFC 4360 §6
 //! (non-transitive extended communities stay in the AS); RFC 2545 §3
-//! (IPv6 next hops); RFC 8654 §4 (65535-octet UPDATEs); RFC 8950 §4 (an
-//! IPv6 next hop for IPv4 NLRI only to a peer that advertised it), §5 (our
-//! own address is of the session's protocol; a next hop passed on keeps
-//! its encoding).
+//! (IPv6 next hops, never with a link-local address, as bgpfc cannot tell
+//! whether a subnet is shared); RFC 8654 §4 (65535-octet UPDATEs); RFC
+//! 8950 §4 (an IPv6 next hop for IPv4 NLRI only to a peer that advertised
+//! it), §5 (our own address is of the session's protocol; a next hop
+//! passed on keeps its encoding).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -126,6 +127,18 @@ pub fn export(
             out.local_pref = Some(attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF));
         }
     }
+    // RFC 2545 §3: "The link-local address shall be included in the Next
+    // Hop field if and only if the BGP speaker shares a common subnet with
+    // the entity identified by the global IPv6 address ... and the peer the
+    // route is being advertised to." bgpfc tracks no interfaces and cannot
+    // tell, so no link-local address goes out: a next hop passed on, to an
+    // internal peer or in an IPv6 route over an IPv4 session, keeps its
+    // global address only, which §3 itself allows towards an internal peer
+    // ("may modify the Network Address of Next Hop field by removing the
+    // link-local IPv6 address"). It stays IPv6, so RFC 8950 §5 still holds.
+    // NOTE(interop): FRR likewise passes a received link-local address on
+    // only when configured to (`nexthop-local unchanged`).
+    out.next_hop = global_only(out.next_hop);
     // RFC 8950 §4: an IPv6 next hop for IPv4 NLRI only to a peer that
     // advertised the capability for the family. §5: a next hop passed on
     // unchanged keeps its encoding, so a peer that cannot take it does not
@@ -134,6 +147,17 @@ pub fn export(
         return None;
     }
     Some(out)
+}
+
+/// `next_hop` without its link-local address, if any (RFC 2545 §3).
+fn global_only(next_hop: NextHop) -> NextHop {
+    match next_hop {
+        NextHop::Ipv6 { global, .. } => NextHop::Ipv6 {
+            global,
+            link_local: None,
+        },
+        v4 @ NextHop::Ipv4(_) => v4,
+    }
 }
 
 /// `as_path` with `asn` prepended to its leading `AS_SEQUENCE`, or as a
