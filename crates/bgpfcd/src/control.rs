@@ -5,7 +5,9 @@
 //!
 //! Implements: `docs/control.md`; RFC 2918 §4 (soft reset asks for a
 //! route refresh); RFC 9003 §3 (a shutdown communication of at most 128
-//! octets); RFC 4486 §4 (Administrative Reset).
+//! octets); RFC 4486 §4 (Administrative Reset; whether the restart limit
+//! left a neighbor Idle); RFC 4271 §6.7 (routes received per family
+//! against the prefix limit).
 
 use std::io::{BufRead as _, BufReader};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -427,6 +429,28 @@ fn counts(stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)], addr: IpAddr) -
         })
 }
 
+/// Per family of an Established neighbor: routes received (what the
+/// RFC 4271 §6.7 limit counts), routes advertised, and the limit.
+fn per_family(
+    stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    addr: IpAddr,
+) -> Vec<(AddressFamily, usize, usize, Option<u32>)> {
+    let Some((info, s)) = stats.iter().find(|(i, _)| i.addr == addr) else {
+        return Vec::new();
+    };
+    s.received
+        .iter()
+        .map(|(family, received)| {
+            let advertised = s
+                .advertised
+                .iter()
+                .find(|(f, _)| f == family)
+                .map_or(0, |(_, n)| *n);
+            (*family, *received, advertised, info.prefix_limit(*family))
+        })
+        .collect()
+}
+
 fn write_neighbor(
     j: &mut Json,
     r: &PeerReport,
@@ -439,10 +463,25 @@ fn write_neighbor(
         .field_display("state", r.state)
         .field_num("since_seconds", r.since.as_secs())
         .field_bool("admin_down", r.admin_down)
+        .field_bool("restart_limit_reached", r.restart_limit_reached)
         .field_num("updates_in", r.updates_in)
         .field_num("updates_out", r.updates_out)
         .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
         .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX));
+    j.key("prefixes").begin_array();
+    for (family, received, advertised, limit) in per_family(stats, r.addr) {
+        j.begin_object()
+            .field_display("family", family)
+            .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
+            .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX))
+            .key("limit");
+        match limit {
+            Some(l) => j.number(l),
+            None => j.null(),
+        };
+        j.end_object();
+    }
+    j.end_array();
     j.key("session");
     match &r.session {
         Some(s) => {
@@ -458,7 +497,21 @@ fn write_neighbor(
             for f in &s.families {
                 j.display(f);
             }
-            j.end_array().end_object();
+            // RFC 8950 §4: families that may carry an IPv6 next hop, from
+            // the peer and to it.
+            j.end_array()
+                .key("extended_next_hop")
+                .begin_object()
+                .key("receive")
+                .begin_array();
+            for f in &s.extended_next_hop_receive {
+                j.display(f);
+            }
+            j.end_array().key("send").begin_array();
+            for f in &s.extended_next_hop_send {
+                j.display(f);
+            }
+            j.end_array().end_object().end_object();
         }
         None => {
             j.null();
@@ -506,8 +559,18 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
         format!("  updates in {} out {}", r.updates_in, r.updates_out),
         format!("  routes received {received} advertised {advertised}"),
     ];
+    for (family, received, advertised, limit) in per_family(stats, r.addr) {
+        lines.push(format!(
+            "    {family} received {received} advertised {advertised}{}",
+            limit.map_or(String::new(), |l| format!(" maximum-prefix {l}"))
+        ));
+    }
     if r.admin_down {
         lines.push("  administratively down".to_owned());
+    }
+    if r.restart_limit_reached {
+        // RFC 4486 §4: no more automatic retries until the operator acts.
+        lines.push("  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned());
     }
     if let Some(s) = &r.session {
         lines.push(format!("  router-id {}", s.peer_router_id));
@@ -520,6 +583,24 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
             "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
             s.four_octet_as, s.extended_messages, s.route_refresh
         ));
+        if !s.extended_next_hop_receive.is_empty() || !s.extended_next_hop_send.is_empty() {
+            let list = |families: &[AddressFamily]| {
+                if families.is_empty() {
+                    "none".to_owned()
+                } else {
+                    families
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            };
+            lines.push(format!(
+                "  extended-next-hop receive {} send {}",
+                list(&s.extended_next_hop_receive),
+                list(&s.extended_next_hop_send)
+            ));
+        }
         lines.push(format!(
             "  families {}",
             s.families
@@ -761,6 +842,185 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn neighbor_detail_shows_the_extended_next_hop_families() {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let mut session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: true,
+            route_refresh: true,
+            families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+            extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop_send: vec![AddressFamily::IPV4_UNICAST],
+            peer_capabilities: Vec::new(),
+        };
+        let mut report = PeerReport {
+            addr: "2001:db8::2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session.clone()),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  extended-next-hop receive ipv4-unicast send ipv4-unicast".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(
+                r#""extended_next_hop":{"receive":["ipv4-unicast"],"send":["ipv4-unicast"]}"#
+            ),
+            "{}",
+            r.json
+        );
+        // RFC 8950 §4 advertised by us alone: taken, not sent.
+        session.extended_next_hop_send.clear();
+        report.session = Some(session.clone());
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  extended-next-hop receive ipv4-unicast send none".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}"#),
+            "{}",
+            r.json
+        );
+        // Not at all: no line, empty lists.
+        session.extended_next_hop_receive.clear();
+        report.session = Some(session);
+        let r = render_neighbor(&report, &[]);
+        assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
+        assert!(
+            r.json
+                .contains(r#""extended_next_hop":{"receive":[],"send":[]}"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_counts_routes_per_family_against_the_limit() {
+        use bgpfc_wire::types::HoldTime;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let info = bgpfc_rib::PeerInfo {
+            addr,
+            local_addr: "192.0.2.1".parse().unwrap(),
+            remote_as: Asn(65_001),
+            router_id: RouterId::new(2).unwrap(),
+            kind: bgpfc_wire::update::PeerKind::External,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            four_octet_as: true,
+            extended_messages: false,
+            extended_next_hop: Vec::new(),
+            advertisement_interval: Duration::ZERO,
+            prefix_limits: vec![(v4, 1000)],
+        };
+        let stats = bgpfc_rib::PeerStats {
+            received: vec![(v4, 12), (v6, 3)],
+            advertised: vec![(v4, 4), (v6, 0)],
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(bgpfc_fsm::Session {
+                peer_as: Asn(65_001),
+                peer_router_id: RouterId::new(2).unwrap(),
+                peer: bgpfc_wire::update::PeerKind::External,
+                hold_time: HoldTime::new(90).unwrap(),
+                keepalive_time: Duration::from_secs(30),
+                four_octet_as: true,
+                extended_messages: false,
+                route_refresh: true,
+                families: vec![v4, v6],
+                receive_families: vec![v4, v6],
+                extended_next_hop_receive: Vec::new(),
+                extended_next_hop_send: Vec::new(),
+                peer_capabilities: Vec::new(),
+            }),
+            updates_in: 7,
+            updates_out: 1,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbor(&report, &[(info, stats)]);
+        // RFC 4271 §6.7: what the limit counts, next to the limit.
+        for line in [
+            "  routes received 15 advertised 4",
+            "    ipv4-unicast received 12 advertised 4 maximum-prefix 1000",
+            "    ipv6-unicast received 3 advertised 0",
+        ] {
+            assert!(r.lines.contains(&line.to_owned()), "{line}: {:?}", r.lines);
+        }
+        assert!(
+            r.json.contains(
+                r#""prefixes":[{"family":"ipv4-unicast","received":12,"advertised":4,"limit":1000},{"family":"ipv6-unicast","received":3,"advertised":0,"limit":null}]"#
+            ),
+            "{}",
+            r.json
+        );
+        // Not up in the RIB: no families.
+        let r = render_neighbor(&report, &[]);
+        assert!(r.json.contains(r#""prefixes":[]"#), "{}", r.json);
+    }
+
+    #[test]
+    fn neighbor_detail_says_when_the_restart_limit_stopped_it() {
+        let mut report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Idle,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbor(&report, &[]);
+        assert!(!r.lines.iter().any(|l| l.contains("restart limit")));
+        assert!(
+            r.json.contains(r#""restart_limit_reached":false"#),
+            "{}",
+            r.json
+        );
+        // RFC 4486 §4: the operator must act, and is told how.
+        report.restart_limit_reached = true;
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines.contains(
+                &"  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""restart_limit_reached":true"#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]

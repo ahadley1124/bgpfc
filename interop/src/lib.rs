@@ -314,10 +314,17 @@ pub struct NeighborOpts {
     pub import: String,
     /// Export policy name.
     pub export: String,
+    /// `advertisement-interval` in seconds; `None` keeps the RFC 4271 §10
+    /// default (30 s external, 5 s internal).
+    pub advertisement_interval: Option<u16>,
+    /// More statements for the `neighbor` block, such as
+    /// `extended-next-hop yes;`.
+    pub extra: String,
 }
 
 impl NeighborOpts {
-    /// An active neighbor on port 179 with a 30 s hold time.
+    /// An active neighbor on port 179 with a 30 s hold time and the
+    /// default advertisement interval.
     #[must_use]
     pub fn new(addr: impl Into<IpAddr>, remote_as: u32) -> NeighborOpts {
         NeighborOpts {
@@ -328,6 +335,8 @@ impl NeighborOpts {
             passive: false,
             import: "ANY".to_owned(),
             export: "ANY".to_owned(),
+            advertisement_interval: None,
+            extra: String::new(),
         }
     }
 }
@@ -379,16 +388,21 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
         let _ = writeln!(text, "listen {{ address {l}; port 179; }}");
     }
     for n in &opts.neighbors {
+        let interval = n
+            .advertisement_interval
+            .map(|s| format!(" advertisement-interval {s};"))
+            .unwrap_or_default();
         let _ = writeln!(
             text,
-            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {}; }}",
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {};{interval} {} }}",
             n.addr,
             n.remote_as,
             n.port,
             n.hold_time,
             if n.passive { "yes" } else { "no" },
             n.import,
-            n.export
+            n.export,
+            n.extra
         );
     }
     fs::write(&cfg, text).expect("bgpfcd config");
@@ -425,6 +439,12 @@ pub struct BirdOpts {
     pub passive: bool,
     /// IPv4 prefixes BIRD originates as blackhole statics.
     pub statics: Vec<String>,
+    /// More options for the BGP `ipv4` channel, such as
+    /// `extended next hop on;`.
+    pub channel: String,
+    /// More options for the BGP protocol itself, such as
+    /// `error wait time 1, 2;`.
+    pub protocol: String,
 }
 
 impl Bird {
@@ -458,7 +478,8 @@ impl Bird {
                  \x20   neighbor {neighbor} port {neighbor_port} as {remote_as};\n\
                  \x20   hold time {hold};\n\
                  {passive}\
-                 \x20   ipv4 {{ import all; export all; }};\n\
+                 \x20   {protocol}\n\
+                 \x20   ipv4 {{ import all; export all; {channel} }};\n\
                  }}\n",
                 local = opts.local,
                 local_port = opts.local_port,
@@ -467,6 +488,8 @@ impl Bird {
                 neighbor_port = opts.neighbor_port,
                 remote_as = opts.remote_as,
                 hold = opts.hold_time,
+                channel = opts.channel,
+                protocol = opts.protocol,
             ),
         )
         .expect("bird config");

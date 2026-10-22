@@ -21,6 +21,16 @@ pub struct ConfigDiff {
     /// anything those policies reference) changed: re-evaluate their
     /// routes, with route refresh where the peer supports it.
     pub policy_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `advertisement-interval`
+    /// changed: the RIB paces the running session with the new value
+    /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
+    /// in `policy_changed` too.
+    pub interval_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `maximum-prefix` limits
+    /// changed: the RIB applies them to the running session (RFC 4271
+    /// §6.7), which ends at once if it already holds more routes than a
+    /// new limit allows. A neighbor may be in the lists above too.
+    pub prefix_limit_changed: Vec<IpAddr>,
     /// Neighbors in both with only a description change, or none.
     pub unchanged: Vec<IpAddr>,
     /// Which global settings changed.
@@ -71,9 +81,21 @@ impl ConfigDiff {
             };
             if identity_changed || !o.same_session(n) {
                 d.reset.push(n.addr);
-            } else if policy_differs(old, o, new, n) {
+                continue;
+            }
+            let policy = policy_differs(old, o, new, n);
+            let interval = o.advertisement_interval != n.advertisement_interval;
+            let limit = o.maximum_prefix != n.maximum_prefix;
+            if policy {
                 d.policy_changed.push(n.addr);
-            } else {
+            }
+            if interval {
+                d.interval_changed.push(n.addr);
+            }
+            if limit {
+                d.prefix_limit_changed.push(n.addr);
+            }
+            if !policy && !interval && !limit {
                 d.unchanged.push(n.addr);
             }
         }
@@ -87,6 +109,8 @@ impl ConfigDiff {
             && self.removed.is_empty()
             && self.reset.is_empty()
             && self.policy_changed.is_empty()
+            && self.interval_changed.is_empty()
+            && self.prefix_limit_changed.is_empty()
             && self.global.is_empty()
     }
 }
@@ -162,6 +186,24 @@ mod tests {
         assert_eq!(d.added, vec![addr("192.0.2.4")]);
         assert_eq!(d.global, vec![]);
         assert!(!d.is_empty());
+        // RFC 8950 §4: extended-next-hop changes the OPEN, so it is a
+        // session parameter.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; extended-next-hop yes;",
+        ));
+        assert_eq!(ConfigDiff::between(&a, &c).reset, vec![addr("192.0.2.3")]);
+        // The RFC 4486 §4 restart limit is the FSM's, like the timers: a
+        // change resets the session, which also starts a peer it stopped.
+        let unbounded =
+            cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit off;"));
+        assert_eq!(
+            ConfigDiff::between(&a, &unbounded).reset,
+            vec![addr("192.0.2.3")]
+        );
+        // Spelling out the default is no change.
+        let explicit = cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit 10;"));
+        assert!(ConfigDiff::between(&a, &explicit).is_empty());
     }
 
     #[test]
@@ -190,6 +232,70 @@ mod tests {
             ConfigDiff::between(a, &e).policy_changed,
             vec![addr("192.0.2.2"), addr("192.0.2.3")]
         );
+    }
+
+    #[test]
+    fn advertisement_interval_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // Set where it was the default, and alongside a policy change.
+        let b = cfg(&BASE
+            .replace(
+                "description \"a\";",
+                "description \"a\"; advertisement-interval 0;",
+            )
+            .replace(
+                "remote-as 65002; import IN;",
+                "remote-as 65002; advertisement-interval 5; import OUT;",
+            ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(
+            d.interval_changed,
+            vec![addr("192.0.2.2"), addr("192.0.2.3")]
+        );
+        assert_eq!(d.policy_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, Vec::<IpAddr>::new());
+        assert!(!d.is_empty());
+        // The explicit default is still a change from "the default": the
+        // daemon resolves both to the same value and does nothing.
+        let c = cfg(&BASE.replace(
+            "description \"a\";",
+            "description \"a\"; advertisement-interval 30;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&a, &c).interval_changed,
+            vec![addr("192.0.2.2")]
+        );
+        assert!(ConfigDiff::between(&b, &b).is_empty());
+    }
+
+    #[test]
+    fn prefix_limit_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // RFC 4271 §6.7: a limit is the RIB's, not the session's.
+        let b = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 100;",
+        ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(d.prefix_limit_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+        assert!(!d.is_empty());
+        // Raised, lowered or removed alike.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 50;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&b, &c).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert_eq!(
+            ConfigDiff::between(&c, &a).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert!(ConfigDiff::between(&c, &c).is_empty());
     }
 
     #[test]

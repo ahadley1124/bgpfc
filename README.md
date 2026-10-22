@@ -7,24 +7,38 @@ per-neighbor import/export policy, and installs best paths into the Linux kernel
 routing table over rtnetlink. It also ships with `bgpfcctl`, a command-line
 client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 
-> **Status:** v1 feature-complete on the `rewrite` branch and exercised against
-> BIRD, FRR and GoBGP in CI, but young: it has not run in production anywhere.
+> **Status:** v1 feature-complete and exercised against BIRD, FRR and GoBGP in
+> CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
-> row is `done` for RFC 5492, 6793, 2918, 8654, 1997, 4360, 8092, 4486, 6608,
-> 9003, 7607, 9072, 9687 and 9774. RFC 4271 is complete except next-hop
-> resolvability (there is no IGP; the kernel's verdict is logged) and the
-> MinRouteAdvertisementInterval timer; RFC 4760 and 7606 each have one `partial`
-> row; the RFC 8950 extended next hop capability is not advertised yet. Nothing
-> else is claimed.
+> row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five rows
+> open. Two need the host's interfaces and routes, which bgpfc does not track,
+> so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
+> and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
+> a received next hop is checked against our own address on that session, not
+> against every address of the host (§6.3 a). Two are deliberate deviations: a
+> NOTIFICATION received in OpenSent closes the connection without an FSM error
+> in reply, as BIRD and FRR do (§8.2.2), and the MinRouteAdvertisementInterval
+> timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
+> 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
+> link-local next hop, which §3 asks for where it shares a subnet with the next
+> hop and the peer. Nothing else is claimed.
 
 ### What works
 
 - Sessions with 2- and 4-octet AS peers over IPv4 and IPv6, with route refresh,
-  extended messages, send hold timer, collision detection and RFC 7606 error
-  handling; interop tests against BIRD 2, FRR 8 and GoBGP 3 run on every push.
+  extended messages, send hold timer, collision detection, RFC 8950 IPv6 next
+  hops for IPv4 routes (per neighbor, `extended-next-hop yes`) and RFC 7606
+  error handling, with the RFC 4271 §6.3 next-hop checks; interop tests against
+  BIRD 2, FRR 8 and GoBGP 3 run on every push.
+- Per-neighbor, per-family prefix limits (`maximum-prefix`, RFC 4271 §6.7) that
+  end the session with the RFC 4486 Cease, and damped automatic restarts with
+  an upper bound (`restart-limit`, RFC 4486 §4) after which a failing neighbor
+  waits for `bgpfcctl clear neighbor`.
 - The RFC 4271 decision process over interned attribute sets, per-neighbor
   import/export policy with prefix lists, an AS-path regex engine and community
-  matching, and update generation packed to the negotiated message size.
+  matching, and update generation packed to the negotiated message size and
+  paced per destination by the RFC 4271 MinRouteAdvertisementInterval timer.
 - Routes installed through rtnetlink under a dedicated protocol number, with
   dry-run as the default and a runtime toggle; privilege drop and a capability
   check; clean shutdown on `SIGTERM`.
@@ -68,11 +82,23 @@ dev-dependencies or in separate crates that the daemon never links against.
 
 Only single best path, with no ECMP. Linux only.
 
+### Next: RPKI route origin validation
+
+Planned, not built yet ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14): route
+origin validation (RFC 6811) against VRPs fetched over RTR (RFC 8210, falling
+back to version 0, RFC 6810), either from external caches or from an optional
+Routinator that bgpfcd starts and supervises as a child process. Routinator is
+a separate program; bgpfc neither bundles nor links it. The plan drops Invalid
+routes by default, offers a non-enforcing prefer-valid mode, and lets policy
+match on the validation state (RFC 6811 §3). RTR will run over plain TCP only
+(RFC 8210 §9), so the cache belongs on loopback or a trusted network.
+
 ### Later
 
-RPKI (RFC 8210, 6811, 8893), BGP roles and OTC (RFC 9234), RFC 8212 default
-policy, graceful restart (RFC 4724), ADD-PATH (RFC 7911), route reflection
-(RFC 4456), multipath, and TCP-MD5/TCP-AO.
+ASPA (planned for v1.1.0), origin validation on export (RFC 8893), BGP roles
+and OTC (RFC 9234), RFC 8212 default policy, graceful restart (RFC 4724),
+ADD-PATH (RFC 7911), route reflection (RFC 4456), multipath, and
+TCP-MD5/TCP-AO.
 
 The full reference list is in [`RESOURCES.md`](RESOURCES.md).
 

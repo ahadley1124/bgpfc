@@ -85,3 +85,30 @@ value-errors.conf:27:13: `maybe` is not `yes` or `no`
 value-errors.conf:28:5: unknown statement `unknown-thing` in `neighbor`
       unknown-thing 1;
       ^
+value-errors.conf:29:28: `65536` is not a number of seconds (0-65535)
+      advertisement-interval 65536;
+                             ^
+value-errors.conf:30:5: `advertisement-interval` is given more than once
+      advertisement-interval 5;
+      ^
+value-errors.conf:31:23: `ipv4` is not `yes` or `no`
+      extended-next-hop ipv4;
+                        ^
+value-errors.conf:32:19: `never` is not a number of restarts or `off`
+      restart-limit never;
+                    ^
+value-errors.conf:33:5: `restart-limit` is given more than once
+      restart-limit 5;
+      ^
+value-errors.conf:34:5: maximum-prefix must be at least 1; an import policy rejects routes
+      maximum-prefix ipv4-unicast 0;
+      ^
+value-errors.conf:35:5: `maximum-prefix` takes 2 arguments, found 1
+      maximum-prefix ipv4-unicast;
+      ^
+value-errors.conf:36:20: `ipv4` is not `ipv4-unicast` or `ipv6-unicast`
+      maximum-prefix ipv4 10;
+                     ^
+value-errors.conf:38:5: `maximum-prefix` is given more than once for ipv6-unicast
+      maximum-prefix ipv6-unicast 20;
+      ^

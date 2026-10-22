@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::types::AddressFamily;
+
 /// NOTIFICATION error code (RFC 4271 §4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
@@ -270,6 +272,9 @@ pub enum EncodeError {
     /// A Shutdown Communication was requested on a Cease subcode other than
     /// Administrative Shutdown or Administrative Reset (RFC 9003 §2).
     NotShutdown,
+    /// NLRI of this family with an IPv6 next hop, for a peer with which
+    /// Extended Next Hop Encoding was not negotiated (RFC 8950 §4).
+    NextHopNotNegotiated(AddressFamily),
     /// A field or message does not fit its length field.
     TooLong {
         /// What was too long.
@@ -287,6 +292,10 @@ impl fmt::Display for EncodeError {
             EncodeError::EmptySegment => f.write_str("AS_PATH segment with no ASes"),
             EncodeError::NotShutdown => f.write_str(
                 "shutdown communication is only allowed with Administrative Shutdown or Reset",
+            ),
+            EncodeError::NextHopNotNegotiated(family) => write!(
+                f,
+                "IPv6 next hop for {family} without the Extended Next Hop Encoding capability"
             ),
             EncodeError::TooLong { what, len, max } => {
                 write!(

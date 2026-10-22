@@ -7,7 +7,11 @@
 //! §9.2 (no internal-to-internal redistribution), §9.2 and §4.1 (message
 //! size); RFC 1997 (`NO_EXPORT`, `NO_ADVERTISE`); RFC 4360 §6
 //! (non-transitive extended communities stay in the AS); RFC 2545 §3
-//! (IPv6 next hops); RFC 8654 §4 (65535-octet UPDATEs).
+//! (IPv6 next hops, never with a link-local address, as bgpfc cannot tell
+//! whether a subnet is shared); RFC 8654 §4 (65535-octet UPDATEs); RFC
+//! 8950 §4 (an IPv6 next hop for IPv4 NLRI only to a peer that advertised
+//! it), §5 (our own address is of the session's protocol; a next hop
+//! passed on keeps its encoding).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -84,12 +88,23 @@ pub fn export(
             // sequence; never a set.
             out.as_path = prepend(&attrs.as_path, local_as);
             // RFC 4271 §5.1.3: the next hop is our address on the session
-            // when it is of the NLRI's family (RFC 2545 §3 for IPv6).
-            // NOTE(interop): for a family the session address does not
-            // belong to (IPv4 routes over an IPv6 session) the next hop is
-            // left as received, as BIRD does without RFC 8950 negotiation.
+            // when it is of the NLRI's family (RFC 2545 §3 for IPv6). RFC
+            // 8950 §5: on a session over IPv6 our own address is an IPv6
+            // one, which IPv4 NLRI may carry to a peer that advertised RFC
+            // 8950 §4 Extended Next Hop Encoding, where we did too.
+            // NOTE(interop): otherwise, for a family the session address
+            // does not belong to (IPv4 routes over an IPv6 session), the
+            // next hop is left as received, as BIRD does without RFC 8950.
             out.next_hop = match (family, to.local_addr) {
                 (AddressFamily::IPV4_UNICAST, IpAddr::V4(a)) => NextHop::Ipv4(a),
+                (AddressFamily::IPV4_UNICAST, IpAddr::V6(a))
+                    if to.extended_next_hop.contains(&family) =>
+                {
+                    NextHop::Ipv6 {
+                        global: a,
+                        link_local: None,
+                    }
+                }
                 (AddressFamily::IPV6_UNICAST, IpAddr::V6(a)) => NextHop::Ipv6 {
                     global: a,
                     link_local: None,
@@ -112,7 +127,37 @@ pub fn export(
             out.local_pref = Some(attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF));
         }
     }
+    // RFC 2545 §3: "The link-local address shall be included in the Next
+    // Hop field if and only if the BGP speaker shares a common subnet with
+    // the entity identified by the global IPv6 address ... and the peer the
+    // route is being advertised to." bgpfc tracks no interfaces and cannot
+    // tell, so no link-local address goes out: a next hop passed on, to an
+    // internal peer or in an IPv6 route over an IPv4 session, keeps its
+    // global address only, which §3 itself allows towards an internal peer
+    // ("may modify the Network Address of Next Hop field by removing the
+    // link-local IPv6 address"). It stays IPv6, so RFC 8950 §5 still holds.
+    // NOTE(interop): FRR likewise passes a received link-local address on
+    // only when configured to (`nexthop-local unchanged`).
+    out.next_hop = global_only(out.next_hop);
+    // RFC 8950 §4: an IPv6 next hop for IPv4 NLRI only to a peer that
+    // advertised the capability for the family. §5: a next hop passed on
+    // unchanged keeps its encoding, so a peer that cannot take it does not
+    // get the route at all.
+    if !to.takes_next_hop(family, &out.next_hop) {
+        return None;
+    }
     Some(out)
+}
+
+/// `next_hop` without its link-local address, if any (RFC 2545 §3).
+fn global_only(next_hop: NextHop) -> NextHop {
+    match next_hop {
+        NextHop::Ipv6 { global, .. } => NextHop::Ipv6 {
+            global,
+            link_local: None,
+        },
+        v4 @ NextHop::Ipv4(_) => v4,
+    }
 }
 
 /// `as_path` with `asn` prepended to its leading `AS_SEQUENCE`, or as a
@@ -176,6 +221,9 @@ impl Batch {
     ) -> Result<Vec<Vec<u8>>, EncodeError> {
         let ctx = EncodeContext {
             four_octet_as: to.four_octet_as,
+            // RFC 8950 §4; `export` already keeps such routes from a peer
+            // without it, and the encoder refuses them as well.
+            extended_next_hop: to.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
         };
         let max_body = to.max_message_len() - HEADER_LEN;
         let mut out = Vec::new();

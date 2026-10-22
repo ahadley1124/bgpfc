@@ -153,9 +153,12 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         privileges::drop(user, opts.group.as_deref());
     }
 
+    let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
+    // RFC 4271 §10: the advertisement intervals are jittered too.
+    rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
     rib::spawn(
-        config.local_as,
-        Box::new(engine),
+        rib,
+        wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
@@ -336,6 +339,17 @@ impl Coordinator<'_> {
             policies: messages::NewPolicies(Box::new(engine)),
             reexport: diff.policy_changed.clone(),
         });
+        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
+        // file without a reset. Sent before new peers start, so their
+        // sessions come up with the new values.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(&new)));
+        // RFC 4271 §6.7: so do the prefix limits; a session already over a
+        // lowered limit ends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -354,11 +368,13 @@ impl Coordinator<'_> {
             p.start();
         }
         let summary = format!(
-            "added {} removed {} reset {} policy {} unchanged {}{}",
+            "added {} removed {} reset {} policy {} interval {} limit {} unchanged {}{}",
             diff.added.len(),
             diff.removed.len(),
             diff.reset.len(),
             diff.policy_changed.len(),
+            diff.interval_changed.len(),
+            diff.prefix_limit_changed.len(),
             diff.unchanged.len(),
             if notes.is_empty() {
                 String::new()

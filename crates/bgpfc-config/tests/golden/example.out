@@ -162,6 +162,12 @@ Config {
             passive: false,
             allow_as_set: false,
             collision_detect_established: false,
+            advertisement_interval: None,
+            extended_next_hop: [],
+            restart_limit: Some(
+                10,
+            ),
+            maximum_prefix: [],
         },
     ],
 }

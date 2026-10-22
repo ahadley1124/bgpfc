@@ -209,10 +209,26 @@ Config {
             passive: true,
             allow_as_set: true,
             collision_detect_established: true,
+            advertisement_interval: Some(
+                10s,
+            ),
+            extended_next_hop: [],
+            restart_limit: Some(
+                3,
+            ),
+            maximum_prefix: [
+                (
+                    AddressFamily {
+                        afi: Ipv4,
+                        safi: Unicast,
+                    },
+                    1000,
+                ),
+            ],
         },
         Neighbor {
             pos: Pos {
-                line: 53,
+                line: 56,
                 col: 1,
             },
             addr: 2001:db8::2,
@@ -242,6 +258,32 @@ Config {
             passive: false,
             allow_as_set: false,
             collision_detect_established: false,
+            advertisement_interval: Some(
+                0ns,
+            ),
+            extended_next_hop: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+            ],
+            restart_limit: None,
+            maximum_prefix: [
+                (
+                    AddressFamily {
+                        afi: Ipv6,
+                        safi: Unicast,
+                    },
+                    250000,
+                ),
+                (
+                    AddressFamily {
+                        afi: Ipv4,
+                        safi: Unicast,
+                    },
+                    1200000,
+                ),
+            ],
         },
     ],
 }

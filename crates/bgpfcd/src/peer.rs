@@ -11,9 +11,9 @@
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,8 @@ use bgpfc_wire::keepalive::KEEPALIVE;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
-use bgpfc_wire::update::{DecodeContext, ErrorAction, PeerKind, UpdateMessage};
+use bgpfc_wire::types::AddressFamily;
+use bgpfc_wire::update::{DecodeContext, PeerKind, UpdateMessage};
 
 use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
 use crate::reader;
@@ -64,6 +65,12 @@ pub(crate) struct PeerHandle {
     /// dropped: the peer thread resets the session rather than leave the
     /// peer with a partial view (AGENTS.md §3, backpressure).
     pub(crate) overrun: Arc<AtomicBool>,
+    /// Set by the RIB thread when the peer exceeded a prefix limit and
+    /// [`PeerInput::PrefixLimit`] did not fit in the full queue: the peer
+    /// thread, busy with what fills it, ends the session after its
+    /// current input (RFC 4271 §6.7), with the right Cease rather than
+    /// the overrun's.
+    pub(crate) prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
 }
 
 struct Conn {
@@ -90,6 +97,7 @@ pub(crate) struct Peer {
     session: Option<Session>,
     write_failed: bool,
     overrun: Arc<AtomicBool>,
+    prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -101,10 +109,12 @@ pub(crate) struct Peer {
 pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
     let overrun = Arc::new(AtomicBool::new(false));
+    let prefix_limit = Arc::new(Mutex::new(None));
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
         overrun: Arc::clone(&overrun),
+        prefix_limit: Arc::clone(&prefix_limit),
     };
     let fsm = Fsm::new(cfg.fsm.clone());
     let peer = Peer {
@@ -120,6 +130,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         session: None,
         write_failed: false,
         overrun,
+        prefix_limit,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -269,6 +280,19 @@ impl Peer {
                     });
                 }
                 Action::LogError(msg) => bgpfc_log::error!(msg, peer = self.cfg.addr),
+                // RFC 4486 §4: automatic retries stop until the operator
+                // intervenes; say so, and how.
+                Action::RestartLimitReached { failures } => bgpfc_log::error!(
+                    "restart limit reached, peer stays idle until `bgpfcctl clear neighbor`",
+                    peer = self.cfg.addr,
+                    damped_failures = failures,
+                    restart_limit = self
+                        .fsm
+                        .config()
+                        .damping
+                        .and_then(|d| d.restart_limit)
+                        .unwrap_or_default()
+                ),
             }
         }
     }
@@ -318,33 +342,20 @@ impl Peer {
                 }
             }
             PeerInput::Stop(subcode) => {
-                // RFC 4271 §8.2.2 ManualStop: a Cease goes out (RFC 4486
-                // §4 Administrative Shutdown) and the FSM returns to Idle;
-                // any other subcode travels in an AutomaticStop.
-                if subcode == CeaseSubcode::AdministrativeShutdown {
-                    self.event(Event::ManualStop, now);
-                } else {
-                    self.event(
-                        Event::AutomaticStop(NotificationMessage::cease(subcode)),
-                        now,
-                    );
-                }
+                // RFC 4271 §8.2.2 ManualStop: the operator's doing, by
+                // `bgpfcctl`, a reload or a shutdown, with the RFC 4486 §4
+                // Cease for it (Administrative Shutdown, Peer De-configured,
+                // Other Configuration Change). No failure of the peer, so
+                // nothing is damped or counted toward the restart limit.
+                self.event(Event::ManualStop(NotificationMessage::cease(subcode)), now);
                 self.drop_conn();
                 return false;
             }
             PeerInput::Reset(message) => {
-                // RFC 4486 §4 Administrative Reset, with the RFC 9003
-                // communication when one was given.
-                let n = match message.as_deref() {
-                    Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
-                        .unwrap_or_else(|_| {
-                            NotificationMessage::cease(CeaseSubcode::AdministrativeReset)
-                        }),
-                    None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
-                };
                 bgpfc_log::info!("session reset by operator", peer = self.cfg.addr);
-                self.event(Event::AutomaticStop(n), now);
-                self.event(Event::ManualStart, now);
+                for event in reset_events(message.as_deref()) {
+                    self.event(event, now);
+                }
             }
             PeerInput::SoftReset => {
                 if self.request_routes(now) {
@@ -366,8 +377,21 @@ impl Peer {
                     updates_in: self.updates_in,
                     updates_out: self.updates_out,
                     admin_down: self.fsm.is_admin_down(),
+                    restart_limit_reached: !self.fsm.automatic_start_allowed(),
                 });
             }
+            PeerInput::PrefixLimit { family, limit } => self.prefix_limit(family, limit, now),
+        }
+        self.flags(now);
+        true
+    }
+
+    /// What the RIB thread flagged because the queue was full when it had
+    /// something to say.
+    fn flags(&mut self, now: Instant) {
+        let pending = self.prefix_limit.lock().ok().and_then(|mut p| p.take());
+        if let Some((family, limit)) = pending {
+            self.prefix_limit(family, limit, now);
         }
         if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
             // RFC 4486 §4: Out of Resources. The peer restarts and gets a
@@ -381,7 +405,30 @@ impl Peer {
                 now,
             );
         }
-        true
+    }
+
+    /// The RIB dropped this peer's routes for exceeding its `maximum-prefix`
+    /// for `family`: end the session (RFC 4271 §6.7 (b)). Only while
+    /// Established; otherwise the session it was about has ended already.
+    fn prefix_limit(&mut self, family: AddressFamily, limit: u32, now: Instant) {
+        if self.fsm.state() != State::Established {
+            return;
+        }
+        // RFC 4271 §6.7: "The speaker MAY also log this locally."
+        bgpfc_log::error!(
+            "maximum prefixes reached, closing session",
+            peer = self.cfg.addr,
+            family = family,
+            limit = limit
+        );
+        // RFC 4486 §4: Cease / Maximum Number of Prefixes Reached, with the
+        // AFI, SAFI and upper bound of Figure 1 as its data. The FSM goes
+        // to Idle through AutomaticStop (RFC 4271 §8.2.2), damped, so the
+        // restart-limit bounds a peer that keeps sending too much.
+        self.event(
+            Event::AutomaticStop(NotificationMessage::max_prefixes_reached(family, limit)),
+            now,
+        );
     }
 
     /// RFC 2918 §4: ask for every negotiated family again, only if the
@@ -545,21 +592,6 @@ impl Peer {
         }
     }
 
-    fn decode_context(&self) -> DecodeContext {
-        match &self.session {
-            Some(s) => DecodeContext {
-                four_octet_as: s.four_octet_as,
-                peer: s.peer,
-                allow_as_set: self.cfg.allow_as_set,
-            },
-            None => DecodeContext {
-                four_octet_as: false,
-                peer: PeerKind::External,
-                allow_as_set: self.cfg.allow_as_set,
-            },
-        }
-    }
-
     /// A message (or framing error) on the FSM's connection.
     fn primary_message(&mut self, message: Result<Inbound, DecodeError>, now: Instant) {
         match message {
@@ -631,13 +663,35 @@ impl Peer {
     }
 
     fn update(&mut self, body: &[u8], now: Instant) {
-        let ctx = self.decode_context();
+        let ctx = decode_context(self.session.as_ref(), self.cfg.allow_as_set);
         match UpdateMessage::decode(body, &ctx) {
             Ok(decoded) => {
                 let established = self.fsm.state() == State::Established;
                 self.event(Event::UpdateMsg, now);
                 if established {
                     self.updates_in += 1;
+                    for d in &decoded.disabled {
+                        // RFC 4760 §7: the RIB drops the family and the
+                        // session stays; the rest of the UPDATE is used.
+                        bgpfc_log::warn!(
+                            "disabling address family after malformed update",
+                            peer = self.cfg.addr,
+                            family = d.family,
+                            error = d.error
+                        );
+                    }
+                    let taken = self
+                        .session
+                        .as_ref()
+                        .map_or(&[][..], |s| &s.receive_families);
+                    for family in unadvertised(&decoded.message, taken) {
+                        // RFC 4760 §8: the RIB ignores them.
+                        bgpfc_log::warn!(
+                            "ignoring routes of a family we did not advertise",
+                            peer = self.cfg.addr,
+                            family = family
+                        );
+                    }
                     if let Some(e) = &decoded.treated_as_withdraw {
                         bgpfc_log::warn!(
                             "update treated as withdraw",
@@ -659,23 +713,8 @@ impl Peer {
                     });
                 }
             }
-            Err(e) => match e.action {
-                ErrorAction::SessionReset => self.event(Event::UpdateMsgErr(e.notification), now),
-                ErrorAction::AfiSafiDisable(family) => {
-                    // RFC 4760 §7: drop the family, keep the session.
-                    bgpfc_log::warn!(
-                        "disabling address family after malformed update",
-                        peer = self.cfg.addr,
-                        family = family,
-                        error = e.notification
-                    );
-                    self.event(Event::UpdateMsg, now);
-                    self.rib_send(RibMsg::FamilyDisabled {
-                        peer: self.cfg.addr,
-                        family,
-                    });
-                }
-            },
+            // RFC 7606 §2: session reset.
+            Err(e) => self.event(Event::UpdateMsgErr(e.notification), now),
         }
     }
 
@@ -714,18 +753,48 @@ impl Peer {
             keep = if keep_pending { "new" } else { "existing" }
         );
         if keep_pending {
-            // RFC 4271 §8.2.2: OpenCollisionDump on the losing connection
-            // sends the Cease and drops it; then the FSM is restarted on the
-            // winner, which carries the OPEN we just read.
-            self.event(Event::OpenCollisionDump, now);
+            let [dump, restart @ ..] = collision_events(open);
+            self.event(dump, now);
             self.conn = Some(pending);
-            self.event(Event::ManualStartPassive, now);
-            self.event(Event::TcpConnectionConfirmed, now);
-            self.event(Event::BgpOpen(open.clone()), now);
+            for event in restart {
+                self.event(event, now);
+            }
         } else {
             close_with_cease(pending, CeaseSubcode::ConnectionCollisionResolution);
         }
     }
+}
+
+/// What the FSM is fed for `bgpfcctl clear neighbor`: a `ManualStop` with
+/// RFC 4486 §4 Administrative Reset, carrying the RFC 9003 communication
+/// when one was given, then a `ManualStart`. The stop is the operator's,
+/// not a failure of the peer, so it is neither damped nor counted toward
+/// the restart limit, and the start is the "administrative intervention"
+/// that ends a run of failures (RFC 4486 §4).
+fn reset_events(message: Option<&str>) -> [Event; 2] {
+    let cease = match message {
+        Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
+            .unwrap_or_else(|_| NotificationMessage::cease(CeaseSubcode::AdministrativeReset)),
+        None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
+    };
+    [Event::ManualStop(cease), Event::ManualStart]
+}
+
+/// What the FSM is fed when the connection it runs on loses a collision
+/// to one whose OPEN was `open` (RFC 4271 §6.8). `OpenCollisionDump` on the
+/// losing connection sends the Cease and drops it (§8.2.2 event 23); the
+/// FSM then goes on with the winner, which carries the OPEN already read.
+/// That restart is automatic and passive (event 5): a `ManualStart` would be
+/// the "administrative intervention" of RFC 4486 §4 and end the run of
+/// damped failures, so that a peer whose restarts collide would never
+/// reach the restart limit.
+fn collision_events(open: &OpenMessage) -> [Event; 4] {
+    [
+        Event::OpenCollisionDump,
+        Event::AutomaticStartPassive,
+        Event::TcpConnectionConfirmed,
+        Event::BgpOpen(open.clone()),
+    ]
 }
 
 /// RFC 4271 §6.8: the losing connection is closed with a Cease.
@@ -737,4 +806,244 @@ fn close_with_cease(mut conn: Conn, subcode: CeaseSubcode) {
         let _ = conn.stream.write_all(&bytes);
     }
     let _ = conn.stream.shutdown(Shutdown::Both);
+}
+
+/// How to decode UPDATEs on `session`.
+fn decode_context(session: Option<&Session>, allow_as_set: bool) -> DecodeContext {
+    match session {
+        Some(s) => DecodeContext {
+            four_octet_as: s.four_octet_as,
+            peer: s.peer,
+            allow_as_set,
+            // RFC 8950 §3, §4: once we advertised the capability, whether
+            // or not the peer did; without it RFC 7606 §7.11 expects four
+            // octets of next hop for IPv4 unicast.
+            extended_next_hop: s
+                .extended_next_hop_receive
+                .contains(&AddressFamily::IPV4_UNICAST),
+        },
+        None => DecodeContext {
+            four_octet_as: false,
+            peer: PeerKind::External,
+            allow_as_set,
+            extended_next_hop: false,
+        },
+    }
+}
+
+/// The families `m` carries routes of, announced or withdrawn, that are not
+/// among `taken`, the families we advertised (RFC 4760 §8), each once.
+fn unadvertised(m: &UpdateMessage, taken: &[AddressFamily]) -> Vec<AddressFamily> {
+    let ipv4 =
+        (!m.withdrawn.is_empty() || !m.nlri.is_empty()).then_some(AddressFamily::IPV4_UNICAST);
+    let mut out = Vec::new();
+    for family in ipv4
+        .into_iter()
+        .chain(m.mp_reach.as_ref().map(|r| r.family))
+        .chain(m.mp_unreach.as_ref().map(|u| u.family))
+    {
+        if !taken.contains(&family) && !out.contains(&family) {
+            out.push(family);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bgpfc_wire::capability::Capability;
+    use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
+
+    #[test]
+    fn families_we_did_not_advertise_are_named_once() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let p = |s: &str| s.parse().unwrap();
+        let mut m = UpdateMessage {
+            withdrawn: vec![p("192.0.2.0/24")],
+            mp_reach: Some(MpReach {
+                family: v6,
+                next_hop: NextHop::Ipv6 {
+                    global: "2001:db8::1".parse().unwrap(),
+                    link_local: None,
+                },
+                nlri: vec![p("2001:db8:1::/48")],
+            }),
+            mp_unreach: Some(MpUnreach {
+                family: v6,
+                withdrawn: vec![p("2001:db8:2::/48")],
+            }),
+            ..UpdateMessage::default()
+        };
+        assert_eq!(unadvertised(&m, &[v4]), vec![v6]);
+        assert_eq!(unadvertised(&m, &[v6]), vec![v4]);
+        assert_eq!(unadvertised(&m, &[v4, v6]), vec![]);
+        assert_eq!(unadvertised(&m, &[]), vec![v4, v6]);
+        m.withdrawn.clear();
+        assert_eq!(unadvertised(&m, &[]), vec![v6]);
+        assert_eq!(unadvertised(&UpdateMessage::default(), &[]), vec![]);
+    }
+
+    #[test]
+    fn a_collision_keeps_the_run_of_damped_failures() {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        // RFC 4486 §4: one automatic restart allowed, and one damped
+        // failure behind us.
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.damping = Some(bgpfc_fsm::Damping {
+            restart_limit: Some(1),
+            ..bgpfc_fsm::Damping::default()
+        });
+        let mut fsm = Fsm::new(cfg);
+        let now = Instant::now();
+        fsm.handle(Event::ManualStart, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        fsm.handle(Event::HoldTimerExpires, now);
+        fsm.handle(Event::IdleHoldTimerExpires, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        assert_eq!(fsm.damped_failures(), 1);
+        // The peer's connection wins the collision.
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            Vec::new(),
+        );
+        for event in collision_events(&open) {
+            let actions = fsm.handle(event, now);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::RestartLimitReached { .. })),
+                "{actions:?}"
+            );
+        }
+        // On with the winner, the run neither grown nor ended.
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        assert_eq!(fsm.damped_failures(), 1);
+        assert!(fsm.automatic_start_allowed());
+    }
+
+    #[test]
+    fn a_hard_clear_is_no_failure_and_restarts_the_peer() {
+        use bgpfc_wire::types::{Asn, RouterId};
+        // RFC 4486 §4: no automatic restart allowed at all; the operator's
+        // reset must neither count as a failure nor claim the peer stays
+        // down.
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.damping = Some(bgpfc_fsm::Damping {
+            restart_limit: Some(0),
+            ..bgpfc_fsm::Damping::default()
+        });
+        for message in [None, Some("maintenance")] {
+            let mut fsm = Fsm::new(cfg.clone());
+            let now = Instant::now();
+            fsm.handle(Event::ManualStart, now);
+            fsm.handle(Event::TcpCrAcked, now);
+            assert_eq!(fsm.state(), State::OpenSent);
+            let actions: Vec<Action> = reset_events(message)
+                .into_iter()
+                .flat_map(|e| fsm.handle(e, now))
+                .collect();
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::RestartLimitReached { .. })),
+                "{actions:?}"
+            );
+            let sent: Vec<&NotificationMessage> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::SendNotification(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "{actions:?}");
+            assert_eq!(
+                (sent[0].code, sent[0].subcode),
+                (ErrorCode::Cease, CeaseSubcode::AdministrativeReset as u8)
+            );
+            assert_eq!(
+                sent[0].shutdown_communication().and_then(Result::ok),
+                message
+            );
+            assert_eq!(fsm.state(), State::Connect);
+            assert_eq!(fsm.damped_failures(), 0);
+            assert!(fsm.automatic_start_allowed());
+        }
+    }
+
+    /// The session an FSM advertising `ours` negotiates with a peer
+    /// advertising `theirs`.
+    fn negotiated(ours: Vec<Capability>, theirs: Vec<Capability>) -> Session {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.capabilities = ours;
+        let mut fsm = Fsm::new(cfg);
+        let now = Instant::now();
+        fsm.handle(Event::ManualStart, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            theirs,
+        );
+        fsm.handle(Event::BgpOpen(open), now);
+        fsm.session().cloned().unwrap()
+    }
+
+    #[test]
+    fn ipv6_next_hops_for_ipv4_routes_are_taken_once_we_advertised_rfc8950() {
+        use bgpfc_wire::as_path::AsPath;
+        use bgpfc_wire::attribute::Origin;
+        use bgpfc_wire::capability::NextHopEncoding;
+        use bgpfc_wire::types::Asn;
+        use bgpfc_wire::update::EncodeContext;
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let enh = Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6]);
+        let mp = Capability::Multiprotocol(v4);
+        let attrs = bgpfc_rib::PathAttrs {
+            origin: Origin::Igp,
+            as_path: AsPath::sequence(&[Asn(65_001)]),
+            next_hop: NextHop::Ipv6 {
+                global: "2001:db8::1".parse().unwrap(),
+                link_local: None,
+            },
+            med: None,
+            local_pref: None,
+            atomic_aggregate: false,
+            aggregator: None,
+            communities: Vec::new(),
+            ext_communities: Vec::new(),
+            large_communities: Vec::new(),
+            unknown: Vec::new(),
+        };
+        let body = attrs
+            .to_update(v4, vec!["192.0.2.0/24".parse().unwrap()])
+            .encode(&EncodeContext {
+                four_octet_as: true,
+                extended_next_hop: true,
+            })
+            .unwrap();
+        let decode = |s: &Session| UpdateMessage::decode(&body, &decode_context(Some(s), false));
+        // RFC 8950 §4: our triple tells the peer it may send us an IPv6
+        // next hop, whether or not it listed one itself (§3: the length
+        // says which protocol the next hop is of).
+        for theirs in [vec![mp.clone()], vec![mp.clone(), enh.clone()]] {
+            let s = negotiated(vec![mp.clone(), enh.clone()], theirs);
+            let d = decode(&s).unwrap();
+            assert!(d.disabled.is_empty(), "{:?}", d.disabled);
+            assert_eq!(d.message.mp_reach.unwrap().next_hop, attrs.next_hop);
+        }
+        // Without ours, only four octets are expected (RFC 7606 §7.11), even
+        // when the peer listed the triple.
+        let s = negotiated(vec![mp.clone()], vec![mp, enh]);
+        let d = decode(&s).unwrap();
+        assert_eq!(
+            d.disabled.iter().map(|x| x.family).collect::<Vec<_>>(),
+            vec![v4]
+        );
+    }
 }

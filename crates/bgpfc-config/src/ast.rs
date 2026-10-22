@@ -277,12 +277,38 @@ pub struct Neighbor {
     pub allow_as_set: bool,
     /// `collision-detect-established` (RFC 4271 §6.8, §8.1.1).
     pub collision_detect_established: bool,
+    /// `advertisement-interval`: the `MinRouteAdvertisementIntervalTimer`
+    /// (RFC 4271 §9.2.1.1), zero for none. `None` takes the RFC 4271 §10
+    /// default for the session type once it is known: 30 s external, 5 s
+    /// internal.
+    pub advertisement_interval: Option<Duration>,
+    /// `extended-next-hop`: the families listed in the Extended Next Hop
+    /// Encoding capability with an IPv6 next hop (RFC 8950 §4).
+    /// `extended-next-hop yes` gives IPv4 unicast, the one family RFC 8950
+    /// covers that bgpfc speaks; empty by default.
+    pub extended_next_hop: Vec<AddressFamily>,
+    /// `restart-limit`: how many automatic restarts in a row after damped
+    /// failures before the peer stays Idle until a manual start
+    /// (RFC 4486 §4); `None` for `off`, no bound.
+    /// [`DEFAULT_RESTART_LIMIT`] when not given.
+    pub restart_limit: Option<u32>,
+    /// `maximum-prefix FAMILY N`: the upper bound on the routes of the
+    /// family accepted from the neighbor (RFC 4271 §6.7), in file order;
+    /// exceeding it ends the session with Cease / Maximum Number of
+    /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
+    pub maximum_prefix: Vec<(AddressFamily, u32)>,
 }
+
+/// The `restart-limit` of a neighbor that sets none: the same figure as
+/// `bgpfc_fsm::DEFAULT_RESTART_LIMIT`, which this crate does not depend on.
+pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
-    /// the session reset, are the same. Description and policies are not
-    /// session parameters.
+    /// the session reset, are the same. Description, policies, the
+    /// advertisement interval and the prefix limits are not session
+    /// parameters: the interval paces what the RIB sends and the limits
+    /// bound what it keeps, and both change without a reset.
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr
@@ -296,5 +322,7 @@ impl Neighbor {
             && self.passive == other.passive
             && self.allow_as_set == other.allow_as_set
             && self.collision_detect_established == other.collision_detect_established
+            && self.extended_next_hop == other.extended_next_hop
+            && self.restart_limit == other.restart_limit
     }
 }

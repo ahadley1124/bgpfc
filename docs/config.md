@@ -90,7 +90,11 @@ neighbor-item
              | "keepalive-time" u32 ";"              (* default hold-time / 3 *)
              | "connect-retry-time" u32 ";"          (* default 120 *)
              | "send-hold-time" ( u16 | "off" ) ";"  (* default max(480, 2 * hold-time) *)
+             | "advertisement-interval" u16 ";"      (* default 30 external, 5 internal; 0 off *)
              | "families" family { family } ";"      (* default both *)
+             | "extended-next-hop" yes-no ";"        (* default no *)
+             | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
+             | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -133,8 +137,9 @@ from (import) or is being sent to (export).
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
 session rewriting of RFC 4271 §5.1 (our AS is prepended after a policy's
-`as-path prepend`; the next hop of a route to an external peer is always
-our address). `next-hop self` is therefore only meaningful in export
+`as-path prepend`; the next hop of a route to an external peer is our
+address on the session, see `extended-next-hop` below for IPv4 routes on an
+IPv6 session). `next-hop self` is therefore only meaningful in export
 policies towards internal peers. A policy cannot advertise a route to the
 peer it came from, nor an internal route to another internal peer.
 
@@ -164,25 +169,99 @@ is an error. `import` and `export` must name policies defined in the same
 file. Timers are in seconds. `hold-time 0` disables keepalives and the hold
 timer (RFC 4271 §4.4). `keepalive-time` must be below `hold-time`.
 `send-hold-time` must exceed `hold-time` (RFC 9687 §4.4); `off` disables
-the send hold timer. `allow-as-set yes` accepts `AS_SET` in received
+the send hold timer. `advertisement-interval` is the
+MinRouteAdvertisementIntervalTimer of RFC 4271 §9.2.1.1: the least time
+between two advertisements of the same prefix to this neighbor. Changes
+inside the interval are held, and when it ends only the latest route goes
+out, so a flapping route is advertised at most once per interval. The
+first advertisement of a prefix is never held, and withdrawals are always
+sent at once (RFC 4271 applies the interval to withdrawals too; bgpfc does
+not, because holding a withdrawal back prolongs a blackhole). So that
+memory follows the routes rather than their churn, at most as many prefixes
+may be held at once as the neighbor was ever sent routes, or 1024 if that
+is more; past that, a change goes out at once. Without the
+statement the interval is the RFC 4271 §10 default for the session: 30
+seconds for an external neighbor, 5 for an internal one. `0` sends every
+change at once. `allow-as-set yes` accepts `AS_SET` in received
 UPDATEs against RFC 9774 §3. `collision-detect-established yes` lets a new
 connection replace an Established session per RFC 4271 §6.8.
+
+`extended-next-hop yes` advertises the Extended Next Hop Encoding
+capability of RFC 8950 for IPv4 unicast, which must then be in `families`.
+The capability tells the neighbor that we take IPv4 routes with an IPv6
+next hop, so such routes from it are accepted whether or not it advertises
+the capability too. When it does, IPv4 routes sent to it may carry an IPv6
+next hop as well: on a session over IPv6 the IPv4 routes sent to an
+external neighbor, or through `set next-hop self`, carry our IPv6 address
+on the session (RFC 8950 §5), and a route whose IPv6 next hop is passed on
+unchanged, as to an internal neighbor, keeps it (its global address: no
+link-local address is ever sent, as bgpfc cannot tell whether it shares a
+subnet with the next hop and the neighbor, RFC 2545 §3). A neighbor that
+did not advertise the capability is never sent an IPv4 route with an IPv6
+next hop (RFC 8950 §4). Without `extended-next-hop yes`, which is the
+default, the extension is used neither way: an IPv4 route received with an
+IPv6 next hop is malformed, and IPv4 unicast is disabled for the session
+(RFC 7606 §7.11); IPv4 routes sent over an IPv6 session keep the next hop
+they were received with. In the FIB, an IPv4 route via an IPv6 next hop is
+installed with `RTA_VIA`.
+
+`maximum-prefix ipv4-unicast 1000;` ends the session once the neighbor has
+more than 1000 IPv4 unicast routes in the RIB (RFC 4271 §6.7): bgpfcd
+sends Cease / Maximum Number of Prefixes Reached with the family and the
+limit in its data (RFC 4486 §4), drops every route the neighbor sent
+(none of the UPDATE that crossed the limit is passed on), and logs an
+error. Counted are the routes accepted: those that passed the AS loop
+check and the import policy, which is what `show neighbor` reports as
+received. Routes the import policy rejects are not kept and not counted,
+as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
+be at least 1 and its family one of the neighbor's `families`. The
+neighbor then restarts like after any other damped failure, so a peer
+that keeps sending too many routes is retried `restart-limit` times and
+then left Idle; `restart-limit 0` leaves it Idle at once.
+
+`restart-limit` bounds the automatic restarts after failures, as RFC 4486
+§4 asks. Some failures damp the restart (RFC 4271 §8.2.2): a NOTIFICATION
+we send for an error, an expired timer or a local stop such as an output
+queue overrun or a `maximum-prefix`; a NOTIFICATION received, or the
+connection lost after the OPENs were exchanged, before the session is up;
+and a Cease received while Established with Administrative Shutdown, Peer
+De-configured, Connection Rejected or Out of Resources (RFC 4486 §4). Each
+holds the neighbor Idle for 10 seconds, doubling with each such failure in
+a row up to 120 seconds. After `restart-limit` restarts in a row, the next
+such failure leaves the neighbor Idle, refusing connections, until
+`bgpfcctl clear neighbor`, or a reload that resets it, starts it again; the
+daemon logs an error when that happens. A manual start ends the run of
+failures, and so does a session that stayed up for five minutes; a session
+torn down soon after it comes up keeps counting. A refused or timed-out
+connection does not damp: a neighbor that is simply down is retried without
+bound. Nor do the operator's own stops and resets, or a connection that
+loses a collision (RFC 4271 §6.8), after which the session goes on with the
+other one; neither counts toward the limit or ends a run. `0` never
+restarts after a damped failure; `off` always does.
 
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
-loopback address; timer constraints above.
+loopback address; timer constraints above; `extended-next-hop` only with
+`ipv4-unicast` in `families`; `maximum-prefix` only for a family in
+`families`.
 
-**Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If it
-fails, the running configuration stays and the errors are logged. Otherwise
-the daemon applies the difference: new neighbors start, removed ones stop
-with Cease / Peer De-configured, neighbors whose session parameters changed
-(anything but `description`, `import` and `export`) reset with Cease / Other
-Configuration Change, and neighbors whose policies, or the prefix lists those
-policies use, changed are re-evaluated without a reset, using route refresh
-where the peer supports it. A changed `router-id` or `local-as` resets every
-session.
+**Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
+it fails, the running configuration stays and the errors are logged.
+Otherwise the daemon applies the difference: new neighbors start, removed
+ones stop with Cease / Peer De-configured, neighbors whose session
+parameters changed (anything but `description`, `import`, `export`,
+`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
+reset with Cease / Other Configuration Change and start again, and
+neighbors whose policies, or the prefix lists those policies use, changed
+are re-evaluated without a reset, using route refresh where the peer
+supports it. A changed `advertisement-interval` applies to the running
+session at once, also without a reset. So does a changed `maximum-prefix`:
+a session that already holds more routes than its new limit ends as if it
+had just exceeded it, and a raised limit does not start a neighbor the old
+one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
+`local-as` resets every session.
 
 ## Command line
 
