@@ -334,7 +334,7 @@ is `done`.
 | 9072 §3 | Type 255 elsewhere is an unrecognised parameter | MUST | done | wire/open.rs `decode_parameters` | open.rs `parameter_errors` |
 | 6286 §2.1 | BGP Identifier is any non-zero 4-octet value | MUST | done | wire/types.rs `RouterId::new` | types.rs `router_id_rejects_zero_only` |
 
-## RFC 6811 / 6483 / 7607 / 9319 — BGP prefix origin validation
+## RFC 6811 / 6483 / 9319 — BGP prefix origin validation
 
 Every route the Adj-RIBs-In hold is validated on arrival and again when the
 validation source changes, and its state is kept on the route and shown by
@@ -349,7 +349,7 @@ duplicates come with the RTR client.
 | 6811 §2 | Route Origin ASN: rightmost AS of a final `AS_SEQUENCE`; own AS for an empty `AS_PATH` or a final `AS_CONFED_SEQUENCE` / `AS_CONFED_SET`; NONE otherwise | MUST | done (from the `AS_PATH` as received, which the decoder has merged with `AS4_PATH`, RFC 6793 §4.2.3) | rpki/origin.rs `RouteOrigin::from_as_path`, rib/lib.rs `Rib::update`, rib/validation.rs | origin.rs `rightmost_as_of_a_final_sequence`, `local_as_for_an_empty_path_or_a_final_confed_segment`, `none_for_any_other_final_segment`, rib/tests/validation.rs `states_are_set_on_arrival_from_the_source` |
 | 6811 §2 | Covered and Matched as defined; Valid if a VRP Matches the route, Invalid if one Covers it and none Matches, NotFound if none Covers it | MUST | done | rpki/set.rs `VrpSet::validate` | set.rs `single_roa_outcomes`, `max_len_edges`, `one_matching_vrp_among_several_suffices`, `families_are_separate`, `host_routes_and_default_vrps`, rpki properties `validate_follows_the_rfc_procedure` |
 | 6811 §2 | A route whose Origin ASN is NONE is never Matched | MUST | done | rpki/set.rs `VrpSet::validate` | set.rs `origin_none_never_matches`, rpki properties `validate_follows_the_rfc_procedure` |
-| 6811 §2 | No route is Matched by a VRP whose ASN is zero | MUST | done | rpki/set.rs `VrpSet::validate` | set.rs `as0_never_matches`, rpki properties `validate_follows_the_rfc_procedure` |
+| 6811 §2 | No route is Matched by a VRP whose ASN is zero | MUST | done (RFC 6811 §2 grounds this in AS 0 never being a valid origin; the RFC 7607 §2 rows above cover a route that carries AS 0, which is treated as withdrawn before it reaches the RIB) | rpki/set.rs `VrpSet::validate` | set.rs `as0_never_matches`, rpki properties `validate_follows_the_rfc_procedure` |
 | 6811 §2 | On receipt of an UPDATE, look up each of its routes | SHOULD | done (every route the Adj-RIB-In keeps, against the RIB's `ValidationSource`) | rib/lib.rs `Rib::update` | rib/tests/validation.rs `states_are_set_on_arrival_from_the_source`, `without_a_validation_source_every_route_is_disabled` |
 | 6811 §2 | Also look up routes redistributed into BGP from another source | SHOULD | n/a (bgpfc originates and redistributes nothing) | | |
 | 6811 §2 | Configuration options to control which routes are looked up | MAY | todo (the `rpki` configuration, AGENTS.md §9 step 13) | | |
@@ -364,6 +364,5 @@ duplicates come with the RTR client.
 | 6483 §2 | Validity of a route against the ROAs: valid if one matches, invalid if one covers it and none matches, unknown (NotFound) if none covers it | info | done | rpki/set.rs `VrpSet::validate` | set.rs `single_roa_outcomes` |
 | 6483 §2 | A route whose final segment is an `AS_SET` is an aggregate whose origin AS cannot be determined | info | done (its origin is NONE, so it is Invalid wherever a VRP covers it) | rpki/origin.rs `RouteOrigin::from_as_path` | origin.rs `none_for_any_other_final_segment`, rib/tests/validation.rs `states_are_set_on_arrival_from_the_source` |
 | 6483 §4 | A ROA for AS 0 makes the routes it covers Invalid unless another ROA matches them | info | done | rpki/set.rs `VrpSet::validate` | set.rs `as0_never_matches` |
-| 7607 §2 | AS 0 is never a valid origin: an `AS_PATH` with AS 0 is malformed, and no route is Matched by an AS 0 VRP | MUST | done (such a path is treated as withdrawn before it reaches the RIB, and a route claiming origin AS 0 is never Valid) | wire/update.rs `decode_as_path`, rpki/set.rs `VrpSet::validate` | update.rs `as_path_rules`, set.rs `as0_never_matches` |
 | 9319 §3 | A VRP authorises no route longer than its maxLength: such a route is Invalid where the VRP covers it | info | done | rpki/set.rs `VrpSet::validate` | set.rs `loose_and_minimal_roas`, `max_len_edges` |
 | 9319 §5 | Operators use minimal ROAs and avoid maxLength | SHOULD | n/a (advice to ROA publishers; the router applies maxLength exactly as given) | | set.rs `loose_and_minimal_roas` |
