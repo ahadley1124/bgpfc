@@ -216,10 +216,19 @@ Config {
             restart_limit: Some(
                 3,
             ),
+            maximum_prefix: [
+                (
+                    AddressFamily {
+                        afi: Ipv4,
+                        safi: Unicast,
+                    },
+                    1000,
+                ),
+            ],
         },
         Neighbor {
             pos: Pos {
-                line: 55,
+                line: 56,
                 col: 1,
             },
             addr: 2001:db8::2,
@@ -259,6 +268,22 @@ Config {
                 },
             ],
             restart_limit: None,
+            maximum_prefix: [
+                (
+                    AddressFamily {
+                        afi: Ipv6,
+                        safi: Unicast,
+                    },
+                    250000,
+                ),
+                (
+                    AddressFamily {
+                        afi: Ipv4,
+                        safi: Unicast,
+                    },
+                    1200000,
+                ),
+            ],
         },
     ],
 }

@@ -7,7 +7,8 @@
 //! Identifier), §9.2.1.1 and §10 (`advertisement-interval`, the
 //! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
 //! is never configurable); RFC 9687 §4.4 (`send-hold-time`); RFC 8950 §4
-//! (`extended-next-hop`); RFC 4486 §4 (`restart-limit`).
+//! (`extended-next-hop`); RFC 4486 §4 (`restart-limit`); RFC 4271 §6.7
+//! (`maximum-prefix`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -771,17 +772,7 @@ impl Lowerer {
         }
         let mut out: Vec<AddressFamily> = Vec::new();
         for a in &s.args {
-            let fam = match a.value.as_str() {
-                "ipv4-unicast" => AddressFamily::IPV4_UNICAST,
-                "ipv6-unicast" => AddressFamily::IPV6_UNICAST,
-                _ => {
-                    self.err(
-                        a.pos,
-                        format!("`{}` is not `ipv4-unicast` or `ipv6-unicast`", a.value),
-                    );
-                    return None;
-                }
-            };
+            let fam = self.family(a)?;
             if out.contains(&fam) {
                 self.err(a.pos, format!("family `{}` is listed twice", a.value));
                 return None;
@@ -789,6 +780,21 @@ impl Lowerer {
             out.push(fam);
         }
         Some(out)
+    }
+
+    /// One family name.
+    fn family(&mut self, a: &Arg) -> Option<AddressFamily> {
+        match a.value.as_str() {
+            "ipv4-unicast" => Some(AddressFamily::IPV4_UNICAST),
+            "ipv6-unicast" => Some(AddressFamily::IPV6_UNICAST),
+            _ => {
+                self.err(
+                    a.pos,
+                    format!("`{}` is not `ipv4-unicast` or `ipv6-unicast`", a.value),
+                );
+                None
+            }
+        }
     }
 }
 
@@ -810,6 +816,7 @@ struct NeighborBuilder {
     advertisement_interval: Once<Duration>,
     extended_next_hop: Once<bool>,
     restart_limit: Once<Option<u32>>,
+    maximum_prefix: Vec<(AddressFamily, u32)>,
 }
 
 impl NeighborBuilder {
@@ -831,6 +838,7 @@ impl NeighborBuilder {
             advertisement_interval: Once::new("advertisement-interval"),
             extended_next_hop: Once::new("extended-next-hop"),
             restart_limit: Once::new("restart-limit"),
+            maximum_prefix: Vec::new(),
         }
     }
 
@@ -928,7 +936,33 @@ impl NeighborBuilder {
                 });
                 self.restart_limit.set(l, t.pos, v);
             }
+            "maximum-prefix" => self.maximum_prefix(l, t),
             _ => l.unknown(t, "`neighbor`"),
+        }
+    }
+
+    /// `maximum-prefix FAMILY N`, at most once per family (RFC 4271 §6.7).
+    fn maximum_prefix(&mut self, l: &mut Lowerer, t: &Statement) {
+        let Some([family, limit]) = l.args(t, 2) else {
+            return;
+        };
+        let family = l.family(family);
+        let limit = l.parse::<u32>(limit, "a number of prefixes (1-4294967295)");
+        let (Some(family), Some(limit)) = (family, limit) else {
+            return;
+        };
+        if limit == 0 {
+            l.err(
+                t.pos,
+                "maximum-prefix must be at least 1; an import policy rejects routes",
+            );
+        } else if self.maximum_prefix.iter().any(|(f, _)| *f == family) {
+            l.err(
+                t.pos,
+                format!("`maximum-prefix` is given more than once for {family}"),
+            );
+        } else {
+            self.maximum_prefix.push((family, limit));
         }
     }
 
@@ -980,6 +1014,7 @@ impl NeighborBuilder {
                 .restart_limit
                 .value
                 .unwrap_or(Some(DEFAULT_RESTART_LIMIT)),
+            maximum_prefix: self.maximum_prefix,
         })
     }
 }

@@ -94,6 +94,7 @@ neighbor-item
              | "families" family { family } ";"      (* default both *)
              | "extended-next-hop" yes-no ";"        (* default no *)
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
+             | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -196,42 +197,60 @@ from it is malformed: IPv4 unicast is disabled for the session (RFC 7606
 the next hop they were received with. In the FIB, an IPv4 route via an
 IPv6 next hop is installed with `RTA_VIA`.
 
+`maximum-prefix ipv4-unicast 1000;` ends the session once the neighbor has
+more than 1000 IPv4 unicast routes in the RIB (RFC 4271 §6.7): bgpfcd
+sends Cease / Maximum Number of Prefixes Reached with the family and the
+limit in its data (RFC 4486 §4), drops every route the neighbor sent
+(none of the UPDATE that crossed the limit is passed on), and logs an
+error. Counted are the routes accepted: those that passed the AS loop
+check and the import policy, which is what `show neighbor` reports as
+received. Routes the import policy rejects are not kept and not counted,
+as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
+be at least 1 and its family one of the neighbor's `families`. The
+neighbor then restarts like after any other damped failure, so a peer
+that keeps sending too many routes is retried `restart-limit` times and
+then left Idle; `restart-limit 0` leaves it Idle at once.
+
 `restart-limit` bounds the automatic restarts after failures, as RFC 4486
 §4 asks. Some failures damp the restart (RFC 4271 §8.2.2): a NOTIFICATION
 we send for an error, an expired timer or a local stop such as an output
-queue overrun; a NOTIFICATION received, or the connection lost after the
-OPENs were exchanged, before the session is up; and a Cease received while
-Established with Administrative Shutdown, Peer De-configured, Connection
-Rejected or Out of Resources (RFC 4486 §4). Each holds the neighbor Idle
-for 10 seconds, doubling with each such failure in a row up to 120
-seconds. After `restart-limit` restarts in a row, the next such failure
-leaves the neighbor Idle, refusing connections, until `bgpfcctl clear
-neighbor`, or a reload that resets it, starts it again; the daemon logs an
-error when that happens. A manual start ends the run of failures, and so
-does a session that stayed up for five minutes; a session torn down soon
-after it comes up keeps counting. A refused or timed-out connection does
-not damp: a neighbor that is simply down is retried without bound. `0`
-never restarts after a damped failure; `off` always does.
+queue overrun or a `maximum-prefix`; a NOTIFICATION received, or the
+connection lost after the OPENs were exchanged, before the session is up;
+and a Cease received while Established with Administrative Shutdown, Peer
+De-configured, Connection Rejected or Out of Resources (RFC 4486 §4). Each
+holds the neighbor Idle for 10 seconds, doubling with each such failure in
+a row up to 120 seconds. After `restart-limit` restarts in a row, the next
+such failure leaves the neighbor Idle, refusing connections, until
+`bgpfcctl clear neighbor`, or a reload that resets it, starts it again; the
+daemon logs an error when that happens. A manual start ends the run of
+failures, and so does a session that stayed up for five minutes; a session
+torn down soon after it comes up keeps counting. A refused or timed-out
+connection does not damp: a neighbor that is simply down is retried without
+bound. `0` never restarts after a damped failure; `off` always does.
 
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
-`ipv4-unicast` in `families`.
+`ipv4-unicast` in `families`; `maximum-prefix` only for a family in
+`families`.
 
-**Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If it
-fails, the running configuration stays and the errors are logged. Otherwise
-the daemon applies the difference: new neighbors start, removed ones stop
-with Cease / Peer De-configured, neighbors whose session parameters changed
-(anything but `description`, `import`, `export` and
-`advertisement-interval`; `restart-limit` included) reset with Cease /
-Other Configuration Change and start again, and
-neighbors whose policies, or the prefix lists those policies use, changed are
-re-evaluated without a reset, using route refresh where the peer supports it.
-A changed `advertisement-interval` applies to the running session at once,
-also without a reset. A changed `router-id` or `local-as` resets every
-session.
+**Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
+it fails, the running configuration stays and the errors are logged.
+Otherwise the daemon applies the difference: new neighbors start, removed
+ones stop with Cease / Peer De-configured, neighbors whose session
+parameters changed (anything but `description`, `import`, `export`,
+`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
+reset with Cease / Other Configuration Change and start again, and
+neighbors whose policies, or the prefix lists those policies use, changed
+are re-evaluated without a reset, using route refresh where the peer
+supports it. A changed `advertisement-interval` applies to the running
+session at once, also without a reset. So does a changed `maximum-prefix`:
+a session that already holds more routes than its new limit ends as if it
+had just exceeded it, and a raised limit does not start a neighbor the old
+one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
+`local-as` resets every session.
 
 ## Command line
 

@@ -292,6 +292,11 @@ pub struct Neighbor {
     /// (RFC 4486 §4); `None` for `off`, no bound.
     /// [`DEFAULT_RESTART_LIMIT`] when not given.
     pub restart_limit: Option<u32>,
+    /// `maximum-prefix FAMILY N`: the upper bound on the routes of the
+    /// family accepted from the neighbor (RFC 4271 §6.7), in file order;
+    /// exceeding it ends the session with Cease / Maximum Number of
+    /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
+    pub maximum_prefix: Vec<(AddressFamily, u32)>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -300,9 +305,10 @@ pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
-    /// the session reset, are the same. Description, policies and the
-    /// advertisement interval are not session parameters: the interval
-    /// paces what the RIB sends and changes without a reset.
+    /// the session reset, are the same. Description, policies, the
+    /// advertisement interval and the prefix limits are not session
+    /// parameters: the interval paces what the RIB sends and the limits
+    /// bound what it keeps, and both change without a reset.
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr

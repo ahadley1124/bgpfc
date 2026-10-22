@@ -167,6 +167,7 @@ Config {
             restart_limit: Some(
                 10,
             ),
+            maximum_prefix: [],
         },
     ],
 }

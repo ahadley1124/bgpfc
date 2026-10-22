@@ -26,6 +26,11 @@ pub struct ConfigDiff {
     /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
     /// in `policy_changed` too.
     pub interval_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `maximum-prefix` limits
+    /// changed: the RIB applies them to the running session (RFC 4271
+    /// §6.7), which ends at once if it already holds more routes than a
+    /// new limit allows. A neighbor may be in the lists above too.
+    pub prefix_limit_changed: Vec<IpAddr>,
     /// Neighbors in both with only a description change, or none.
     pub unchanged: Vec<IpAddr>,
     /// Which global settings changed.
@@ -80,13 +85,17 @@ impl ConfigDiff {
             }
             let policy = policy_differs(old, o, new, n);
             let interval = o.advertisement_interval != n.advertisement_interval;
+            let limit = o.maximum_prefix != n.maximum_prefix;
             if policy {
                 d.policy_changed.push(n.addr);
             }
             if interval {
                 d.interval_changed.push(n.addr);
             }
-            if !policy && !interval {
+            if limit {
+                d.prefix_limit_changed.push(n.addr);
+            }
+            if !policy && !interval && !limit {
                 d.unchanged.push(n.addr);
             }
         }
@@ -101,6 +110,7 @@ impl ConfigDiff {
             && self.reset.is_empty()
             && self.policy_changed.is_empty()
             && self.interval_changed.is_empty()
+            && self.prefix_limit_changed.is_empty()
             && self.global.is_empty()
     }
 }
@@ -257,6 +267,35 @@ mod tests {
             vec![addr("192.0.2.2")]
         );
         assert!(ConfigDiff::between(&b, &b).is_empty());
+    }
+
+    #[test]
+    fn prefix_limit_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // RFC 4271 §6.7: a limit is the RIB's, not the session's.
+        let b = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 100;",
+        ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(d.prefix_limit_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+        assert!(!d.is_empty());
+        // Raised, lowered or removed alike.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 50;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&b, &c).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert_eq!(
+            ConfigDiff::between(&c, &a).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert!(ConfigDiff::between(&c, &c).is_empty());
     }
 
     #[test]

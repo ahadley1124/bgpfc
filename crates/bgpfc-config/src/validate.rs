@@ -5,7 +5,8 @@
 //!
 //! Implements: RFC 9687 §4.4 (a fixed `SendHoldTime` exceeds the Hold
 //! Time); RFC 4271 §10 (`KeepaliveTime` below the Hold Time); RFC 8950 §4
-//! (`extended-next-hop` qualifies a configured family).
+//! (`extended-next-hop` qualifies a configured family); RFC 4271 §6.7
+//! (`maximum-prefix` bounds a configured family).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -88,6 +89,19 @@ pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
                     n.pos,
                     format!(
                         "neighbor {}: extended-next-hop needs the {family} family (RFC 8950 §4)",
+                        n.addr
+                    ),
+                );
+            }
+        }
+        // RFC 4760 §8: a family not configured is never negotiated, so a
+        // limit on it could never apply; say so rather than ignore it.
+        for (family, _) in &n.maximum_prefix {
+            if !n.families.contains(family) {
+                err(
+                    n.pos,
+                    format!(
+                        "neighbor {}: maximum-prefix for {family}, which is not in its families",
                         n.addr
                     ),
                 );
