@@ -1,4 +1,6 @@
-//! RIB insert and withdraw at scale (AGENTS.md §5, benches row), churn
+//! RIB insert and withdraw at scale (AGENTS.md §5, benches row), from one
+//! peer and from two that send the same table, as a multi-homed network
+//! has it, churn
 //! under the RFC 4271 §9.2.1.1 advertisement interval, and validating
 //! routes again when the validation source changes (RFC 6811 §4). The
 //! default sizes are a fraction of a full table so the bench finishes
@@ -128,6 +130,26 @@ fn bench(c: &mut Criterion) {
             rib.peer_up(peer(2), now);
             for u in v4.iter().chain(&v6) {
                 black_box(rib.update(peer(1).addr, u, now));
+            }
+            rib
+        });
+    });
+    // Every destination heard from two peers: what the RIB keeps per
+    // destination beyond the first route shows here and not above.
+    let v4_other = updates(routes * 4 / 5, false, 65_003, 7);
+    let v6_other = updates(routes / 5, true, 65_003, 7);
+    group.bench_function(format!("insert_{routes}_from_two_peers_to_one_peer"), |b| {
+        b.iter(|| {
+            let now = Instant::now();
+            let mut rib = Rib::new(Asn(65_000));
+            rib.peer_up(peer(1), now);
+            rib.peer_up(peer(2), now);
+            rib.peer_up(peer(3), now);
+            for u in v4.iter().chain(&v6) {
+                black_box(rib.update(peer(1).addr, u, now));
+            }
+            for u in v4_other.iter().chain(&v6_other) {
+                black_box(rib.update(peer(3).addr, u, now));
             }
             rib
         });
