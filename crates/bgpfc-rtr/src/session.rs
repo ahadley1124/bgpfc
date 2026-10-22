@@ -35,6 +35,10 @@
 //! for a full reload, the changed prefixes for an incremental update. A
 //! reply that fails half-way, for whatever reason, is dropped whole.
 //!
+//! A reply is bounded in size and in time: it may leave the router with
+//! no more than [`Config::max_vrps`] VRPs, and must reach its End of Data
+//! within [`Config::reply_timeout`] of the query.
+//!
 //! # Stale data
 //!
 //! When the cache cannot be reached, or has no data, the session keeps
@@ -63,7 +67,7 @@
 //! an Error Report), §6 (Refresh, Retry and Expire), §7 (version
 //! negotiation and downgrade), §8.1–§8.4 (the protocol sequences), §10
 //! (keep the data while the cache is away), §12 (fatal errors drop the
-//! session; codes 6 and 7);
+//! session; codes 1, 6 and 7);
 //! RFC 6810 §6.1 (poll at least hourly in version 0), §8 (version 0 data
 //! is deleted after twice the polling period).
 //!
@@ -77,7 +81,6 @@ mod staging;
 mod tests;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,6 +115,19 @@ pub struct Config {
     /// query and never answers would stall the session until the data
     /// expired. [`Session::new`] raises it to at least one second.
     pub response_timeout: Duration,
+    /// The longest a reply may take, from the query to its End of Data,
+    /// however steadily its PDUs come. RFC 8210 sets no such limit, but
+    /// without one a cache that trickles out a reply would hold the
+    /// session, and the client would never move to another cache.
+    /// [`Session::new`] raises it to at least the response timeout.
+    pub reply_timeout: Duration,
+    /// The most VRPs a reply may leave the router holding: those of a
+    /// Reset reply, or the committed data with a Serial reply's changes.
+    /// RFC 8210 sets no limit, but runs over unprotected TCP (§9), and
+    /// without one a cache, or anyone on the path, could grow the router's
+    /// memory until it fails. A reply that goes past it is refused with an
+    /// Internal Error (§12 code 1) and dropped whole.
+    pub max_vrps: usize,
 }
 
 /// The longest time between two queries in a version 0 session:
@@ -132,16 +148,30 @@ impl Config {
     /// timer restarts with every PDU of the answer, a full load over a slow
     /// link does not trip it.
     pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// The default [`Config::reply_timeout`]. No RFC gives one. In half an
+    /// hour a full load of [`Config::DEFAULT_MAX_VRPS`] Prefix PDUs, at
+    /// most 32 octets each (RFC 8210 §5.7), or 128 MB, gets through at
+    /// 600 kbit/s.
+    pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_mins(30);
+
+    /// The default [`Config::max_vrps`]: four million, several times the
+    /// VRPs the whole RPKI holds, so that it stops only a cache that has
+    /// gone wrong, while what a reply can make the router hold stays in
+    /// the hundreds of megabytes.
+    pub const DEFAULT_MAX_VRPS: usize = 4_000_000;
 }
 
 impl Default for Config {
     /// Version 1, the cache's Expire Interval up to the RFC maximum, and
-    /// the default response timeout.
+    /// the default timeouts and maximum of VRPs.
     fn default() -> Config {
         Config {
             version: Version::V1,
             max_expire: Config::MAX_EXPIRE,
             response_timeout: Config::DEFAULT_RESPONSE_TIMEOUT,
+            reply_timeout: Config::DEFAULT_REPLY_TIMEOUT,
+            max_vrps: Config::DEFAULT_MAX_VRPS,
         }
     }
 }
@@ -376,6 +406,8 @@ pub struct Session {
     synced_at: Option<Instant>,
     /// When the last query went out.
     queried_at: Option<Instant>,
+    /// When the answer to the query that is out must be complete.
+    reply_deadline: Option<Instant>,
     /// The serial of a Serial Notify that arrived while a query was out.
     notified: Option<u32>,
     /// The shell's delay before reconnecting after a failure, in place of
@@ -390,11 +422,13 @@ impl Session {
     /// connect.
     #[must_use]
     pub fn new(config: Config, connect_at: Instant) -> Session {
+        let response_timeout = config.response_timeout.max(Duration::from_secs(1));
         let config = Config {
             max_expire: config
                 .max_expire
                 .clamp(Config::MIN_EXPIRE, Config::MAX_EXPIRE),
-            response_timeout: config.response_timeout.max(Duration::from_secs(1)),
+            response_timeout,
+            reply_timeout: config.reply_timeout.max(response_timeout),
             ..config
         };
         Session {
@@ -413,6 +447,7 @@ impl Session {
             expire_at: None,
             synced_at: None,
             queried_at: None,
+            reply_deadline: None,
             notified: None,
             retry_delay: None,
         }
@@ -561,7 +596,12 @@ impl Session {
                     // The query failed (RFC 8210 §6 Retry Interval). The
                     // data and its serial are intact: the next connection
                     // goes on with a Serial Query (§8.1).
-                    self.log_stale(Level::Warn, "rtr cache stopped answering", now, out);
+                    let message = if self.reply_deadline.is_some_and(|end| end <= now) {
+                        "rtr cache took longer than the reply timeout"
+                    } else {
+                        "rtr cache stopped answering"
+                    };
+                    self.log_stale(Level::Warn, message, now, out);
                     out.push(Action::Close);
                     self.disconnect(now, false);
                 }
@@ -594,7 +634,7 @@ impl Session {
         // A Serial reply under way updates data that is gone now.
         match &mut self.phase {
             Phase::Querying(Query::Serial { stale, .. }) => *stale = true,
-            Phase::Receiving(reply) if matches!(reply.staging, Staging::Delta(_)) => {
+            Phase::Receiving(reply) if matches!(reply.staging, Staging::Delta { .. }) => {
                 reply.staging = Staging::Discard;
             }
             _ => {}
@@ -719,6 +759,7 @@ impl Session {
         self.phase = Phase::Querying(query);
         self.notified = None;
         self.queried_at = Some(now);
+        self.reply_deadline = after(now, self.config.reply_timeout);
         self.deadline = after(now, self.config.response_timeout);
     }
 
@@ -1025,7 +1066,7 @@ impl Session {
                 if stale {
                     Staging::Discard
                 } else {
-                    Staging::Delta(HashMap::new())
+                    Staging::delta(self.committed.as_deref())
                 }
             }
             // RFC 8210 §5.5: "In response to a Reset Query, the new value of
@@ -1045,8 +1086,15 @@ impl Session {
     /// [`Config::response_timeout`]. Only the answer's own PDUs restart the
     /// timer: a Serial Notify is part of none, and a cache that sends them
     /// and never answers still times out.
+    /// Nor does the timer run past [`Config::reply_timeout`].
     fn answer_goes_on(&mut self, now: Instant) {
-        self.deadline = after(now, self.config.response_timeout);
+        self.deadline = match (
+            after(now, self.config.response_timeout),
+            self.reply_deadline,
+        ) {
+            (Some(next), Some(end)) => Some(next.min(end)),
+            (next, end) => next.or(end),
+        };
     }
 
     fn on_cache_reset(&mut self, now: Instant, out: &mut Vec<Action>) {
@@ -1074,11 +1122,21 @@ impl Session {
         let Phase::Receiving(reply) = &mut self.phase else {
             return;
         };
-        match reply
-            .staging
-            .apply(announce, vrp, self.committed.as_deref())
-        {
+        match reply.staging.apply(
+            announce,
+            vrp,
+            self.committed.as_deref(),
+            self.config.max_vrps,
+        ) {
             Ok(()) => self.answer_goes_on(now),
+            // RFC 8210 §5.11: "If the error is generic (e.g., "Internal
+            // Error") and not associated with the PDU to which it is
+            // responding, the Erroneous PDU field MUST be empty". The PDU
+            // is sound; the router has no room for it.
+            Err(rejected) if rejected.code == ErrorCode::InternalError => {
+                let text = format!("{} ({})", rejected.reason, self.config.max_vrps);
+                self.internal_error(&text, now, out);
+            }
             Err(rejected) => {
                 // RFC 8210 §12: codes 6 and 7 are fatal, like code 0. The
                 // reply is dropped whole and the data stays as it was; §5.1
@@ -1138,7 +1196,7 @@ impl Session {
                     self.commit(set, affected, out);
                 }
             }
-            Staging::Delta(changes) => {
+            Staging::Delta { changes, .. } => {
                 let base = self.committed.clone().unwrap_or_default();
                 if let Some((set, affected)) = staging::apply_delta(&base, changes) {
                     self.commit(set, affected, out);
@@ -1322,6 +1380,24 @@ impl Session {
         // "MUST cause the session to be dropped". The next connection
         // starts with a Reset Query (§8.1): the router "fears that it has
         // otherwise lost its way".
+        out.push(Action::Close);
+        self.disconnect(now, true);
+    }
+
+    /// The router cannot go on for a reason of its own: report it as an
+    /// Internal Error about no PDU, and drop the session (RFC 8210 §12 code
+    /// 1, fatal). The data stays as it was.
+    fn internal_error(&mut self, text: &str, now: Instant, out: &mut Vec<Action>) {
+        let mut fields = self.stale_fields(now);
+        fields.push(field("error", text));
+        log(
+            out,
+            Level::Error,
+            "rtr router cannot take the cache's reply; dropping the session",
+            fields,
+        );
+        let report = ErrorReport::new(self.report_version(), ErrorCode::InternalError, &[], text);
+        out.push(Action::Send(Pdu::ErrorReport(report)));
         out.push(Action::Close);
         self.disconnect(now, true);
     }

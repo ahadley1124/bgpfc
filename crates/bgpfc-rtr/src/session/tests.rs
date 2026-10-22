@@ -1433,8 +1433,14 @@ fn version_0_queries_at_least_hourly() {
     h.now = asked + Duration::from_secs(3_600);
     assert_eq!(tags(&h.step(Event::Tick)), ["serial-query v0 7/1"]);
     // A reply that takes longer than the hour, each PDU within the
-    // response timeout, is followed by the next query at once.
-    let mut h = querying_cold();
+    // response timeout and all within the reply timeout, is followed by the
+    // next query at once.
+    let mut h = H::with(Config {
+        reply_timeout: Duration::from_hours(2),
+        ..Config::default()
+    });
+    h.wait(0);
+    assert_eq!(tags(&h.step(Event::Connected)), ["reset-query v1"]);
     h.now += Duration::from_secs(59);
     h.pdu(response(V0, SID));
     for i in 0..61 {
@@ -1531,6 +1537,110 @@ fn serial_notifies_do_not_hold_off_the_response_timer() {
         );
         assert_eq!(h.s.state(), State::Disconnected, "{name}");
     }
+}
+
+#[test]
+fn a_reply_that_trickles_on_times_out() {
+    // Each PDU within the response timeout, but the reply as a whole not
+    // within the reply timeout of the query.
+    let mut h = querying_serial();
+    let asked = h.now;
+    h.pdu(response(V1, SID));
+    let mut asn = 0;
+    while h.now + Duration::from_secs(50) < asked + Config::DEFAULT_REPLY_TIMEOUT {
+        h.now += Duration::from_secs(50);
+        asn += 1;
+        let vrp = vrp("10.0.0.0/8", 24, asn);
+        assert_eq!(tags(&h.pdu(announce(V1, vrp))), NONE);
+    }
+    assert_eq!(
+        h.s.next_deadline(),
+        Some(asked + Config::DEFAULT_REPLY_TIMEOUT)
+    );
+    h.now = asked + Config::DEFAULT_REPLY_TIMEOUT;
+    let actions = h.step(Event::Tick);
+    assert_eq!(tags(&actions), ["close"]);
+    assert!(
+        logs(&actions)
+            .iter()
+            .any(|l| l.message == "rtr cache took longer than the reply timeout")
+    );
+    // Like any query that fails: nothing committed, the serial kept.
+    assert_eq!(h.vrps(), set(&[a(), b()]));
+    assert_eq!(h.s.serial(), Some(5));
+    // A Serial Notify does not move it either.
+    let mut h = querying_cold();
+    h.now += Duration::from_secs(50);
+    h.pdu(response(V1, SID));
+    for _ in 0..40 {
+        h.now += Duration::from_secs(50);
+        h.pdu(router_key());
+        h.pdu(notify(V1, SID, 1));
+    }
+    assert_eq!(h.s.state(), State::Disconnected);
+}
+
+#[test]
+fn a_reply_beyond_the_maximum_of_vrps_is_refused() {
+    let cap = Config {
+        max_vrps: 3,
+        ..Config::default()
+    };
+    // A Reset reply.
+    let mut h = H::with(cap);
+    h.wait(0);
+    h.step(Event::Connected);
+    h.pdus(&[response(V1, SID), announce(V1, a()), announce(V1, b())]);
+    assert_eq!(tags(&h.pdu(announce(V1, c()))), NONE, "three fit");
+    let extra = announce(V1, vrp("203.0.113.0/24", 24, 64_499));
+    let actions = h.pdu(extra);
+    assert_eq!(tags(&actions), ["report v1 code 1", "close"]);
+    // RFC 8210 §5.11: a generic error quotes no PDU.
+    let report = reports(&actions)[0];
+    assert_eq!(report.erroneous_pdu(), b"");
+    assert!(report.text().contains("maximum"), "{}", report.text());
+    assert!(logs(&actions).iter().any(|l| l.level == Level::Error));
+    assert!(h.s.vrps().is_none(), "nothing is committed");
+    assert_eq!(h.s.state(), State::Disconnected);
+
+    // A Serial reply counts the committed data with its changes.
+    let mut h = H::with(cap);
+    h.wait(0);
+    h.step(Event::Connected);
+    h.pdus(&[
+        response(V1, SID),
+        announce(V1, a()),
+        announce(V1, b()),
+        eod(SID, 5),
+    ]);
+    h.wait(3_600);
+    h.pdus(&[response(V1, SID), announce(V1, c())]);
+    let actions = h.pdu(announce(V1, vrp("203.0.113.0/24", 24, 64_499)));
+    assert_eq!(tags(&actions), ["report v1 code 1", "close"]);
+    // The committed data stays, and is served until it expires (§6).
+    assert_eq!(h.vrps(), set(&[a(), b()]));
+    assert_eq!(h.s.expires_at(), Some(h.secs(3_600)));
+    // Withdrawals make room within the same reply.
+    let mut h = H::with(cap);
+    h.wait(0);
+    h.step(Event::Connected);
+    h.pdus(&[
+        response(V1, SID),
+        announce(V1, a()),
+        announce(V1, b()),
+        announce(V1, c()),
+        eod(SID, 5),
+    ]);
+    h.wait(3_600);
+    let d = vrp("203.0.113.0/24", 24, 64_499);
+    let actions = h.pdus(&[
+        response(V1, SID),
+        withdraw(V1, a()),
+        announce(V1, d),
+        eod(SID, 6),
+    ]);
+    assert_eq!(tags(&actions), ["commit 3 ~2"]);
+    assert_eq!(h.vrps(), set(&[b(), c(), d]));
 }
 
 #[test]
@@ -1683,6 +1793,19 @@ fn the_configured_expiry_stays_within_the_rfc_range() {
     );
     assert_eq!(s.config().max_expire, Config::MIN_EXPIRE);
     assert_eq!(Config::MAX_EXPIRE.as_secs(), 172_800);
+    // The reply timeout is at least the response timeout.
+    let s = Session::new(
+        Config {
+            response_timeout: Duration::from_secs(90),
+            reply_timeout: Duration::from_secs(5),
+            ..Config::default()
+        },
+        Instant::now(),
+    );
+    assert_eq!(s.config().reply_timeout, Duration::from_secs(90));
+    let defaults = Config::default();
+    assert_eq!(defaults.reply_timeout, Duration::from_mins(30));
+    assert_eq!(defaults.max_vrps, 4_000_000);
 }
 
 #[test]
