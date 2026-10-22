@@ -24,6 +24,10 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   hops for IPv4 routes (per neighbor, `extended-next-hop yes`) and RFC 7606
   error handling; interop tests against BIRD 2, FRR 8 and GoBGP 3 run on every
   push.
+- Per-neighbor, per-family prefix limits (`maximum-prefix`, RFC 4271 §6.7) that
+  end the session with the RFC 4486 Cease, and damped automatic restarts with
+  an upper bound (`restart-limit`, RFC 4486 §4) after which a failing neighbor
+  waits for `bgpfcctl clear neighbor`.
 - The RFC 4271 decision process over interned attribute sets, per-neighbor
   import/export policy with prefix lists, an AS-path regex engine and community
   matching, and update generation packed to the negotiated message size and
