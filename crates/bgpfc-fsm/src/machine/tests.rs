@@ -109,6 +109,7 @@ fn tags(actions: &[Action]) -> Vec<String> {
             Action::SessionUp(_) => "up".to_owned(),
             Action::SessionDown => "down".to_owned(),
             Action::LogError(_) => "log".to_owned(),
+            Action::RestartLimitReached { failures } => format!("limit {failures}"),
         })
         .collect()
 }
@@ -795,13 +796,16 @@ fn damping_doubles_the_idle_hold_and_a_session_resets_it() {
     // RFC 4271 §8.2.2 Idle: every start zeroes the counter, so only the
     // last failure is counted.
     assert_eq!(f.connect_retry_counter(), 1);
-    // Establish once: damping resets.
+    assert_eq!(f.damped_failures(), 6);
+    // Establish once and stay up for `forget_after`: damping resets.
     f.handle(Event::IdleHoldTimerExpires, now);
     f.handle(Event::TcpCrAcked, now);
     f.handle(Event::BgpOpen(peer_open()), now);
     f.handle(Event::KeepAliveMsg, now);
     assert_eq!(f.state(), State::Established);
+    now += Damping::default().forget_after;
     f.handle(Event::TcpConnectionFails, now);
+    assert_eq!(f.damped_failures(), 0);
     assert_eq!(
         f.timer(TimerKind::IdleHold).deadline(),
         Some(now + Duration::from_secs(10))
@@ -919,4 +923,233 @@ fn event_numbers_and_timer_events() {
 fn damping_default_values() {
     assert_eq!(Damping::default().initial, Duration::from_secs(10));
     assert_eq!(Damping::default().max, Duration::from_secs(120));
+    assert_eq!(Damping::default().restart_limit, Some(10));
+    assert_eq!(Damping::default().forget_after, Duration::from_secs(300));
+}
+
+/// A configuration whose damping allows `limit` automatic restarts.
+fn limited(limit: Option<u32>) -> Config {
+    let mut cfg = config();
+    cfg.damping = Some(Damping {
+        restart_limit: limit,
+        ..Damping::default()
+    });
+    cfg
+}
+
+/// One step of a scripted run: the event, the seconds since the start at
+/// which it happens, the state after it, the actions it returns, and the
+/// `IdleHoldTimer` it leaves (seconds after the event, or none).
+type Step = (Event, u64, State, &'static [&'static str], Option<u64>);
+
+fn run_steps(mut f: Fsm, start: Instant, steps: &[Step]) -> Fsm {
+    for (i, (event, at, state, expect, idle_hold)) in steps.iter().enumerate() {
+        let now = start + Duration::from_secs(*at);
+        let actions = f.handle(event.clone(), now);
+        assert_eq!(f.state(), *state, "step {i} ({event:?})");
+        assert_eq!(tags(&actions), *expect, "step {i} ({event:?})");
+        assert_eq!(
+            f.timer(TimerKind::IdleHold)
+                .deadline()
+                .map(|d| (d - now).as_secs()),
+            *idle_hold,
+            "step {i} ({event:?}): IdleHoldTimer"
+        );
+    }
+    f
+}
+
+#[test]
+fn restart_limit_leaves_the_peer_idle_until_a_manual_start() {
+    use Event::{
+        AutomaticStart, HoldTimerExpires, IdleHoldTimerExpires, ManualStart,
+        TcpConnectionConfirmed, TcpCrAcked,
+    };
+    use State::{Connect, Idle, OpenSent};
+    // RFC 4486 §4: two automatic restarts, then the third damped failure
+    // in a row leaves the peer Idle until a ManualStart.
+    let start = t0();
+    let f = run_steps(
+        Fsm::new(limited(Some(2))),
+        start,
+        &[
+            (ManualStart, 0, Connect, &["connect"], None),
+            (TcpCrAcked, 1, OpenSent, &["open"], None),
+            (HoldTimerExpires, 2, Idle, &["notif 4/0", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 12, Connect, &["connect"], None),
+            (TcpCrAcked, 13, OpenSent, &["open"], None),
+            (HoldTimerExpires, 14, Idle, &["notif 4/0", "drop"], Some(20)),
+            (IdleHoldTimerExpires, 34, Connect, &["connect"], None),
+            (TcpCrAcked, 35, OpenSent, &["open"], None),
+            (
+                HoldTimerExpires,
+                36,
+                Idle,
+                &["notif 4/0", "drop", "limit 3"],
+                None,
+            ),
+            // AllowAutomaticStart is FALSE: nothing starts the peer, and
+            // Idle keeps refusing connections.
+            (AutomaticStart, 1000, Idle, &[], None),
+            (IdleHoldTimerExpires, 1001, Idle, &[], None),
+            (TcpConnectionConfirmed, 1002, Idle, &[], None),
+        ],
+    );
+    assert!(!f.automatic_start_allowed());
+    assert!(!f.is_admin_down());
+    assert_eq!(f.damped_failures(), 3);
+    assert_eq!(f.next_deadline(), None);
+    // The administrative intervention: a ManualStart starts a new run.
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (ManualStart, 2000, Connect, &["connect"], None),
+            (TcpCrAcked, 2001, OpenSent, &["open"], None),
+            (
+                HoldTimerExpires,
+                2002,
+                Idle,
+                &["notif 4/0", "drop"],
+                Some(10),
+            ),
+        ],
+    );
+    assert!(f.automatic_start_allowed());
+    assert_eq!(f.damped_failures(), 1);
+}
+
+#[test]
+fn restart_limit_counts_short_sessions_and_forgets_stable_ones() {
+    use Event::{AutomaticStop, BgpOpen, IdleHoldTimerExpires, KeepAliveMsg, TcpCrAcked};
+    use State::{Connect, Established, Idle, OpenConfirm, OpenSent};
+    // A peer torn down by a prefix limit right after it sends its table
+    // reaches Established every time; that must not end the run, or the
+    // oscillation would never be damped or bounded (RFC 4486 §4).
+    let stop = || {
+        AutomaticStop(NotificationMessage::max_prefixes_reached(
+            AddressFamily::IPV4_UNICAST,
+            100,
+        ))
+    };
+    let (f, start) = fsm_at(State::Established, limited(Some(2)));
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (stop(), 1, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 11, Connect, &["connect"], None),
+            (TcpCrAcked, 11, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 11, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 11, Established, &["up"], None),
+            (stop(), 12, Idle, &["notif 6/1", "down", "drop"], Some(20)),
+            (IdleHoldTimerExpires, 32, Connect, &["connect"], None),
+            (TcpCrAcked, 32, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 32, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 32, Established, &["up"], None),
+            (
+                stop(),
+                33,
+                Idle,
+                &["notif 6/1", "down", "drop", "limit 3"],
+                None,
+            ),
+        ],
+    );
+    assert!(!f.automatic_start_allowed());
+    // A session that stayed up for `forget_after` ends the run first:
+    // whatever brings it down counts as the first failure of a new one.
+    let (f, start) = fsm_at(State::Established, limited(Some(2)));
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (stop(), 1, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 11, Connect, &["connect"], None),
+            (TcpCrAcked, 11, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 11, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 11, Established, &["up"], None),
+            (stop(), 311, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+        ],
+    );
+    assert_eq!(f.damped_failures(), 1);
+    assert!(f.automatic_start_allowed());
+}
+
+#[test]
+fn restart_limit_zero_never_restarts_and_none_always_does() {
+    // `Some(0)`: no automatic restart after any damped failure.
+    let (mut f, now) = fsm_at(State::OpenSent, limited(Some(0)));
+    let a = f.handle(Event::HoldTimerExpires, now);
+    assert_eq!(tags(&a), ["notif 4/0", "drop", "limit 1"]);
+    assert!(!f.timer(TimerKind::IdleHold).is_running());
+    // A failure that does not damp is not bounded: a peer that refuses
+    // connections is retried for as long as it takes.
+    let (mut f, mut now) = fsm_at(State::Connect, limited(Some(0)));
+    for _ in 0..20 {
+        let a = f.handle(Event::TcpConnectionFails, now);
+        assert_eq!(tags(&a), ["drop"]);
+        now = f.timer(TimerKind::IdleHold).deadline().unwrap();
+        f.handle(Event::IdleHoldTimerExpires, now);
+        assert_eq!(f.state(), State::Connect);
+    }
+    assert_eq!(f.damped_failures(), 0);
+    // `None`: unbounded, the hold stays at the cap.
+    let (mut f, mut now) = fsm_at(State::OpenSent, limited(None));
+    for _ in 0..50 {
+        let a = f.handle(Event::HoldTimerExpires, now);
+        assert_eq!(tags(&a), ["notif 4/0", "drop"]);
+        now = f.timer(TimerKind::IdleHold).deadline().unwrap();
+        f.handle(Event::IdleHoldTimerExpires, now);
+        f.handle(Event::TcpCrAcked, now);
+    }
+    assert_eq!(f.damped_failures(), 50);
+    assert!(f.automatic_start_allowed());
+    // ManualStop wins over the bound: the peer stays down, no limit action.
+    let (mut f, now) = fsm_at(State::OpenSent, limited(Some(0)));
+    let a = f.handle(Event::ManualStop, now);
+    assert_eq!(tags(&a), ["notif 6/2", "drop"]);
+    assert_eq!(f.damped_failures(), 0);
+}
+
+#[test]
+fn received_ceases_damp_as_rfc4486_recommends() {
+    // RFC 4486 §4: damp after Administrative Shutdown, Peer De-configured,
+    // Connection Rejected and Out of Resources; RFC 4271 §8.2.2 names no
+    // damping for any other NOTIFICATION received while Established.
+    for subcode in 0..=9u8 {
+        let (mut f, now) = fsm_at(State::Established, config());
+        let n = NotificationMessage {
+            code: bgpfc_wire::error::ErrorCode::Cease,
+            subcode,
+            data: Vec::new(),
+        };
+        let a = f.handle(Event::NotifMsg(n), now);
+        assert_eq!(tags(&a), ["down", "drop"]);
+        let damped = matches!(subcode, 2 | 3 | 5 | 8);
+        assert_eq!(f.damped_failures(), u32::from(damped), "subcode {subcode}");
+        // The first damped failure waits the initial hold; the next one
+        // waits twice as long.
+        assert_eq!(
+            f.timer(TimerKind::IdleHold).deadline(),
+            Some(now + Duration::from_secs(10))
+        );
+        let later = now + Duration::from_secs(10);
+        f.handle(Event::IdleHoldTimerExpires, later);
+        f.handle(Event::TcpCrAcked, later);
+        f.handle(Event::HoldTimerExpires, later);
+        let expected = if damped { 20 } else { 10 };
+        assert_eq!(
+            f.timer(TimerKind::IdleHold).deadline(),
+            Some(later + Duration::from_secs(expected)),
+            "subcode {subcode}"
+        );
+    }
+    // Any other NOTIFICATION while Established does not damp either.
+    let (mut f, now) = fsm_at(State::Established, config());
+    f.handle(
+        Event::NotifMsg(NotificationMessage::hold_timer_expired()),
+        now,
+    );
+    assert_eq!(f.damped_failures(), 0);
 }

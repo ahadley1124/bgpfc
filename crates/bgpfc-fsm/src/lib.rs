@@ -11,7 +11,9 @@
 //! resolution hooks), §8 (events 1–28, all states), §10 (timer defaults and
 //! jitter); RFC 9687 §4, §5 (`SendHoldTimer`, event 29); RFC 6608 §4 (FSM
 //! error subcodes with the offending message type); RFC 4486 §4 (Cease
-//! subcodes for administrative stops and collisions); RFC 5492 §5
+//! subcodes for administrative stops and collisions; damping after the
+//! Cease subcodes it names, and a bound on consecutive automatic
+//! restarts); RFC 5492 §5
 //! (Unsupported Capability); RFC 4760 §8 (families need both sides);
 //! RFC 6793 §3 (four-octet AS negotiation); RFC 8654 §4 (Extended Message
 //! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
@@ -81,7 +83,8 @@ pub enum Event {
     ManualStartPassive,
     /// 8: the local system stops the peer (prefix limit, resource
     /// exhaustion) with the Cease to send (RFC 4486 §4 picks the subcode by
-    /// reason); it restarts after the `IdleHoldTimer`.
+    /// reason); it restarts after the `IdleHoldTimer`, unless the
+    /// [`Damping::restart_limit`] is reached.
     AutomaticStop(NotificationMessage),
     /// 9.
     ConnectRetryTimerExpires,
@@ -198,6 +201,13 @@ pub enum Action {
     /// Log at error level (RFC 9687 §5 requires it for Send Hold Timer
     /// Expired; also used for FSM errors).
     LogError(&'static str),
+    /// The damped failure just handled exceeded
+    /// [`Damping::restart_limit`] (RFC 4486 §4): the peer stays Idle, with
+    /// automatic starts ignored, until a `ManualStart`. The caller logs it.
+    RestartLimitReached {
+        /// Consecutive damped failures, this one included.
+        failures: u32,
+    },
 }
 
 /// Parameters agreed in the OPEN exchange, fixed for the session's life.
@@ -233,22 +243,49 @@ pub struct Session {
 }
 
 /// Peer oscillation damping (RFC 4271 §8.1.1 group 1): how long to hold
-/// the peer in Idle before an automatic restart, doubling on each failure.
+/// the peer in Idle before an automatic restart, doubling on each failure,
+/// and how many such restarts in a row are allowed (RFC 4486 §4).
+///
+/// A damped failure is one after which RFC 4271 §8.2.2 says "(optionally)
+/// performs peer oscillation damping", or a received Cease whose subcode
+/// RFC 4486 §4 names. Consecutive damped failures form a run; a manual
+/// start, or a session that stayed Established for `forget_after`, ends it.
+/// Other failures, such as a refused TCP connection, neither count nor end
+/// a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Damping {
-    /// `IdleHoldTime` after the first failure.
+    /// `IdleHoldTime` after the first failure of a run.
     pub initial: Duration,
     /// Upper bound for the doubled `IdleHoldTime`.
     pub max: Duration,
+    /// RFC 4486 §4: the most automatic restarts after consecutive damped
+    /// failures; the next damped failure leaves the peer Idle until a
+    /// `ManualStart`. `None` restarts without bound; `Some(0)` never
+    /// restarts after a damped failure.
+    pub restart_limit: Option<u32>,
+    /// How long a session must stay Established for its end to start a
+    /// new run. A shorter session, such as one torn down by a prefix limit
+    /// as soon as the peer sends its table, is part of the oscillation the
+    /// damping is for.
+    pub forget_after: Duration,
 }
+
+/// The default [`Damping::restart_limit`]: with the default doubling this
+/// is about a quarter of an hour of failures (10 + 20 + 40 + 80 + 6 × 120
+/// seconds of `IdleHoldTime`) before the peer is left Idle.
+pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 
 impl Default for Damping {
     /// 10 s doubling up to 120 s, the figure RFC 4271 §8.1.1 uses as its
-    /// example.
+    /// example; [`DEFAULT_RESTART_LIMIT`] restarts; a run forgotten after
+    /// five minutes Established.
     fn default() -> Self {
         Damping {
             initial: Duration::from_secs(10),
             max: Duration::from_secs(120),
+            restart_limit: Some(DEFAULT_RESTART_LIMIT),
+            // NOTE(interop): BIRD's `error forget time` defaults to 300 s.
+            forget_after: Duration::from_mins(5),
         }
     }
 }

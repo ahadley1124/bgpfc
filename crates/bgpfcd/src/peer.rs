@@ -270,6 +270,19 @@ impl Peer {
                     });
                 }
                 Action::LogError(msg) => bgpfc_log::error!(msg, peer = self.cfg.addr),
+                // RFC 4486 §4: automatic retries stop until the operator
+                // intervenes; say so, and how.
+                Action::RestartLimitReached { failures } => bgpfc_log::error!(
+                    "restart limit reached, peer stays idle until `bgpfcctl clear neighbor`",
+                    peer = self.cfg.addr,
+                    damped_failures = failures,
+                    restart_limit = self
+                        .fsm
+                        .config()
+                        .damping
+                        .and_then(|d| d.restart_limit)
+                        .unwrap_or_default()
+                ),
             }
         }
     }
