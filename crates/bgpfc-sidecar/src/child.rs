@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
 use bgpfc_sys::{
-    ChildSignal, clear_ambient_capabilities, send_signal, send_signal_to_group,
-    set_parent_death_signal, wait_for_exit,
+    ChildSignal, clear_ambient_capabilities, inherit_only_standard_streams, send_signal,
+    send_signal_to_group, set_parent_death_signal, wait_for_exit,
 };
 
 use crate::config::SidecarConfig;
@@ -70,7 +70,7 @@ pub(crate) const CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 /// (Routinator takes RRDP proxies from its config file, `rrdp-proxies`),
 /// and whatever bgpfcd was started with. The child's behaviour then
 /// depends on bgpfcd's settings alone. [`command`] also keeps bgpfcd's
-/// ambient capabilities from it.
+/// ambient capabilities and descriptors from it.
 pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
     [
         (
@@ -83,8 +83,9 @@ pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
 
 /// A command for the configured binary, without arguments or output yet:
 /// the environment of [`child_env`], `/` as working directory, standard
-/// input from `/dev/null`, a process group of its own, no ambient
-/// capabilities, and [`DEATH_SIGNAL`] as the parent-death signal.
+/// input from `/dev/null`, no other descriptor of bgpfcd's, a process group
+/// of its own, no ambient capabilities, and [`DEATH_SIGNAL`] as the
+/// parent-death signal.
 ///
 /// Its own process group keeps a terminal's Ctrl-C, which goes to the
 /// whole foreground group, from reaching the child at the same moment as
@@ -101,6 +102,12 @@ pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
 /// only after dropping root (README, "Option B"). The child also cannot
 /// bind a port below 1024 then, unless the host's
 /// `net.ipv4.ip_unprivileged_port_start` allows it.
+///
+/// bgpfcd's signal self-pipe ([`bgpfc_sys::Signals`]) is not
+/// close-on-exec, and a child holding it could feed bgpfcd fake
+/// `SIGTERM`s for as long as it runs. Every descriptor from 3 up is
+/// therefore marked close-on-exec in the child, leaving it its standard
+/// streams.
 pub(crate) fn command(config: &SidecarConfig) -> Command {
     let mut cmd = Command::new(&config.binary);
     cmd.env_clear()
@@ -109,6 +116,7 @@ pub(crate) fn command(config: &SidecarConfig) -> Command {
         .stdin(Stdio::null())
         .process_group(0);
     clear_ambient_capabilities(&mut cmd);
+    inherit_only_standard_streams(&mut cmd);
     // Last, so no hook can change the child's credentials after it, which
     // would clear the death signal (prctl(2)).
     set_parent_death_signal(&mut cmd, DEATH_SIGNAL);
@@ -519,31 +527,70 @@ mod tests {
             u64::from_str_radix(value.trim(), 16).unwrap()
         }
 
-        /// The ambient set that `/bin/sh`, spawned by `cmd`, starts with.
-        fn child_ambient(mut cmd: Command) -> u64 {
+        /// The descriptors from 3 up that are pipes, in this process.
+        fn pipes() -> Vec<String> {
+            let mut found: Vec<u32> = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let fd: u32 = entry.file_name().to_str()?.parse().ok()?;
+                    let target = std::fs::read_link(entry.path()).ok()?;
+                    let pipe = target.as_os_str().as_encoded_bytes().starts_with(b"pipe:");
+                    (fd > 2 && pipe).then_some(fd)
+                })
+                .collect();
+            found.sort_unstable();
+            found.iter().map(ToString::to_string).collect()
+        }
+
+        /// `/bin/sh` spawned by `cmd` reports the ambient set it started
+        /// with and which of `fds` it holds, comma-separated or `-`.
+        fn child_report(mut cmd: Command, fds: &[String]) -> (u64, String) {
+            let script = "cat /proc/$$/status; for n; do if [ -e /proc/$$/fd/$n ]; then echo \"open $n\"; fi; done";
             let out = cmd
-                .args(["-c", "cat /proc/$$/status"])
+                .args(["-c", script, "sh"])
+                .args(fds)
                 .stdin(Stdio::null())
                 .output()
                 .expect("spawn /bin/sh");
             assert!(out.status.success(), "{out:?}");
-            ambient(&String::from_utf8(out.stdout).unwrap())
+            let text = String::from_utf8(out.stdout).unwrap();
+            let open: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("open "))
+                .collect();
+            (ambient(&text), list(&open))
+        }
+
+        /// `items` comma-separated, or `-` for none.
+        fn list(items: &[impl AsRef<str>]) -> String {
+            if items.is_empty() {
+                return "-".to_owned();
+            }
+            let items: Vec<&str> = items.iter().map(AsRef::as_ref).collect();
+            items.join(",")
         }
 
         /// Not a test on its own: [`run_probe`] runs this test binary
-        /// again with [`PROBE_ENV`] set, and this function then prints the
-        /// ambient sets of itself, of a child of a plain [`Command`] and
-        /// of a child of [`command`]. Without the variable it returns at
-        /// once.
+        /// again with [`PROBE_ENV`] set, and this function then plays
+        /// bgpfcd: it installs the signal handlers, whose self-pipe is not
+        /// close-on-exec, and spawns a child of a plain [`Command`] and a
+        /// child of [`command`]. It prints the ambient sets of itself and
+        /// of both children, the self-pipe's descriptors, and which of them
+        /// each child holds. Without the variable it returns at once.
         #[test]
         fn probe_intermediate() {
             if std::env::var_os(PROBE_ENV).is_none() {
                 return;
             }
+            let _signals = bgpfc_sys::Signals::install().unwrap();
+            let pipes = pipes();
             let own = ambient(&std::fs::read_to_string("/proc/self/status").unwrap());
-            let bare = child_ambient(Command::new("/bin/sh"));
-            let sidecar = child_ambient(command(&SidecarConfig::new("/bin/sh", "/")));
-            println!("probe {own:x} {bare:x} {sidecar:x}");
+            let (bare, bare_open) = child_report(Command::new("/bin/sh"), &pipes);
+            let config = SidecarConfig::new("/bin/sh", "/");
+            let (sidecar, sidecar_open) = child_report(command(&config), &pipes);
+            let pipes = list(&pipes);
+            println!("probe {own:x} {bare:x} {sidecar:x} {pipes} {bare_open} {sidecar_open}");
         }
 
         /// Run [`probe_intermediate`] as `wrapper` followed by this test
@@ -602,6 +649,7 @@ mod tests {
             let words = run_probe(&["setpriv", RAISE[0], RAISE[1]]);
             let masks: Vec<u64> = words
                 .iter()
+                .take(3)
                 .map(|w| u64::from_str_radix(w, 16).unwrap())
                 .collect();
             let [own, bare, sidecar] = masks[..] else {
@@ -610,6 +658,20 @@ mod tests {
             assert_ne!(own & NET_BIND_SERVICE, 0, "setpriv raised nothing");
             assert_eq!(bare, own, "the control inherits the ambient set");
             assert_eq!(sidecar, 0, "the sidecar's child has ambient capabilities");
+        }
+
+        /// bgpfcd with its signal handlers installed: a child of a plain
+        /// `Command` holds both ends of the self-pipe, the control, and
+        /// the sidecar's child holds neither.
+        #[test]
+        fn the_child_gets_none_of_bgpfcds_descriptors() {
+            let words = run_probe(&[]);
+            let [_, _, _, pipes, bare, sidecar] = &words[..] else {
+                panic!("six words expected: {words:?}");
+            };
+            assert_eq!(pipes.split(',').count(), 2, "the self-pipe: {pipes}");
+            assert_eq!(bare, pipes, "the control inherits the self-pipe");
+            assert_eq!(sidecar, "-", "the sidecar's child holds the self-pipe");
         }
     }
 }
