@@ -35,6 +35,14 @@ use crate::config::SidecarConfig;
 /// matter either. Routinator keeps a cache, which it must already
 /// rebuild after a power cut or an OOM kill, so dying without cleanup
 /// loses nothing it cannot fetch again.
+///
+/// The kernel clears the setting when the child changes its user or
+/// group (`prctl(2)`), and Routinator does that in server mode when its
+/// `user` or `group` setting is given. The escape hatch therefore refuses
+/// `--user` and `--group`, and a Routinator config file must not set
+/// them. When bgpfcd runs unprivileged, as it should once it has dropped
+/// root, Routinator cannot switch to another user anyway: it exits with
+/// an error, which the supervisor reports.
 pub(crate) const DEATH_SIGNAL: ChildSignal = ChildSignal::Kill;
 
 /// `PATH` in the child: systemd's default for services, whatever bgpfcd's

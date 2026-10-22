@@ -93,7 +93,10 @@ impl Options {
 ///   `SIGTERM` because nobody is left then to escalate a `SIGTERM` the
 ///   child ignores, and a validator that outlives bgpfcd would keep the
 ///   RTR port from the next one; Routinator's cache survives a `SIGKILL`
-///   as it must survive a power cut.
+///   as it must survive a power cut. A child that switches to another
+///   user loses its death signal (`prctl(2)`), so Routinator's `--user`
+///   and `--group` are refused and its config file must not set `user`
+///   or `group`.
 /// - **A waiter thread per child.** It blocks until the child exits and
 ///   tells the supervisor thread, without reaping it
 ///   ([`bgpfc_sys::wait_for_exit`]). It spawns nothing, so when it ends

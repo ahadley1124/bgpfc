@@ -46,11 +46,15 @@ const EXITS: &str = "Routinator would print and exit instead of serving";
 /// `src/config.rs` at v0.15.2); its manual page says `--listen-systemd`,
 /// which clap rejects.
 const SYSTEMD: &str = "Routinator would take its RTR listener from systemd, and bgpfcd passes it none, so it would fail at every start";
+/// Routinator applies `--user` and `--group` in server mode, detached or
+/// not: `Server::run` calls `drop_privileges` (`src/process.rs` at
+/// v0.15.2) once it has bound its listeners.
+const CREDENTIALS: &str = "Routinator would switch to it by itself, which clears the parent-death signal that ends it when bgpfcd dies";
 
 /// Long options the escape hatch may not carry, because bgpfcd sets them
 /// itself or because they defeat supervision or the loopback-only RTR
 /// listener (issue #71), with the reason given to the operator.
-const RESERVED_LONG: [(&str, &str); 12] = [
+const RESERVED_LONG: [(&str, &str); 14] = [
     (
         "config",
         "bgpfcd passes --config from the config file setting",
@@ -76,6 +80,8 @@ const RESERVED_LONG: [(&str, &str); 12] = [
         "detach",
         "a detached Routinator leaves bgpfcd's supervision",
     ),
+    ("user", CREDENTIALS),
+    ("group", CREDENTIALS),
     ("help", EXITS),
     ("version", EXITS),
 ];
@@ -445,6 +451,9 @@ mod tests {
             (b"--rtr-tcp-keepalive=60", false),
             (b"--rtr-client-metrics", false),
             (b"--systemd-listen", true),
+            (b"--user=routinator", true),
+            (b"--group", true),
+            (b"--users", false),
             // The manual page's spelling, which clap refuses by itself.
             (b"--listen-systemd", false),
             (b"--tals", false),

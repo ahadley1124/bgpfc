@@ -587,6 +587,14 @@ mod tests {
                 ),
             ),
             (
+                "switching users",
+                |c| c.extra_server_args = args(&["--user=routinator"]),
+                reserved(
+                    "--user=routinator",
+                    "Routinator would switch to it by itself, which clears the parent-death signal that ends it when bgpfcd dies",
+                ),
+            ),
+            (
                 "detach",
                 |c| c.extra_server_args = args(&["-d"]),
                 reserved("-d", "a detached Routinator leaves bgpfcd's supervision"),
