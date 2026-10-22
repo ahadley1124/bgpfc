@@ -7,10 +7,13 @@
 
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
+use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -163,7 +166,9 @@ impl Options {
 #[must_use = "dropping a Sidecar stops Routinator"]
 pub struct Sidecar {
     rtr: SocketAddr,
-    version: Version,
+    /// Shared with the supervisor thread, which updates it when it checks
+    /// a replaced binary.
+    version: Arc<Mutex<Version>>,
     status: Arc<Mutex<SidecarStatus>>,
     control: Mutex<Option<Control>>,
     threads: Threads,
@@ -186,6 +191,18 @@ impl Sidecar {
     /// release of the series bgpfcd drives
     /// ([`TESTED_VERSION`](crate::TESTED_VERSION)); it runs with the
     /// child's environment and is killed if it takes longer.
+    ///
+    /// The check is repeated before a restart whenever the binary is no
+    /// longer the file it was, as after a package upgrade: its device,
+    /// inode, size or times differ (`stat(2)`). A binary that fails it is
+    /// not run; the attempt counts as a failure to start, with the reason
+    /// in [`SidecarStatus::last_exit`] and an error in the log, and the
+    /// next attempt checks again. One that passes is run, and
+    /// [`version`](Self::version) reports its version from then on. The
+    /// check runs on the supervisor thread, so a [`stop`](Self::stop)
+    /// during it waits for it, ten seconds at most. A binary replaced
+    /// between the check and the `execve` that follows it runs unchecked
+    /// until the restart after.
     ///
     /// A configured RTR port of 0 is replaced with a free one: bind the
     /// configured loopback address with port 0, read the port the kernel
@@ -220,6 +237,9 @@ impl Sidecar {
     ) -> Result<Sidecar, SidecarError> {
         config.validate()?;
         let threads = Threads::default();
+        // Before the check: a binary replaced during it differs from this
+        // at the first spawn and is checked again.
+        let binary = BinaryId::of(&config.binary);
         let version = check_version(&config, &options, &threads)?;
         let rtr = resolve_rtr(config.rtr_listen)?;
         (options.log)(
@@ -233,11 +253,14 @@ impl Sidecar {
         );
         let supervisor = Supervisor::new(&config, rtr, options.seed);
         let status = Arc::new(Mutex::new(supervisor.status()));
+        let version = Arc::new(Mutex::new(version));
         let (tx, rx) = mpsc::channel();
         let log = Arc::clone(&options.log);
         let shell = Shell {
             config,
             rtr,
+            binary,
+            version: Arc::clone(&version),
             supervisor,
             child: None,
             spawned: 0,
@@ -267,10 +290,12 @@ impl Sidecar {
         self.rtr
     }
 
-    /// The version the binary reported at start.
+    /// The version the binary reported when it was last checked: at
+    /// start, and again before a restart whenever the binary had been
+    /// replaced and passed the check (see [`start`](Self::start)).
     #[must_use]
-    pub const fn version(&self) -> &Version {
-        &self.version
+    pub fn version(&self) -> Version {
+        lock(&self.version).clone()
     }
 
     /// The supervisor's current status.
@@ -322,7 +347,7 @@ impl fmt::Debug for Sidecar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sidecar")
             .field("rtr", &self.rtr)
-            .field("version", &self.version)
+            .field("version", &self.version())
             .field("status", &self.status())
             .field("threads", &self.threads.load(Ordering::Acquire))
             .finish_non_exhaustive()
@@ -346,6 +371,11 @@ enum Msg {
 struct Shell {
     config: SidecarConfig,
     rtr: SocketAddr,
+    /// The binary that last passed the version check, if it could be
+    /// identified.
+    binary: Option<BinaryId>,
+    /// What [`Sidecar::version`] reports.
+    version: Arc<Mutex<Version>>,
     supervisor: Supervisor,
     /// The child, with its number in [`Shell::spawned`]'s count.
     child: Option<(u64, ChildProc<()>)>,
@@ -474,6 +504,9 @@ impl Shell {
 
     fn spawn(&mut self) -> Event {
         self.spawned += 1;
+        if let Err(error) = self.recheck_binary() {
+            return Event::SpawnFailed(error);
+        }
         match self.launch(self.spawned) {
             Ok(child) => {
                 let pid = child.pid();
@@ -481,6 +514,44 @@ impl Shell {
                 Event::Spawned(pid)
             }
             Err(error) => Event::SpawnFailed(error),
+        }
+    }
+
+    /// Issue #72: if the binary is no longer the file that last passed the
+    /// version check, check it again before running it. The binary is
+    /// remembered only once it passes, so a binary that fails is checked
+    /// at every attempt until it is replaced again.
+    ///
+    /// # Errors
+    /// The failed check, for [`Event::SpawnFailed`].
+    fn recheck_binary(&mut self) -> io::Result<()> {
+        let binary = &self.config.binary;
+        let Some(id) = BinaryId::of(binary) else {
+            // Gone or unreadable: the spawn that follows says why.
+            return Ok(());
+        };
+        if self.binary == Some(id) {
+            return Ok(());
+        }
+        match check_version(&self.config, &self.options, &self.threads) {
+            Ok(version) => {
+                self.log(
+                    Level::Info,
+                    "the Routinator binary changed; found a supported Routinator",
+                    &[("binary", &binary.display()), ("version", &version)],
+                );
+                self.binary = Some(id);
+                *lock(&self.version) = version;
+                Ok(())
+            }
+            Err(error) => {
+                self.log(
+                    Level::Error,
+                    "the Routinator binary changed and fails the version check; not running it",
+                    &[("binary", &binary.display()), ("error", &error)],
+                );
+                Err(io::Error::other(error))
+            }
         }
     }
 
@@ -623,6 +694,36 @@ fn check_version(
         return Err(failed(ExitReason::from(status), &output));
     }
     check_version_output(&output)
+}
+
+/// Which file a path names, as far as `stat(2)` tells: a binary replaced
+/// by a package upgrade, which renames a new file over it, has another
+/// inode; one rewritten in place has another size or other times, at the
+/// least a newer change time, which no one can set back. Times are as fine
+/// as the file system's clock, a few milliseconds at worst, so a rewrite
+/// of the same size within one tick of the last check goes unnoticed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BinaryId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl BinaryId {
+    /// The file `path` names, following symbolic links as `execve` does;
+    /// `None` if it cannot be read.
+    fn of(path: &Path) -> Option<BinaryId> {
+        let meta = fs::metadata(path).ok()?;
+        Some(BinaryId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
 }
 
 /// `listen` with a port 0 replaced by a free port, picked by binding the
@@ -809,10 +910,22 @@ mod tests {
         /// A stub Routinator that answers `--version` with
         /// [`TESTED_VERSION`] and otherwise runs `body`.
         fn stub(&self, body: &str) -> PathBuf {
-            let version = format!(
-                "if [ \"$1\" = --version ]; then echo 'Routinator {TESTED_VERSION}'; exit 0; fi"
-            );
-            self.script("routinator", &format!("{version}\n{body}"))
+            self.versioned_stub("routinator", &TESTED_VERSION.to_string(), body)
+        }
+
+        /// A stub `name` that answers `--version` with `Routinator
+        /// version` and otherwise runs `body`.
+        fn versioned_stub(&self, name: &str, version: &str, body: &str) -> PathBuf {
+            let version =
+                format!("if [ \"$1\" = --version ]; then echo 'Routinator {version}'; exit 0; fi");
+            self.script(name, &format!("{version}\n{body}"))
+        }
+
+        /// Replace `binary` with a stub as a package upgrade does: write
+        /// the new file beside it and rename it over the old one.
+        fn upgrade(&self, binary: &Path, version: &str, body: &str) {
+            let new = self.versioned_stub("routinator.new", version, body);
+            fs::rename(new, binary).unwrap();
         }
     }
 
@@ -886,7 +999,7 @@ mod tests {
         );
         let capture = Capture::default();
         let sidecar = Sidecar::start_with(config(&dir, binary), capture.options()).unwrap();
-        assert_eq!(sidecar.version(), &TESTED_VERSION);
+        assert_eq!(sidecar.version(), TESTED_VERSION);
         let rtr = sidecar.rtr_addr();
         assert_eq!(rtr.ip(), Ipv4Addr::LOCALHOST);
         assert_ne!(rtr.port(), 0, "port 0 is replaced at start");
@@ -1165,6 +1278,83 @@ mod tests {
         wait_until("the background process to die", || {
             matches!(proc_stat(bg), None | Some(('Z' | 'X' | 'x', _))).then_some(())
         });
+    }
+
+    /// Issue #72: a binary replaced while the sidecar runs is checked
+    /// again before the next start. One from another release series is
+    /// never run, and every attempt checks it again; a patch release of
+    /// the supported series runs, and its version is published.
+    #[test]
+    fn a_replaced_binary_is_checked_before_a_restart() {
+        const REFUSED: &str =
+            "the Routinator binary changed and fails the version check; not running it";
+        const ACCEPTED: &str = "the Routinator binary changed; found a supported Routinator";
+        let dir = TempDir::new("upgrade");
+        let binary = dir.stub("echo 'serving 0.15.2'\nexec sleep 30");
+        let capture = Capture::default();
+        let sidecar = Sidecar::start_with(config(&dir, binary.clone()), capture.options()).unwrap();
+        let first = wait_until("a running child", || running_pid(&sidecar));
+        capture.wait_for("serving 0.15.2");
+        assert_eq!(sidecar.version(), TESTED_VERSION);
+        assert!(
+            capture.find(REFUSED).is_empty(),
+            "an unchanged binary is not checked"
+        );
+
+        dir.upgrade(&binary, "0.16.0", "echo 'serving 0.16.0'\nexec sleep 30");
+        send_signal(first, ChildSignal::Kill).unwrap();
+        let refused = wait_until("two refused attempts", || {
+            let found = capture.find(REFUSED);
+            (found.len() >= 2).then_some(found)
+        });
+        let not_supported = "Routinator 0.16.0 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2";
+        assert_eq!(refused[0].level, Level::Error);
+        assert_eq!(refused[0].field("error"), Some(not_supported));
+        let failed = wait_until("the refusal as a failure", || {
+            let exit = sidecar.status().last_exit;
+            matches!(exit, Some(ExitReason::SpawnFailed(_))).then_some(exit)
+        });
+        assert_eq!(
+            failed,
+            Some(ExitReason::SpawnFailed(not_supported.to_owned()))
+        );
+        assert_eq!(sidecar.version(), TESTED_VERSION);
+
+        dir.upgrade(&binary, "0.15.3", "echo 'serving 0.15.3'\nexec sleep 30");
+        capture.wait_for("serving 0.15.3");
+        let accepted = capture.wait_for(ACCEPTED);
+        assert_eq!(accepted.field("version"), Some("0.15.3"));
+        let patch = Version {
+            major: 0,
+            minor: 15,
+            patch: 3,
+            pre: None,
+        };
+        assert_eq!(sidecar.version(), patch);
+        sidecar.stop();
+        assert!(capture.find("serving 0.16.0").is_empty(), "0.16.0 ran");
+        assert_eq!(sidecar.threads(), 0);
+    }
+
+    /// The identity changes when the file is rewritten in place or another
+    /// file is renamed over it, and not otherwise.
+    #[test]
+    fn a_binary_is_identified_by_its_file() {
+        let dir = TempDir::new("identity");
+        let path = dir.script("routinator", "exit 0");
+        let first = BinaryId::of(&path).expect("the file exists");
+        assert_eq!(BinaryId::of(&path), Some(first), "nothing changed");
+        // Another size: the times alone may not change within a clock tick.
+        dir.script("routinator", "exit 10");
+        let rewritten = BinaryId::of(&path).unwrap();
+        assert_eq!(rewritten.ino, first.ino, "rewritten in place");
+        assert_ne!(rewritten, first);
+        let replacement = dir.script("routinator.new", "exit 1");
+        fs::rename(replacement, &path).unwrap();
+        let replaced = BinaryId::of(&path).unwrap();
+        assert_ne!(replaced.ino, rewritten.ino, "a new file");
+        assert_ne!(replaced, rewritten);
+        assert_eq!(BinaryId::of(&dir.join("missing")), None);
     }
 
     /// Bad settings are refused before anything runs.

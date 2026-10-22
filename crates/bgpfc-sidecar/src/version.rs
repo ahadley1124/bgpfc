@@ -1,7 +1,8 @@
 //! Routinator's version: parse what `routinator --version` prints and check
 //! that it is the release series the command line was written for, so a
-//! mismatch is reported clearly at startup (issue #72) instead of showing
-//! up as a child that exits on an unknown option.
+//! mismatch is reported clearly at startup, and before a restart of a
+//! binary that was replaced since (issue #72), instead of showing up as a
+//! child that exits on an unknown option.
 //!
 //! Implements: no RFC. Routinator builds its command line with clap as
 //! `Command::new("Routinator").version(crate_version!())` (`src/main.rs`
