@@ -137,6 +137,36 @@ impl Lab {
         c
     }
 
+    /// An address on the link between A and B where what A sends goes
+    /// nowhere: A has a permanent neighbour entry for it with a MAC address
+    /// nobody has, and B drops frames for that address. A connection to
+    /// it from A hangs until it times out, as to a host that is gone.
+    ///
+    /// # Panics
+    /// If `ip` fails.
+    #[must_use]
+    pub fn blackhole(&self) -> Ipv4Addr {
+        let [a, b, c, _] = self.a_addr.octets();
+        let addr = Ipv4Addr::new(a, b, c, 9);
+        sh(
+            "ip",
+            &[
+                "-n",
+                &self.a,
+                "neigh",
+                "add",
+                &addr.to_string(),
+                "lladdr",
+                "02:00:00:00:00:09",
+                "dev",
+                &format!("v{}a", self.id),
+                "nud",
+                "permanent",
+            ],
+        );
+        addr
+    }
+
     /// A command that runs inside namespace `ns`.
     #[must_use]
     pub fn exec(&self, ns: &str, program: &str) -> Command {
@@ -777,7 +807,10 @@ impl StayRtr {
     /// Start `stayrtr` in namespace `ns`, listening on `bind` (such as
     /// `127.0.0.1:3323`) and serving `vrps`: (prefix, max length, origin
     /// AS). It reads the file again every second and tells its clients
-    /// with a Serial Notify when the VRPs change.
+    /// with a Serial Notify when the VRPs change. Its End of Data gives a
+    /// Retry Interval of two seconds (RFC 8210 §6), so that a client in
+    /// sync with it while a more preferred cache is configured looks for
+    /// that cache again within seconds.
     ///
     /// # Panics
     /// If the file cannot be written or `stayrtr` cannot be spawned.
@@ -797,6 +830,8 @@ impl StayRtr {
             "-checktime=false",
             "-refresh",
             "1",
+            "-rtr.retry",
+            "2",
             // No metrics listener, so that several caches can share a
             // namespace.
             "-metrics.addr",

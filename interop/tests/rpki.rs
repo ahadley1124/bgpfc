@@ -7,6 +7,8 @@
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
 //! 0.5.1 cannot do (see `a_restarted_cache_brings_bgpfcd_back_in_sync`).
+//! Another lists a cache whose address swallows every packet, so that a
+//! connection attempt to it hangs until its timeout.
 //!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`,
 //! `curl` and `stayrtr` on `PATH`, and a built `bgpfcd`. CI runs them with
@@ -14,8 +16,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use interop::{
     BgpfcdOpts, Bird, BirdOpts, Daemon, Lab, NeighborOpts, RtrStub, StayRtr, start_bgpfcd, wait_for,
@@ -80,6 +83,23 @@ const FLIPPED: [(&str, &str); 4] = [
     ("203.0.113.0/24", "valid"),
 ];
 
+/// What the less preferred cache serves in the failover scenario: [`FIRST`]
+/// and one VRP more, which makes 203.0.113.0/24 valid, so that its full set
+/// shows when it replaces the first cache's.
+const FAILOVER: [(&str, u8, u32); 3] = [
+    ("192.0.2.0/24", 24, BIRD_AS),
+    ("198.51.100.0/24", 24, 64_999),
+    ("203.0.113.0/24", 24, BIRD_AS),
+];
+
+/// The states with [`FAILOVER`].
+const FAILED_OVER: [(&str, &str); 4] = [
+    ("192.0.2.0/24", "valid"),
+    ("192.0.2.128/25", "invalid"),
+    ("198.51.100.0/24", "invalid"),
+    ("203.0.113.0/24", "valid"),
+];
+
 /// The states without validation (issue #52).
 const DISABLED: [(&str, &str); 4] = [
     ("192.0.2.0/24", "disabled"),
@@ -101,10 +121,29 @@ enum Caches {
 /// What a scenario runs.
 struct Opts {
     caches: Caches,
+    /// What the `StayRTR` caches after the first serve, if not the same
+    /// VRPs as the first.
+    backup: Option<&'static [(&'static str, u8, u32)]>,
+    /// Whether the cache list starts with one at [`Lab::blackhole`], whose
+    /// every connection attempt hangs for its `connect-timeout`, 30 s.
+    unanswered: bool,
     /// The `mode` of the `rpki` block.
     mode: &'static str,
     /// Whether a second BIRD, in C, takes the routes from bgpfcd.
     relay: bool,
+}
+
+impl Opts {
+    /// `caches` with `mode external`, nothing else.
+    fn external(caches: Caches) -> Opts {
+        Opts {
+            caches,
+            backup: None,
+            unanswered: false,
+            mode: "external",
+            relay: false,
+        }
+    }
 }
 
 /// BIRD in B sends its routes to bgpfcd in A, which validates them with
@@ -119,12 +158,15 @@ struct Setup {
     bird: Bird,
     relay: Option<Bird>,
     socket: PathBuf,
+    /// The address of the cache that never answers, with
+    /// [`Opts::unanswered`].
+    unanswered: Option<Ipv4Addr>,
     /// Last, so that the namespaces go after the daemons in them.
     lab: Lab,
 }
 
 impl Setup {
-    /// Start what `opts` asks for, every cache serving `vrps`.
+    /// Start what `opts` asks for, the first cache serving `vrps`.
     fn start(tag: &str, subnet: u8, opts: &Opts, vrps: &[(&str, u8, u32)]) -> Setup {
         let mut lab = Lab::new(tag, subnet);
         let ns_a = lab.a.clone();
@@ -132,7 +174,15 @@ impl Setup {
             Caches::StayRtr(n) => (
                 CACHES[..n]
                     .iter()
-                    .map(|bind| StayRtr::start(&lab, &ns_a, bind, vrps))
+                    .enumerate()
+                    .map(|(i, bind)| {
+                        let served = if i == 0 {
+                            vrps
+                        } else {
+                            opts.backup.unwrap_or(vrps)
+                        };
+                        StayRtr::start(&lab, &ns_a, bind, served)
+                    })
                     .collect(),
                 None,
                 &CACHES[..n],
@@ -191,21 +241,11 @@ impl Setup {
             bgpfcd_opts.neighbors.push(to_relay);
             bgpfcd_opts.listen.push(lab.a2_addr.into());
         }
-        let mut entries = String::new();
-        for (preference, bind) in binds.iter().enumerate() {
-            let port = bind.rsplit(':').next().unwrap_or(bind);
-            let _ = write!(
-                entries,
-                " cache 127.0.0.1 port {port} preference {preference};"
-            );
-        }
-        // The shortest back-off, so that a cache that comes back is found
-        // within a second or two.
+        let unanswered = opts.unanswered.then(|| lab.blackhole());
         bgpfcd_opts.extra = format!(
-            "control {{ socket {}; http {{ listen {HTTP}; }} }}\n\
-             rpki {{ mode {};{entries} backoff 1 1; }}",
+            "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}",
             socket.display(),
-            opts.mode
+            rpki_block(opts.mode, binds, unanswered)
         );
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &bgpfcd_opts);
         Setup {
@@ -215,8 +255,14 @@ impl Setup {
             bird,
             relay,
             socket,
+            unanswered,
             lab,
         }
+    }
+
+    /// bgpfcd's configuration file.
+    fn config_path(&self) -> PathBuf {
+        self.lab.dir.join(format!("bgpfcd-{}.conf", self.lab.a))
     }
 
     fn ctl(&self, args: &[&str]) -> (String, bool) {
@@ -295,6 +341,49 @@ impl Setup {
         self.bgpfcd.log_text().matches(text).count()
     }
 
+    /// What each "rib: validation states changed" line bgpfcd has logged
+    /// says the change of the validation source did: how many routes
+    /// changed state, and the changes of state, sorted
+    /// (`invalid->valid:1`).
+    fn revalidations(&self) -> Vec<(usize, Vec<String>)> {
+        self.bgpfcd
+            .log_text()
+            .lines()
+            .filter(|l| l.contains("msg=\"rib: validation states changed\""))
+            .map(|l| {
+                let field = |key: &str| {
+                    l.split_whitespace()
+                        .find_map(|w| w.strip_prefix(key))
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                let mut changes: Vec<String> = field("changes=")
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                changes.sort();
+                (field("changed=").parse().unwrap_or(usize::MAX), changes)
+            })
+            .collect()
+    }
+
+    /// Wait up to `timeout` for bgpfcd to log `count` more revalidation
+    /// lines than it had logged when `before` was taken; those lines.
+    fn new_revalidations(
+        &self,
+        timeout: Duration,
+        before: usize,
+        count: usize,
+    ) -> Vec<(usize, Vec<String>)> {
+        assert!(
+            wait_for(timeout, || self.revalidations().len() >= before + count),
+            "{}",
+            self.report()
+        );
+        self.revalidations().split_off(before)
+    }
+
     /// How many UPDATEs bgpfcd has taken from BIRD.
     fn updates_from_bird(&self) -> usize {
         self.count(&format!("msg=\"rib: update\" peer={} ", self.lab.b_addr))
@@ -302,13 +391,15 @@ impl Setup {
 
     /// Wait up to `timeout` for `show rpki` to say that bgpfcd lost its
     /// cache: no connection, failures counted and the last one named,
-    /// and the last VRPs still in use. Returns what it said.
+    /// and the last VRPs still in use, those of the first cache, which the
+    /// warnings tell. Returns what it said.
     fn wait_for_lost_cache(&self, timeout: Duration) -> String {
         let lost = |out: &str| {
             !out.contains(", connected")
                 && !out.contains("failures 0")
                 && out.contains("last error")
-                && out.contains("vrps ipv4 2 ipv6 0, expire in")
+                && out.contains("serving_vrps=2 expires_in=")
+                && out.contains("vrps ipv4 2 ipv6 0 from 127.0.0.1:3323, expire in")
         };
         let mut out = String::new();
         assert!(
@@ -336,6 +427,29 @@ impl Setup {
     }
 }
 
+/// The `rpki` block for the caches at `binds`, in that order of
+/// preference, after the one at `unanswered` if there is one.
+fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
+    let mut entries = String::new();
+    if let Some(addr) = unanswered {
+        let _ = write!(
+            entries,
+            " cache {addr} port 3323 preference 0; connect-timeout 30; response-timeout 60;"
+        );
+    }
+    for (i, bind) in binds.iter().enumerate() {
+        let port = bind.rsplit(':').next().unwrap_or(bind);
+        let preference = i + usize::from(unanswered.is_some());
+        let _ = write!(
+            entries,
+            " cache 127.0.0.1 port {port} preference {preference};"
+        );
+    }
+    // The shortest back-off, so that a cache that comes back is found
+    // within a second or two.
+    format!("rpki {{ mode {mode};{entries} backoff 1 1; }}")
+}
+
 /// The `session-id ... serial ...` line of `show rpki`.
 fn session_line(show_rpki: &str) -> String {
     show_rpki
@@ -355,9 +469,8 @@ fn session_line(show_rpki: &str) -> String {
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
     let opts = Opts {
-        caches: Caches::StayRtr(1),
-        mode: "external",
         relay: true,
+        ..Opts::external(Caches::StayRtr(1))
     };
     let s = Setup::start("v", 15, &opts, &FIRST);
     s.wait_for_states(ESTABLISH, &VALIDATED);
@@ -409,9 +522,24 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
     let updates = s.updates_from_bird();
     let sessions = s.count("session established");
     let serial_queries = s.count("query=\"Serial Query\"");
+    let revalidations = s.revalidations().len();
     s.caches[0].set_vrps(&SECOND);
     s.wait_for_states(CHANGE, &FLIPPED);
-    s.wait_for_log(Duration::ZERO, "changed=4");
+    // One change of the VRPs, one line: every route changed state.
+    assert_eq!(
+        s.new_revalidations(Duration::ZERO, revalidations, 1),
+        [(
+            4,
+            vec![
+                "invalid->not-found:1".to_owned(),
+                "invalid->valid:1".to_owned(),
+                "not-found->valid:1".to_owned(),
+                "valid->invalid:1".to_owned(),
+            ]
+        )],
+        "{}",
+        s.report()
+    );
     assert!(
         s.count("query=\"Serial Query\"") > serial_queries,
         "{}",
@@ -430,11 +558,7 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn the_vrps_outlive_a_restarted_stayrtr() {
-    let opts = Opts {
-        caches: Caches::StayRtr(1),
-        mode: "external",
-        relay: false,
-    };
+    let opts = Opts::external(Caches::StayRtr(1));
     let mut s = Setup::start("k", 16, &opts, &FIRST);
     s.wait_for_states(ESTABLISH, &VALIDATED);
     let session = session_line(&s.ctl(&["show", "rpki"]).0);
@@ -493,11 +617,7 @@ fn the_vrps_outlive_a_restarted_stayrtr() {
 #[test]
 #[ignore = "needs root, bird, curl and iproute2"]
 fn a_restarted_cache_brings_bgpfcd_back_in_sync() {
-    let opts = Opts {
-        caches: Caches::Stub,
-        mode: "external",
-        relay: false,
-    };
+    let opts = Opts::external(Caches::Stub);
     let mut s = Setup::start("s", 17, &opts, &FIRST);
     s.wait_for_states(ESTABLISH, &VALIDATED);
     let (out, ok) = s.ctl(&["show", "rpki"]);
@@ -561,9 +681,8 @@ fn a_restarted_cache_brings_bgpfcd_back_in_sync() {
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn with_mode_disabled_no_cache_is_asked() {
     let opts = Opts {
-        caches: Caches::StayRtr(1),
         mode: "disabled",
-        relay: false,
+        ..Opts::external(Caches::StayRtr(1))
     };
     let s = Setup::start("d", 18, &opts, &FIRST);
     // A client would start before the neighbors, so it would have
@@ -596,48 +715,113 @@ fn with_mode_disabled_no_cache_is_asked() {
     assert!(!log.contains("Accepted tcp connection"), "{log}");
 }
 
-/// The preferred of two caches goes away for good: bgpfcd warns, keeps
-/// its VRPs (RFC 8210 §10) and moves to the other cache, whose full set
-/// replaces them. Then a reload to `mode disabled` and back.
+/// The preferred of two caches goes away: bgpfcd warns, keeps its VRPs
+/// (RFC 8210 §10) and moves to the other cache, whose full set, which
+/// differs in one VRP, replaces them; when the preferred cache comes back,
+/// bgpfcd returns to it within the Retry Interval (§4, §10). A reload that
+/// names a cache that cannot be found fails and keeps the client (issue
+/// #60). Then a reload to `mode disabled` and back.
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn the_vrps_outlive_their_cache_and_follow_a_reload() {
     let opts = Opts {
-        caches: Caches::StayRtr(2),
-        mode: "external",
-        relay: false,
+        backup: Some(&FAILOVER),
+        ..Opts::external(Caches::StayRtr(2))
     };
     let mut s = Setup::start("w", 19, &opts, &FIRST);
     s.wait_for_states(ESTABLISH, &VALIDATED);
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
-        ok && out.contains("cache 127.0.0.1:3323 preference 0, in use")
+        ok && out.contains("cache 127.0.0.1:3323 preference 0, in use, current\n")
             && out.contains("cache 127.0.0.1:3324 preference 1\n"),
         "{out}"
     );
+    let revalidations = s.revalidations().len();
     // A warning, and the VRPs stay in use while bgpfcd tries the cache
-    // again and then the other one, whose full set replaces them (an info
-    // line when in sync again).
+    // again and then the other one (an info line when in sync again).
     s.caches[0].daemon.kill();
     s.wait_for_log(
         RECONNECT,
         "WARN  msg=\"rtr lost the cache; serving the last data while reconnecting\"",
     );
-    s.wait_for_states(Duration::ZERO, &VALIDATED);
     s.wait_for_log(RECONNECT, "INFO  msg=\"rtr cache reachable again\"");
+    s.wait_for_states(CHANGE, &FAILED_OVER);
     let (out, ok) = s.ctl(&["show", "rpki"]);
+    for line in [
+        "cache 127.0.0.1:3323 preference 0\n",
+        "cache 127.0.0.1:3324 preference 1, in use, current\n",
+        "state idle, connected",
+        "vrps ipv4 3 ipv6 0 from 127.0.0.1:3324, expire in",
+    ] {
+        assert!(ok && out.contains(line), "{line}:\n{out}");
+    }
+    // One change since the cache went away, which moved one route: the
+    // first cache's VRPs stayed in use until the other's full set
+    // replaced them, and only what the two sets judge differently changed.
+    assert_eq!(
+        s.new_revalidations(Duration::ZERO, revalidations, 1),
+        [(1, vec!["not-found->valid:1".to_owned()])],
+        "{}",
+        s.report()
+    );
+
+    // The preferred cache comes back. In sync with the other, bgpfcd looks
+    // for it every Retry Interval, two seconds here (RFC 8210 §6), and
+    // moves back to it: §4, the most preferred cache that accepts.
+    let revalidations = s.revalidations().len();
+    let ns_a = s.lab.a.clone();
+    s.caches[0] = StayRtr::start(&s.lab, &ns_a, CACHES[0], &FIRST);
+    s.wait_for_log(
+        RECONNECT,
+        "INFO  msg=\"rtr moving to a more preferred cache\"",
+    );
+    s.wait_for_states(CHANGE, &VALIDATED);
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    for line in [
+        "cache 127.0.0.1:3323 preference 0, in use, current\n",
+        "cache 127.0.0.1:3324 preference 1\n",
+        "state idle, connected",
+        "vrps ipv4 2 ipv6 0 from 127.0.0.1:3323, expire in",
+    ] {
+        assert!(ok && out.contains(line), "{line}:\n{out}");
+    }
+    assert_eq!(
+        s.new_revalidations(Duration::ZERO, revalidations, 1),
+        [(1, vec!["valid->not-found:1".to_owned()])],
+        "{}",
+        s.report()
+    );
+
+    // Issue #60: a reload that adds a cache whose name does not resolve
+    // fails, and the running client goes on as it was.
+    let cfg_path = s.config_path();
+    let external = fs::read_to_string(&cfg_path).unwrap();
+    // RFC 2606 §2: a name under `.invalid` never resolves.
+    fs::write(
+        &cfg_path,
+        external.replace(
+            " backoff 1 1;",
+            " cache rtr.invalid preference 5; backoff 1 1;",
+        ),
+    )
+    .unwrap();
+    let (out, ok) = s.ctl(&["reload"]);
     assert!(
-        ok && out.contains("cache 127.0.0.1:3324 preference 1, in use")
-            && out.contains("state idle, connected"),
+        !ok && out.contains("cannot resolve rpki cache rtr.invalid"),
         "{out}"
     );
-    // The same VRPs from the other cache: no state changed.
+    s.wait_for_log(Duration::ZERO, "reload failed; running configuration kept");
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains("cache 127.0.0.1:3323 preference 0, in use, current\n")
+            && out.contains("state idle, connected")
+            && !out.contains("rtr.invalid"),
+        "{out}"
+    );
     s.wait_for_states(Duration::ZERO, &VALIDATED);
 
     // A reload to `mode disabled` turns validation off for every route,
     // and one back to `mode external` brings the states back.
-    let cfg_path = s.lab.dir.join(format!("bgpfcd-{}.conf", s.lab.a));
-    let external = fs::read_to_string(&cfg_path).unwrap();
     fs::write(
         &cfg_path,
         external.replace("mode external", "mode disabled"),
@@ -654,4 +838,79 @@ fn the_vrps_outlive_their_cache_and_follow_a_reload() {
     s.wait_for_states(CHANGE, &VALIDATED);
     // None of this touched the BGP session.
     assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
+
+/// A cache whose address swallows every packet comes first in the list,
+/// with a connection attempt of up to 30 seconds. A reload that drops it
+/// does not wait for the attempt, nor does a shutdown during one: the
+/// peer gets its Cease at once.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn a_cache_that_never_answers_holds_up_neither_reload_nor_shutdown() {
+    let opts = Opts {
+        unanswered: true,
+        ..Opts::external(Caches::StayRtr(1))
+    };
+    let mut s = Setup::start("h", 20, &opts, &FIRST);
+    let unanswered = s.unanswered.expect("the unanswered cache");
+    let hanging = format!("cache {unanswered}:3323 preference 0, current\n");
+    // The routes come in while bgpfcd still waits for the first cache.
+    s.wait_for_states(ESTABLISH, &DISABLED);
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains(&hanging) && out.contains("state connecting, version 1"),
+        "{out}"
+    );
+
+    // A reload without that cache: the client restarts at once.
+    let cfg_path = s.config_path();
+    let with = fs::read_to_string(&cfg_path).unwrap();
+    let entry = format!(" cache {unanswered} port 3323 preference 0;");
+    assert!(with.contains(&entry), "{with}");
+    fs::write(&cfg_path, with.replace(&entry, "")).unwrap();
+    let reloading = Instant::now();
+    let (out, ok) = s.ctl(&["reload"]);
+    assert!(ok && out.contains("rpki: rtr client restarted"), "{out}");
+    assert!(
+        reloading.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        reloading.elapsed()
+    );
+    s.wait_for_states(CHANGE, &VALIDATED);
+
+    // Back to the list that starts with it, and a shutdown during the
+    // attempt: the Cease, the FIB cleanup and the exit do not wait.
+    fs::write(&cfg_path, &with).unwrap();
+    let (out, ok) = s.ctl(&["reload"]);
+    assert!(ok && out.contains("rpki: rtr client restarted"), "{out}");
+    assert!(
+        wait_for(RECONNECT, || {
+            let out = s.ctl(&["show", "rpki"]).0;
+            out.contains(&hanging) && out.contains("state connecting")
+        }),
+        "{}",
+        s.report()
+    );
+    let stopping = Instant::now();
+    assert!(
+        s.bgpfcd.terminate(Duration::from_secs(10)),
+        "{}",
+        s.report()
+    );
+    assert!(
+        stopping.elapsed() < Duration::from_secs(5),
+        "{:?}\n{}",
+        stopping.elapsed(),
+        s.report()
+    );
+    s.wait_for_log(Duration::ZERO, "msg=\"bgpfcd stopped\"");
+    assert!(
+        wait_for(Duration::from_secs(10), || s
+            .bird
+            .daemon
+            .log_text()
+            .contains("Received: Administrative shutdown")),
+        "{}",
+        s.bird.daemon.log_text()
+    );
 }
