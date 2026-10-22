@@ -857,6 +857,39 @@ fn prefix_in_both_withdrawn_and_nlri_is_announced() {
 }
 
 #[test]
+fn routes_of_a_family_the_session_did_not_negotiate_are_ignored() {
+    // RFC 4760 §8: e1 negotiated IPv4 unicast only. Its IPv6 routes would
+    // reach the other peers, and outlive its session, since a session's
+    // routes go per negotiated family.
+    let mut rib = Rib::new(LOCAL_AS);
+    let mut e1 = peer("10.0.0.1", 65_001, 1);
+    e1.families = vec![V4];
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let v6 = announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1"));
+    assert_eq!(rib.update(e1.addr, &v6, now()), vec![]);
+    assert!(rib.candidates(V6, p("2001:db8:1::/48")).is_empty());
+    // e2 has it, and e1's withdrawal of it means nothing either.
+    let from_e2 = announce(&["2001:db8:1::/48"], &attrs(&[65_002], "2001:db8::2"));
+    assert_eq!(fib(&rib.update(e2.addr, &from_e2, now())).len(), 1);
+    assert_eq!(
+        rib.update(e1.addr, &withdraw(&["2001:db8:1::/48"]), now()),
+        vec![]
+    );
+    assert_eq!(rib.loc_rib(V6).count(), 1);
+    // IPv4 goes on as usual, and nothing of e1 is left once it is down.
+    let v4 = announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1"));
+    assert_eq!(fib(&rib.update(e1.addr, &v4, now())).len(), 1);
+    rib.peer_down(e1.addr, now());
+    assert_eq!(rib.loc_rib(V4).count(), 0);
+    assert!(
+        rib.loc_rib(V6).all(|(_, b)| b.peer == e2.addr),
+        "a route of e1 outlived its session"
+    );
+}
+
+#[test]
 fn as_loop_routes_are_excluded() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);

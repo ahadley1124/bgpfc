@@ -191,7 +191,7 @@ is `done`.
 | 8 | Use capability advertisement to negotiate | SHOULD | done (codec; FSM uses it later) | wire/capability.rs | capability.rs |
 | 8 | Capability 1, length 4: AFI, reserved, SAFI | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 8 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/capability.rs | capability.rs `multiprotocol_ignores_the_reserved_octet` |
-| 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | done (no Multiprotocol capability means IPv4 unicast only) | fsm/machine.rs `negotiate_families` | fsm tests `open_negotiation`, `internal_session_and_old_speaker` |
+| 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | done (no Multiprotocol capability means IPv4 unicast only; routes received for a family the session did not negotiate are ignored and logged) | fsm/machine.rs `negotiate_families`, rib/lib.rs `Rib::update`, bgpfcd/peer.rs `unnegotiated` | fsm tests `open_negotiation`, `internal_session_and_old_speaker`, rib tests `routes_of_a_family_the_session_did_not_negotiate_are_ignored`, bgpfcd/peer.rs `families_not_negotiated_are_named_once` |
 | 3 | `MP_REACH_NLRI` type 14, optional non-transitive: AFI, SAFI, next hop length, next hop, reserved, NLRI | MUST | done | wire/mp.rs `MpReach` | mp.rs `ipv6_unicast_reach_round_trips` |
 | 3 | Reserved octet zero on send, ignored on receipt | MUST / SHOULD | done | wire/mp.rs | mp.rs `ipv4_nlri_with_ipv4_or_ipv6_next_hop` |
 | 3 | UPDATE with `MP_REACH_NLRI` carries ORIGIN and `AS_PATH` (and `LOCAL_PREF` on iBGP) | MUST | done for ORIGIN/`AS_PATH` (treat-as-withdraw); `LOCAL_PREF` left to the RIB | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |

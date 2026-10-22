@@ -11,8 +11,9 @@
 //! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's),
 //! §6.3 a) (a route whose next hop is our own address is ignored, see
 //! [`Output::InvalidNextHop`]);
-//! RFC 4760 §3, §5, §7 (each NLRI field with its own next hop, per-family
-//! RIBs, family disable); RFC 2918 §4 (route refresh re-sends the
+//! RFC 4760 §3, §5, §7, §8 (each NLRI field with its own next hop,
+//! per-family RIBs, family disable, only negotiated families); RFC 2918 §4
+//! (route refresh re-sends the
 //! Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6 next hop, see
 //! [`export`]); RFC 4271 §6.7 (a per-family prefix limit that ends the
 //! session, see [`Output::PrefixLimitExceeded`]).
@@ -591,10 +592,11 @@ impl Rib {
 
     /// An UPDATE from `addr`: disable the families its incorrect MP
     /// attributes named (RFC 4760 §7), apply its withdrawals and
-    /// announcements to the Adj-RIB-In, rerun the decision process for the destinations
-    /// touched, and produce the FIB changes and UPDATEs that follow, after
-    /// an [`Output::InvalidNextHop`] for each part of the UPDATE whose
-    /// routes were ignored.
+    /// announcements to the Adj-RIB-In, rerun the decision process for the
+    /// destinations touched, and produce the FIB changes and UPDATEs that
+    /// follow, after an [`Output::InvalidNextHop`] for each part of the
+    /// UPDATE whose routes were ignored. Routes of a family the session did
+    /// not negotiate are ignored (RFC 4760 §8).
     pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate, now: Instant) -> Vec<Output> {
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
@@ -612,15 +614,19 @@ impl Rib {
             .get(&addr)
             .map(|s| s.disabled.clone())
             .unwrap_or_default();
+        // RFC 4760 §8: a family is exchanged only once both sides have
+        // advertised it. Routes of another are not the session's to give:
+        // they are ignored, as is a family disabled by RFC 4760 §7.
+        let unused = |family: AddressFamily| disabled.contains(&family) || !info.speaks(family);
         for (family, prefix) in update.withdrawals() {
-            if disabled.contains(&family) {
+            if unused(family) {
                 continue;
             }
             self.remove_route(addr, family, prefix, &mut dirty);
         }
         let mut ignored = Vec::new();
         for (family, next_hop, prefixes) in attrs::announced(update) {
-            if disabled.contains(&family) {
+            if unused(family) {
                 continue;
             }
             // RFC 4271 §6.3 a): a next hop that is the receiving speaker's
