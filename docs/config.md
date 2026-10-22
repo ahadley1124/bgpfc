@@ -284,6 +284,13 @@ set, which replaces them, or until they expire (RFC 8210 §10, §6). A cache
 listed twice, by the same address or the same name in any case, and the
 same port, is an error.
 
+A cache that restarts usually starts a new session, with a new Session ID
+(RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
+(§8.1), which such a cache should answer with an Error Report or a Cache
+Reset, after which bgpfcd loads the cache's data afresh. StayRTR 0.5.1 closes
+the connection instead, so bgpfcd, like BIRD, keeps its VRPs and asks again
+until they expire. List a second cache to have bgpfcd move on to it then.
+
 `version 1`, the default, offers RTR version 1 (RFC 8210) and falls back to
 version 0 (RFC 6810) for a cache that answers in version 0 (RFC 8210 §7);
 `version 0` starts with version 0, for a cache that mishandles version 1.

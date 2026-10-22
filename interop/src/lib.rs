@@ -1,6 +1,6 @@
 //! Interoperability test harness. Drives BIRD, FRR and `GoBGP` in network
-//! namespaces and peers them with `bgpfcd`. Nothing in this
-//! crate is shipped (AGENTS.md §1.2).
+//! namespaces and peers them with `bgpfcd`, and serves it VRPs over RTR
+//! from `StayRTR`. Nothing in this crate is shipped (AGENTS.md §1.2).
 //!
 //! Needs root, `iproute2` and the daemon under test:
 //!
@@ -760,5 +760,85 @@ impl GoBgp {
     #[must_use]
     pub fn neighbors(&self, lab: &Lab) -> String {
         self.gobgp(lab, &["neighbor"])
+    }
+}
+
+/// A `StayRTR` RPKI cache: an RTR server (RFC 8210) that serves the VRPs
+/// of a JSON file, which the test rewrites to change them.
+pub struct StayRtr {
+    /// The process.
+    pub daemon: Daemon,
+    vrps: PathBuf,
+}
+
+impl StayRtr {
+    /// Start `stayrtr` in namespace `ns`, listening on `bind` (such as
+    /// `127.0.0.1:3323`) and serving `vrps`: (prefix, max length, origin
+    /// AS). It reads the file again every second and tells its clients
+    /// with a Serial Notify when the VRPs change.
+    ///
+    /// # Panics
+    /// If the file cannot be written or `stayrtr` cannot be spawned.
+    #[must_use]
+    pub fn start(lab: &Lab, ns: &str, bind: &str, vrps: &[(&str, u8, u32)]) -> StayRtr {
+        let port = bind.rsplit(':').next().unwrap_or(bind);
+        let path = lab.dir.join(format!("vrps-{ns}-{port}.json"));
+        StayRtr::write(&path, vrps);
+        let mut cmd = lab.exec(ns, "stayrtr");
+        cmd.args([
+            "-cache",
+            path.to_str().expect("path"),
+            "-bind",
+            bind,
+            // The file's metadata says when it was made; a test file is
+            // never fresh.
+            "-checktime=false",
+            "-refresh",
+            "1",
+            // No metrics listener, so that several caches can share a
+            // namespace.
+            "-metrics.addr",
+            "",
+        ]);
+        let cache = StayRtr {
+            daemon: Daemon::start(cmd, lab.dir.join(format!("stayrtr-{ns}-{port}.log"))),
+            vrps: path,
+        };
+        assert!(
+            wait_for(Duration::from_secs(10), || cache
+                .daemon
+                .log_text()
+                .contains("Server started")),
+            "stayrtr did not start:\n{}",
+            cache.daemon.log_text()
+        );
+        cache
+    }
+
+    /// Serve `vrps` from now on.
+    pub fn set_vrps(&self, vrps: &[(&str, u8, u32)]) {
+        StayRtr::write(&self.vrps, vrps);
+    }
+
+    fn write(path: &Path, vrps: &[(&str, u8, u32)]) {
+        let roas: Vec<String> = vrps
+            .iter()
+            .map(|(prefix, max_len, asn)| {
+                format!(
+                    "{{\"prefix\":\"{prefix}\",\"maxLength\":{max_len},\"asn\":\"AS{asn}\",\"ta\":\"test\"}}"
+                )
+            })
+            .collect();
+        // Written whole and renamed, so that stayrtr never reads half a file.
+        let tmp = path.with_extension("tmp");
+        fs::write(
+            &tmp,
+            format!(
+                "{{\"metadata\":{{\"generated\":0}},\"roas\":[{}]}}",
+                roas.join(",")
+            ),
+        )
+        .expect("vrps file");
+        fs::rename(&tmp, path).expect("vrps file");
     }
 }
