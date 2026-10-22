@@ -21,7 +21,12 @@
 //! router in sync, the next cache in that order is tried after the
 //! back-off, wrapping round to the most preferred. When the cache or the
 //! network closes a connection that was in sync, the client starts again
-//! from the most preferred cache after the shortest delay.
+//! from the most preferred cache after the shortest delay. And while it is
+//! in sync with a cache that is not the most preferred, it tries the more
+//! preferred ones again every Retry Interval of the cache in use, and
+//! moves to the first that accepts a connection: §4 has the router choose
+//! "the most preferred, by configuration, cache or set of caches", so
+//! that one that comes back after an outage takes its load back.
 //!
 //! Moving to another cache does not drop the data: the RIB goes on
 //! validating with the previous cache's data until the new cache has sent
@@ -72,11 +77,13 @@
 //! of the Refresh Interval and the response timeout find a dead
 //! connection instead.
 //!
-//! Implements: RFC 8210 §8.3 and §8.4 (other caches first after a Cache
-//! Reset or No Data Available), §9 (unprotected TCP to the rpki-rtr port,
-//! 323), §10 (the list of caches in order of preference; the data from one
-//! cache at a time, replaced only by a full set from another; the
-//! previous cache's data kept until then, also across a new cache list),
+//! Implements: RFC 8210 §4 (the most preferred cache that accepts a
+//! connection, also one that comes back), §8.3 and §8.4 (other caches
+//! first after a Cache Reset or No Data Available), §9 (unprotected TCP to
+//! the rpki-rtr port, 323), §10 (the list of caches in order of
+//! preference; the data from one cache at a time, marked as to source and
+//! replaced only by a full set from another; the previous cache's data
+//! kept until then, also across a new cache list),
 //! §6 (data not kept past its Expire Interval across a move to another
 //! cache or client; the reconnect delay, see [`Backoff`]); RFC 6810 §7
 //! (port 323 for version 0), §8 (the cache list).
@@ -685,6 +692,9 @@ struct Worker<S> {
     held_expires: Option<Instant>,
     /// Since when no connection has been in sync, after one was.
     down_since: Option<Instant>,
+    /// When to look again for a cache more preferred than the one the
+    /// client is in sync with (see [`Worker::look_for_preferred`]).
+    look_at: Option<Instant>,
     last_commit: Option<Instant>,
     last_error: Option<(Instant, String)>,
     /// The level of the line in `last_error`, if the step at hand wrote
@@ -753,6 +763,7 @@ impl<S: ValidationSink> Worker<S> {
             counts: (0, 0),
             held_expires: None,
             down_since: None,
+            look_at: None,
             last_commit: None,
             last_error: None,
             step_level: None,
@@ -803,7 +814,9 @@ impl<S: ValidationSink> Worker<S> {
         while !self.exit && !self.shared.stopping() {
             let now = self.clock.now();
             let wake = self.next_wake();
-            if wake.is_some_and(|at| at <= now) {
+            if self.look_at.is_some_and(|at| at <= now) {
+                self.look_for_preferred(now);
+            } else if wake.is_some_and(|at| at <= now) {
                 self.handle(Event::Tick);
             } else if self.conn.is_some() {
                 self.read(wake, now);
@@ -818,12 +831,17 @@ impl<S: ValidationSink> Worker<S> {
     }
 
     /// When the thread must next step the session without input: its
-    /// timers, or the expiry of data held over from another cache.
+    /// timers, the expiry of data held over from another cache, or the
+    /// next look for a more preferred cache.
     fn next_wake(&self) -> Option<Instant> {
-        match (self.session.next_deadline(), self.held_expires) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.session.next_deadline(),
+            self.held_expires,
+            self.look_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     // ------------------------------------------------------------ input
@@ -1052,7 +1070,7 @@ impl<S: ValidationSink> Worker<S> {
                 self.synced_on_conn = false;
                 let delay = self.backoff.delay(0, self.jitter_seed);
                 let at = now.checked_add(delay).unwrap_or(now);
-                self.switch_to(0, at, now);
+                self.switch_to(0, at, now, "rtr trying the next cache");
             }
         }
     }
@@ -1093,12 +1111,75 @@ impl<S: ValidationSink> Worker<S> {
         };
         if next != self.current {
             let at = now.checked_add(delay).unwrap_or(now);
-            self.switch_to(next, at, now);
+            self.switch_to(next, at, now, "rtr trying the next cache");
         }
     }
 
-    /// Use the cache at `next` from now on, connecting at `connect_at`.
-    fn switch_to(&mut self, next: usize, connect_at: Instant, now: Instant) {
+    /// In sync with a cache while more preferred ones are configured, try
+    /// those again, most preferred first, every Retry Interval of the
+    /// cache in use (RFC 8210 §6), and move to the first that accepts a
+    /// connection.
+    ///
+    /// RFC 8210 §4: "The router MUST choose the most preferred, by
+    /// configuration, cache or set of caches so that the operator may
+    /// control load on their caches"; §10: "When a more-preferred cache
+    /// becomes available, if resources allow, it would be prudent for the
+    /// client to start fetching from that cache." A move keeps the data in
+    /// use until the cache moved to has sent a full set (§10), as any
+    /// other move does; a cache that accepts and then fails sends the
+    /// client on down the list as after any failure.
+    fn look_for_preferred(&mut self, now: Instant) {
+        self.look_at = None;
+        if self.session.state() != State::Idle {
+            // An answer is coming: look again once it is in.
+            self.look_at = now.checked_add(Duration::from_secs(1));
+            return;
+        }
+        let preference = self.cache().preference;
+        // Sorted by preference: the more preferred caches come first.
+        let preferred = self
+            .caches
+            .iter()
+            .take_while(|cache| cache.preference < preference)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, cache) in preferred.iter().enumerate() {
+            match self.shared.connect(cache, self.connect_timeout) {
+                // Stopped meanwhile.
+                None => return,
+                Some(Ok(probe)) => {
+                    // The session with it opens a connection of its own.
+                    let _ = probe.shutdown(Shutdown::Both);
+                    let now = self.clock.now();
+                    self.close();
+                    self.synced_on_conn = false;
+                    self.switch_to(index, now, now, "rtr moving to a more preferred cache");
+                    return;
+                }
+                Some(Err(_)) => {}
+            }
+        }
+        self.schedule_look(self.clock.now());
+    }
+
+    /// Look for a more preferred cache one Retry Interval from `now`, if
+    /// there is one.
+    fn schedule_look(&mut self, now: Instant) {
+        let more_preferred = self
+            .caches
+            .first()
+            .is_some_and(|first| first.preference < self.cache().preference);
+        self.look_at = if more_preferred {
+            let retry = Duration::from_secs(u64::from(self.session.intervals().retry));
+            now.checked_add(retry)
+        } else {
+            None
+        };
+    }
+
+    /// Use the cache at `next` from now on, connecting at `connect_at`;
+    /// log `why` at info level.
+    fn switch_to(&mut self, next: usize, connect_at: Instant, now: Instant, why: &'static str) {
         if !self.fresh_session {
             // The RIB has this session's data. RFC 8210 §10: "If a client
             // loses connectivity to a cache it is using or otherwise decides
@@ -1110,16 +1191,20 @@ impl<S: ValidationSink> Worker<S> {
         self.current = next;
         self.session = Session::new(self.session_config, connect_at);
         self.fresh_session = true;
+        self.look_at = None;
         self.tell_held();
         let fields = vec![
             field("preference", self.cache().preference),
             field("in", Millis(connect_at.saturating_duration_since(now))),
         ];
-        self.shell_log(Level::Info, "rtr trying the next cache", fields, now);
+        self.shell_log(Level::Info, why, fields, now);
     }
 
     fn on_sync(&mut self, now: Instant) {
         self.synced_on_conn = true;
+        if self.look_at.is_none() {
+            self.schedule_look(now);
+        }
         // A success ends the run of failures: the next one waits the
         // shortest back-off again.
         self.failures = 0;

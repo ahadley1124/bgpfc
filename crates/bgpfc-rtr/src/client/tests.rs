@@ -1112,6 +1112,93 @@ mod net {
     }
 
     #[test]
+    fn the_client_returns_to_a_more_preferred_cache_that_comes_back() {
+        // The most preferred cache is gone at first: its port refuses.
+        let first = TestCache::new();
+        let port = first.listener.local_addr().unwrap().port();
+        drop(first);
+        let second = TestCache::new();
+        let first_entry = Cache {
+            host: "127.0.0.1".to_owned(),
+            port,
+            preference: 0,
+        };
+        let (client, rx) = start(vec![first_entry.clone(), second.entry(1)]);
+        let mut router = second.accept();
+        router.serve_reset(SID, 1, &[a(), b()]);
+        next_change(&rx);
+        eventually("the second cache in sync", || {
+            client.status().synced_at.is_some()
+        });
+        // It comes back.
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let first = TestCache { listener };
+        // Not before the Retry Interval of the cache in use, 60 s (RFC 8210
+        // §6). A Serial Notify for the serial the client has wakes it and
+        // asks for nothing.
+        client.advance(59 * SEC);
+        router.send(&[notify(SID, 1)]);
+        assert!(first.quiet_for(100 * MS));
+        // Then RFC 8210 §4, the most preferred cache that accepts: one
+        // connection to see that it does, which the client closes at once,
+        // and one for the session with it.
+        client.advance(2 * SEC);
+        router.send(&[notify(SID, 1)]);
+        first.accept().expect_close();
+        let mut back = first.accept();
+        back.serve_reset(9, 1, &[a(), c()]);
+        // Its full set replaces the second cache's, which stayed in use
+        // until then (§10).
+        let change = next_change(&rx);
+        assert!(covers(&change, "2001:db8::/32") && covers(&change, "198.51.100.0/24"));
+        assert!(!covers(&change, "192.0.2.0/24"));
+        router.expect_close();
+        eventually("the first cache in use", || {
+            let status = client.status();
+            status.cache == first_entry && status.source == Some(first_entry.clone())
+        });
+        // With the most preferred cache in use, nothing is looked for.
+        client.advance(61 * SEC);
+        back.send(&[notify(9, 1)]);
+        assert!(first.quiet_for(100 * MS) && second.quiet_for(100 * MS));
+        assert!(
+            client
+                .status()
+                .last_error
+                .is_none_or(|e| !e.contains("preferred")),
+            "{:?}",
+            client.status().last_error
+        );
+    }
+
+    #[test]
+    fn a_more_preferred_cache_that_stays_away_is_tried_each_retry_interval() {
+        let gone = TestCache::new().entry(0);
+        let second = TestCache::new();
+        let (client, rx) = start(vec![gone, second.entry(1)]);
+        let mut router = second.accept();
+        router.serve_reset(SID, 1, &[a()]);
+        next_change(&rx);
+        eventually("the second cache in sync", || {
+            client.status().synced_at.is_some()
+        });
+        // Each look finds the first cache still refusing: the client stays
+        // with the second, on the same connection, its data untouched.
+        for _ in 0..3 {
+            client.advance(61 * SEC);
+            router.send(&[notify(SID, 1)]);
+            thread::sleep(50 * MS);
+        }
+        assert!(second.quiet_for(100 * MS), "no new connection");
+        assert!(rx.try_recv().is_err());
+        let status = client.status();
+        assert_eq!(status.cache, second.entry(1));
+        assert!(status.connected && status.state == State::Idle);
+        assert_eq!(status.session_id, Some(SID));
+    }
+
+    #[test]
     fn stop_closes_the_connection_and_joins_the_thread() {
         let cache = TestCache::new();
         let (mut client, _rx, mut router) = in_sync(&cache);

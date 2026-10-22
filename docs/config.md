@@ -278,11 +278,15 @@ whether a route is accepted or which one is chosen.
 first (RFC 8210 §10); caches of equal preference are tried in file order.
 bgpfcd uses one cache at a time: the first in that order that answers.
 After a failure it tries the next, wrapping round to the first; when a
-cache it was in sync with goes away, it starts again from the first. The
-VRPs from the last cache stay in use until another cache has sent a full
-set, which replaces them, or until they expire (RFC 8210 §10, §6). A cache
-listed twice, by the same address or the same name in any case, and the
-same port, is an error.
+cache it was in sync with goes away, it starts again from the first. In
+sync with a cache while more preferred ones are listed, it tries those
+again every Retry Interval the cache in use gives (600 seconds unless it
+says otherwise), and moves to the first that accepts a connection, so
+that a preferred cache that comes back after an outage takes its load
+back (RFC 8210 §4). The VRPs from the last cache stay in use until another
+cache has sent a full set, which replaces them, or until they expire (RFC
+8210 §10, §6). A cache listed twice, by the same address or the same name
+in any case, and the same port, is an error.
 
 A cache that restarts usually starts a new session, with a new Session ID
 (RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
