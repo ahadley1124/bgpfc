@@ -583,8 +583,15 @@ mod tests {
             if std::env::var_os(PROBE_ENV).is_none() {
                 return;
             }
+            // Pipes inherited from whatever ran the tests (cargo's jobserver,
+            // a CI runner) are open before the handlers go in; only the ones
+            // that appear with them are the self-pipe.
+            let inherited = pipes();
             let _signals = bgpfc_sys::Signals::install().unwrap();
-            let pipes = pipes();
+            let pipes: Vec<String> = pipes()
+                .into_iter()
+                .filter(|fd| !inherited.contains(fd))
+                .collect();
             let own = ambient(&std::fs::read_to_string("/proc/self/status").unwrap());
             let (bare, bare_open) = child_report(Command::new("/bin/sh"), &pipes);
             let config = SidecarConfig::new("/bin/sh", "/");
