@@ -342,33 +342,20 @@ impl Peer {
                 }
             }
             PeerInput::Stop(subcode) => {
-                // RFC 4271 §8.2.2 ManualStop: a Cease goes out (RFC 4486
-                // §4 Administrative Shutdown) and the FSM returns to Idle;
-                // any other subcode travels in an AutomaticStop.
-                if subcode == CeaseSubcode::AdministrativeShutdown {
-                    self.event(Event::ManualStop, now);
-                } else {
-                    self.event(
-                        Event::AutomaticStop(NotificationMessage::cease(subcode)),
-                        now,
-                    );
-                }
+                // RFC 4271 §8.2.2 ManualStop: the operator's doing, by
+                // `bgpfcctl`, a reload or a shutdown, with the RFC 4486 §4
+                // Cease for it (Administrative Shutdown, Peer De-configured,
+                // Other Configuration Change). No failure of the peer, so
+                // nothing is damped or counted toward the restart limit.
+                self.event(Event::ManualStop(NotificationMessage::cease(subcode)), now);
                 self.drop_conn();
                 return false;
             }
             PeerInput::Reset(message) => {
-                // RFC 4486 §4 Administrative Reset, with the RFC 9003
-                // communication when one was given.
-                let n = match message.as_deref() {
-                    Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
-                        .unwrap_or_else(|_| {
-                            NotificationMessage::cease(CeaseSubcode::AdministrativeReset)
-                        }),
-                    None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
-                };
                 bgpfc_log::info!("session reset by operator", peer = self.cfg.addr);
-                self.event(Event::AutomaticStop(n), now);
-                self.event(Event::ManualStart, now);
+                for event in reset_events(message.as_deref()) {
+                    self.event(event, now);
+                }
             }
             PeerInput::SoftReset => {
                 if self.request_routes(now) {
@@ -778,6 +765,21 @@ impl Peer {
     }
 }
 
+/// What the FSM is fed for `bgpfcctl clear neighbor`: a `ManualStop` with
+/// RFC 4486 §4 Administrative Reset, carrying the RFC 9003 communication
+/// when one was given, then a `ManualStart`. The stop is the operator's,
+/// not a failure of the peer, so it is neither damped nor counted toward
+/// the restart limit, and the start is the "administrative intervention"
+/// that ends a run of failures (RFC 4486 §4).
+fn reset_events(message: Option<&str>) -> [Event; 2] {
+    let cease = match message {
+        Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
+            .unwrap_or_else(|_| NotificationMessage::cease(CeaseSubcode::AdministrativeReset)),
+        None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
+    };
+    [Event::ManualStop(cease), Event::ManualStart]
+}
+
 /// What the FSM is fed when the connection it runs on loses a collision
 /// to one whose OPEN was `open` (RFC 4271 §6.8). `OpenCollisionDump` on the
 /// losing connection sends the Cease and drops it (§8.2.2 event 23); the
@@ -921,6 +923,55 @@ mod tests {
         assert_eq!(fsm.state(), State::OpenConfirm);
         assert_eq!(fsm.damped_failures(), 1);
         assert!(fsm.automatic_start_allowed());
+    }
+
+    #[test]
+    fn a_hard_clear_is_no_failure_and_restarts_the_peer() {
+        use bgpfc_wire::types::{Asn, RouterId};
+        // RFC 4486 §4: no automatic restart allowed at all; the operator's
+        // reset must neither count as a failure nor claim the peer stays
+        // down.
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.damping = Some(bgpfc_fsm::Damping {
+            restart_limit: Some(0),
+            ..bgpfc_fsm::Damping::default()
+        });
+        for message in [None, Some("maintenance")] {
+            let mut fsm = Fsm::new(cfg.clone());
+            let now = Instant::now();
+            fsm.handle(Event::ManualStart, now);
+            fsm.handle(Event::TcpCrAcked, now);
+            assert_eq!(fsm.state(), State::OpenSent);
+            let actions: Vec<Action> = reset_events(message)
+                .into_iter()
+                .flat_map(|e| fsm.handle(e, now))
+                .collect();
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::RestartLimitReached { .. })),
+                "{actions:?}"
+            );
+            let sent: Vec<&NotificationMessage> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::SendNotification(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "{actions:?}");
+            assert_eq!(
+                (sent[0].code, sent[0].subcode),
+                (ErrorCode::Cease, CeaseSubcode::AdministrativeReset as u8)
+            );
+            assert_eq!(
+                sent[0].shutdown_communication().and_then(Result::ok),
+                message
+            );
+            assert_eq!(fsm.state(), State::Connect);
+            assert_eq!(fsm.damped_failures(), 0);
+            assert!(fsm.automatic_start_allowed());
+        }
     }
 
     /// The session an FSM advertising `ours` negotiates with a peer

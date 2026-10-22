@@ -236,7 +236,7 @@ impl Fsm {
             }
             // RFC 4271 §8.2.2 Idle: ManualStop is ignored for the state, but
             // it must cancel a pending automatic restart.
-            Event::ManualStop => {
+            Event::ManualStop(_) => {
                 self.admin_down = true;
                 self.idle_hold.stop();
             }
@@ -273,7 +273,7 @@ impl Fsm {
             | Event::AutomaticStartPassive
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Connect: ManualStop.
-            Event::ManualStop => self.manual_stop(now, actions),
+            Event::ManualStop(_) => self.manual_stop(now, actions),
             // RFC 4271 §8.2.2 Connect: ConnectRetryTimer_Expires.
             Event::ConnectRetryTimerExpires => {
                 actions.push(Action::DropConnection);
@@ -345,11 +345,9 @@ impl Fsm {
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Active: ManualStop, with the optional Cease
             // when an OPEN was being delayed.
-            Event::ManualStop => {
+            Event::ManualStop(cease) => {
                 if self.delay_open.is_running() && self.config.send_notification_without_open {
-                    actions.push(Action::SendNotification(NotificationMessage::cease(
-                        CeaseSubcode::AdministrativeShutdown,
-                    )));
+                    actions.push(Action::SendNotification(cease));
                 }
                 self.manual_stop(now, actions);
             }
@@ -421,10 +419,8 @@ impl Fsm {
             | Event::TcpConnectionConfirmed
             | Event::TcpCrInvalid => {}
             // RFC 4271 §8.2.2 OpenSent: ManualStop sends a Cease.
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 self.manual_stop(now, actions);
             }
             // RFC 4271 §8.2.2 OpenSent: AutomaticStop sends a Cease.
@@ -513,10 +509,8 @@ impl Fsm {
             | Event::TcpConnectionConfirmed
             | Event::TcpCrInvalid
             | Event::BgpOpen(_) => {}
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 self.manual_stop(now, actions);
             }
             Event::AutomaticStop(cease) => {
@@ -587,10 +581,8 @@ impl Fsm {
     fn in_established(&mut self, event: Event, now: Instant, actions: &mut Vec<Action>) {
         match event {
             // RFC 4271 §8.2.2 Established: ManualStop deletes routes too.
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 actions.push(Action::SessionDown);
                 self.manual_stop(now, actions);
             }

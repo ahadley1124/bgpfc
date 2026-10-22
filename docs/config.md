@@ -229,7 +229,10 @@ daemon logs an error when that happens. A manual start ends the run of
 failures, and so does a session that stayed up for five minutes; a session
 torn down soon after it comes up keeps counting. A refused or timed-out
 connection does not damp: a neighbor that is simply down is retried without
-bound. `0` never restarts after a damped failure; `off` always does.
+bound. Nor do the operator's own stops and resets, or a connection that
+loses a collision (RFC 4271 §6.8), after which the session goes on with the
+other one; neither counts toward the limit or ends a run. `0` never
+restarts after a damped failure; `off` always does.
 
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and

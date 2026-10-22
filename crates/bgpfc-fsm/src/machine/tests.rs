@@ -46,6 +46,11 @@ fn peer_open() -> OpenMessage {
     )
 }
 
+/// The Cease of a plain operator stop (RFC 4486 §4).
+fn shutdown() -> NotificationMessage {
+    NotificationMessage::cease(CeaseSubcode::AdministrativeShutdown)
+}
+
 fn cease() -> NotificationMessage {
     NotificationMessage::cease(CeaseSubcode::OtherConfigurationChange)
 }
@@ -67,7 +72,7 @@ fn update_err() -> DecodeError {
 fn every_event() -> Vec<(u8, Event)> {
     vec![
         (1, Event::ManualStart),
-        (2, Event::ManualStop),
+        (2, Event::ManualStop(shutdown())),
         (3, Event::AutomaticStart),
         (4, Event::ManualStartPassive),
         (5, Event::AutomaticStartPassive),
@@ -854,7 +859,7 @@ fn send_notification_without_open() {
     let (mut f, now) = fsm_at(State::Active, cfg);
     f.handle(Event::TcpConnectionConfirmed, now);
     assert!(f.timer(TimerKind::DelayOpen).is_running());
-    let a = f.handle(Event::ManualStop, now);
+    let a = f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(tags(&a), ["notif 6/2", "drop"]);
 }
 
@@ -926,7 +931,7 @@ fn damping_doubles_the_idle_hold_and_a_session_resets_it() {
 #[test]
 fn manual_stop_holds_the_peer_down_until_manual_start() {
     let (mut f, now) = fsm_at(State::Established, config());
-    f.handle(Event::ManualStop, now);
+    f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(f.state(), State::Idle);
     assert!(f.is_admin_down());
     assert_eq!(f.connect_retry_counter(), 0);
@@ -942,8 +947,47 @@ fn manual_stop_holds_the_peer_down_until_manual_start() {
     f.handle(Event::TcpConnectionFails, now);
     f.handle(Event::NotifMsgVerErr, now);
     assert!(f.timer(TimerKind::IdleHold).is_running());
-    f.handle(Event::ManualStop, now);
+    f.handle(Event::ManualStop(shutdown()), now);
     assert!(!f.timer(TimerKind::IdleHold).is_running());
+}
+
+#[test]
+fn manual_stop_sends_its_cease_and_counts_no_failure() {
+    // RFC 4486 §4: an operator reset is a ManualStop with Administrative
+    // Reset (here with an RFC 9003 communication), then a ManualStart. With
+    // no automatic restart allowed at all, neither step is a damped
+    // failure, so the restart limit has nothing to report.
+    let reset =
+        NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, "maintenance").unwrap();
+    for state in [
+        State::Connect,
+        State::Active,
+        State::OpenSent,
+        State::OpenConfirm,
+        State::Established,
+    ] {
+        let (mut f, now) = fsm_at(state, limited(Some(0)));
+        let a = f.handle(Event::ManualStop(reset.clone()), now);
+        assert!(
+            !a.iter()
+                .any(|x| matches!(x, Action::RestartLimitReached { .. })),
+            "{state}: {a:?}"
+        );
+        let sent = a.iter().find_map(|x| match x {
+            Action::SendNotification(n) => Some(n.clone()),
+            _ => None,
+        });
+        // RFC 4271 §8.2.2: the Cease goes out once an OPEN may have.
+        let expect = matches!(
+            state,
+            State::OpenSent | State::OpenConfirm | State::Established
+        );
+        assert_eq!(sent, expect.then(|| reset.clone()), "{state}");
+        assert_eq!(f.damped_failures(), 0, "{state}");
+        assert!(f.automatic_start_allowed(), "{state}");
+        f.handle(Event::ManualStart, now);
+        assert_eq!(f.state(), State::Connect, "{state}");
+    }
 }
 
 #[test]
@@ -1202,7 +1246,7 @@ fn restart_limit_zero_never_restarts_and_none_always_does() {
     assert!(f.automatic_start_allowed());
     // ManualStop wins over the bound: the peer stays down, no limit action.
     let (mut f, now) = fsm_at(State::OpenSent, limited(Some(0)));
-    let a = f.handle(Event::ManualStop, now);
+    let a = f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(tags(&a), ["notif 6/2", "drop"]);
     assert_eq!(f.damped_failures(), 0);
 }
@@ -1263,7 +1307,7 @@ fn a_collision_neither_counts_nor_ends_a_run_of_damped_failures() {
     assert_eq!(f.handle(AutomaticStartPassive, start), vec![]);
     assert_eq!(f.state(), Idle);
     let (mut f, now) = fsm_at(Idle, config());
-    f.handle(Event::ManualStop, now);
+    f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(f.handle(AutomaticStartPassive, now), vec![]);
     assert_eq!(f.state(), Idle);
     // Once Established (CollisionDetectEstablishedState), the same: the

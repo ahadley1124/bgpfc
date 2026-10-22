@@ -75,9 +75,15 @@ impl fmt::Display for State {
 pub enum Event {
     /// 1: operator starts the peer.
     ManualStart,
-    /// 2: operator stops the peer; it stays Idle until started again.
-    ManualStop,
-    /// 3, 5, 6, 7: the local system restarts the peer (after an
+    /// 2: the operator stops the peer, with the Cease to send where the
+    /// state sends one (RFC 4486 §4: Administrative Shutdown to stop it,
+    /// Administrative Reset to restart it, Peer De-configured or Other
+    /// Configuration Change after a reload; with an RFC 9003 Shutdown
+    /// Communication when the operator gave one). The peer stays Idle until
+    /// started again. It is no failure of the peer: nothing is damped or
+    /// counted toward the restart limit.
+    ManualStop(NotificationMessage),
+    /// 3, 6, 7: the local system restarts the peer (after an
     /// `IdleHoldTimer` expiry, or at daemon start for configured peers).
     AutomaticStart,
     /// 4: as 1 with `PassiveTcpEstablishment`. Kept distinct so that a
@@ -156,7 +162,7 @@ impl Event {
     pub const fn number(&self) -> u8 {
         match self {
             Event::ManualStart => 1,
-            Event::ManualStop => 2,
+            Event::ManualStop(_) => 2,
             Event::AutomaticStart => 3,
             Event::ManualStartPassive => 4,
             Event::AutomaticStartPassive => 5,

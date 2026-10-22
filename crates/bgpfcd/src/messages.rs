@@ -77,9 +77,9 @@ pub(crate) enum PeerInput {
     /// Framed UPDATE messages from the RIB thread, to write in order while
     /// Established (RFC 4271 §9.2).
     Send(Vec<Vec<u8>>),
-    /// Shut the session down with this Cease subcode (`ManualStop` for
-    /// Administrative Shutdown, RFC 4271 §8.1.2 event 2; `AutomaticStop`
-    /// with the subcode otherwise, RFC 4486 §4) and end the thread.
+    /// Shut the session down with this Cease subcode (a `ManualStop`, RFC
+    /// 4271 §8.1.2 event 2, with the RFC 4486 §4 subcode for the reason)
+    /// and end the thread.
     Stop(CeaseSubcode),
     /// Reset the session: Cease / Administrative Reset, with a shutdown
     /// communication when given (RFC 9003), then start again.
