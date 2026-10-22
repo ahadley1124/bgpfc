@@ -13,8 +13,10 @@
 //!   message stands ([`DecodedUpdate::discarded`]).
 //!
 //! Implements: RFC 4271 §4.3 (format), §5 (attribute categories), §6.3
-//! (error subcodes); RFC 7606 §3, §4, §5.1–§5.3, §7.1–§7.8, §7.11, §7.12,
-//! §7.14; RFC 4760 §3, §4, §7; RFC 6793 §4.2.2, §4.2.3, §6; RFC 7607 §2;
+//! (error subcodes; a next hop is a valid IP host address); RFC 7606 §3,
+//! §4, §5.1–§5.3, §7, §7.1–§7.8, §7.11, §7.12, §7.14; RFC 4760 §3 (the next
+//! hop rules hold for `MP_REACH_NLRI`), §4, §7; RFC 6793 §4.2.2, §4.2.3,
+//! §6; RFC 7607 §2;
 //! RFC 9774 §3; RFC 8092 §6; RFC 8950 §3, §4 (IPv6 next hops for IPv4
 //! NLRI, only when negotiated).
 
@@ -28,7 +30,7 @@ use crate::attribute::{
 };
 use crate::community::{decode_communities, decode_extended_communities, decode_large_communities};
 use crate::error::{DecodeError, EncodeError, UpdateSubcode};
-use crate::mp::{MpReach, MpUnreach, NextHop, family_of};
+use crate::mp::{MpReach, MpUnreach, NextHop, family_of, is_host_ipv4};
 use crate::prefix::{Prefix, decode_prefixes, encode_prefixes};
 use crate::reader::{Reader, WriteBytes as _};
 use crate::types::{AddressFamily, Afi, Asn};
@@ -223,7 +225,7 @@ impl UpdateMessage {
         let nlri = decode_prefixes(nlri_bytes, Afi::Ipv4)
             .map_err(|_| UpdateError::reset(UpdateSubcode::InvalidNetworkField, Vec::new()))?;
         let mut st = State::default();
-        decode_attributes(attr_bytes, *ctx, &mut st)?;
+        decode_attributes(attr_bytes, *ctx, !nlri.is_empty(), &mut st)?;
         apply_as4(&mut st, *ctx);
         // RFC 4271 §5: any order is accepted; ascending type order is the
         // canonical form, so equal messages compare equal.
@@ -342,7 +344,14 @@ enum Outcome {
     Withdraw(DecodeError),
 }
 
-fn decode_attributes(bytes: &[u8], ctx: DecodeContext, st: &mut State) -> Result<(), UpdateError> {
+/// Decode the path attributes into `st`. `nlri_field`: the NLRI field
+/// carries routes, which `NEXT_HOP` is for.
+fn decode_attributes(
+    bytes: &[u8],
+    ctx: DecodeContext,
+    nlri_field: bool,
+    st: &mut State,
+) -> Result<(), UpdateError> {
     let mut r = Reader::new(bytes);
     while !r.is_empty() {
         let Ok(raw) = parse_raw(&mut r) else {
@@ -368,9 +377,16 @@ fn decode_attributes(bytes: &[u8], ctx: DecodeContext, st: &mut State) -> Result
             continue;
         }
         match decode_one(&raw, ctx)? {
-            Outcome::Keep(PathAttribute::MpReach(m)) => st.mp_reach = Some(m),
-            Outcome::Keep(PathAttribute::MpUnreach(m)) => st.mp_unreach = Some(m),
-            Outcome::Keep(a) => st.attributes.push(a),
+            Outcome::Keep(a) => {
+                if let Some(e) = invalid_next_hop(&a, &raw, nlri_field) {
+                    st.withdraw(e);
+                }
+                match a {
+                    PathAttribute::MpReach(m) => st.mp_reach = Some(m),
+                    PathAttribute::MpUnreach(m) => st.mp_unreach = Some(m),
+                    a => st.attributes.push(a),
+                }
+            }
             Outcome::As4Path(p) => st.as4_path = Some(p),
             Outcome::As4Aggregator(a) => st.as4_aggregator = Some(a),
             Outcome::Ignore => {}
@@ -421,8 +437,9 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
             _ => length_error(),
         },
         code::AS_PATH => decode_as_path(raw, ctx.four_octet_as, ctx.allow_as_set),
-        // RFC 7606 §7.3: length only; semantic checks are the RIB's
-        // (RFC 4271 §6.3 says to log and ignore the route, never reset).
+        // RFC 7606 §7.3: the length. Whether it is a host address is
+        // `invalid_next_hop`'s; the semantic checks of RFC 4271 §6.3 are
+        // the RIB's (log and ignore the route, never reset).
         code::NEXT_HOP => match <[u8; 4]>::try_from(v) {
             Ok(octets) => Outcome::Keep(PathAttribute::NextHop(Ipv4Addr::from(octets))),
             Err(_) => length_error(),
@@ -544,6 +561,28 @@ fn decode_as4_path(raw: &RawAttribute<'_>, allow_as_set: bool) -> Outcome {
         // RFC 6793 §6: confederation segments are dropped, processing goes on.
         Ok(p) => Outcome::As4Path(p.without_confed()),
     }
+}
+
+/// RFC 4271 §6.3: a `NEXT_HOP` that is not a valid IP host address is
+/// syntactically incorrect, an Invalid `NEXT_HOP` Attribute error with the
+/// attribute as data; RFC 7606 §3 e) makes that treat-as-withdraw. RFC 4760
+/// §3 gives the next hop of `MP_REACH_NLRI` the same rules, and RFC 7606 §7
+/// asks for the same approach for checks it does not list, so it is
+/// handled alike (the attribute's length was right, so its NLRI can be
+/// withdrawn, unlike RFC 7606 §7.11's case). A next hop with no routes to
+/// go with is not judged: RFC 4760 §3 has `NEXT_HOP` ignored when the NLRI
+/// field is empty.
+fn invalid_next_hop(
+    a: &PathAttribute,
+    raw: &RawAttribute<'_>,
+    nlri_field: bool,
+) -> Option<DecodeError> {
+    let valid = match a {
+        PathAttribute::NextHop(n) => !nlri_field || is_host_ipv4(*n),
+        PathAttribute::MpReach(m) => m.nlri.is_empty() || m.next_hop.is_valid(),
+        _ => true,
+    };
+    (!valid).then(|| DecodeError::update(UpdateSubcode::InvalidNextHop, raw.raw.to_vec()))
 }
 
 fn discard_malformed(raw: &RawAttribute<'_>) -> Outcome {
@@ -946,6 +985,160 @@ mod tests {
         assert_eq!(d.discarded[0].code, code::ATOMIC_AGGREGATE);
         assert!(matches!(d.discarded[0].reason, DiscardReason::Malformed(_)));
         assert_eq!(d.message.attribute(code::ATOMIC_AGGREGATE), None);
+    }
+
+    #[test]
+    fn next_hops_that_are_not_host_addresses_are_treat_as_withdraw() {
+        // RFC 4271 §6.3: syntactically incorrect, Invalid NEXT_HOP Attribute
+        // with the attribute as data; RFC 7606 §3 e): treat-as-withdraw.
+        for bad in [
+            [0, 0, 0, 0],
+            [0, 1, 2, 3],
+            [127, 0, 0, 1],
+            [224, 0, 0, 5],
+            [239, 1, 1, 1],
+            [240, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            let mut wire = ANNOUNCE.to_vec();
+            wire[20..24].copy_from_slice(&bad);
+            let d = UpdateMessage::decode(&wire, &EBGP2).unwrap();
+            let e = d.treated_as_withdraw.clone().unwrap();
+            assert_eq!(e.subcode, UpdateSubcode::InvalidNextHop as u8, "{bad:?}");
+            let mut attr = vec![0x40, 3, 4];
+            attr.extend_from_slice(&bad);
+            assert_eq!(e.data, attr);
+            assert_eq!(d.announcements().count(), 0);
+            assert_eq!(
+                d.withdrawals().collect::<Vec<_>>(),
+                vec![(AddressFamily::IPV4_UNICAST, p("10.0.0.0/8"))]
+            );
+        }
+        // The data is the attribute as received, Extended Length included.
+        let mut wire = ANNOUNCE.to_vec();
+        wire.splice(17..20, [0x50, 3, 0, 4]);
+        wire[3] += 1;
+        wire[21..25].copy_from_slice(&[0, 0, 0, 0]);
+        let e = UpdateMessage::decode(&wire, &EBGP2)
+            .unwrap()
+            .treated_as_withdraw
+            .unwrap();
+        assert_eq!(e.data, [0x50, 3, 0, 4, 0, 0, 0, 0]);
+        // A host address is fine at the edges of the ranges around it.
+        for good in [[1, 0, 0, 0], [126, 255, 255, 255], [223, 255, 255, 255]] {
+            let mut wire = ANNOUNCE.to_vec();
+            wire[20..24].copy_from_slice(&good);
+            let d = UpdateMessage::decode(&wire, &EBGP2).unwrap();
+            assert_eq!(d.treated_as_withdraw, None, "{good:?}");
+        }
+    }
+
+    #[test]
+    fn mp_reach_next_hops_follow_the_next_hop_rules() {
+        // RFC 4760 §3: the rules of NEXT_HOP hold for MP_REACH_NLRI, which
+        // RFC 2545 §3 makes a global address, optionally followed by a
+        // link-local one.
+        let reach = |family, next_hop| UpdateMessage {
+            mp_reach: Some(MpReach {
+                family,
+                next_hop,
+                nlri: vec![match family {
+                    AddressFamily::IPV6_UNICAST => p("2001:db8:1::/48"),
+                    _ => p("192.0.2.0/24"),
+                }],
+            }),
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+            ],
+            ..UpdateMessage::default()
+        };
+        let v6 = |global: &str, link_local: Option<&str>| NextHop::Ipv6 {
+            global: global.parse().unwrap(),
+            link_local: link_local.map(|a| a.parse().unwrap()),
+        };
+        let enc = EncodeContext {
+            extended_next_hop: true,
+            ..ENC4
+        };
+        let ctx = DecodeContext {
+            extended_next_hop: true,
+            ..EBGP4
+        };
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6f = AddressFamily::IPV6_UNICAST;
+        for (family, next_hop, valid) in [
+            (v6f, v6("2001:db8::1", None), true),
+            (v6f, v6("2001:db8::1", Some("fe80::1")), true),
+            (v6f, v6("::", None), false),
+            (v6f, v6("::", Some("fe80::1")), false),
+            (v6f, v6("::1", None), false),
+            (v6f, v6("ff02::1", None), false),
+            // RFC 2545 §3: link-local is legal second, not alone or first.
+            (v6f, v6("fe80::1", None), false),
+            (v6f, v6("fe80::1", Some("fe80::2")), false),
+            (v4, NextHop::Ipv4(Ipv4Addr::new(192, 0, 2, 1)), true),
+            (v4, NextHop::Ipv4(Ipv4Addr::UNSPECIFIED), false),
+            (v4, NextHop::Ipv4(Ipv4Addr::BROADCAST), false),
+            // RFC 8950 §3: IPv4 NLRI with an IPv6 next hop.
+            (v4, v6("2001:db8::1", Some("fe80::1")), true),
+            (v4, v6("ff02::1", None), false),
+        ] {
+            let m = reach(family, next_hop);
+            let wire = m.encode(&enc).unwrap();
+            let d = UpdateMessage::decode(&wire, &ctx).unwrap();
+            if valid {
+                assert_eq!(d.treated_as_withdraw, None, "{next_hop}");
+                assert_eq!(d.message, m);
+            } else {
+                let e = d.treated_as_withdraw.clone().unwrap();
+                assert_eq!(e.subcode, UpdateSubcode::InvalidNextHop as u8);
+                assert_eq!(e.data[1], code::MP_REACH_NLRI);
+                assert_eq!(d.announcements().count(), 0, "{next_hop}");
+                assert_eq!(d.withdrawals().count(), 1);
+            }
+        }
+        // An MP_REACH_NLRI with no routes has nothing to withdraw.
+        let mut m = reach(v6f, v6("::", None));
+        if let Some(r) = &mut m.mp_reach {
+            r.nlri.clear();
+        }
+        let d = UpdateMessage::decode(&m.encode(&enc).unwrap(), &ctx).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+    }
+
+    #[test]
+    fn next_hop_is_judged_only_for_the_nlri_field() {
+        // RFC 4760 §3: with routes only in MP_REACH_NLRI, a NEXT_HOP is to
+        // be ignored, so whatever it holds withdraws nothing.
+        let mut m = UpdateMessage {
+            mp_reach: Some(MpReach {
+                family: AddressFamily::IPV6_UNICAST,
+                next_hop: NextHop::Ipv6 {
+                    global: "2001:db8::1".parse().unwrap(),
+                    link_local: None,
+                },
+                nlri: vec![p("2001:db8:1::/48")],
+            }),
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+                PathAttribute::NextHop(Ipv4Addr::UNSPECIFIED),
+            ],
+            ..UpdateMessage::default()
+        };
+        let d = UpdateMessage::decode(&m.encode(&ENC4).unwrap(), &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.announcements().count(), 1);
+        // With routes in the NLRI field it serves them, and all of the
+        // UPDATE's routes are withdrawn (RFC 7606 §2).
+        m.nlri = vec![p("10.0.0.0/8")];
+        let d = UpdateMessage::decode(&m.encode(&ENC4).unwrap(), &EBGP4).unwrap();
+        assert_eq!(
+            d.treated_as_withdraw.as_ref().map(|e| e.subcode),
+            Some(UpdateSubcode::InvalidNextHop as u8)
+        );
+        assert_eq!(d.withdrawals().count(), 2);
     }
 
     #[test]

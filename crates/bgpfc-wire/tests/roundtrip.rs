@@ -16,8 +16,9 @@ use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
 use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::error::ErrorCode;
+use bgpfc_wire::error::UpdateSubcode;
 use bgpfc_wire::header::{Header, MessageType, frame};
-use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
+use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop, is_global_ipv6, is_host_ipv4};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::prefix::{Prefix, decode_prefixes};
@@ -141,19 +142,64 @@ fn notification() -> impl Strategy<Value = NotificationMessage> {
     })
 }
 
+/// An IPv4 host address (RFC 4271 §6.3), as a valid next hop must be.
+fn host_v4() -> impl Strategy<Value = Ipv4Addr> {
+    any::<u32>()
+        .prop_map(Ipv4Addr::from)
+        .prop_filter("host address", |a| is_host_ipv4(*a))
+}
+
+/// An IPv4 address that is no host's: `0/8`, `127/8`, `224/4`, `240/4`.
+fn non_host_v4() -> impl Strategy<Value = Ipv4Addr> {
+    prop_oneof![
+        0u32..=0x00ff_ffff,
+        0x7f00_0000u32..=0x7fff_ffff,
+        0xe000_0000u32..=u32::MAX,
+    ]
+    .prop_map(Ipv4Addr::from)
+}
+
+/// The global address that comes first in an IPv6 next hop (RFC 2545 §3).
+fn global_v6() -> impl Strategy<Value = Ipv6Addr> {
+    any::<u128>()
+        .prop_map(Ipv6Addr::from)
+        .prop_filter("global address", |a| is_global_ipv6(*a))
+}
+
+/// A link-local address, `fe80::/10` (RFC 4291 §2.5.6).
+fn link_local_v6() -> impl Strategy<Value = Ipv6Addr> {
+    any::<u128>().prop_map(|a| Ipv6Addr::from((0x3fa << 118) | (a & ((1 << 118) - 1))))
+}
+
+/// What cannot come first in an IPv6 next hop: unspecified, loopback,
+/// multicast or link-local (RFC 4291 §2.5.2, §2.5.3, §2.7, §2.5.6).
+fn non_global_v6() -> impl Strategy<Value = Ipv6Addr> {
+    prop_oneof![
+        Just(Ipv6Addr::UNSPECIFIED),
+        Just(Ipv6Addr::LOCALHOST),
+        any::<u128>().prop_map(|a| Ipv6Addr::from((0xff << 120) | (a >> 8))),
+        link_local_v6(),
+    ]
+}
+
+/// A valid next hop for NLRI of `afi` (RFC 4271 §6.3, RFC 4760 §3,
+/// RFC 2545 §3, RFC 8950 §3).
 fn next_hop(afi: Afi) -> BoxedStrategy<NextHop> {
-    let v6 =
-        (any::<u128>(), proptest::option::of(any::<u128>())).prop_map(|(g, ll)| NextHop::Ipv6 {
-            global: Ipv6Addr::from(g),
-            link_local: ll.map(Ipv6Addr::from),
-        });
+    let v6 = (global_v6(), proptest::option::of(link_local_v6()))
+        .prop_map(|(global, link_local)| NextHop::Ipv6 { global, link_local });
     match afi {
-        Afi::Ipv4 => prop_oneof![
-            any::<u32>().prop_map(|a| NextHop::Ipv4(Ipv4Addr::from(a))),
-            v6
-        ]
-        .boxed(),
+        Afi::Ipv4 => prop_oneof![host_v4().prop_map(NextHop::Ipv4), v6].boxed(),
         _ => v6.boxed(),
+    }
+}
+
+/// A next hop of the same form as `nh` that is no host's.
+fn invalid_like(nh: NextHop) -> BoxedStrategy<NextHop> {
+    match nh {
+        NextHop::Ipv4(_) => non_host_v4().prop_map(NextHop::Ipv4).boxed(),
+        NextHop::Ipv6 { link_local, .. } => non_global_v6()
+            .prop_map(move |global| NextHop::Ipv6 { global, link_local })
+            .boxed(),
     }
 }
 
@@ -257,7 +303,7 @@ fn update_message(confed: bool) -> impl Strategy<Value = UpdateMessage> {
             Just(Origin::Incomplete)
         ],
         as_path(confed),
-        any::<u32>(),
+        host_v4(),
         optional_attributes(),
     )
         .prop_map(
@@ -267,7 +313,7 @@ fn update_message(confed: bool) -> impl Strategy<Value = UpdateMessage> {
                 let mut attributes = vec![
                     PathAttribute::Origin(origin),
                     PathAttribute::AsPath(path),
-                    PathAttribute::NextHop(Ipv4Addr::from(nh)),
+                    PathAttribute::NextHop(nh),
                 ];
                 attributes.append(&mut optional);
                 attributes.sort_by_key(PathAttribute::code);
@@ -519,6 +565,66 @@ proptest! {
         prop_assert_eq!(&codes[..mp.len()], &mp[..]);
         prop_assert!(rest.windows(2).all(|w| w[0] < w[1]));
     }
+
+    #[test]
+    fn a_next_hop_that_is_no_host_withdraws_the_routes(m in update_message(true), bad in non_host_v4()) {
+        // RFC 4271 §6.3 with RFC 7606 §3 e): treat-as-withdraw, but only
+        // when NEXT_HOP serves routes in the NLRI field (RFC 4760 §3).
+        let mut m = m;
+        for a in &mut m.attributes {
+            if let PathAttribute::NextHop(n) = a {
+                *n = bad;
+            }
+        }
+        let d = UpdateMessage::decode(&m.encode(&ENC4).unwrap(), &IBGP4).unwrap();
+        if m.nlri.is_empty() {
+            prop_assert_eq!(&d.treated_as_withdraw, &None);
+            prop_assert_eq!(&d.message, &m);
+        } else {
+            prop_assert_eq!(
+                d.treated_as_withdraw.as_ref().map(|e| e.subcode),
+                Some(UpdateSubcode::InvalidNextHop as u8)
+            );
+            prop_assert_eq!(d.announcements().count(), 0);
+            prop_assert_eq!(d.withdrawals().count(), routes(&m));
+        }
+    }
+
+    #[test]
+    fn an_mp_reach_next_hop_that_is_no_host_withdraws_the_routes(
+        (m, bad) in update_message(true)
+            .prop_filter("an MP_REACH_NLRI", |m| m.mp_reach.is_some())
+            .prop_flat_map(|m| {
+                let nh = m.mp_reach.as_ref().map(|r| r.next_hop);
+                (Just(m), invalid_like(nh.unwrap_or(NextHop::Ipv4(Ipv4Addr::UNSPECIFIED))))
+            })
+    ) {
+        // RFC 4760 §3: the NEXT_HOP rules hold for MP_REACH_NLRI too.
+        let mut m = m;
+        if let Some(r) = &mut m.mp_reach {
+            r.next_hop = bad;
+        }
+        let with_routes = m.mp_reach.as_ref().is_some_and(|r| !r.nlri.is_empty());
+        let d = UpdateMessage::decode(&m.encode(&ENC4).unwrap(), &IBGP4).unwrap();
+        if with_routes {
+            prop_assert_eq!(
+                d.treated_as_withdraw.as_ref().map(|e| e.subcode),
+                Some(UpdateSubcode::InvalidNextHop as u8)
+            );
+            prop_assert_eq!(d.announcements().count(), 0);
+            prop_assert_eq!(d.withdrawals().count(), routes(&m));
+        } else {
+            prop_assert_eq!(&d.treated_as_withdraw, &None);
+        }
+    }
+}
+
+/// Every route an UPDATE carries, announced or withdrawn.
+fn routes(m: &UpdateMessage) -> usize {
+    m.withdrawn.len()
+        + m.nlri.len()
+        + m.mp_reach.as_ref().map_or(0, |r| r.nlri.len())
+        + m.mp_unreach.as_ref().map_or(0, |u| u.withdrawn.len())
 }
 
 /// Withdrawn Routes Length of an encoded UPDATE body.

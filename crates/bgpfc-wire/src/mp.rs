@@ -4,7 +4,9 @@
 //! (NLRI encoding), §6 (SAFI values); RFC 2545 §3 (IPv6 next hop: global,
 //! optionally followed by link-local); RFC 8950 §3 (IPv6 next hop for IPv4
 //! NLRI, told apart by its length), §4 (only once negotiated); RFC 7606
-//! §5.3 (minimum lengths, NLRI syntax), §7.11 (next hop length).
+//! §5.3 (minimum lengths, NLRI syntax), §7.11 (next hop length); RFC 4271
+//! §6.3 (a next hop is a valid IP host address), which RFC 4760 §3 applies
+//! to the next hop of `MP_REACH_NLRI` as well.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -45,6 +47,19 @@ impl NextHop {
         }
     }
 
+    /// Whether the next hop is a valid IP host address: what RFC 4271 §6.3
+    /// calls a syntactically correct `NEXT_HOP`, with RFC 4760 §3 holding
+    /// `MP_REACH_NLRI` next hops to the same rules. For IPv6 that is the
+    /// global address RFC 2545 §3 puts first; the link-local one after it
+    /// is checked on decode.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        match self {
+            NextHop::Ipv4(a) => is_host_ipv4(*a),
+            NextHop::Ipv6 { global, .. } => is_global_ipv6(*global),
+        }
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             NextHop::Ipv4(a) => out.put_bytes(&a.octets()),
@@ -74,11 +89,41 @@ impl NextHop {
                 } else {
                     None
                 };
+                // RFC 2545 §3: the second address is "the link-local IPv6
+                // address of the next hop". NOTE(interop): the RFC says
+                // nothing of one that is not link-local; BIRD and FRR
+                // ignore it and keep the route, and so do we.
+                let link_local = link_local.filter(Ipv6Addr::is_unicast_link_local);
                 Some(NextHop::Ipv6 { global, link_local })
             }
             _ => None,
         }
     }
+}
+
+/// Whether `a` is a valid IP host address, which RFC 4271 §6.3 requires of
+/// a `NEXT_HOP`. Not host addresses: `0.0.0.0/8`, which RFC 1122 §3.2.1.3
+/// (a) and (b) allow only as a source while a host learns its address;
+/// `127.0.0.0/8`, which §3.2.1.3 (g) keeps inside a host; `224.0.0.0/4`,
+/// which identifies host groups (RFC 1112 §4); and `240.0.0.0/4`, reserved
+/// (RFC 1112 §4), which holds the limited broadcast address
+/// `255.255.255.255` (RFC 1122 §3.2.1.3 (c)). A directed broadcast address
+/// cannot be told apart without the subnet's mask.
+#[must_use]
+pub const fn is_host_ipv4(a: Ipv4Addr) -> bool {
+    let [first, ..] = a.octets();
+    !(first == 0 || first == 127 || first >= 224)
+}
+
+/// Whether `a` can be the global address RFC 2545 §3 puts first in an IPv6
+/// next hop. Not the unspecified address, which "must not be used as the
+/// destination address" (RFC 4291 §2.5.2); not the loopback address, which
+/// never leaves a node (§2.5.3); not a multicast address (§2.7); and not a
+/// link-local one (§2.5.6), whose place is the second address of a 32-octet
+/// next hop.
+#[must_use]
+pub const fn is_global_ipv6(a: Ipv6Addr) -> bool {
+    !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_unicast_link_local())
 }
 
 impl fmt::Display for NextHop {
@@ -321,6 +366,72 @@ mod tests {
         m16.encode(&mut wire);
         assert_eq!(wire[3], 16);
         assert_eq!(MpReach::decode(&wire, false).unwrap(), m16);
+    }
+
+    #[test]
+    fn host_addresses_per_rfc4271_section_6_3() {
+        // RFC 1122 §3.2.1.3 and RFC 1112 §4, at the edges of each range.
+        for (a, host) in [
+            ("0.0.0.0", false),
+            ("0.255.255.255", false),
+            ("1.0.0.0", true),
+            ("10.0.0.1", true),
+            ("126.255.255.255", true),
+            ("127.0.0.1", false),
+            ("127.255.255.255", false),
+            ("128.0.0.0", true),
+            ("223.255.255.255", true),
+            ("224.0.0.0", false),
+            ("239.255.255.255", false),
+            ("240.0.0.1", false),
+            ("255.255.255.255", false),
+        ] {
+            let a: Ipv4Addr = a.parse().unwrap();
+            assert_eq!(is_host_ipv4(a), host, "{a}");
+            assert_eq!(NextHop::Ipv4(a).is_valid(), host, "{a}");
+        }
+        // RFC 2545 §3 and RFC 4291: the first address is a global one.
+        for (a, global) in [
+            ("::", false),
+            ("::1", false),
+            ("ff02::1", false),
+            ("ff0e::1", false),
+            ("fe80::1", false),
+            ("febf::1", false),
+            ("fec0::1", true),
+            ("fc00::1", true),
+            ("2001:db8::1", true),
+            ("::ffff:192.0.2.1", true),
+        ] {
+            let a: Ipv6Addr = a.parse().unwrap();
+            assert_eq!(is_global_ipv6(a), global, "{a}");
+            let nh = NextHop::Ipv6 {
+                global: a,
+                link_local: Some("fe80::1".parse().unwrap()),
+            };
+            assert_eq!(nh.is_valid(), global, "{a}");
+        }
+    }
+
+    #[test]
+    fn a_second_address_that_is_not_link_local_is_ignored() {
+        // RFC 2545 §3 wants the link-local address second; BIRD and FRR
+        // drop anything else and keep the route.
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let other: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut wire = vec![0, 2, 1, 32];
+        wire.extend_from_slice(&global.octets());
+        wire.extend_from_slice(&other.octets());
+        wire.extend_from_slice(&[0, 32, 0x20, 0x01, 0x0d, 0xb8]);
+        let m = MpReach::decode(&wire, false).unwrap();
+        assert_eq!(
+            m.next_hop,
+            NextHop::Ipv6 {
+                global,
+                link_local: None
+            }
+        );
+        assert_eq!(m.nlri, vec![p("2001:db8::/32")]);
     }
 
     #[test]
