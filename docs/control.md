@@ -108,8 +108,9 @@ member:
 
 `disabled` is kept apart from `not-found`, which RFC 6811 §2 suggests for
 a route that was not validated, so that a route nobody checked can be told
-from one that no VRP covers (issue #52). bgpfcd cannot be given a
-validation source yet, so for now every route is `disabled`.
+from one that no VRP covers (issue #52). Every route is `disabled` until
+`rpki { mode external; ... }` (`docs/config.md`, "RPKI") gives bgpfcd the
+VRPs of an RPKI cache; from then on the states follow the cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
 policy, and follows the validation source when it changes. It is shown

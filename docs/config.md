@@ -306,6 +306,17 @@ exceed it is refused with an Internal Error (RFC 8210 §12) and the data
 before it stays in use. The default, four million, is several times what
 the whole RPKI holds.
 
+With `mode external`, bgpfcd looks every cache up as it starts and
+refuses to start, naming the cache, if one has no address: a typo must not
+leave every route unvalidated without a word (issue #60). `bgpfcd --check`
+looks nothing up; it judges the file alone, wherever it runs. The client
+looks a name up again at every connection attempt, so a cache whose address
+changes is followed. It starts before the neighbors, and every route is
+`disabled` until a cache has sent its VRPs; from then on the states follow
+the cache's data. The client logs with the rest of the daemon, at the `log`
+level: losing a cache is a warning, its return an info line, and VRPs that
+expire before a cache could refresh them an error.
+
 `backoff MIN MAX` paces reconnects. After a connection attempt fails, a
 connection ends before the cache has brought bgpfcd in sync, or a cache
 answers No Data Available, bgpfcd waits MIN seconds, doubling with
@@ -352,7 +363,8 @@ bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
 ```
 
 `--check` parses and validates the file (policies included), prints any
-errors, and exits with status 0 or 1 without starting anything.
+errors, and exits with status 0 or 1 without starting anything; it does not
+look up the names of `rpki` caches.
 `--log-level` and `--fib` override the corresponding settings in the file
 for this run. `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user

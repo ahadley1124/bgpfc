@@ -131,6 +131,7 @@ dependencies = [
  "bgpfc-policy",
  "bgpfc-rib",
  "bgpfc-rpki",
+ "bgpfc-rtr",
  "bgpfc-sys",
  "bgpfc-wire",
 ]
