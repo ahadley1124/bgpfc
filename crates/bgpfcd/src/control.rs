@@ -506,9 +506,40 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     });
     lines.push(format!("failures {}", s.failures));
     if let (Some(e), Some(at)) = (&s.last_error, s.last_error_at) {
-        lines.push(format!("last error {}s ago: {e}", seconds_between(at, now)));
+        lines.push(format!(
+            "last error {}s ago: {}",
+            seconds_between(at, now),
+            one_line(e)
+        ));
     }
     lines
+}
+
+/// `text` with its control characters escaped (`\n`, `\r`, `\t`,
+/// `\u{001b}`), for a line of a reply. The line protocol of
+/// `docs/control.md` ends a line at a newline and a reply at a line of a
+/// lone `.`, so text from outside the daemon, such as an Error Report a
+/// cache sent (RFC 8210 §5.11: any UTF-8), must neither end its line nor
+/// reach the operator's terminal as an escape sequence.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.into()
 }
 
 fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
@@ -1701,6 +1732,40 @@ mod tests {
             status: None,
         };
         assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+    }
+
+    #[test]
+    fn text_from_a_cache_stays_on_its_line() {
+        // RFC 8210 §5.11: an Error Report's text is any UTF-8. A newline, a
+        // lone `.` after it or an escape sequence must neither end the reply
+        // early, nor add lines to it, nor reach the operator's terminal.
+        let now = Instant::now();
+        let mut report = rpki_report(now, &[]);
+        if let Some(s) = &mut report.status {
+            s.last_error = Some("rtr error text=boom\n.\nstate idle\u{1b}[2J\r\t".to_owned());
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines.last().map(String::as_str),
+            Some(r"last error 30s ago: rtr error text=boom\n.\nstate idle\u{001b}[2J\r\t")
+        );
+        assert!(r.lines.iter().all(|l| !l.chars().any(char::is_control)));
+        // Through the line protocol and back: every line, and no other.
+        let mut wire = Vec::new();
+        proto::Response::ok(r.lines.clone())
+            .write_to(&mut wire)
+            .unwrap();
+        let back = proto::Response::read_from(&mut wire.as_slice()).unwrap();
+        assert_eq!(back.lines, r.lines);
+        // JSON escapes it as RFC 8259 §7 has it.
+        assert!(
+            r.json
+                .contains(r#""last_error":"rtr error text=boom\n.\nstate idle\u001b[2J\r\t""#),
+            "{}",
+            r.json
+        );
+        // Text without control characters is left alone.
+        assert_eq!(one_line("a \"quoted\" \\ value"), "a \"quoted\" \\ value");
     }
 
     #[test]

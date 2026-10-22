@@ -154,7 +154,7 @@ only value is `disabled`, so it is not shown.
 | `vrps` | `vrps` | the VRPs in use, per family; `null` (`none yet`) before any cache sent data, when every route is `disabled` |
 | `expires_in_seconds` | `expire in` | until those VRPs expire unless a cache refreshes them (RFC 8210 §6); then every route becomes `not-found` |
 | `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
-| `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, and how long ago |
+| `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
 Without a client, in `mode disabled`, every member but `mode` and
 `caches` is `null`, `false` or 0, and the text lists only those two.
