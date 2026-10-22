@@ -1232,55 +1232,83 @@ fn the_first_connection_can_wait() {
 }
 
 #[test]
-fn intervals_out_of_range_are_ignored() {
+fn intervals_out_of_range_never_lengthen_the_expiry() {
     // §6: Refresh 1..=86400, Retry 1..=7200, Expire 600..=172800 and
-    // larger than both.
-    for bad in [
-        Intervals {
-            refresh: 0,
-            retry: 30,
-            expire: 900,
-        },
-        Intervals {
-            refresh: 120,
-            retry: 7_201,
-            expire: 9_000,
-        },
-        Intervals {
-            refresh: 120,
-            retry: 30,
-            expire: 599,
-        },
-        Intervals {
-            refresh: 1_000,
-            retry: 30,
-            expire: 900,
-        },
+    // larger than both. A Refresh or Retry out of range is ignored; the
+    // Expire Interval holds whatever it is: "The router MUST NOT retain the
+    // data past the time indicated by this parameter."
+    let i = |refresh, retry, expire| Intervals {
+        refresh,
+        retry,
+        expire,
+    };
+    // (sent, in force after, seconds until the data expires).
+    for (sent, kept, expires_in) in [
+        (i(0, 30, 900), i(3_600, 30, 900), 900),
+        (i(86_401, 30, 900), i(3_600, 30, 900), 900),
+        (i(120, 0, 9_000), i(120, 600, 9_000), 9_000),
+        (i(120, 7_201, 9_000), i(120, 600, 9_000), 9_000),
+        // Below the minimum: the shorter time still holds.
+        (i(120, 30, 599), i(120, 30, 599), 599),
+        // Within each range, but not larger than the Refresh Interval.
+        (i(1_000, 30, 900), i(1_000, 30, 900), 900),
+        // Above the maximum: cut to two days by the configured maximum.
+        (i(120, 30, 200_000), i(120, 30, 200_000), 172_800),
     ] {
         let mut h = receiving_reset();
-        let actions = h.pdu(eod_with(SID, 1, bad));
-        assert_eq!(h.s.intervals(), Intervals::DEFAULT, "{bad:?}");
+        let actions = h.pdus(&[announce(V1, a()), eod_with(SID, 1, sent)]);
+        assert_eq!(tags(&actions), ["commit 1 all"], "{sent:?}");
+        assert_eq!(h.s.intervals(), kept, "{sent:?}");
         assert!(
             logs(&actions)
                 .iter()
                 .any(|l| l.level == Level::Warn && l.message.contains("out of range")),
-            "{bad:?}"
+            "{sent:?}"
         );
+        assert_eq!(h.s.expires_at(), Some(h.secs(expires_in)), "{sent:?}");
+        // The data is not kept a moment past that, whatever else happens.
+        h.step(Event::Disconnected);
+        h.now += Duration::from_secs(expires_in - 1);
+        assert_eq!(commits(&h.step(Event::Tick)), NO_COMMITS, "{sent:?}");
+        assert_eq!(tags(&h.wait(1)), ["commit 0 ~1"], "{sent:?}");
     }
-    // The ones in force stay, not the defaults.
-    let good = Intervals {
-        refresh: 120,
-        retry: 30,
-        expire: 900,
-    };
+    // A Refresh or Retry out of range leaves the one in force, not the
+    // default.
+    let good = i(120, 30, 900);
     let mut h = receiving_reset();
     h.pdu(eod_with(SID, 1, good));
     h.wait(120);
-    h.pdus(&[
+    h.pdus(&[response(V1, SID), eod_with(SID, 2, i(0, 0, 800))]);
+    assert_eq!(h.s.intervals(), i(120, 30, 800));
+    assert_eq!(h.s.next_deadline(), Some(h.secs(120)));
+    assert_eq!(h.s.expires_at(), Some(h.secs(800)));
+}
+
+#[test]
+fn an_expire_interval_of_zero_drops_the_data_at_once() {
+    // §6: not past the time the Expire Interval indicates, which is now.
+    let mut h = idle();
+    h.wait(3_600);
+    let actions = h.pdus(&[
         response(V1, SID),
-        eod_with(SID, 2, Intervals { refresh: 0, ..good }),
+        announce(V1, c()),
+        eod_with(
+            SID,
+            6,
+            Intervals {
+                refresh: 120,
+                retry: 30,
+                expire: 0,
+            },
+        ),
     ]);
-    assert_eq!(h.s.intervals(), good);
+    assert_eq!(tags(&actions), ["commit 3 ~1", "commit 0 ~3"]);
+    assert!(h.vrps().is_empty());
+    assert_eq!(h.s.expires_at(), None);
+    // No serial without data: the next poll reloads.
+    assert_eq!(h.s.serial(), None);
+    assert!(h.s.next_deadline().is_some_and(|at| at > h.now));
+    assert_eq!(tags(&h.wait(120)), ["reset-query v1"]);
 }
 
 #[test]

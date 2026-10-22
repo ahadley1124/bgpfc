@@ -470,8 +470,11 @@ impl Session {
         self.committed.as_ref()
     }
 
-    /// The timing intervals in force: the last valid ones a version 1 End
-    /// of Data carried, or the RFC 8210 §6 defaults.
+    /// The timing intervals in force (RFC 8210 §6): the RFC defaults until
+    /// a version 1 End of Data carries others, and again after a version 0
+    /// one. Each Refresh and Retry Interval is the last one in its §6
+    /// range; the Expire Interval is the last one the cache sent, whatever
+    /// its value, since the router never keeps data past it.
     #[must_use]
     pub const fn intervals(&self) -> Intervals {
         self.intervals
@@ -502,7 +505,10 @@ impl Session {
     }
 
     /// Apply one event at time `now`: first the timers due by `now`, then
-    /// the event.
+    /// the event, then any timer the event made due by `now`, such as the
+    /// expiry of data whose End of Data gave an Expire Interval of 0. So
+    /// after a step, [`Session::next_deadline`] is later than `now`
+    /// unless a delay of zero was set.
     pub fn step(&mut self, event: Event, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         self.run_timers(now, &mut out);
@@ -516,6 +522,7 @@ impl Session {
                 erroneous_pdu,
             } => self.on_decode_error(&error, &erroneous_pdu, now, &mut out),
         }
+        self.run_timers(now, &mut out);
         out
     }
 
@@ -1137,22 +1144,23 @@ impl Session {
             // than once an hour" (§6.1), and data deleted after "twice the
             // polling period" (§8).
             None => self.intervals = Intervals::DEFAULT,
-            Some(intervals) if intervals.within_limits() => self.intervals = intervals,
             Some(intervals) => {
-                // RFC 8210 §6 bounds each interval, and "Caches MUST set
-                // Expire Interval to a value larger than either Refresh
-                // Interval or Retry Interval." Values outside that are
-                // ignored together, and those in force stay.
-                log(
-                    out,
-                    Level::Warn,
-                    "rtr cache sent timing intervals out of range; keeping the previous ones",
-                    vec![
-                        field("refresh", intervals.refresh),
-                        field("retry", intervals.retry),
-                        field("expire", intervals.expire),
-                    ],
-                );
+                if !intervals.within_limits() {
+                    // RFC 8210 §6 bounds each interval, and "Caches MUST set
+                    // Expire Interval to a value larger than either Refresh
+                    // Interval or Retry Interval."
+                    log(
+                        out,
+                        Level::Warn,
+                        "rtr cache sent timing intervals out of range; ignoring a refresh or retry out of range, honouring the expiry",
+                        vec![
+                            field("refresh", intervals.refresh),
+                            field("retry", intervals.retry),
+                            field("expire", intervals.expire),
+                        ],
+                    );
+                }
+                self.intervals = merge_intervals(self.intervals, intervals);
             }
         }
         if self.expire_interval() <= secs(self.intervals.refresh) {
@@ -1328,6 +1336,38 @@ impl Session {
             fields.push(field("expires_in", Secs(at.saturating_duration_since(now))));
         }
         fields
+    }
+}
+
+/// The timing parameters in force after a version 1 End of Data that
+/// carried `new`, with `in_force` before it (RFC 8210 §6).
+///
+/// A Refresh or Retry Interval outside the range §6 allows the cache is
+/// ignored, and the one in force stays: a cache that sends 0 or a week
+/// does not get the router polling in a tight loop or not at all. The
+/// Expire Interval is taken whatever its value, because "The router MUST
+/// NOT retain the data past the time indicated by this parameter": one
+/// below the 600-second minimum is the shorter time it says, and one above
+/// the two-day maximum is cut by [`Config::max_expire`], which never
+/// exceeds that maximum. So an End of Data out of range never lets the
+/// router keep data longer than the cache said.
+const fn merge_intervals(in_force: Intervals, new: Intervals) -> Intervals {
+    Intervals {
+        // RFC 8210 §6 Refresh Interval: "Minimum allowed value: 1 second",
+        // "Maximum allowed value: 86400 seconds (1 day)".
+        refresh: if matches!(new.refresh, 1..=86_400) {
+            new.refresh
+        } else {
+            in_force.refresh
+        },
+        // RFC 8210 §6 Retry Interval: "Minimum allowed value: 1 second",
+        // "Maximum allowed value: 7200 seconds (2 hours)".
+        retry: if matches!(new.retry, 1..=7_200) {
+            new.retry
+        } else {
+            in_force.retry
+        },
+        expire: new.expire,
     }
 }
 
