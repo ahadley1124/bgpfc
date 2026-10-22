@@ -275,8 +275,9 @@ pub struct Status {
     pub vrps_ipv6: usize,
     /// Consecutive failures, as the back-off counts them: attempts that
     /// failed, and connections that ended in an error or before the cache
-    /// brought the router in sync. A connection that was in sync and that
-    /// the cache or the network then closed sets it back to 0.
+    /// brought the router in sync. Each time the cache brings the router
+    /// in sync it goes back to 0, and a connection that was in sync and
+    /// that the cache or the network then closed does not count.
     pub failures: u32,
     /// The last warning or error the client logged, with its fields.
     pub last_error: Option<String>,
@@ -872,6 +873,9 @@ impl<S: ValidationSink> Worker<S> {
 
     fn on_sync(&mut self, now: Instant) {
         self.synced_on_conn = true;
+        // A success ends the run of failures: the next one waits the
+        // shortest back-off again.
+        self.failures = 0;
         if let Some(since) = self.down_since.take() {
             let fields = vec![field(
                 "down_for",
