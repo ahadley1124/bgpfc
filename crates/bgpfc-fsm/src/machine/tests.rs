@@ -70,6 +70,7 @@ fn every_event() -> Vec<(u8, Event)> {
         (2, Event::ManualStop),
         (3, Event::AutomaticStart),
         (4, Event::ManualStartPassive),
+        (5, Event::AutomaticStartPassive),
         (8, Event::AutomaticStop(cease())),
         (9, Event::ConnectRetryTimerExpires),
         (10, Event::HoldTimerExpires),
@@ -176,6 +177,7 @@ fn idle_state_table() {
             (2, Idle, &[]),
             (3, Connect, &["connect"]),
             (4, State::Active, &[]),
+            (5, State::Active, &[]),
             (8, Idle, &[]),
             (9, Idle, &[]),
             (10, Idle, &[]),
@@ -212,6 +214,7 @@ fn connect_state_table() {
             (2, Idle, &["drop"]),
             (3, Connect, &[]),
             (4, Connect, &[]),
+            (5, Connect, &[]),
             (8, Idle, &["drop"]),
             (9, Connect, &["drop", "connect"]),
             (10, Idle, &["drop"]),
@@ -251,6 +254,7 @@ fn active_state_table() {
             (2, Idle, &["drop"]),
             (3, Active, &[]),
             (4, Active, &[]),
+            (5, Active, &[]),
             (8, Idle, &["drop"]),
             (9, Active, &[]),
             (10, Idle, &["drop"]),
@@ -287,6 +291,7 @@ fn open_sent_state_table() {
             (2, Idle, &["notif 6/2", "drop"]),
             (3, OpenSent, &[]),
             (4, OpenSent, &[]),
+            (5, OpenSent, &[]),
             (8, Idle, &["notif 6/6", "drop"]),
             (9, Idle, &["notif 5/0", "log", "drop"]),
             (10, Idle, &["notif 4/0", "drop"]),
@@ -324,6 +329,7 @@ fn open_confirm_state_table() {
             (2, Idle, &["notif 6/2", "drop"]),
             (3, OpenConfirm, &[]),
             (4, OpenConfirm, &[]),
+            (5, OpenConfirm, &[]),
             (8, Idle, &["notif 6/6", "drop"]),
             (9, Idle, &["notif 5/0", "log", "drop"]),
             (10, Idle, &["notif 4/0", "drop"]),
@@ -360,6 +366,7 @@ fn established_state_table() {
             (2, Idle, &["notif 6/2", "down", "drop"]),
             (3, Established, &[]),
             (4, Established, &[]),
+            (5, Established, &[]),
             (8, Idle, &["notif 6/6", "down", "drop"]),
             (9, Idle, &["notif 5/0", "log", "down", "drop"]),
             (10, Idle, &["notif 4/0", "down", "drop"]),
@@ -1198,6 +1205,80 @@ fn restart_limit_zero_never_restarts_and_none_always_does() {
     let a = f.handle(Event::ManualStop, now);
     assert_eq!(tags(&a), ["notif 6/2", "drop"]);
     assert_eq!(f.damped_failures(), 0);
+}
+
+#[test]
+fn a_collision_neither_counts_nor_ends_a_run_of_damped_failures() {
+    use Event::{
+        AutomaticStartPassive, BgpOpen, HoldTimerExpires, IdleHoldTimerExpires, ManualStart,
+        OpenCollisionDump, TcpConnectionConfirmed, TcpCrAcked,
+    };
+    use State::{Active, Connect, Idle, OpenConfirm, OpenSent};
+    // One automatic restart allowed. A damped failure starts the run; the
+    // restart collides with the peer's own connection, which wins (RFC
+    // 4271 §6.8), and the coordinator goes on with it through event 5.
+    let start = t0();
+    let f = run_steps(
+        Fsm::new(limited(Some(1))),
+        start,
+        &[
+            (ManualStart, 0, Connect, &["connect"], None),
+            (TcpCrAcked, 1, OpenSent, &["open"], None),
+            (HoldTimerExpires, 2, Idle, &["notif 4/0", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 12, Connect, &["connect"], None),
+            (TcpCrAcked, 13, OpenSent, &["open"], None),
+            // The dump is no damped failure: no limit, the hold not
+            // doubled...
+            (
+                OpenCollisionDump,
+                14,
+                Idle,
+                &["notif 6/7", "drop"],
+                Some(20),
+            ),
+            // ... and the restart on the winner is no ManualStart.
+            (AutomaticStartPassive, 14, Active, &[], None),
+            (TcpConnectionConfirmed, 14, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 14, OpenConfirm, &["keepalive"], None),
+        ],
+    );
+    assert_eq!(f.damped_failures(), 1);
+    assert!(f.automatic_start_allowed());
+    // So the next damped failure is the second of the run, over the limit.
+    let f = run_steps(
+        f,
+        start,
+        &[(
+            HoldTimerExpires,
+            15,
+            Idle,
+            &["notif 4/0", "drop", "limit 2"],
+            None,
+        )],
+    );
+    assert!(!f.automatic_start_allowed());
+    // Event 5 is automatic: it does not start a peer the limit stopped,
+    // nor one the operator stopped.
+    let mut f = f;
+    assert_eq!(f.handle(AutomaticStartPassive, start), vec![]);
+    assert_eq!(f.state(), Idle);
+    let (mut f, now) = fsm_at(Idle, config());
+    f.handle(Event::ManualStop, now);
+    assert_eq!(f.handle(AutomaticStartPassive, now), vec![]);
+    assert_eq!(f.state(), Idle);
+    // Once Established (CollisionDetectEstablishedState), the same: the
+    // session goes down without damping.
+    let mut cfg = limited(Some(0));
+    cfg.collision_detect_established = true;
+    let (mut f, now) = fsm_at(State::Established, cfg);
+    let a = f.handle(OpenCollisionDump, now);
+    assert_eq!(tags(&a), ["notif 6/7", "down", "drop"]);
+    assert_eq!(f.damped_failures(), 0);
+    assert_eq!(
+        tags(&f.handle(AutomaticStartPassive, now)),
+        Vec::<String>::new()
+    );
+    assert_eq!(f.state(), Active);
 }
 
 #[test]

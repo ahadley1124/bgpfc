@@ -766,18 +766,33 @@ impl Peer {
             keep = if keep_pending { "new" } else { "existing" }
         );
         if keep_pending {
-            // RFC 4271 §8.2.2: OpenCollisionDump on the losing connection
-            // sends the Cease and drops it; then the FSM is restarted on the
-            // winner, which carries the OPEN we just read.
-            self.event(Event::OpenCollisionDump, now);
+            let [dump, restart @ ..] = collision_events(open);
+            self.event(dump, now);
             self.conn = Some(pending);
-            self.event(Event::ManualStartPassive, now);
-            self.event(Event::TcpConnectionConfirmed, now);
-            self.event(Event::BgpOpen(open.clone()), now);
+            for event in restart {
+                self.event(event, now);
+            }
         } else {
             close_with_cease(pending, CeaseSubcode::ConnectionCollisionResolution);
         }
     }
+}
+
+/// What the FSM is fed when the connection it runs on loses a collision
+/// to one whose OPEN was `open` (RFC 4271 §6.8). `OpenCollisionDump` on the
+/// losing connection sends the Cease and drops it (§8.2.2 event 23); the
+/// FSM then goes on with the winner, which carries the OPEN already read.
+/// That restart is automatic and passive (event 5): a `ManualStart` would be
+/// the "administrative intervention" of RFC 4486 §4 and end the run of
+/// damped failures, so that a peer whose restarts collide would never
+/// reach the restart limit.
+fn collision_events(open: &OpenMessage) -> [Event; 4] {
+    [
+        Event::OpenCollisionDump,
+        Event::AutomaticStartPassive,
+        Event::TcpConnectionConfirmed,
+        Event::BgpOpen(open.clone()),
+    ]
 }
 
 /// RFC 4271 §6.8: the losing connection is closed with a Cease.
@@ -866,6 +881,46 @@ mod tests {
         m.withdrawn.clear();
         assert_eq!(unadvertised(&m, &[]), vec![v6]);
         assert_eq!(unadvertised(&UpdateMessage::default(), &[]), vec![]);
+    }
+
+    #[test]
+    fn a_collision_keeps_the_run_of_damped_failures() {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        // RFC 4486 §4: one automatic restart allowed, and one damped
+        // failure behind us.
+        let mut cfg = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        cfg.damping = Some(bgpfc_fsm::Damping {
+            restart_limit: Some(1),
+            ..bgpfc_fsm::Damping::default()
+        });
+        let mut fsm = Fsm::new(cfg);
+        let now = Instant::now();
+        fsm.handle(Event::ManualStart, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        fsm.handle(Event::HoldTimerExpires, now);
+        fsm.handle(Event::IdleHoldTimerExpires, now);
+        fsm.handle(Event::TcpCrAcked, now);
+        assert_eq!(fsm.damped_failures(), 1);
+        // The peer's connection wins the collision.
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            Vec::new(),
+        );
+        for event in collision_events(&open) {
+            let actions = fsm.handle(event, now);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::RestartLimitReached { .. })),
+                "{actions:?}"
+            );
+        }
+        // On with the winner, the run neither grown nor ended.
+        assert_eq!(fsm.state(), State::OpenConfirm);
+        assert_eq!(fsm.damped_failures(), 1);
+        assert!(fsm.automatic_start_allowed());
     }
 
     /// The session an FSM advertising `ours` negotiates with a peer

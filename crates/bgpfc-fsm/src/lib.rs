@@ -68,8 +68,9 @@ impl fmt::Display for State {
 }
 
 /// FSM input events, numbered as in RFC 4271 §8.1 (and RFC 9687 §4.2 for
-/// event 29). Events 3–7 collapse onto [`Event::AutomaticStart`]: whether a
-/// start is passive or damped comes from [`Config`], not from the event.
+/// event 29). Events 3, 6 and 7 collapse onto [`Event::AutomaticStart`]:
+/// whether a start is passive or damped comes from [`Config`], not from
+/// the event; event 5 is kept for a one-off passive restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// 1: operator starts the peer.
@@ -82,6 +83,14 @@ pub enum Event {
     /// 4: as 1 with `PassiveTcpEstablishment`. Kept distinct so that a
     /// one-off passive start is possible without changing the config.
     ManualStartPassive,
+    /// 5: as 3 with `PassiveTcpEstablishment`: the local system restarts
+    /// the peer once without opening a connection itself. The coordinator
+    /// uses it to go on with the connection that won a collision (RFC 4271
+    /// §6.8); unlike event 4 it is no administrative intervention (RFC
+    /// 4486 §4), so it leaves the run of damped failures as it is, and,
+    /// like event 3, does nothing once the restart limit cleared
+    /// `AllowAutomaticStart`.
+    AutomaticStartPassive,
     /// 8: the local system stops the peer (prefix limit, resource
     /// exhaustion) with the Cease to send (RFC 4486 §4 picks the subcode by
     /// reason); it restarts after the `IdleHoldTimer`, unless the
@@ -115,7 +124,9 @@ pub enum Event {
     /// 22: an OPEN failed the §6.2 checks.
     BgpOpenMsgErr(DecodeError),
     /// 23: the coordinator resolved a collision (§6.8) against this
-    /// connection.
+    /// connection, and goes on with the other one
+    /// ([`Event::AutomaticStartPassive`]). Not a failure of the peer, so
+    /// not damped.
     OpenCollisionDump,
     /// 24: a NOTIFICATION with OPEN Message Error / Unsupported Version.
     NotifMsgVerErr,
@@ -148,6 +159,7 @@ impl Event {
             Event::ManualStop => 2,
             Event::AutomaticStart => 3,
             Event::ManualStartPassive => 4,
+            Event::AutomaticStartPassive => 5,
             Event::AutomaticStop(_) => 8,
             Event::ConnectRetryTimerExpires => 9,
             Event::HoldTimerExpires => 10,

@@ -221,13 +221,18 @@ impl Fsm {
                 self.start(now, true, actions);
             }
             // RFC 4271 §8.2.2 Idle: event 13 ends the damping hold. Neither
-            // it nor event 3 starts a peer the operator stopped, or one
-            // whose AllowAutomaticStart the restart limit cleared
-            // (RFC 4486 §4).
+            // it nor events 3 and 5 start a peer the operator stopped, or
+            // one whose AllowAutomaticStart the restart limit cleared
+            // (RFC 4486 §4), and none of them ends a run of damped
+            // failures.
             Event::AutomaticStart | Event::IdleHoldTimerExpires
                 if !self.admin_down && self.automatic_start =>
             {
                 self.start(now, self.config.passive, actions);
+            }
+            Event::AutomaticStartPassive if !self.admin_down && self.automatic_start => {
+                self.passive_once = true;
+                self.start(now, true, actions);
             }
             // RFC 4271 §8.2.2 Idle: ManualStop is ignored for the state, but
             // it must cancel a pending automatic restart.
@@ -265,6 +270,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Connect: ManualStop.
             Event::ManualStop => self.manual_stop(now, actions),
@@ -335,6 +341,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Active: ManualStop, with the optional Cease
             // when an OPEN was being delayed.
@@ -408,6 +415,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
@@ -499,6 +507,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
@@ -612,6 +621,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
@@ -882,16 +892,21 @@ impl Fsm {
     }
 
     /// RFC 4271 §8.2.2 event 23: Cease / Connection Collision Resolution
-    /// (RFC 4486 §4).
+    /// (RFC 4486 §4). The damping RFC 4271 §8.2.2 makes optional here is
+    /// left out: this FSM runs one connection at a time, and the
+    /// coordinator goes on at once with the connection that won
+    /// ([`Event::AutomaticStartPassive`]), so the losing one is no failure
+    /// of the peer. Counting it would end the session against the RFC
+    /// 4486 §4 restart limit for a collision the peer cannot avoid.
     fn collision_dump(&mut self, now: Instant, established: bool, actions: &mut Vec<Action>) {
         actions.push(Action::SendNotification(NotificationMessage::cease(
             CeaseSubcode::ConnectionCollisionResolution,
         )));
         if established {
-            self.session_down(now, true, actions);
+            self.session_down(now, false, actions);
         } else {
             self.connect_retry.stop();
-            self.go_idle(now, true, true, actions);
+            self.go_idle(now, true, false, actions);
         }
     }
 
