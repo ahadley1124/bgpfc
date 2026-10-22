@@ -29,10 +29,14 @@
 //! (§10, §6). Each cache gets a session of its own, so the new cache is
 //! asked with a Reset Query.
 //!
-//! After a Cache Reset or No Data Available the client stays with the
-//! cache, and reloads or polls it as §8.3 and §8.4 require when there is
-//! no other cache; it does not try the other caches first, as those
-//! sections recommend.
+//! A cache that answers No Data Available is left for the next cache, as
+//! after a failed attempt (§8.4: "the router SHOULD attempt to connect to
+//! any other caches in its cache list, in preference order"). One that
+//! answers a Serial Query with a Cache Reset while more-preferred caches
+//! are configured is left for the most preferred (§8.3). The data stays
+//! in use meanwhile, as on any move. With no other cache, or none more
+//! preferred, the client stays: it reloads after a Cache Reset, and
+//! repeats the Reset Query to a cache without data after each back-off.
 //!
 //! # Reconnecting
 //!
@@ -58,8 +62,9 @@
 //! of the Refresh Interval and the response timeout find a dead
 //! connection instead.
 //!
-//! Implements: RFC 8210 §9 (unprotected TCP to the rpki-rtr port, 323),
-//! §10 (the list of caches in order of preference; the data from one
+//! Implements: RFC 8210 §8.3 and §8.4 (other caches first after a Cache
+//! Reset or No Data Available), §9 (unprotected TCP to the rpki-rtr port,
+//! 323), §10 (the list of caches in order of preference; the data from one
 //! cache at a time, replaced only by a full set from another; the
 //! previous cache's data kept until then), §6 (data not kept past its
 //! Expire Interval across a move to another cache; the reconnect delay,
@@ -83,7 +88,7 @@ use bgpfc_wire::prefix::Prefix;
 
 use crate::framer::{Framer, Received};
 use crate::pdu::{Pdu, Version};
-use crate::session::{self, Action, Commit, Event, LogLine, Session, State};
+use crate::session::{self, Action, Commit, Event, Fallback, LogLine, Session, State};
 
 /// The rpki-rtr port. RFC 8210 §9: "Caches and routers MUST implement
 /// unprotected transport over TCP using a port, rpki-rtr (323)"; RFC 6810
@@ -150,7 +155,10 @@ impl fmt::Display for Cache {
 /// hammered. [`Backoff::DEFAULT`] grows to that default Retry Interval,
 /// and the jitter only lengthens a delay, so a cache that stays away is
 /// tried no more often than the RFC asks once the back-off has grown.
-/// Queries on an open connection keep the cache's Retry Interval.
+/// The same goes for the periodic Reset Queries to the only cache when it
+/// has No Data Available (§8.4), which is how a restarting validator
+/// answers until its first run. The other queries on an open connection
+/// keep the cache's Refresh Interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Backoff {
     /// The delay after the first failure. Raised to 1 ms if lower.
@@ -274,10 +282,11 @@ pub struct Status {
     /// IPv6 VRPs in [`Status::vrps`].
     pub vrps_ipv6: usize,
     /// Consecutive failures, as the back-off counts them: attempts that
-    /// failed, and connections that ended in an error or before the cache
-    /// brought the router in sync. Each time the cache brings the router
-    /// in sync it goes back to 0, and a connection that was in sync and
-    /// that the cache or the network then closed does not count.
+    /// failed, connections that ended in an error or before the cache
+    /// brought the router in sync, and No Data Available answers. Each
+    /// time the cache brings the router in sync it goes back to 0, and a
+    /// connection that was in sync and that the cache or the network then
+    /// closed does not count.
     pub failures: u32,
     /// The last warning or error the client logged, with its fields.
     pub last_error: Option<String>,
@@ -773,10 +782,15 @@ impl<S: ValidationSink> Worker<S> {
         let before = self.session.state();
         let synced_before = self.session.synced_at();
         let mut connect = false;
+        let mut fallback = None;
+        let mut leaving = false;
         for action in self.session.step(event, now) {
             match action {
                 // After the other actions of the step: a Close comes first.
                 Action::Connect => connect = true,
+                // The query the session sends in place of the other caches
+                // goes with the connection.
+                Action::Send(_) if leaving => {}
                 Action::Send(pdu) => self.send(&pdu),
                 Action::Close => self.close(),
                 Action::Negotiated(version) => {
@@ -788,10 +802,30 @@ impl<S: ValidationSink> Worker<S> {
                 Action::Downgrade(_) => {}
                 Action::Commit(commit) => self.publish(commit, now),
                 Action::Log(line) => self.log(&line, context.as_deref(), now),
+                Action::Fallback(why) => {
+                    leaving = self.leaves(why);
+                    fallback = Some(why);
+                }
             }
         }
         if self.session.synced_at() != synced_before {
             self.on_sync(now);
+        }
+        match fallback {
+            Some(why) if leaving => {
+                self.leave(why, failures, delay, now);
+                self.pending_error = None;
+                return None;
+            }
+            Some(Fallback::NoData) => {
+                // RFC 8210 §8.4 with no other cache: the session stays and
+                // issues "periodic Reset Queries", each after the back-off,
+                // which grows with every No Data Available like with every
+                // failed attempt.
+                self.failures = failures;
+                self.synced_on_conn = false;
+            }
+            _ => {}
         }
         let after = self.session.state();
         let connected = matches!(after, State::Querying | State::Receiving | State::Idle);
@@ -812,6 +846,43 @@ impl<S: ValidationSink> Worker<S> {
         // A transport error not followed by a step is stale by now.
         self.pending_error = None;
         None
+    }
+
+    /// Whether to leave the cache that cannot serve the router for `why`.
+    fn leaves(&self, why: Fallback) -> bool {
+        match why {
+            // RFC 8210 §8.4: "any other caches in its cache list".
+            Fallback::NoData => self.caches.len() > 1,
+            // RFC 8210 §8.3: "any more-preferred caches in its cache list":
+            // a lower preference value (§10), not an equal one.
+            Fallback::CacheReset => self
+                .caches
+                .first()
+                .is_some_and(|first| first.preference < self.cache().preference),
+        }
+    }
+
+    /// Close the connection to a cache that cannot serve the router for
+    /// `why`, and try the others, keeping its data meanwhile (§10).
+    fn leave(&mut self, why: Fallback, failures: u32, delay: Duration, now: Instant) {
+        self.close();
+        match why {
+            // RFC 8210 §8.4: "the router SHOULD attempt to connect to any
+            // other caches in its cache list, in preference order": as after
+            // a failed attempt, the next one in that order, wrapping round,
+            // after the back-off.
+            Fallback::NoData => self.on_failure(false, failures, delay, now),
+            // RFC 8210 §8.3: "the router SHOULD attempt to connect to any
+            // more-preferred caches in its cache list": the most preferred,
+            // then on down the list as attempts fail. The cache works; that
+            // is no failure.
+            Fallback::CacheReset => {
+                self.synced_on_conn = false;
+                let delay = self.backoff.delay(0, self.jitter_seed);
+                let at = now.checked_add(delay).unwrap_or(now);
+                self.switch_to(0, at, now);
+            }
+        }
     }
 
     /// The connection ended, or an attempt failed, and the session waits

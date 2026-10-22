@@ -75,6 +75,8 @@ impl Shell {
                     self.rib = Some(commit.vrps);
                 }
                 Action::Log(line) => line.write(&[]),
+                // A shell with one cache stays with it (RFC 8210 §8.3, §8.4).
+                Action::Fallback(_) => {}
             }
         }
         assert_eq!(self.session.vrps(), self.rib.as_ref());

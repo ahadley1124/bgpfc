@@ -290,7 +290,9 @@ impl Sim {
                 Action::Commit(commit) => self.check_commit(&commit, expect),
                 Action::Negotiated(v) => assert_eq!(v, Version::V1),
                 Action::Downgrade(v) => panic!("downgrade to {v} from a version 1 cache"),
-                Action::Log(_) => {}
+                // A single cache: the session goes on with it (RFC 8210
+                // §8.3, §8.4).
+                Action::Fallback(_) | Action::Log(_) => {}
             }
         }
     }

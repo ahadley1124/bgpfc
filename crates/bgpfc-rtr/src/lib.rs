@@ -42,4 +42,4 @@ pub use client::Client;
 pub use error::{ErrorCode, RtrError};
 pub use framer::{Framer, Received};
 pub use pdu::{ErrorReport, Intervals, MAX_PDU_LEN, Pdu, PduType, RouterKey, Version};
-pub use session::Session;
+pub use session::{Fallback, Session};
