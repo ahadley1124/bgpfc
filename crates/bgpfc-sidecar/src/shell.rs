@@ -1286,8 +1286,13 @@ mod tests {
         let dir = TempDir::new("escape");
         let pid_file = dir.join("escaped.pid");
         let (ours, theirs) = output_pair().unwrap();
+        // The escaped process writes its own id once `setsid` has taken
+        // it out of the group. `$!` would be known as soon as the shell
+        // forked, before `setsid` ran, and a group signal sent in between
+        // would still reach it.
+        let script = "setsid /bin/sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & wait";
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "setsid sleep 30 & echo $! > \"$1\"; wait", "sh"])
+        cmd.args(["-c", script, "sh"])
             .arg(&pid_file)
             .stdout(stdio(theirs))
             .process_group(0);
