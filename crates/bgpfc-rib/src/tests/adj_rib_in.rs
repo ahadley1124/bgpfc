@@ -87,9 +87,9 @@ fn received(rib: &Rib, family: AddressFamily, prefix: Prefix) -> Vec<(IpAddr, Ar
         .get(&family)
         .and_then(|t| t.get(&prefix))
         .map(|d| {
-            d.received
+            d.routes
                 .iter()
-                .map(|r| (r.peer, Arc::clone(&r.attrs)))
+                .map(|r| (r.peer, Arc::clone(&r.received)))
                 .collect()
         })
         .unwrap_or_default()
@@ -315,4 +315,93 @@ fn withdrawals_peer_down_and_family_disable_drop_held_routes_too() {
     assert_eq!(destinations(&rib, V4), vec![held]);
     let peers: Vec<IpAddr> = received(&rib, V4, held).iter().map(|r| r.0).collect();
     assert_eq!(peers, vec![e2.addr]);
+}
+
+#[test]
+fn each_route_is_held_once_with_what_policy_made_of_it() {
+    // One entry per peer and destination carries the attributes as
+    // received and as import policy gave them; the list grows a slot at a
+    // time while short, as most destinations have one to four routes.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOneRaiseRest(p("10.9.9.0/24"))));
+    let peers: Vec<PeerInfo> = (1..=6u8)
+        .map(|i| peer(&format!("10.0.0.{i}"), 65_000 + u32::from(i), u32::from(i)))
+        .collect();
+    for info in &peers {
+        rib.peer_up(info.clone(), now());
+    }
+    let dest = |rib: &Rib| -> (usize, usize) {
+        let d = &rib.tables[&V4][&p("192.0.2.0/24")];
+        (d.routes.len(), d.routes.capacity())
+    };
+    for (n, info) in peers.iter().enumerate() {
+        let a = attrs(&[info.remote_as.0], &info.addr.to_string());
+        rib.update(info.addr, &announce(&["192.0.2.0/24"], &a), now());
+        let (len, capacity) = dest(&rib);
+        assert_eq!(len, n + 1);
+        // Exact up to four, then doubling.
+        assert_eq!(capacity, if len <= 4 { len } else { 8 }, "{len}");
+    }
+    let d = &rib.tables[&V4][&p("192.0.2.0/24")];
+    for r in &d.routes {
+        assert!(!r.held);
+        assert_eq!(r.received.local_pref, None);
+        assert_eq!(r.attrs.local_pref, Some(200));
+        assert_eq!(r.attrs.as_path, r.received.as_path);
+    }
+    assert_eq!(rib.candidates(V4, p("192.0.2.0/24")).len(), 6);
+}
+
+#[test]
+fn held_routes_follow_the_candidates() {
+    // Peers 1 and 3 send a route the policy takes only once it is
+    // validated: held, after peer 2's candidate, whatever the order the
+    // routes came in.
+    let prefix = p("198.51.100.0/24");
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectUnvalidated::new(vec![prefix])));
+    let e: Vec<PeerInfo> = (1..=3u8)
+        .map(|i| peer(&format!("10.0.0.{i}"), 65_000 + u32::from(i), u32::from(i)))
+        .collect();
+    for info in &e {
+        rib.peer_up(info.clone(), now());
+    }
+    let send = |rib: &mut Rib, i: usize, prefix: &str| {
+        let a = attrs(&[e[i].remote_as.0], &e[i].addr.to_string());
+        rib.update(e[i].addr, &announce(&[prefix], &a), now())
+    };
+    send(&mut rib, 0, "198.51.100.0/24");
+    // Peer 2's route arrives while the policy takes everything, so it is
+    // a candidate.
+    rib.set_policies(Box::new(AcceptAll));
+    send(&mut rib, 1, "198.51.100.0/24");
+    rib.set_policies(Box::new(RejectUnvalidated::new(vec![prefix])));
+    send(&mut rib, 2, "198.51.100.0/24");
+    let order = |rib: &Rib| -> Vec<(IpAddr, bool)> {
+        rib.tables[&V4][&prefix]
+            .routes
+            .iter()
+            .map(|r| (r.peer, r.held))
+            .collect()
+    };
+    assert_eq!(
+        order(&rib),
+        vec![(e[1].addr, false), (e[0].addr, true), (e[2].addr, true)]
+    );
+    let c = rib.candidates(V4, prefix);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].peer, e[1].addr);
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e[1].addr);
+    // Peer 2's route is sent again under that policy and held too: no
+    // candidate is left, and the destination's best route goes.
+    let out = send(&mut rib, 1, "198.51.100.0/24");
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix,
+            next_hop: None
+        }]
+    );
+    assert!(order(&rib).iter().all(|r| r.1));
+    assert!(rib.candidates(V4, prefix).is_empty());
+    assert_eq!(rib.peer_stats(e[1].addr).unwrap().received[0], (V4, 1));
 }

@@ -144,7 +144,7 @@ fn held(rib: &Rib, family: AddressFamily, prefix: &str) -> Vec<(IpAddr, RovState
     rib.tables
         .get(&family)
         .and_then(|t| t.get(&p(prefix)))
-        .map(|d| d.received.iter().map(|r| (r.peer, r.rov)).collect())
+        .map(|d| d.routes.iter().map(|r| (r.peer, r.rov)).collect())
         .unwrap_or_default()
 }
 
@@ -857,4 +857,63 @@ fn a_held_route_no_state_can_admit_any_more_goes_when_validated_again() {
         rib.peer_stats(e1.addr).unwrap().received,
         vec![(V4, 0), (V6, 0)]
     );
+}
+
+#[test]
+fn routes_change_places_between_candidates_and_held_routes() {
+    use RovState::{Invalid, Valid};
+    // Two peers' routes to one destination, from different origins: the
+    // VRP's AS is Valid and a candidate, the other Invalid and held. When
+    // the VRP moves to the other AS the two swap, and the decision follows.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectInvalidTagValid));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let first = vrps(&[("192.0.2.0/24", 24, 64_496)]);
+    rib.validation_changed(all(first.clone()), now());
+    rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+        now(),
+    );
+    rib.update(
+        e2.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_002, 64_497], "10.0.0.2")),
+        now(),
+    );
+    let order = |rib: &Rib| -> Vec<(IpAddr, RovState, bool)> {
+        rib.tables[&V4][&p("192.0.2.0/24")]
+            .routes
+            .iter()
+            .map(|r| (r.peer, r.rov, r.held))
+            .collect()
+    };
+    assert_eq!(
+        order(&rib),
+        vec![(e1.addr, Valid, false), (e2.addr, Invalid, true)]
+    );
+    let second = vrps(&[("192.0.2.0/24", 24, 64_497)]);
+    let out = rib.validation_changed(delta(&first, second), now());
+    assert_eq!(
+        order(&rib),
+        vec![(e2.addr, Valid, false), (e1.addr, Invalid, true)]
+    );
+    let c = rib.candidates(V4, p("192.0.2.0/24"));
+    assert_eq!((c.len(), c[0].peer), (1, e2.addr));
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("10.0.0.2")),
+        }]
+    );
+    let r = report(&out).unwrap();
+    assert_eq!(r.changes, vec![(Valid, Invalid, 1), (Invalid, Valid, 1)]);
+    assert_eq!((r.routes, r.destinations, r.best_changed), (2, 1, 1));
+    // Both still counted, each by its peer.
+    for e in [&e1, &e2] {
+        assert_eq!(rib.peer_stats(e.addr).unwrap().received[0], (V4, 1));
+    }
 }

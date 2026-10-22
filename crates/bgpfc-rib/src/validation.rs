@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bgpfc_rpki::{
@@ -23,9 +24,7 @@ use bgpfc_rpki::{
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::{
-    Destination, Interner, Judged, Output, PeerState, Policies, Rib, judge, set_candidate,
-};
+use crate::{Destination, Interner, Judged, Output, PeerState, Policies, Rib, judge};
 
 /// A table walks its affected destinations in one pass, rather than one
 /// range query per range, once it has fewer than this many destinations
@@ -223,16 +222,17 @@ impl Pass<'_> {
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let mut changed = false;
         let mut restated = false;
-        let mut i = 0;
-        while i < dest.received.len() {
+        // Whether a route moved between the candidates and the held
+        // routes, and which ones no state admits any more.
+        let mut moved = false;
+        let mut dropped: Vec<IpAddr> = Vec::new();
+        for route in &mut dest.routes {
             self.tally.routes += 1;
-            let route = &mut dest.received[i];
             // RFC 6811 §2, on the route as received, as on its arrival.
-            let origin = RouteOrigin::from_as_path(&route.attrs.as_path, self.local_as);
+            let origin = RouteOrigin::from_as_path(&route.received.as_path, self.local_as);
             let rov = self.source.rov(prefix, origin);
-            let aspa = self.source.aspa(&route.attrs.as_path);
+            let aspa = self.source.aspa(&route.received.as_path);
             if rov == route.rov && aspa == route.aspa {
-                i += 1;
                 continue;
             }
             if rov != route.rov {
@@ -244,38 +244,48 @@ impl Pass<'_> {
             // Always found: the Adj-RIBs-In hold routes only of peers
             // that are up, as a peer's routes go with it.
             let Some(peer) = self.peers.get_mut(&route.peer) else {
-                i += 1;
                 continue;
             };
+            let was_held = route.held;
             let judged = judge(
                 self.policies,
                 self.interner,
                 &peer.info,
                 (self.family, prefix),
-                &route.attrs,
+                &route.received,
                 rov,
             );
-            let accepted = match judged {
-                Judged::Accepted(attrs) => Some(attrs),
-                Judged::Held => None,
+            match judged {
+                Judged::Accepted(attrs) => {
+                    route.attrs = attrs;
+                    route.held = false;
+                }
+                Judged::Held => {
+                    route.attrs = Arc::clone(&route.received);
+                    route.held = true;
+                }
                 // Policy accepted the route with some state when it was
-                // held, so only a change of policy since, before the
-                // ROUTE-REFRESH that follows one, can leave none.
+                // last judged, so only a change of policy since, before
+                // the ROUTE-REFRESH that follows one, can leave none.
                 Judged::Dropped => {
-                    let gone = dest.received.remove(i);
                     let n = peer.adj_in_count.entry(self.family).or_insert(0);
                     *n = n.saturating_sub(1);
-                    changed |= set_candidate(&mut dest.candidates, &peer.info, &gone, None);
-                    continue;
+                    dropped.push(route.peer);
+                    // No candidate any more, like a held route, until it
+                    // goes below.
+                    route.held = true;
                 }
-            };
-            changed |= set_candidate(
-                &mut dest.candidates,
-                &peer.info,
-                &dest.received[i],
-                accepted,
-            );
-            i += 1;
+            }
+            // A candidate with a new state, or one that came or went.
+            changed |= !(was_held && route.held);
+            moved |= was_held != route.held;
+        }
+        if !dropped.is_empty() {
+            dest.routes.retain(|r| !dropped.contains(&r.peer));
+        }
+        if moved {
+            // Candidates first; a stable sort keeps their order.
+            dest.routes.sort_by_key(|r| r.held);
         }
         if restated {
             self.tally.destinations += 1;

@@ -23,13 +23,23 @@ pub struct Candidate {
     pub router_id: u32,
     /// The peer's AS.
     pub remote_as: Asn,
-    /// The route's attributes.
+    /// The route's attributes, as import policy gave them.
     pub attrs: Arc<PathAttrs>,
     /// The route's RFC 6811 §2 validation state, judged on the route as
     /// received. Phase 2 does not use it.
     pub rov: RovState,
     /// The route's ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
+    /// The route's attributes as its peer sent them, before import
+    /// policy, which runs on them again when the route's validation state
+    /// changes; the same as `attrs` when policy changed nothing. With
+    /// them, a destination's routes are its part of the Adj-RIBs-In
+    /// (RFC 4271 §3.2), held once.
+    pub(crate) received: Arc<PathAttrs>,
+    /// Import policy rejected the route for its validation state alone:
+    /// the Adj-RIB-In holds it (RFC 6811 §2), but it is no candidate, and
+    /// a destination lists it after the candidates.
+    pub(crate) held: bool,
 }
 
 /// The `LOCAL_PREF` assumed for routes without one (external routes the

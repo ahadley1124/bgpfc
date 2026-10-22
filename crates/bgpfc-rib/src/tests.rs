@@ -98,9 +98,11 @@ fn candidate(info: &PeerInfo, a: PathAttrs) -> Candidate {
         kind: info.kind,
         router_id: info.router_id.to_u32(),
         remote_as: info.remote_as,
+        received: Arc::new(a.clone()),
         attrs: Arc::new(a),
         rov: RovState::Disabled,
         aspa: AspaState::Disabled,
+        held: false,
     }
 }
 
