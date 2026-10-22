@@ -96,9 +96,10 @@ Example objects:
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
-{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true}],
- "running":true,"state":"idle","connected":true,"version":1,"session_id":4242,"serial":17,
- "synced_seconds_ago":12,"expires_in_seconds":7188,"vrps":{"ipv4":512340,"ipv6":121877},
+{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
+ "current":true}],"running":true,"state":"idle","connected":true,"version":1,"session_id":4242,
+ "serial":17,"synced_seconds_ago":12,"expires_in_seconds":7188,
+ "vrps":{"ipv4":512340,"ipv6":121877,"from":{"host":"127.0.0.1","port":3323}},
  "failures":0,"last_error":null,"last_error_seconds_ago":null}
 
 {"prefix":"192.0.2.0/24","origin":64496,"rov":"valid",
@@ -138,20 +139,25 @@ only value is `disabled`, so it is not shown.
 ## RPKI
 
 `show rpki` and `GET /v1/rpki` report the `rpki` block (`docs/config.md`,
-"RPKI") and its RTR client. bgpfcd uses one cache of the list at a time
-(RFC 8210 §10); `in_use` marks it.
+"RPKI") and its RTR client. bgpfcd validates with the VRPs of one cache at
+a time (RFC 8210 §10), which `in_use` (`in use`) marks, and its client
+talks to one cache at a time, which `current` marks: the one it is
+connected to, or the one it tries next. Once that cache has sent its VRPs,
+both mark the same cache. After a move to another cache they differ: the
+last VRPs stay in use until the new cache has sent a full set, which
+replaces them, or until they expire (§10, §6).
 
 | Member | Line | Meaning |
 |---|---|---|
 | `mode` | `mode` | `disabled` or `external` |
-| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` |
+| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
 | `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
-| `state` | `state` | the session with the cache in use: `disconnected`, `connecting`, `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
+| `state` | `state` | the session with the current cache: `disconnected`, `connecting` (a connection attempt is under way), `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
 | `connected` | `connected` | whether a TCP connection to it is open |
 | `version` | `version` | the RTR protocol version spoken: 1 (RFC 8210), or 0 (RFC 6810) after a fallback (RFC 8210 §7) or with `version 0` |
 | `session_id`, `serial` | `session-id`, `serial` | the cache's Session ID and the Serial Number of the data, while the client can ask for changes since then (RFC 8210 §5.1) |
 | `synced_seconds_ago` | `last sync` | since the cache's last End of Data |
-| `vrps` | `vrps` | the VRPs in use, per family; `null` (`none yet`) before any cache sent data, when every route is `disabled` |
+| `vrps` | `vrps` | the VRPs in use, per family, and `from` (`from`) the cache they came from, `host` and `port`: the one `in_use` marks, or after a reload maybe a cache the list no longer has; `null` once VRPs held from a cache bgpfcd moved away from expired. `vrps` is `null` (`none yet`) before any cache sent data, when every route is `disabled` |
 | `expires_in_seconds` | `expire in` | until those VRPs expire unless a cache refreshes them (RFC 8210 §6); then every route becomes `not-found` |
 | `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |

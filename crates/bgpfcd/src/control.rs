@@ -7,8 +7,9 @@
 //! route refresh); RFC 9003 §3 (a shutdown communication of at most 128
 //! octets); RFC 4486 §4 (Administrative Reset; whether the restart limit
 //! left a neighbor Idle); RFC 4271 §6.7 (routes received per family
-//! against the prefix limit); RFC 8210 §10 (the cache list and the one in
-//! use); RFC 6811 §2 (a route's validation state against the VRPs in use,
+//! against the prefix limit); RFC 8210 §10 (the cache list, the cache
+//! whose data is in use, marked as to source, and the one the client talks
+//! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
 //! with the VRPs that Cover and Match it).
 
 use std::io::{BufRead as _, BufReader};
@@ -445,17 +446,26 @@ fn render_rpki(r: &RpkiReport, now: Instant) -> Reply {
     }
 }
 
-/// Whether the client uses `cache`: RFC 8210 §10, one cache of the list
-/// at a time.
+/// Whether the RIB validates with VRPs from `cache`: RFC 8210 §10, the
+/// data of one cache of the list at a time, "marked as to source".
 fn in_use(
     status: Option<&bgpfc_rtr::client::Status>,
     cache: &bgpfc_config::ast::RpkiCache,
 ) -> bool {
-    status.is_some_and(|s| {
-        s.cache.host == cache.host
-            && s.cache.port == cache.port
-            && s.cache.preference == cache.preference
-    })
+    status
+        .and_then(|s| s.source.as_ref())
+        .is_some_and(|source| cache.is_at(&source.host, source.port))
+}
+
+/// Whether the client talks to `cache`: is connected to it, or tries it
+/// next. The `state` line is about that session. After a move it is
+/// another cache than the one [`in_use`] marks, until that cache has sent
+/// a full set (RFC 8210 §10).
+fn current(
+    status: Option<&bgpfc_rtr::client::Status>,
+    cache: &bgpfc_config::ast::RpkiCache,
+) -> bool {
+    status.is_some_and(|s| s.running && cache.is_at(&s.cache.host, s.cache.port))
 }
 
 fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
@@ -463,9 +473,10 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let mut lines = vec![format!("mode {}", r.config.mode)];
     for c in &r.config.caches {
         lines.push(format!(
-            "cache {c} preference {}{}",
+            "cache {c} preference {}{}{}",
             c.preference,
-            if in_use(status, c) { ", in use" } else { "" }
+            if in_use(status, c) { ", in use" } else { "" },
+            if current(status, c) { ", current" } else { "" }
         ));
     }
     let Some(s) = status else {
@@ -493,9 +504,12 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     ));
     lines.push(if s.vrps.is_some() {
         format!(
-            "vrps ipv4 {} ipv6 {}{}",
+            "vrps ipv4 {} ipv6 {}{}{}",
             s.vrps_ipv4,
             s.vrps_ipv6,
+            s.source
+                .as_ref()
+                .map_or(String::new(), |source| format!(" from {source}")),
             s.expires_at.map_or(String::new(), |at| format!(
                 ", expire in {}s",
                 seconds_between(now, at)
@@ -554,6 +568,7 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
             .field_num("port", c.port)
             .field_num("preference", c.preference)
             .field_bool("in_use", in_use(status, c))
+            .field_bool("current", current(status, c))
             .end_object();
     }
     j.end_array();
@@ -598,7 +613,16 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
         j.begin_object()
             .field_num("ipv4", u64::try_from(s.vrps_ipv4).unwrap_or(u64::MAX))
             .field_num("ipv6", u64::try_from(s.vrps_ipv6).unwrap_or(u64::MAX))
-            .end_object();
+            .key("from");
+        if let Some(source) = &s.source {
+            j.begin_object()
+                .field_str("host", &source.host)
+                .field_num("port", source.port)
+                .end_object();
+        } else {
+            j.null();
+        }
+        j.end_object();
     } else {
         j.null();
     }
@@ -1644,17 +1668,18 @@ mod tests {
     fn rpki_status_renders_as_lines_and_json() {
         let now = Instant::now();
         let r = render_rpki(&rpki_report(now, &[]), now);
-        // RFC 8210 §10: the cache list, and the one cache in use.
+        // RFC 8210 §10: the cache list, the one cache whose VRPs are in
+        // use, and the one the client talks to: the same, in sync.
         assert_eq!(
             r.lines,
             [
                 "mode external",
                 "cache 127.0.0.1:3323 preference 0",
-                "cache rtr.example.net:323 preference 10, in use",
+                "cache rtr.example.net:323 preference 10, in use, current",
                 "state idle, connected, version 1",
                 "session-id 4242 serial 17",
                 "last sync 12s ago",
-                "vrps ipv4 2 ipv6 1, expire in 7188s",
+                "vrps ipv4 2 ipv6 1 from rtr.example.net:323, expire in 7188s",
                 "failures 0",
                 "last error 30s ago: rtr cache connection timed out cache=127.0.0.1:3323",
             ]
@@ -1663,11 +1688,15 @@ mod tests {
             r.json,
             concat!(
                 r#"{"mode":"external","caches":["#,
-                r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false},"#,
-                r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true}],"#,
+                r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
+                r#""current":false},"#,
+                r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
+                r#""current":true}],"#,
                 r#""running":true,"state":"idle","connected":true,"version":1,"#,
                 r#""session_id":4242,"serial":17,"synced_seconds_ago":12,"#,
-                r#""expires_in_seconds":7188,"vrps":{"ipv4":2,"ipv6":1},"failures":0,"#,
+                r#""expires_in_seconds":7188,"#,
+                r#""vrps":{"ipv4":2,"ipv6":1,"from":{"host":"rtr.example.net","port":323}},"#,
+                r#""failures":0,"#,
                 r#""last_error":"rtr cache connection timed out cache=127.0.0.1:3323","#,
                 r#""last_error_seconds_ago":30}"#
             )
@@ -1682,7 +1711,7 @@ mod tests {
             s.connected = false;
             s.state = bgpfc_rtr::session::State::Connecting;
             (s.session_id, s.serial, s.synced_at, s.expires_at) = (None, None, None, None);
-            (s.vrps, s.last_error, s.last_error_at) = (None, None, None);
+            (s.vrps, s.source, s.last_error, s.last_error_at) = (None, None, None, None);
             s.failures = 3;
         }
         let r = render_rpki(&report, now);
@@ -1725,7 +1754,8 @@ mod tests {
             r.json,
             concat!(
                 r#"{"mode":"disabled","caches":[{"host":"192.0.2.10","port":323,"#,
-                r#""preference":0,"in_use":false}],"running":false,"state":null,"#,
+                r#""preference":0,"in_use":false,"current":false}],"#,
+                r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
                 r#""synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"#,
                 r#""failures":0,"last_error":null,"last_error_seconds_ago":null}"#
@@ -1736,6 +1766,90 @@ mod tests {
             status: None,
         };
         assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+    }
+
+    #[test]
+    fn the_cache_in_use_is_the_source_of_the_vrps() {
+        use bgpfc_rtr::client::Cache;
+        let now = Instant::now();
+        // The cache of preference 10 went away; the client tries the
+        // other, whose session has nothing yet. Its VRPs stay in use until
+        // the other has sent a full set (RFC 8210 §10).
+        let mut report = rpki_report(now, &[]);
+        if let Some(s) = &mut report.status {
+            s.cache = Cache {
+                port: 3323,
+                ..Cache::new("127.0.0.1")
+            };
+            s.state = bgpfc_rtr::session::State::Connecting;
+            s.connected = false;
+            (s.session_id, s.serial, s.synced_at) = (None, None, None);
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[1..7],
+            [
+                "cache 127.0.0.1:3323 preference 0, current",
+                "cache rtr.example.net:323 preference 10, in use",
+                "state connecting, version 1",
+                "session-id - serial -",
+                "last sync never",
+                "vrps ipv4 2 ipv6 1 from rtr.example.net:323, expire in 7188s",
+            ]
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
+                r#""current":true},{"host":"rtr.example.net","port":323,"#,
+                r#""preference":10,"in_use":true,"current":false}]"#
+            )),
+            "{}",
+            r.json
+        );
+        // A reload replaced the list: the VRPs held come from a cache it
+        // no longer has, which the vrps line names.
+        if let Some(s) = &mut report.status {
+            s.source = Some(Cache::new("192.0.2.99"));
+        }
+        let r = render_rpki(&report, now);
+        assert!(
+            r.lines.iter().all(|l| !l.contains("in use")),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(
+            r.lines[6],
+            "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
+        );
+        assert!(
+            r.json
+                .contains(r#""vrps":{"ipv4":2,"ipv6":1,"from":{"host":"192.0.2.99","port":323}}"#),
+            "{}",
+            r.json
+        );
+        // The list names the cache in use another way: still that cache.
+        let mut respelled = rpki_report(now, &[]);
+        respelled.config = rpki_block(
+            "rpki { mode external; cache 127.0.0.1 port 3323;
+             cache RTR.Example.NET. preference 10; }",
+        );
+        assert_eq!(
+            render_rpki(&respelled, now).lines[2],
+            "cache RTR.Example.NET.:323 preference 10, in use, current"
+        );
+        // Held data that expired is no cache's: every route not-found.
+        if let Some(s) = &mut report.status {
+            s.source = None;
+            s.vrps = Some(Arc::new(VrpSet::new()));
+            (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(r.lines[6], "vrps ipv4 0 ipv6 0");
+        assert!(
+            r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]
