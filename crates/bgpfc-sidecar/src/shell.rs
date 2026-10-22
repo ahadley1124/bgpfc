@@ -1210,8 +1210,13 @@ mod tests {
     fn the_child_gets_the_derived_arguments_and_a_clean_environment() {
         let dir = TempDir::new("argv");
         let (argv, env, pwd) = (dir.join("argv"), dir.join("env"), dir.join("pwd"));
+        // The environment the shell was started with, as `execve` passed
+        // it: what `env` prints would include what the shell itself
+        // exports, which differs between shells (bash adds `SHLVL` and
+        // `_`, dash and bash add `PWD`).
         let body = format!(
-            "env > '{env}'\npwd > '{pwd}'\nprintf '%s\\0' \"$0\" \"$@\" > '{argv}.tmp'\n\
+            "cat /proc/$$/environ > '{env}'\npwd > '{pwd}'\n\
+             printf '%s\\0' \"$0\" \"$@\" > '{argv}.tmp'\n\
              mv '{argv}.tmp' '{argv}'\nexec sleep 30",
             env = env.display(),
             pwd = pwd.display(),
@@ -1247,12 +1252,12 @@ mod tests {
         assert!(got.contains(&rtr_arg), "{got:?}");
 
         let env = fs::read_to_string(&env).unwrap();
-        let mut vars: Vec<&str> = env.lines().collect();
+        let mut vars: Vec<&str> = env.strip_suffix('\0').unwrap().split('\0').collect();
         vars.sort_unstable();
         let home = format!("HOME={}", config.repository_dir.display());
         let path = format!("PATH={CHILD_PATH}");
-        // dash adds `PWD`; nothing comes from this process.
-        assert_eq!(vars, [home.as_str(), path.as_str(), "PWD=/"]);
+        // Nothing comes from this process.
+        assert_eq!(vars, [home.as_str(), path.as_str()]);
         assert_eq!(fs::read_to_string(&pwd).unwrap(), "/\n");
     }
 
