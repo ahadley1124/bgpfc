@@ -606,11 +606,12 @@ fn extended_next_hop_with_bird() {
         bgpfcd.log_text().matches("session established").count() == 2
     });
     assert!(ok, "{}", bgpfcd.log_text());
-    // RFC 8950 §4: both sessions negotiated <1, 1, 2>.
+    // RFC 8950 §4: both sides list <1, 1, 2> on both sessions, so IPv6
+    // next hops may go either way.
     let ok = wait_for(Duration::from_secs(5), || {
         bgpfcd
             .log_text()
-            .matches("extended_next_hop=ipv4-unicast")
+            .matches("extended_next_hop_send=ipv4-unicast")
             .count()
             == 2
     });
@@ -618,7 +619,7 @@ fn extended_next_hop_with_bird() {
     for addr in [lab.b_addr, lab.c_addr] {
         let (out, ok) = ctl(&["show", "neighbor", &addr.to_string()]);
         assert!(
-            ok && out.contains("extended-next-hop ipv4-unicast"),
+            ok && out.contains("extended-next-hop receive ipv4-unicast send ipv4-unicast"),
             "{out}"
         );
     }
