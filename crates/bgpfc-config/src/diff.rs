@@ -50,6 +50,9 @@ pub enum GlobalChange {
     Log,
     /// The `control` block.
     Control,
+    /// The `rpki` block, an absent one counting as `mode disabled` with
+    /// the defaults: the RTR client starts, stops or restarts.
+    Rpki,
 }
 
 impl ConfigDiff {
@@ -64,6 +67,7 @@ impl ConfigDiff {
             (old.fib != new.fib, GlobalChange::Fib),
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
+            (old.rpki != new.rpki, GlobalChange::Rpki),
         ] {
             if changed {
                 d.global.push(what);
@@ -314,6 +318,58 @@ mod tests {
         assert_eq!(
             ConfigDiff::between(&a, &c).global,
             vec![GlobalChange::Fib, GlobalChange::Log, GlobalChange::Control]
+        );
+    }
+
+    #[test]
+    fn rpki_changes_are_one_global_change() {
+        let a = cfg(BASE);
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let external = with("rpki { mode external; cache 192.0.2.10; }");
+        let d = ConfigDiff::between(&a, &external);
+        assert_eq!(d.global, vec![GlobalChange::Rpki]);
+        // No neighbor is touched.
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+        assert!(d.reset.is_empty() && d.policy_changed.is_empty());
+        assert!(!d.is_empty());
+        // Spelling out a default, or moving the block, is no change: the
+        // running client is left alone.
+        for same in [
+            "rpki { mode external; cache 192.0.2.10 port 323 preference 0; }",
+            "rpki { mode external; version 1; max-expire 172800; cache 192.0.2.10; }",
+            "rpki { mode external; backoff 1 600; connect-timeout 10; cache 192.0.2.10; }",
+        ] {
+            assert!(
+                ConfigDiff::between(&external, &with(same)).is_empty(),
+                "{same}"
+            );
+        }
+        let moved = cfg(&format!(
+            "rpki {{ mode external; cache 192.0.2.10; }}\n# moved\n{BASE}"
+        ));
+        assert!(ConfigDiff::between(&external, &moved).is_empty());
+        // No block is `mode disabled`.
+        assert!(ConfigDiff::between(&a, &with("rpki { mode disabled; }")).is_empty());
+        // Anything else is a change: the mode, a cache, the order of the
+        // caches (it breaks ties of preference), a setting.
+        for other in [
+            "rpki { mode disabled; cache 192.0.2.10; }",
+            "rpki { mode external; cache 192.0.2.10 port 3323; }",
+            "rpki { mode external; cache 192.0.2.10 preference 1; }",
+            "rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }",
+            "rpki { mode external; cache 192.0.2.10; max-vrps 10; }",
+        ] {
+            assert_eq!(
+                ConfigDiff::between(&external, &with(other)).global,
+                vec![GlobalChange::Rpki],
+                "{other}"
+            );
+        }
+        let two = with("rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }");
+        let swapped = with("rpki { mode external; cache 192.0.2.11; cache 192.0.2.10; }");
+        assert_eq!(
+            ConfigDiff::between(&two, &swapped).global,
+            vec![GlobalChange::Rpki]
         );
     }
 }

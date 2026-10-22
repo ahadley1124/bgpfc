@@ -328,7 +328,7 @@ impl Coordinator<'_> {
                 GlobalChange::Identity => {
                     return Err("router-id or local-as changed: restart the daemon".to_owned());
                 }
-                GlobalChange::Listen | GlobalChange::Control => {
+                GlobalChange::Listen | GlobalChange::Control | GlobalChange::Rpki => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
                 GlobalChange::Log => bgpfc_log::init(new.log_level),

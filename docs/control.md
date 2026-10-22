@@ -134,5 +134,5 @@ session without a reset, and so does a changed `maximum-prefix` (a session
 already over its new limit ends with Cease / Maximum Number of Prefixes
 Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once. `router-id` and `local-as` changes
-are refused, and `listen`, `control`, `fib { table }` and
-`fib { protocol }` changes are noted for the next restart.
+are refused, and `listen`, `control`, `fib { table }`, `fib { protocol }`
+and `rpki` changes are noted for the next restart.
