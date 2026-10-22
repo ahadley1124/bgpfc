@@ -221,8 +221,10 @@ pub struct Rib {
     /// and the best among them.
     tables: HashMap<AddressFamily, BTreeMap<Prefix, Destination>>,
     interner: Interner,
-    /// Pending wake-ups, earliest first. Entries made stale by later
-    /// changes stay until due and are then ignored.
+    /// Pending wake-ups, earliest first. Each `AdjRibOut` knows the one
+    /// live entry per destination; an entry an earlier one replaced stays
+    /// until due and is then ignored, and those of a peer that went down
+    /// are removed with it.
     deadlines: BinaryHeap<Reverse<Deadline>>,
     /// Pacing time, counted from the first instant the RIB was given.
     clock: Option<Clock>,
@@ -306,6 +308,9 @@ impl Rib {
         if self.peers.remove(&addr).is_none() {
             return Vec::new();
         }
+        // Its wake-ups have nothing left to wake.
+        self.deadlines.retain(|Reverse(d)| d.peer != addr);
+        shrink_heap(&mut self.deadlines);
         let mut dirty: Vec<(AddressFamily, Prefix)> = Vec::new();
         for (family, table) in &mut self.tables {
             for (prefix, dest) in table.iter_mut() {
@@ -488,12 +493,14 @@ impl Rib {
         };
         for (family, adj) in &mut state.adj_out {
             for (prefix, at) in adj.reschedule(&mut pace) {
-                self.deadlines.push(Reverse(Deadline {
-                    at,
-                    peer: addr,
-                    family: *family,
-                    prefix,
-                }));
+                if adj.queue(prefix, at) {
+                    self.deadlines.push(Reverse(Deadline {
+                        at,
+                        peer: addr,
+                        family: *family,
+                        prefix,
+                    }));
+                }
             }
         }
         self.flush(now)
@@ -528,10 +535,10 @@ impl Rib {
         if due.is_empty() {
             return Vec::new();
         }
+        shrink_heap(&mut self.deadlines);
         // One batch per peer and family, so that what is released together
         // is packed together (RFC 4271 §9.2).
-        due.sort_unstable_by_key(|d| (d.peer, d.family, d.prefix));
-        due.dedup_by_key(|d| (d.peer, d.family, d.prefix));
+        due.sort_unstable_by_key(|d| (d.peer, d.family, d.prefix, d.at));
         let mut out = Vec::new();
         for group in due.chunk_by(|a, b| a.peer == b.peer && a.family == b.family) {
             let (peer, family) = (group[0].peer, group[0].family);
@@ -547,8 +554,14 @@ impl Rib {
                 else {
                     break;
                 };
+                // One that an earlier wake-up replaced: nothing to do.
+                if !adj.fired(d.prefix, d.at) {
+                    continue;
+                }
                 let wake = adj.wake(d.prefix, info.advertisement_interval, now);
-                if let Some(at) = wake.again {
+                if let Some(at) = wake.again
+                    && adj.queue(d.prefix, at)
+                {
                     self.deadlines.push(Reverse(Deadline { at, ..*d }));
                 }
                 if !wake.release {
@@ -565,19 +578,22 @@ impl Rib {
                     now,
                     jitter: &mut self.jitter,
                 };
-                let step = state
-                    .adj_out
-                    .entry(family)
-                    .or_default()
-                    .release(d.prefix, desired, &mut pace);
+                let adj = state.adj_out.entry(family).or_default();
+                let step = adj.release(d.prefix, desired, &mut pace);
                 record(
                     step,
-                    peer,
-                    family,
-                    d.prefix,
+                    adj,
+                    (peer, family, d.prefix),
                     &mut batch,
                     &mut self.deadlines,
                 );
+            }
+            if let Some(adj) = self
+                .peers
+                .get_mut(&peer)
+                .and_then(|s| s.adj_out.get_mut(&family))
+            {
+                adj.compact();
             }
             out.extend(Rib::emit(&info, family, &batch));
         }
@@ -927,12 +943,15 @@ impl Rib {
             now,
             jitter: &mut self.jitter,
         };
-        let step = state
-            .adj_out
-            .entry(family)
-            .or_default()
-            .offer(prefix, desired, &mut pace);
-        record(step, peer, family, prefix, batch, &mut self.deadlines);
+        let adj = state.adj_out.entry(family).or_default();
+        let step = adj.offer(prefix, desired, &mut pace);
+        record(
+            step,
+            adj,
+            (peer, family, prefix),
+            batch,
+            &mut self.deadlines,
+        );
     }
 
     /// The pacing time of `now`; the first instant ever given is tick 0.
@@ -1007,34 +1026,45 @@ impl Rib {
     }
 }
 
-/// Put a pacing decision for `prefix` into `batch`, and its wake-up, if
-/// any, into `deadlines`.
+/// Put a pacing decision for `prefix` of `peer` and `family` into
+/// `batch`, and its wake-up, if it needs one that `adj` has not queued
+/// yet, into `deadlines`.
 fn record(
     step: Step,
-    peer: IpAddr,
-    family: AddressFamily,
-    prefix: Prefix,
+    adj: &mut AdjRibOut,
+    (peer, family, prefix): (IpAddr, AddressFamily, Prefix),
     batch: &mut Batch,
     deadlines: &mut BinaryHeap<Reverse<Deadline>>,
 ) {
-    let wake = |at| {
-        Reverse(Deadline {
+    let wake = match step {
+        Step::Quiet => None,
+        Step::Announce(a) => {
+            batch.announce(&a, prefix);
+            None
+        }
+        Step::Withdraw { forget } => {
+            batch.withdraw.push(prefix);
+            forget
+        }
+        Step::Hold(at) => Some(at),
+    };
+    if let Some(at) = wake
+        && adj.queue(prefix, at)
+    {
+        deadlines.push(Reverse(Deadline {
             at,
             peer,
             family,
             prefix,
-        })
-    };
-    match step {
-        Step::Quiet => {}
-        Step::Announce(a) => batch.announce(&a, prefix),
-        Step::Withdraw { forget } => {
-            batch.withdraw.push(prefix);
-            if let Some(at) = forget {
-                deadlines.push(wake(at));
-            }
-        }
-        Step::Hold(at) => deadlines.push(wake(at)),
+        }));
+    }
+}
+
+/// `heap` with its capacity cut down once it is less than a quarter used,
+/// so that a burst of churn does not keep its memory.
+fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
+    if heap.capacity() > 64 && heap.len() < heap.capacity() / 4 {
+        heap.shrink_to(heap.len() * 2);
     }
 }
 

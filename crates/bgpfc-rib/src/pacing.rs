@@ -15,6 +15,16 @@
 //! per destination, and a destination that is not held back costs one
 //! timestamp in its Adj-RIB-Out entry.
 //!
+//! Memory follows the destinations, not the churn (AGENTS.md §3). Each
+//! destination has at most one wake-up queued, however often it changes,
+//! and a held destination stays held when its route changes back, so its
+//! interval is drawn once. The destinations that may wait at once, held
+//! back or remembered after a withdrawal, are bounded by the most routes
+//! the Adj-RIB-Out ever held, or 1024 if that is more: past the bound, a
+//! change goes out at once and a withdrawal is not remembered, so that a
+//! peer cannot grow the RIB by announcing and withdrawing ever new
+//! destinations within its prefix limit.
+//!
 //! Time is counted in whole seconds (`Tick`) since the first instant the
 //! RIB was given. Advertisement times round up and the current time rounds
 //! down, so an interval is never shortened; it can grow by up to two
@@ -199,6 +209,10 @@ pub(crate) struct Wake {
     pub(crate) again: Option<Tick>,
 }
 
+/// However few routes an Adj-RIB-Out has held, this many of its
+/// destinations may wait at once (see the module documentation).
+pub(crate) const MIN_WAITING: usize = 1024;
+
 /// One peer's Adj-RIB-Out for one family (RFC 4271 §3.2) together with
 /// its RFC 4271 §9.2.1.1 state.
 #[derive(Debug, Default)]
@@ -209,8 +223,16 @@ pub(crate) struct AdjRibOut {
     /// interval, with its time, so that a route flapping through
     /// withdrawals is still paced.
     withdrawn: HashMap<Prefix, Tick>,
-    /// Destinations held back, and when they may go out.
+    /// Destinations whose interval runs and whose route changed during
+    /// it, and when the interval ends: their route then is compared with
+    /// what the peer has. Each is in `sent` or `withdrawn`.
     held: HashMap<Prefix, Tick>,
+    /// The one wake-up queued for each destination that has one: a
+    /// queue entry for another tick is stale and ignored. Covers every
+    /// destination in `held` and `withdrawn`.
+    wakeups: HashMap<Prefix, Tick>,
+    /// The most routes `sent` has held.
+    peak: usize,
 }
 
 impl AdjRibOut {
@@ -235,6 +257,53 @@ impl AdjRibOut {
         self.held.len()
     }
 
+    /// How many destinations pacing remembers beyond the Adj-RIB-Out:
+    /// held back, remembered after a withdrawal, or with a wake-up queued.
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> usize {
+        self.held.len() + self.withdrawn.len() + self.wakeups.len()
+    }
+
+    /// Whether `prefix` may wait for its interval to end: it has a wake-up
+    /// queued already, or fewer destinations wait than the bound allows
+    /// (see the module documentation).
+    fn may_wait(&self, prefix: Prefix) -> bool {
+        self.wakeups.contains_key(&prefix) || self.wakeups.len() < self.peak.max(MIN_WAITING)
+    }
+
+    /// A wake-up for `prefix` is needed at `at`: whether the caller must
+    /// queue one. Not when one is queued for then or earlier, since a
+    /// wake-up that comes early finds what is left to do and asks again
+    /// ([`Wake::again`]).
+    pub(crate) fn queue(&mut self, prefix: Prefix, at: Tick) -> bool {
+        match self.wakeups.get(&prefix) {
+            Some(&queued) if queued <= at => false,
+            _ => {
+                self.wakeups.insert(prefix, at);
+                true
+            }
+        }
+    }
+
+    /// A queued wake-up for `prefix` at `at` came due: whether it is the
+    /// one [`Self::queue`] last asked for (then it is used up), rather
+    /// than one an earlier wake-up replaced.
+    pub(crate) fn fired(&mut self, prefix: Prefix, at: Tick) -> bool {
+        if self.wakeups.get(&prefix) == Some(&at) {
+            self.wakeups.remove(&prefix);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Give back the memory of maps that churn left mostly empty.
+    pub(crate) fn compact(&mut self) {
+        shrink(&mut self.withdrawn);
+        shrink(&mut self.held);
+        shrink(&mut self.wakeups);
+    }
+
     /// The route to `prefix` should now be `desired` (`None`: no route
     /// for this peer). Decide what to send.
     ///
@@ -253,12 +322,11 @@ impl AdjRibOut {
             return self.withdraw(prefix, pace);
         };
         let last = match self.sent.get(&prefix) {
-            Some(s) if Arc::ptr_eq(&s.attrs, &attrs) => {
-                // RFC 4271 §9.2: the peer already has this route; a held
-                // change that reverted needs nothing either.
-                self.held.remove(&prefix);
-                return Step::Quiet;
-            }
+            // RFC 4271 §9.2: the peer already has this route. A held
+            // change that reverted needs nothing either; the destination
+            // stays held, so that its interval is not drawn again, and the
+            // release finds nothing to send.
+            Some(s) if Arc::ptr_eq(&s.attrs, &attrs) => return Step::Quiet,
             Some(s) => Some(s.at),
             None => self.withdrawn.get(&prefix).copied(),
         };
@@ -271,7 +339,8 @@ impl AdjRibOut {
         {
             // RFC 4271 §10: the timer is jittered each time it is set.
             let due = last.after(secs_ceil(pace.jitter.apply(pace.interval)));
-            if due > pace.now.floor {
+            // Past the bound on waiting destinations it goes out now.
+            if due > pace.now.floor && self.may_wait(prefix) {
                 self.held.insert(prefix, due);
                 return Step::Hold(due);
             }
@@ -279,8 +348,8 @@ impl AdjRibOut {
         self.advertise(prefix, attrs, pace.now)
     }
 
-    /// A wake-up for `prefix` came at `now`, with `interval` the peer's
-    /// current interval.
+    /// A wake-up for `prefix` came at `now` (after [`Self::fired`] said
+    /// so), with `interval` the peer's current interval.
     pub(crate) fn wake(&mut self, prefix: Prefix, interval: Duration, now: Now) -> Wake {
         let mut wake = Wake::default();
         if let Some(&at) = self.withdrawn.get(&prefix) {
@@ -291,11 +360,14 @@ impl AdjRibOut {
                 wake.again = Some(until);
             }
         }
-        if let Some(&due) = self.held.get(&prefix)
-            && due <= now.floor
-        {
-            self.held.remove(&prefix);
-            wake.release = true;
+        if let Some(&due) = self.held.get(&prefix) {
+            if due <= now.floor {
+                self.held.remove(&prefix);
+                wake.release = true;
+            } else {
+                // Woken early, by a wake-up queued for something else.
+                wake.again = Some(wake.again.map_or(due, |t| t.min(due)));
+            }
         }
         wake
     }
@@ -329,7 +401,8 @@ impl AdjRibOut {
     /// Adj-RIB-Out (RFC 4271 §9.2) or a route refresh (RFC 2918 §4), which
     /// re-advertises held destinations as they are now and restarts every
     /// interval. Returns the destinations the peer had that are no longer
-    /// in `routes`, which the caller withdraws.
+    /// in `routes`, which the caller withdraws. Wake-ups already queued
+    /// stay, and find nothing to do.
     pub(crate) fn readvertise(
         &mut self,
         routes: Vec<(Prefix, Arc<PathAttrs>)>,
@@ -350,6 +423,7 @@ impl AdjRibOut {
         }
         self.held.clear();
         let old = std::mem::replace(&mut self.sent, fresh);
+        self.peak = self.peak.max(self.sent.len());
         old.into_keys()
             .filter(|p| !self.sent.contains_key(p))
             .collect()
@@ -392,14 +466,17 @@ impl AdjRibOut {
                 at: now.ceil,
             },
         );
+        self.peak = self.peak.max(self.sent.len());
         Step::Announce(attrs)
     }
 
-    /// The peer must no longer have a route to `prefix`.
+    /// The peer must no longer have a route to `prefix`. A held
+    /// destination stays held while its last advertisement is remembered,
+    /// so that the route coming back waits for the same interval end; the
+    /// release finds nothing to send if it does not.
     fn withdraw(&mut self, prefix: Prefix, pace: &Pace<'_>) -> Step {
-        // Whatever was held back has nothing left to advertise.
-        self.held.remove(&prefix);
         let Some(old) = self.sent.remove(&prefix) else {
+            // Held, if at all, from a remembered withdrawal.
             return Step::Quiet;
         };
         // NOTE(interop): RFC 4271 §9.2.1.1 paces withdrawals too ("an
@@ -409,18 +486,25 @@ impl AdjRibOut {
         // withdrawals immediately. A withdrawal neither waits for nor
         // restarts the interval; the last advertisement's time is kept so
         // that a route flapping through withdrawals is still paced.
-        if pace.interval.is_zero() {
-            return Step::Withdraw { forget: None };
-        }
         let until = old.at.after(secs_ceil(pace.interval));
-        if until > pace.now.floor {
+        // Past the bound on waiting destinations it is not remembered.
+        if !pace.interval.is_zero() && until > pace.now.floor && self.may_wait(prefix) {
             self.withdrawn.insert(prefix, old.at);
             Step::Withdraw {
                 forget: Some(until),
             }
         } else {
+            // Nothing to pace from: whatever was held goes.
+            self.held.remove(&prefix);
             Step::Withdraw { forget: None }
         }
+    }
+}
+
+/// `map` with its capacity cut down once it is less than a quarter used.
+fn shrink<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 64 && map.len() < map.capacity() / 4 {
+        map.shrink_to(map.len() * 2);
     }
 }
 
@@ -536,7 +620,14 @@ mod tests {
         // Held: later changes ride along, without a second wake-up.
         assert_eq!(offer(&mut out, p, Some(&c), 2), Step::Quiet);
         assert_eq!(out.held(), 1);
-        assert_eq!(out.wake(p, IV, at(29)), Wake::default());
+        // Woken early, it asks to be woken again when it is due.
+        assert_eq!(
+            out.wake(p, IV, at(29)),
+            Wake {
+                release: false,
+                again: Some(Tick(30))
+            }
+        );
         assert_eq!(
             out.wake(p, IV, at(30)),
             Wake {
@@ -572,9 +663,15 @@ mod tests {
         offer(&mut out, p, Some(&a), 0);
         assert_eq!(offer(&mut out, p, Some(&route(2)), 5), Step::Hold(Tick(30)));
         assert_eq!(offer(&mut out, p, Some(&a), 6), Step::Quiet);
+        // Still held, with the interval end it has: a change back within
+        // it waits for the same end, without a new wake-up...
+        assert_eq!(out.held(), 1);
+        assert_eq!(offer(&mut out, p, Some(&route(3)), 7), Step::Quiet);
+        assert_eq!(offer(&mut out, p, Some(&a), 8), Step::Quiet);
+        // ... and the release finds nothing to send.
+        assert!(out.wake(p, IV, at(30)).release);
+        assert_eq!(release(&mut out, p, Some(&a), 30), Step::Quiet);
         assert_eq!(out.held(), 0);
-        // The stale wake-up finds nothing to do.
-        assert_eq!(out.wake(p, IV, at(30)), Wake::default());
     }
 
     #[test]
@@ -595,15 +692,149 @@ mod tests {
         assert_eq!(offer(&mut out, p, None, 2), Step::Quiet);
         // The route comes back: still paced from the advertisement at 0.
         assert_eq!(offer(&mut out, p, Some(&a), 3), Step::Hold(Tick(30)));
-        // And goes again before the interval ends: nothing is left to
-        // advertise, and nothing was sent.
+        // And goes again before the interval ends: nothing is sent, and
+        // it stays held, so that coming back once more waits for the
+        // same end.
         assert_eq!(offer(&mut out, p, None, 4), Step::Quiet);
-        assert_eq!(out.held(), 0);
-        // The remembered time is dropped when the interval is over.
-        assert_eq!(out.wake(p, IV, at(30)), Wake::default());
+        assert_eq!(out.held(), 1);
+        assert_eq!(offer(&mut out, p, Some(&a), 5), Step::Quiet);
+        assert_eq!(offer(&mut out, p, None, 6), Step::Quiet);
+        // At the end the release has nothing to send, and the remembered
+        // time is dropped.
+        assert_eq!(
+            out.wake(p, IV, at(30)),
+            Wake {
+                release: true,
+                again: None
+            }
+        );
+        assert_eq!(release(&mut out, p, None, 30), Step::Quiet);
         assert_eq!(out.withdrawn.len(), 0);
         // After that the route is new again.
         assert_eq!(offer(&mut out, p, Some(&a), 31), Step::Announce(a));
+    }
+
+    #[test]
+    fn one_wake_up_is_queued_per_destination() {
+        let mut out = AdjRibOut::default();
+        let (p, q) = (pfx("192.0.2.0/24"), pfx("198.51.100.0/24"));
+        assert!(out.queue(p, Tick(30)));
+        // One for then or earlier is queued already.
+        assert!(!out.queue(p, Tick(30)));
+        assert!(!out.queue(p, Tick(40)));
+        // An earlier one replaces it; the replaced one is ignored.
+        assert!(out.queue(p, Tick(20)));
+        assert!(out.queue(q, Tick(40)));
+        assert!(!out.fired(p, Tick(30)));
+        assert!(out.fired(p, Tick(20)));
+        assert!(!out.fired(p, Tick(20)));
+        assert!(out.fired(q, Tick(40)));
+        assert_eq!(out.remembered(), 0);
+    }
+
+    /// [`offer`] as the RIB makes it: its wake-up queued if needed.
+    fn offer_queued(
+        out: &mut AdjRibOut,
+        p: Prefix,
+        desired: Option<&Arc<PathAttrs>>,
+        secs: u32,
+    ) -> Step {
+        let step = offer(out, p, desired, secs);
+        if let Step::Hold(at)
+        | Step::Withdraw {
+            forget: Some(at), ..
+        } = step
+        {
+            out.queue(p, at);
+        }
+        step
+    }
+
+    #[test]
+    fn waiting_destinations_are_bounded_by_the_adj_rib_out() {
+        // A peer that has one route at a time, while ever new destinations
+        // come and go: pacing remembers at most MIN_WAITING of them.
+        let mut out = AdjRibOut::default();
+        let a = route(1);
+        let prefixes: Vec<Prefix> = (0..u32::try_from(MIN_WAITING).unwrap() + 10)
+            .map(|i| pfx(&format!("10.{}.{}.0/24", i >> 8, i & 0xff)))
+            .collect();
+        for (i, &p) in prefixes.iter().enumerate() {
+            assert_eq!(offer(&mut out, p, Some(&a), 0), Step::Announce(a.clone()));
+            let step = offer_queued(&mut out, p, None, 0);
+            let remembered = i < MIN_WAITING;
+            assert_eq!(
+                step,
+                Step::Withdraw {
+                    forget: remembered.then_some(Tick(30))
+                },
+                "{i}"
+            );
+        }
+        assert_eq!(out.withdrawn.len(), MIN_WAITING);
+        // A remembered one coming back waits; one past the bound goes out.
+        let (first, last) = (prefixes[0], prefixes[prefixes.len() - 1]);
+        assert_eq!(
+            offer_queued(&mut out, first, Some(&a), 1),
+            Step::Hold(Tick(30))
+        );
+        assert_eq!(
+            offer(&mut out, last, Some(&a), 1),
+            Step::Announce(a.clone())
+        );
+        // A change to it goes out at once too: nothing more may wait.
+        assert_eq!(
+            offer(&mut out, last, Some(&route(2)), 2),
+            Step::Announce(route(2))
+        );
+        // When the interval is over, everything is forgotten and the
+        // memory given back.
+        for &p in &prefixes {
+            if out.fired(p, Tick(30)) {
+                let w = out.wake(p, IV, at(30));
+                assert_eq!(w.again, None);
+                if w.release {
+                    release(&mut out, p, Some(&a), 30);
+                }
+            }
+        }
+        out.compact();
+        assert_eq!(out.remembered(), 0);
+        assert!(
+            out.withdrawn.capacity() < MIN_WAITING,
+            "{}",
+            out.withdrawn.capacity()
+        );
+        assert!(
+            out.wakeups.capacity() < MIN_WAITING,
+            "{}",
+            out.wakeups.capacity()
+        );
+    }
+
+    #[test]
+    fn a_full_adj_rib_out_may_have_all_its_destinations_wait() {
+        // The bound follows the most routes the Adj-RIB-Out held: a table
+        // larger than MIN_WAITING withdrawn at once is remembered whole.
+        let mut out = AdjRibOut::default();
+        let a = route(1);
+        let n = u32::try_from(MIN_WAITING).unwrap() * 2;
+        let prefixes: Vec<Prefix> = (0..n)
+            .map(|i| pfx(&format!("10.{}.{}.0/24", i >> 8, i & 0xff)))
+            .collect();
+        for &p in &prefixes {
+            offer(&mut out, p, Some(&a), 0);
+        }
+        for &p in &prefixes {
+            let step = offer_queued(&mut out, p, None, 1);
+            assert_eq!(
+                step,
+                Step::Withdraw {
+                    forget: Some(Tick(30))
+                }
+            );
+        }
+        assert_eq!(out.withdrawn.len(), prefixes.len());
     }
 
     #[test]

@@ -1868,3 +1868,95 @@ fn mrai_churn_at_scale_is_released_once_and_packed() {
     assert_eq!(rib.deadlines.len(), 0);
     assert_eq!(rib.next_deadline(), None);
 }
+
+#[test]
+fn mrai_wake_ups_stay_one_per_destination_however_it_flaps() {
+    // A destination that changes and changes back, or is withdrawn and
+    // announced again, many times inside one interval: the queue holds a
+    // bounded number of wake-ups for it, not one per flap, and what is
+    // sent is still paced (AGENTS.md §3: memory must not grow with churn).
+    const FLAPS: u64 = 5_000;
+    let t0 = Instant::now();
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = paced("10.0.0.2", 65_002, 2, EBGP_IV);
+    rib.peer_up(e1.clone(), t0);
+    rib.peer_up(e2.clone(), t0);
+    let dst = p("192.0.2.0/24");
+    let a = attrs(&[65_001], "10.0.0.1");
+    let b = attrs(&[65_001, 7], "10.0.0.1");
+    let first = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), t0);
+    assert_eq!(sent_for(&first, &e2, dst).len(), 1);
+    let mut sent = 0;
+    for i in 0..FLAPS {
+        let at = t0 + Duration::from_millis(i);
+        // A change and its revert, then a withdrawal and the route back.
+        for d in [
+            announce(&["192.0.2.0/24"], &b),
+            announce(&["192.0.2.0/24"], &a),
+            withdraw(&["192.0.2.0/24"]),
+            announce(&["192.0.2.0/24"], &a),
+        ] {
+            sent += sent_for(&rib.update(e1.addr, &d, at), &e2, dst).len();
+        }
+    }
+    // One withdrawal went out; every re-announcement waits.
+    assert_eq!(sent, 1);
+    assert!(rib.deadlines.len() <= 2, "{} wake-ups", rib.deadlines.len());
+    // The interval ends: the route goes out once, and the queue empties.
+    let out = rib.flush(secs(t0, 31));
+    assert_eq!(
+        sent_for(&out, &e2, dst),
+        vec![Some(vec![LOCAL_AS, Asn(65_001)])]
+    );
+    let out = rib.flush(secs(t0, 61));
+    assert_eq!(sent_for(&out, &e2, dst), vec![]);
+    assert_eq!(rib.deadlines.len(), 0);
+}
+
+#[test]
+fn mrai_state_stays_bounded_under_churn_of_new_destinations() {
+    // Ever new destinations, each announced and withdrawn inside one
+    // interval, while the peer never has more than one: what pacing
+    // remembers stays within a bound, and is given back afterwards.
+    const N: u32 = 20_000;
+    let t0 = Instant::now();
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = paced("10.0.0.2", 65_002, 2, EBGP_IV);
+    rib.peer_up(e1.clone(), t0);
+    rib.peer_up(e2.clone(), t0);
+    let a = attrs(&[65_001], "10.0.0.1");
+    for i in 0..N {
+        let prefix = format!("10.{}.{}.0/24", i >> 8, i & 0xff);
+        let out = rib.update(e1.addr, &announce(&[&prefix], &a), t0);
+        assert_eq!(sent_for(&out, &e2, p(&prefix)).len(), 1);
+        let out = rib.update(e1.addr, &withdraw(&[&prefix]), t0);
+        assert_eq!(sent_for(&out, &e2, p(&prefix)), vec![None]);
+    }
+    let cap = crate::pacing::MIN_WAITING;
+    assert!(
+        rib.deadlines.len() <= cap,
+        "{} wake-ups",
+        rib.deadlines.len()
+    );
+    let adj = &rib.peers[&e2.addr].adj_out[&V4];
+    assert!(
+        adj.remembered() <= 3 * cap,
+        "{} remembered",
+        adj.remembered()
+    );
+    // Remembered ones are still paced: the first comes back, and waits.
+    let out = rib.update(e1.addr, &announce(&["10.0.0.0/24"], &a), t0);
+    assert_eq!(sent_for(&out, &e2, p("10.0.0.0/24")), vec![]);
+    // When the interval is over everything is forgotten and given back.
+    rib.flush(secs(t0, 31));
+    assert_eq!(rib.deadlines.len(), 0);
+    assert!(
+        rib.deadlines.capacity() <= 4 * cap,
+        "{}",
+        rib.deadlines.capacity()
+    );
+    let adj = &rib.peers[&e2.addr].adj_out[&V4];
+    assert_eq!(adj.remembered(), 0);
+}

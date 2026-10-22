@@ -176,7 +176,10 @@ inside the interval are held, and when it ends only the latest route goes
 out, so a flapping route is advertised at most once per interval. The
 first advertisement of a prefix is never held, and withdrawals are always
 sent at once (RFC 4271 applies the interval to withdrawals too; bgpfc does
-not, because holding a withdrawal back prolongs a blackhole). Without the
+not, because holding a withdrawal back prolongs a blackhole). So that
+memory follows the routes rather than their churn, at most as many prefixes
+may be held at once as the neighbor was ever sent routes, or 1024 if that
+is more; past that, a change goes out at once. Without the
 statement the interval is the RFC 4271 §10 default for the session: 30
 seconds for an external neighbor, 5 for an internal one. `0` sends every
 change at once. `allow-as-set yes` accepts `AS_SET` in received
