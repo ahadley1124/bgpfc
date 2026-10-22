@@ -200,7 +200,7 @@ impl Rpki {
         old: &ast::Rpki,
         new: &ast::Rpki,
     ) -> Result<&'static str, String> {
-        if old == new {
+        if old.same_as(new) {
             return Ok("rpki unchanged");
         }
         let ran = self.client.is_some();
@@ -540,6 +540,34 @@ mod tests {
         assert_eq!(
             cache.listener.accept().map_err(|e| e.kind()).err(),
             Some(ErrorKind::WouldBlock)
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(rpki.status().is_some_and(|s| s.connected));
+        rpki.stop();
+    }
+
+    #[test]
+    fn a_respelled_cache_leaves_the_client_alone() {
+        // The parser takes a name in another case, or with its final dot,
+        // for the same cache; so does a reload.
+        let cache = StubCache::new();
+        let named = |host: &str| {
+            config(&format!(
+                "rpki {{ mode external; cache {host} port {}; }}",
+                cache.port()
+            ))
+        };
+        let (old, new) = (named("localhost"), named("LocalHost."));
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&old.rpki, old.router_id, tx).unwrap();
+        let _conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
+        assert_eq!(rpki.reconfigure(&old.rpki, &new.rpki), Ok("rpki unchanged"));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            cache.listener.accept().map_err(|e| e.kind()).err(),
+            Some(ErrorKind::WouldBlock),
+            "no new connection"
         );
         assert!(rx.try_recv().is_err());
         assert!(rpki.status().is_some_and(|s| s.connected));

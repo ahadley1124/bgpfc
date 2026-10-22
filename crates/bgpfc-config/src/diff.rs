@@ -51,7 +51,10 @@ pub enum GlobalChange {
     /// The `control` block.
     Control,
     /// The `rpki` block, an absent one counting as `mode disabled` with
-    /// the defaults: the RTR client starts, stops or restarts.
+    /// the defaults: the RTR client starts, stops or restarts. A block
+    /// that only spells something differently, such as a default written
+    /// out or a cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)),
+    /// is no change.
     Rpki,
 }
 
@@ -67,7 +70,7 @@ impl ConfigDiff {
             (old.fib != new.fib, GlobalChange::Fib),
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
-            (old.rpki != new.rpki, GlobalChange::Rpki),
+            (!old.rpki.same_as(&new.rpki), GlobalChange::Rpki),
         ] {
             if changed {
                 d.global.push(what);
@@ -342,6 +345,31 @@ mod tests {
             assert!(
                 ConfigDiff::between(&external, &with(same)).is_empty(),
                 "{same}"
+            );
+        }
+        // Nor is respelling a cache as the parser reads it: the same
+        // address, or the same name in another case or with its final dot.
+        let named = with("rpki { mode external; cache rtr.example.net; cache 2001:db8::1; }");
+        for same in [
+            "rpki { mode external; cache RTR.Example.NET; cache 2001:db8::1; }",
+            "rpki { mode external; cache rtr.example.net.; cache 2001:0db8:0::1; }",
+            "rpki { mode external; cache rtr.example.net port 323; cache 2001:db8::1; }",
+        ] {
+            assert!(
+                ConfigDiff::between(&named, &with(same)).is_empty(),
+                "{same}"
+            );
+        }
+        for other in [
+            "rpki { mode external; cache rtr.example.org; cache 2001:db8::1; }",
+            "rpki { mode external; cache rtr.example.net; cache 2001:db8::2; }",
+            "rpki { mode external; cache rtr.example.net port 3323; cache 2001:db8::1; }",
+            "rpki { mode external; cache 2001:db8::1; cache rtr.example.net; }",
+        ] {
+            assert_eq!(
+                ConfigDiff::between(&named, &with(other)).global,
+                vec![GlobalChange::Rpki],
+                "{other}"
             );
         }
         let moved = cfg(&format!(

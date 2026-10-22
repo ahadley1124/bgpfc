@@ -976,18 +976,10 @@ fn is_host(host: &str) -> bool {
             .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether two `cache` statements name the same cache: the same port, and
-/// the same address, or the same name whatever its case or final dot.
+/// Whether two `cache` statements name the same cache: see
+/// [`RpkiCache::is_at`].
 fn same_cache(a: &RpkiCache, b: &RpkiCache) -> bool {
-    let key = |c: &RpkiCache| match c.host.parse::<IpAddr>() {
-        Ok(ip) => ip.to_string(),
-        Err(_) => c
-            .host
-            .strip_suffix('.')
-            .unwrap_or(&c.host)
-            .to_ascii_lowercase(),
-    };
-    a.port == b.port && key(a) == key(b)
+    a.is_at(&b.host, b.port)
 }
 
 /// The statements of the `rpki` block, each at most once but `cache`.

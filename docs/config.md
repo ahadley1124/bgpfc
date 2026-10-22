@@ -368,9 +368,10 @@ VRPs the old client had stay in use until a cache of the new list has sent
 a full set, which then validates again only the routes it judges
 differently, or until they expire (RFC 8210 §10, §6). A change to `mode
 disabled` stops the client and makes every route `disabled` again. A block
-that differs only in spelling, such as a default written out, leaves the
-running client alone, and a new cache whose name does not resolve fails the
-reload as it fails the start.
+that differs only in spelling, such as a default written out or a cache
+written another way that names the same cache (see `cache` above), leaves
+the running client alone, and a new cache whose name does not resolve fails
+the reload as it fails the start.
 
 ## Command line
 

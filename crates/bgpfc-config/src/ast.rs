@@ -187,6 +187,43 @@ impl Rpki {
     pub const MAX_BACKOFF: Duration = Duration::from_hours(2);
 }
 
+impl Rpki {
+    /// Whether `other` asks for what `self` does: every setting the same,
+    /// and the same caches in the same order with the same preferences,
+    /// each host however it is spelled (see [`RpkiCache::is_at`]). A
+    /// reload leaves the RTR client alone unless this is false.
+    #[must_use]
+    pub fn same_as(&self, other: &Rpki) -> bool {
+        // Destructured, so that a new setting cannot be left out.
+        let Rpki {
+            mode,
+            caches,
+            version,
+            connect_timeout,
+            response_timeout,
+            reply_timeout,
+            max_expire,
+            max_vrps,
+            backoff_min,
+            backoff_max,
+        } = self;
+        *mode == other.mode
+            && caches.len() == other.caches.len()
+            && caches
+                .iter()
+                .zip(&other.caches)
+                .all(|(a, b)| a.preference == b.preference && a.is_at(&b.host, b.port))
+            && *version == other.version
+            && *connect_timeout == other.connect_timeout
+            && *response_timeout == other.response_timeout
+            && *reply_timeout == other.reply_timeout
+            && *max_expire == other.max_expire
+            && *max_vrps == other.max_vrps
+            && *backoff_min == other.backoff_min
+            && *backoff_max == other.backoff_max
+    }
+}
+
 impl Default for Rpki {
     /// No `rpki` block: disabled.
     fn default() -> Rpki {
@@ -235,6 +272,29 @@ pub struct RpkiCache {
     /// `preference`: "the lower the value, the more preferred"; 0 unless
     /// given.
     pub preference: u32,
+}
+
+impl RpkiCache {
+    /// Whether `host` on `port` names this cache: the same port, and the
+    /// same address however it is written (`2001:db8::1`,
+    /// `2001:0db8::1`), or the same name in any case, with or without its
+    /// final dot (RFC 4343 §3: a name lookup matches ASCII letters without
+    /// regard to case). Two `cache` statements for one cache are an
+    /// error, a reload that only respells a cache leaves the RTR client
+    /// alone, and the control plane finds the cache the client uses by it.
+    #[must_use]
+    pub fn is_at(&self, host: &str, port: u16) -> bool {
+        self.port == port && host_key(&self.host) == host_key(host)
+    }
+}
+
+/// What tells hosts apart: an address in its canonical text form, or a
+/// name in lower case without its final dot.
+fn host_key(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase(),
+    }
 }
 
 impl std::fmt::Display for RpkiCache {
