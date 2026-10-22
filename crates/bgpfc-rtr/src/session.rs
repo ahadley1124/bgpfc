@@ -455,6 +455,9 @@ pub struct Session {
     /// The shell's delay after a failure, in place of the Retry Interval
     /// (see [`Session::set_retry_delay`]).
     retry_delay: Option<Duration>,
+    /// What the router serves until the first commit: VRPs held from
+    /// elsewhere, and when they expire (see [`Session::set_held`]).
+    held: (usize, Option<Instant>),
 }
 
 impl Session {
@@ -492,6 +495,7 @@ impl Session {
             reply_deadline: None,
             notified: None,
             retry_delay: None,
+            held: (0, None),
         }
     }
 
@@ -508,6 +512,19 @@ impl Session {
     /// connection keep the cache's Refresh Interval.
     pub fn set_retry_delay(&mut self, delay: Option<Duration>) {
         self.retry_delay = delay;
+    }
+
+    /// Tell the session what the router validates with until the session
+    /// first commits: `vrps` VRPs held over from another cache, or from an
+    /// earlier client, which expire at `expires_at` (RFC 8210 §10, §6).
+    ///
+    /// The session's log lines about stale data give them as
+    /// `serving_vrps` and `expires_in`, so that the lines tell what the
+    /// router serves meanwhile, rather than that it serves nothing; once
+    /// the session has committed, they give its own data. 0 and `None`,
+    /// the default, for a router that holds nothing.
+    pub fn set_held(&mut self, vrps: usize, expires_at: Option<Instant>) {
+        self.held = (vrps, expires_at);
     }
 
     /// The configuration, as clamped by [`Session::new`].
@@ -1508,10 +1525,15 @@ impl Session {
         log(out, level, message, fields);
     }
 
+    /// What the router serves, and for how long: the session's data, or
+    /// before its first commit what the shell holds from elsewhere.
     fn stale_fields(&self, now: Instant) -> Vec<(&'static str, String)> {
-        let vrps = self.committed.as_ref().map_or(0, |c| c.len());
+        let (vrps, expires_at) = match &self.committed {
+            Some(committed) => (committed.len(), self.expire_at),
+            None => self.held,
+        };
         let mut fields = vec![field("serving_vrps", vrps)];
-        if let Some(at) = self.expire_at {
+        if let Some(at) = expires_at {
             fields.push(field("expires_in", Secs(at.saturating_duration_since(now))));
         }
         fields

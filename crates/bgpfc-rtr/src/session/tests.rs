@@ -1811,6 +1811,55 @@ fn stale_data_is_served_until_it_expires() {
 }
 
 #[test]
+fn stale_lines_tell_the_held_data_until_the_first_commit() {
+    // A shell that moved to this cache serves another cache's data until
+    // this one sends a full set (RFC 8210 §10): 5 VRPs, for 3000 s more.
+    let mut h = H::new();
+    h.s.set_held(5, Some(h.secs(3_000)));
+    assert_eq!(tags(&h.wait(0)), ["connect"]);
+    h.now += Duration::from_secs(100);
+    let actions = h.step(Event::Disconnected);
+    assert!(
+        logs(&actions).iter().any(|l| l.level == Level::Warn
+            && field_of(l, "serving_vrps") == Some("5")
+            && field_of(l, "expires_in") == Some("2900s")),
+        "{actions:?}"
+    );
+    // No Data Available says the same.
+    assert_eq!(tags(&h.wait(600)), ["connect"]);
+    assert_eq!(tags(&h.step(Event::Connected)), ["reset-query v1"]);
+    let actions = h.pdu(report(V1, ErrorCode::NoDataAvailable));
+    assert!(
+        logs(&actions)
+            .iter()
+            .any(|l| field_of(l, "serving_vrps") == Some("5")
+                && field_of(l, "expires_in") == Some("2300s")),
+        "{actions:?}"
+    );
+    // Once the session has data of its own, its lines tell that.
+    assert_eq!(tags(&h.wait(600)), ["reset-query v1"]);
+    let actions = h.pdus(&[response(V1, SID), announce(V1, a()), eod(SID, 1)]);
+    assert_eq!(tags(&actions), ["commit 1 all"]);
+    let actions = h.step(Event::Disconnected);
+    assert!(
+        logs(&actions).iter().any(|l| l.level == Level::Warn
+            && field_of(l, "serving_vrps") == Some("1")
+            && field_of(l, "expires_in") == Some("7200s")),
+        "{actions:?}"
+    );
+    // Without anything held, as before: nothing served, no expiry.
+    let mut h = H::new();
+    assert_eq!(tags(&h.wait(0)), ["connect"]);
+    let actions = h.step(Event::Disconnected);
+    assert!(
+        logs(&actions).iter().any(
+            |l| field_of(l, "serving_vrps") == Some("0") && field_of(l, "expires_in").is_none()
+        ),
+        "{actions:?}"
+    );
+}
+
+#[test]
 fn data_expires_while_the_cache_has_none() {
     let mut h = querying_serial();
     h.pdu(report(V1, ErrorCode::NoDataAvailable));

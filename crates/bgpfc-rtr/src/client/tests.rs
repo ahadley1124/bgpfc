@@ -956,6 +956,52 @@ mod net {
     }
 
     #[test]
+    fn warnings_tell_the_data_a_new_client_holds() {
+        // An earlier client's data, which the RIB still uses (RFC 8210
+        // §10), and a cache that refuses the connection: the warning says
+        // what is served, and for how long.
+        let gone = TestCache::new().entry(0);
+        let held = Held {
+            vrps: Arc::new(set(&[a(), b()])),
+            expires_at: Some(Instant::now() + 3_600 * SEC),
+        };
+        let (tx, _rx): (Sender<ValidationChange>, _) = mpsc::channel();
+        let client = Client::start_holding(config(vec![gone]), tx, Some(held)).unwrap();
+        eventually("a failed attempt", || client.status().failures > 0);
+        let error = client.status().last_error.unwrap();
+        assert!(
+            error.starts_with("rtr cache connection failed cache=127.0.0.1:"),
+            "{error}"
+        );
+        assert!(error.contains(" serving_vrps=2 expires_in=35"), "{error}");
+    }
+
+    #[test]
+    fn warnings_tell_the_data_held_from_the_previous_cache() {
+        let first = TestCache::new();
+        let second = TestCache::new().entry(1);
+        let (client, rx) = start(vec![first.entry(0), second.clone()]);
+        let mut router = first.accept();
+        router.serve_reset(SID, 1, &[a(), b()]);
+        next_change(&rx);
+        eventually("in sync", || client.status().synced_at.is_some());
+        // The first cache goes away, takes the next connection and drops it
+        // before answering: the client moves on to the second, which
+        // refuses. Its warning tells the first cache's data, still in use.
+        drop(router);
+        drop(first.accept());
+        let refused = format!("rtr cache connection failed cache={second} ");
+        eventually("the second cache refused", || {
+            client
+                .status()
+                .last_error
+                .is_some_and(|e| e.starts_with(&refused))
+        });
+        let error = client.status().last_error.unwrap();
+        assert!(error.contains(" serving_vrps=2 expires_in=59"), "{error}");
+    }
+
+    #[test]
     fn a_client_that_never_published_hands_nothing_over() {
         let cache = TestCache::new();
         let (mut client, _rx) = start(vec![cache.entry(0)]);

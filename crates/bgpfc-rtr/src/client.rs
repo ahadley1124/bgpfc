@@ -752,7 +752,28 @@ impl<S: ValidationSink> Worker<S> {
         self.counts = count(&held.vrps);
         self.published = Some(held.vrps);
         self.held_expires = held.expires_at;
+        self.tell_held();
         self.publish_status(true);
+    }
+
+    /// Tell a session that has not committed yet what the RIB validates
+    /// with meanwhile, for its lines about stale data.
+    fn tell_held(&mut self) {
+        if self.fresh_session {
+            let vrps = self.published.as_ref().map_or(0, |v| v.len());
+            self.session.set_held(vrps, self.held_expires);
+        }
+    }
+
+    /// When the data the RIB validates with expires: that of the session
+    /// once it has committed, and until then what the client holds from
+    /// elsewhere.
+    fn expires_at(&self) -> Option<Instant> {
+        if self.fresh_session {
+            self.held_expires
+        } else {
+            self.session.expires_at()
+        }
     }
 
     fn cache(&self) -> &Cache {
@@ -1027,13 +1048,16 @@ impl<S: ValidationSink> Worker<S> {
         self.failures = failures;
         if was_in_sync && self.down_since.is_none() {
             self.down_since = Some(now);
-            let fields = vec![
-                field(
-                    "serving_vrps",
-                    self.published.as_ref().map_or(0, |v| v.len()),
-                ),
-                field("reconnect_in", Millis(delay)),
-            ];
+            let mut fields = vec![field(
+                "serving_vrps",
+                self.published.as_ref().map_or(0, |v| v.len()),
+            )];
+            if let Some(at) = self.expires_at() {
+                // Whole seconds, as the session's lines give it.
+                let secs = at.saturating_duration_since(now).as_secs();
+                fields.push(field("expires_in", format_args!("{secs}s")));
+            }
+            fields.push(field("reconnect_in", Millis(delay)));
             self.shell_log(
                 Level::Warn,
                 "rtr lost the cache; serving the last data while reconnecting",
@@ -1068,6 +1092,7 @@ impl<S: ValidationSink> Worker<S> {
         self.current = next;
         self.session = Session::new(self.session_config, connect_at);
         self.fresh_session = true;
+        self.tell_held();
         let fields = vec![
             field("preference", self.cache().preference),
             field("in", Millis(connect_at.saturating_duration_since(now))),
@@ -1187,6 +1212,7 @@ impl<S: ValidationSink> Worker<S> {
         let empty = Arc::new(VrpSet::new());
         let affected = AffectedPrefixes::between(&old, &empty);
         self.send_change(empty, affected, now);
+        self.tell_held();
     }
 
     fn send_change(&mut self, vrps: Arc<VrpSet>, affected: AffectedPrefixes, now: Instant) {
@@ -1251,7 +1277,6 @@ impl<S: ValidationSink> Worker<S> {
     }
 
     fn publish_status(&self, running: bool) {
-        let fresh = self.fresh_session;
         let status = Status {
             cache: self.cache().clone(),
             state: self.session.state(),
@@ -1261,13 +1286,7 @@ impl<S: ValidationSink> Worker<S> {
             serial: self.session.serial(),
             synced_at: self.session.synced_at(),
             last_commit: self.last_commit,
-            // The published data comes from the session once it has
-            // committed, and from an earlier one until then.
-            expires_at: if fresh {
-                self.held_expires
-            } else {
-                self.session.expires_at()
-            },
+            expires_at: self.expires_at(),
             vrps: self.published.clone(),
             vrps_ipv4: self.counts.0,
             vrps_ipv6: self.counts.1,
