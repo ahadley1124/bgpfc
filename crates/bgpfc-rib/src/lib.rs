@@ -8,7 +8,9 @@
 //! (overlapping routes are independent destinations), §9.2 (update
 //! generation), §9.2.1.1 (`MinRouteAdvertisementIntervalTimer`, see
 //! [`pacing`]), §9.3 (Loc-RIB changes are reported for the FIB), §6.3
-//! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's);
+//! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's),
+//! §6.3 a) (a route whose next hop is our own address is ignored, see
+//! [`Output::InvalidNextHop`]);
 //! RFC 4760 §3, §5, §7 (each NLRI field with its own next hop, per-family
 //! RIBs, family disable); RFC 2918 §4 (route refresh re-sends the
 //! Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6 next hop, see
@@ -34,6 +36,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
@@ -136,6 +139,19 @@ pub enum Output {
         family: AddressFamily,
         /// The limit.
         limit: u32,
+    },
+    /// Routes ignored because their next hop is semantically incorrect
+    /// (RFC 4271 §6.3): our own address on the session. The caller logs
+    /// them; no NOTIFICATION is sent and the session stays up.
+    InvalidNextHop {
+        /// The peer that sent them.
+        peer: IpAddr,
+        /// Their family.
+        family: AddressFamily,
+        /// The next hop they came with.
+        next_hop: NextHop,
+        /// The routes.
+        prefixes: Vec<Prefix>,
     },
 }
 
@@ -570,7 +586,9 @@ impl Rib {
 
     /// An UPDATE from `addr`: apply its withdrawals and announcements to
     /// the Adj-RIB-In, rerun the decision process for the destinations
-    /// touched, and produce the FIB changes and UPDATEs that follow.
+    /// touched, and produce the FIB changes and UPDATEs that follow, after
+    /// an [`Output::InvalidNextHop`] for each part of the UPDATE whose
+    /// routes were ignored.
     pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate, now: Instant) -> Vec<Output> {
         let Some(state) = self.peers.get(&addr) else {
             return Vec::new();
@@ -582,18 +600,32 @@ impl Rib {
             if disabled.contains(&family) {
                 continue;
             }
-            if let Some(dest) = self
-                .tables
-                .get_mut(&family)
-                .and_then(|t| t.get_mut(&prefix))
-                && remove_candidate(dest, addr)
-            {
-                self.count(addr, family, -1);
-                dirty.push((family, prefix));
-            }
+            self.remove_route(addr, family, prefix, &mut dirty);
         }
+        let mut ignored = Vec::new();
         for (family, next_hop, prefixes) in attrs::announced(update) {
             if disabled.contains(&family) {
+                continue;
+            }
+            // RFC 4271 §6.3 a): a next hop that is the receiving speaker's
+            // own address is semantically incorrect, and RFC 4760 §3 holds
+            // MP_REACH_NLRI next hops to the same rule. "The error SHOULD
+            // be logged, and the route SHOULD be ignored", with no
+            // NOTIFICATION: the caller logs the output. Ignored like a
+            // route import policy rejects, so one the peer sent before for
+            // the prefix goes too; the new announcement replaced it, and
+            // keeping it would keep what the peer no longer advertises
+            // (RFC 7606 §6 on discarding UPDATEs).
+            if info.is_own_address(&next_hop) {
+                for &prefix in prefixes {
+                    self.remove_route(addr, family, prefix, &mut dirty);
+                }
+                ignored.push(Output::InvalidNextHop {
+                    peer: addr,
+                    family,
+                    next_hop,
+                    prefixes: prefixes.to_vec(),
+                });
                 continue;
             }
             let attrs = self
@@ -614,11 +646,34 @@ impl Rib {
                 if let Some(limit) = limit
                     && self.received(addr, family) > u64::from(limit)
                 {
-                    return self.prefix_limit_exceeded(addr, family, limit, dirty, now);
+                    let mut out = self.prefix_limit_exceeded(addr, family, limit, dirty, now);
+                    out.append(&mut ignored);
+                    return out;
                 }
             }
         }
-        self.reconsider(&dirty, now)
+        ignored.extend(self.reconsider(&dirty, now));
+        ignored
+    }
+
+    /// Drop the route `addr` sent for `prefix`, if any; `dirty` gets the
+    /// destination when there was one.
+    fn remove_route(
+        &mut self,
+        addr: IpAddr,
+        family: AddressFamily,
+        prefix: Prefix,
+        dirty: &mut Vec<(AddressFamily, Prefix)>,
+    ) {
+        if let Some(dest) = self
+            .tables
+            .get_mut(&family)
+            .and_then(|t| t.get_mut(&prefix))
+            && remove_candidate(dest, addr)
+        {
+            self.count(addr, family, -1);
+            dirty.push((family, prefix));
+        }
     }
 
     /// Routes of `family` from `addr` in the Adj-RIB-In.
@@ -656,15 +711,7 @@ impl Rib {
             }
         };
         let Some(attrs) = accepted else {
-            if let Some(dest) = self
-                .tables
-                .get_mut(&family)
-                .and_then(|t| t.get_mut(&prefix))
-                && remove_candidate(dest, addr)
-            {
-                self.count(addr, family, -1);
-                dirty.push((family, prefix));
-            }
+            self.remove_route(addr, family, prefix, dirty);
             return;
         };
         let dest = self

@@ -2,7 +2,7 @@
 //!
 //! Implements: RFC 4760 §8 (negotiated families); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
-//! per-family prefix limit).
+//! per-family prefix limit), §6.3 a) (our own address is no next hop).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -74,6 +74,21 @@ impl PeerInfo {
             .iter()
             .find(|(f, _)| *f == family)
             .map(|(_, l)| *l)
+    }
+
+    /// Whether `next_hop` is our own address on this session, which RFC
+    /// 4271 §6.3 a) makes semantically incorrect in a route received over
+    /// it. What counts is where traffic would go: the global address of an
+    /// IPv6 next hop (RFC 2545 §3). Compared in canonical form, so that an
+    /// IPv4-mapped IPv6 next hop (RFC 4291 §2.5.5.2) holding our IPv4
+    /// address is ours too.
+    #[must_use]
+    pub fn is_own_address(&self, next_hop: &NextHop) -> bool {
+        let addr = match next_hop {
+            NextHop::Ipv4(a) => IpAddr::V4(*a),
+            NextHop::Ipv6 { global, .. } => IpAddr::V6(*global),
+        };
+        addr.to_canonical() == self.local_addr.to_canonical()
     }
 
     /// Whether a route of `family` may go to this peer with `next_hop`:

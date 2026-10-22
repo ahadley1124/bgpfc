@@ -716,6 +716,130 @@ fn leftmost_as_must_be_the_external_peer() {
 }
 
 #[test]
+fn a_next_hop_that_is_our_own_address_is_ignored() {
+    // RFC 4271 §6.3 a): semantically incorrect, so the route is ignored and
+    // reported for the log, with no NOTIFICATION. Our address on e1's
+    // session is 10.0.0.254.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let dst = p("192.0.2.0/24");
+    rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+        now(),
+    );
+    assert_eq!(rib.loc_rib(V4).count(), 1);
+    // The destination again, via our own address: the route e1 had goes
+    // too, since the new announcement replaced it.
+    let own = attrs(&[65_001], "10.0.0.254");
+    let out = rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &own),
+        now(),
+    );
+    assert_eq!(
+        out[0],
+        Output::InvalidNextHop {
+            peer: e1.addr,
+            family: V4,
+            next_hop: NextHop::Ipv4(Ipv4Addr::new(10, 0, 0, 254)),
+            prefixes: vec![dst, p("198.51.100.0/24")],
+        }
+    );
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: dst,
+            next_hop: None
+        }]
+    );
+    assert_eq!(
+        decode_sent(sends(&out, e2.addr)[0], &e2)[0].withdrawn,
+        vec![dst]
+    );
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 0), (V6, 0)]
+    );
+    // The session goes on, and the peer's next good route is taken.
+    let out = rib.update(
+        e1.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+        now(),
+    );
+    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+}
+
+#[test]
+fn own_address_next_hops_per_part_family_and_limit() {
+    // RFC 4760 §3: the RFC 4271 §6.3 a) rule holds for MP_REACH_NLRI next
+    // hops, an IPv4-mapped one included, and each part of an UPDATE is
+    // judged by its own next hop.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    rib.peer_up(e1.clone(), now());
+    let own = attrs(&[65_001], "10.0.0.254");
+    let mut d = announce(&["203.0.113.0/24"], &own);
+    d.message.mp_reach = Some(bgpfc_wire::mp::MpReach {
+        family: V6,
+        next_hop: NextHop::Ipv6 {
+            global: "::ffff:10.0.0.254".parse().unwrap(),
+            link_local: None,
+        },
+        nlri: vec![p("2001:db8:1::/48")],
+    });
+    let out = rib.update(e1.addr, &d, now());
+    let ignored: Vec<_> = out
+        .iter()
+        .filter_map(|o| match o {
+            Output::InvalidNextHop {
+                family, prefixes, ..
+            } => Some((*family, prefixes.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored,
+        vec![
+            (V4, vec![p("203.0.113.0/24")]),
+            (V6, vec![p("2001:db8:1::/48")])
+        ]
+    );
+    assert_eq!(fib(&out), vec![]);
+    if let Some(r) = &mut d.message.mp_reach {
+        r.next_hop = v6_next_hop("2001:db8::1", "fe80::1");
+    }
+    let out = rib.update(e1.addr, &d, now());
+    assert!(matches!(out[0], Output::InvalidNextHop { family: V4, .. }));
+    assert_eq!(fib(&out)[0].prefix, p("2001:db8:1::/48"));
+    // Over IPv6, the global address is the one compared.
+    let e6 = peer("2001:db8::1", 65_006, 6);
+    rib.peer_up(e6.clone(), now());
+    let d = announce(&["2001:db8:6::/48"], &attrs(&[65_006], "2001:db8::fe"));
+    assert!(matches!(
+        rib.update(e6.addr, &d, now())[0],
+        Output::InvalidNextHop { family: V6, .. }
+    ));
+    // Ignored routes do not count towards a prefix limit (RFC 4271 §6.7).
+    let e3 = limited(peer("10.0.0.3", 65_003, 3), V4, 1);
+    rib.peer_up(e3.clone(), now());
+    let out = rib.update(
+        e3.addr,
+        &announce(
+            &["192.0.2.0/24", "198.51.100.0/24"],
+            &attrs(&[65_003], "10.0.0.254"),
+        ),
+        now(),
+    );
+    assert_eq!(limit_hits(&out), vec![]);
+    assert!(rib.peer(e3.addr).is_some());
+}
+
+#[test]
 fn prefix_in_both_withdrawn_and_nlri_is_announced() {
     // RFC 4271 §4.3: a prefix in both Withdrawn Routes and NLRI is treated
     // as not withdrawn.

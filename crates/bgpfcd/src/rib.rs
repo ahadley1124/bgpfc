@@ -4,7 +4,8 @@
 //! messages it sleeps until the next RFC 4271 §9.2.1.1 deadline and then
 //! releases the advertisements that were held back; the pacing itself is
 //! `bgpfc_rib`'s. A peer over its RFC 4271 §6.7 prefix limit is told to
-//! end its session.
+//! end its session. Routes the RIB ignored for a semantically incorrect
+//! next hop are logged (RFC 4271 §6.3).
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -326,8 +327,40 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                     }
                 }
             }
+            Output::InvalidNextHop {
+                peer,
+                family,
+                next_hop,
+                prefixes,
+            } => {
+                // RFC 4271 §6.3: a semantically incorrect next hop "SHOULD
+                // be logged"; no NOTIFICATION, and the session stays up.
+                bgpfc_log::warn!(
+                    "rib: routes ignored, their next hop is our own address",
+                    peer = peer,
+                    family = family,
+                    next_hop = next_hop,
+                    routes = prefixes.len(),
+                    prefixes = sample(&prefixes)
+                );
+            }
         }
     }
+}
+
+/// The first few of `prefixes` for a log line, `...` marking the rest.
+fn sample(prefixes: &[bgpfc_wire::prefix::Prefix]) -> String {
+    const SHOWN: usize = 8;
+    let mut s = prefixes
+        .iter()
+        .take(SHOWN)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if prefixes.len() > SHOWN {
+        s.push_str(",...");
+    }
+    s
 }
 
 fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
@@ -514,6 +547,44 @@ mod tests {
                 discarded: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn routes_via_our_own_session_address_are_ignored_and_logged() {
+        // RFC 4271 §6.3 a): the PeerUp's local address is our address on
+        // the session; a route back through it is ignored, the session
+        // stays, and the routes are logged.
+        use bgpfc_wire::attribute::PathAttribute;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let peer = ip("192.0.2.1");
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let mut msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24"]);
+        if let RibMsg::Update { update, .. } = &mut msg {
+            update.message.attributes[2] = PathAttribute::NextHop("192.0.2.254".parse().unwrap());
+        }
+        let out = handle(&mut rib, &mut settings, msg, now);
+        assert!(
+            matches!(&out[..], [Output::InvalidNextHop { peer: p, family: V4, .. }] if *p == peer),
+            "{out:?}"
+        );
+        assert!(rib.peer(peer).is_some());
+        assert_eq!(rib.loc_rib(V4).count(), 0);
+        let (fib_tx, fib_rx) = sync_channel(4);
+        let table: PeerTable = std::sync::Arc::default();
+        deliver(out, &table, &fib_tx);
+        assert!(fib_rx.try_recv().is_err());
+        let prefixes: Vec<_> = (0..9)
+            .map(|i| format!("10.{i}.0.0/16").parse().unwrap())
+            .collect();
+        assert_eq!(sample(&prefixes[..2]), "10.0.0.0/16,10.1.0.0/16");
+        assert!(sample(&prefixes).ends_with(",10.7.0.0/16,..."));
     }
 
     fn limit_hits(out: &[Output]) -> Vec<(IpAddr, AddressFamily, u32)> {
