@@ -1,0 +1,87 @@
+value-errors.conf:1:11: router-id must not be 0.0.0.0
+  router-id 0.0.0.0;
+            ^
+value-errors.conf:2:1: `router-id` is given more than once
+  router-id 192.0.2.1;
+  ^
+value-errors.conf:3:10: AS 0 is reserved (RFC 7607)
+  local-as 0;
+           ^
+value-errors.conf:4:13: `loud` is not a log level (error, warn, info, debug, trace)
+  log { level loud; }
+              ^
+value-errors.conf:5:1: `listen` needs an `address`
+  listen { port 179; }
+  ^
+value-errors.conf:6:12: `maybe` is not `dry-run` or `install`
+  fib { mode maybe; table main; }
+             ^
+value-errors.conf:7:18: http listen address 192.0.2.1:8179 is not a loopback address
+  control { http { listen 192.0.2.1:8179; writes perhaps; } }
+                   ^
+value-errors.conf:7:48: `perhaps` is not `yes` or `no`
+  control { http { listen 192.0.2.1:8179; writes perhaps; } }
+                                                 ^
+value-errors.conf:9:19: length 7 is not between 8 and 32
+      10.0.0.0/8 le 7;
+                    ^
+value-errors.conf:10:5: `10.0.0.0/33` is not a prefix (`address/length`)
+      10.0.0.0/33;
+      ^
+value-errors.conf:11:5: `ge 24` is greater than `le 16`
+      10.0.0.0/8 ge 24 le 16;
+      ^
+value-errors.conf:12:16: expected `ge` or `le`, found `gt`
+      10.0.0.0/8 gt 9;
+                 ^
+value-errors.conf:15:20: `match prefix-list` takes one value, found 0
+      term t { match prefix-list; set community add; action maybe; }
+                     ^
+value-errors.conf:15:37: `set community` needs at least one value
+      term t { match prefix-list; set community add; action maybe; }
+                                      ^
+value-errors.conf:15:59: `maybe` is not `accept`, `reject` or `next`
+      term t { match prefix-list; set community add; action maybe; }
+                                                            ^
+value-errors.conf:17:5: term `u` has no `action`
+      term u { match as-path ^65000$; }
+      ^
+value-errors.conf:17:28: an as-path regex must be a quoted string
+      term u { match as-path ^65000$; }
+                             ^
+value-errors.conf:18:18: expected `set as-path prepend ASN...`
+      term v { set as-path 65000; set next-hop peer; set local-pref x; action accept; }
+                   ^
+value-errors.conf:18:46: only `set next-hop self` is supported
+      term v { set as-path 65000; set next-hop peer; set local-pref x; action accept; }
+                                               ^
+value-errors.conf:18:67: `x` is not a number
+      term v { set as-path 65000; set next-hop peer; set local-pref x; action accept; }
+                                                                    ^
+value-errors.conf:19:5: unknown statement `bogus` in `policy`
+      bogus;
+      ^
+value-errors.conf:21:10: `nowhere` is not an IP address
+  neighbor nowhere { remote-as 1; import A; export A; }
+           ^
+value-errors.conf:22:1: neighbor 192.0.2.2 has no `import`
+  neighbor 192.0.2.2 {
+  ^
+value-errors.conf:22:1: neighbor 192.0.2.2 has no `export`
+  neighbor 192.0.2.2 {
+  ^
+value-errors.conf:24:5: `remote-as` is given more than once
+      remote-as 65001;
+      ^
+value-errors.conf:25:15: hold-time must be 0 or at least 3 (RFC 4271 §4.2)
+      hold-time 2;
+                ^
+value-errors.conf:26:27: family `ipv4-unicast` is listed twice
+      families ipv4-unicast ipv4-unicast;
+                            ^
+value-errors.conf:27:13: `maybe` is not `yes` or `no`
+      passive maybe;
+              ^
+value-errors.conf:28:5: unknown statement `unknown-thing` in `neighbor`
+      unknown-thing 1;
+      ^

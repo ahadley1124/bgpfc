@@ -1,0 +1,13 @@
+[package]
+name = "bgpfc-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Leveled stderr logger"
+
+[dependencies]
+
+[lints]
+workspace = true

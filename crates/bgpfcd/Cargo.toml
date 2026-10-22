@@ -1,0 +1,22 @@
+[package]
+name = "bgpfcd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "bgpfc BGP-4 routing daemon"
+
+[dependencies]
+bgpfc-config.workspace = true
+bgpfc-control.workspace = true
+bgpfc-fib.workspace = true
+bgpfc-fsm.workspace = true
+bgpfc-log.workspace = true
+bgpfc-policy.workspace = true
+bgpfc-rib.workspace = true
+bgpfc-sys.workspace = true
+bgpfc-wire.workspace = true
+
+[lints]
+workspace = true

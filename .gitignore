@@ -1,2 +1,5 @@
 /target
 *.back
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

@@ -1,0 +1,24 @@
+syntax-errors.conf:5:1: `remote-as` is missing its `;`
+  }
+  ^
+syntax-errors.conf:6:1: expected a keyword, found `;`
+  ;
+  ^
+syntax-errors.conf:7:1: unexpected `}` outside any block
+  }
+  ^
+syntax-errors.conf:9:19: unknown escape `\q` in string
+  log { level "oops\q"; }
+                    ^
+syntax-errors.conf:10:18: unterminated string
+  control { socket "unterminated;
+                   ^
+syntax-errors.conf:10:18: `socket` is not terminated by `;` or a block
+  control { socket "unterminated;
+                   ^
+syntax-errors.conf:10:18: missing `}` for the `control` block opened at 10:1
+  control { socket "unterminated;
+                   ^
+syntax-errors.conf:10:18: missing `}` for the `policy` block opened at 8:1
+  control { socket "unterminated;
+                   ^

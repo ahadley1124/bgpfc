@@ -1,0 +1,15 @@
+validation-errors.conf:4:5: term `t` in policy `A` uses undefined prefix-list `MISSING`
+      term t { match prefix-list MISSING; action accept; }
+      ^
+validation-errors.conf:6:1: neighbor 192.0.2.2 exports undefined policy `B`
+  neighbor 192.0.2.2 { remote-as 65001; import A; export B; }
+  ^
+validation-errors.conf:7:1: neighbor 192.0.2.2 is defined twice
+  neighbor 192.0.2.2 { remote-as 65001; import A; export A; }
+  ^
+validation-errors.conf:8:1: neighbor 192.0.2.3: keepalive-time 30s must be below hold-time 30s
+  neighbor 192.0.2.3 {
+  ^
+validation-errors.conf:8:1: neighbor 192.0.2.3: send-hold-time 30s must exceed hold-time 30s (RFC 9687 §4.4)
+  neighbor 192.0.2.3 {
+  ^
