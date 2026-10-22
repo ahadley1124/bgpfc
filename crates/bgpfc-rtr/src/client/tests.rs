@@ -562,6 +562,34 @@ mod net {
     }
 
     #[test]
+    fn a_sync_ends_the_run_of_failures() {
+        let cache = TestCache::new();
+        let (client, rx) = start(vec![cache.entry(0)]);
+        // The cache drops the first connections before it answers.
+        for _ in 0..3 {
+            drop(cache.accept());
+        }
+        let mut router = cache.accept();
+        eventually("three failures", || client.status().failures == 3);
+        router.serve_reset(SID, 1, &[a()]);
+        next_change(&rx);
+        eventually("in sync, the failures behind it", || {
+            let status = client.status();
+            status.synced_at.is_some() && status.failures == 0
+        });
+        // An error long after: the first failure of a new run, which waits
+        // the shortest back-off (Backoff).
+        router.send_raw(&[
+            1, 4, 0, 0, 0, 0, 0, 20, 1, 33, 33, 0, 192, 0, 2, 0, 0, 0, 0xFB, 0xF0,
+        ]);
+        assert!(matches!(router.recv(), Pdu::ErrorReport(_)));
+        router.expect_close();
+        eventually("one failure", || client.status().failures == 1);
+        let mut router = cache.accept();
+        assert_eq!(router.recv(), RESET_V1);
+    }
+
+    #[test]
     fn a_version_0_cache_that_refuses_version_1_gets_version_0() {
         let cache = TestCache::new();
         let (client, rx) = start(vec![cache.entry(0)]);
