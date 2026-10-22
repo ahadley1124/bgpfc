@@ -263,7 +263,9 @@ impl Config {
 /// A snapshot of the client, for the control plane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
-    /// The cache in use, or the one the client is trying next.
+    /// The cache the client talks to: the one it is connected to, or the
+    /// one it tries next. Not always the one [`Status::vrps`] came from:
+    /// see [`Status::source`].
     pub cache: Cache,
     /// Where the session with that cache stands.
     pub state: State,
@@ -287,6 +289,13 @@ pub struct Status {
     /// The published data: what the RIB validates with. `None` before the
     /// first change.
     pub vrps: Option<Arc<VrpSet>>,
+    /// The cache [`Status::vrps`] came from: [`Status::cache`] once its
+    /// session has published, and until then the cache the client moved
+    /// away from, or the one an earlier client had the data from (RFC
+    /// 8210 §10: data "marked as to source"). `None` before the first
+    /// change, and once data held over from another cache has expired,
+    /// which leaves no cache's data in use.
+    pub source: Option<Cache>,
     /// IPv4 VRPs in [`Status::vrps`].
     pub vrps_ipv4: usize,
     /// IPv6 VRPs in [`Status::vrps`].
@@ -321,6 +330,7 @@ impl Status {
         self.vrps.as_ref().map(|vrps| Held {
             vrps: Arc::clone(vrps),
             expires_at: self.expires_at,
+            source: self.source.clone(),
         })
     }
 }
@@ -340,6 +350,9 @@ pub struct Held {
     /// When it expires. `None` for data that has nothing left to expire:
     /// the empty set a client publishes once its data expired.
     pub expires_at: Option<Instant>,
+    /// The cache it came from, which [`Status::source`] of the new client
+    /// goes on naming. `None` if it came from none.
+    pub source: Option<Cache>,
 }
 
 /// A cloneable reader of a [`Client`]'s [`Status`], for the control
@@ -662,6 +675,8 @@ struct Worker<S> {
     fresh_session: bool,
     /// The data the RIB validates with, as last published.
     published: Option<Arc<VrpSet>>,
+    /// The cache `published` came from (see [`Status::source`]).
+    source: Option<Cache>,
     /// VRPs in `published`: IPv4, IPv6.
     counts: (usize, usize),
     /// When `published` expires, while it came from a session the client
@@ -705,6 +720,7 @@ impl<S: ValidationSink> Worker<S> {
             last_commit: None,
             expires_at: None,
             vrps: None,
+            source: None,
             vrps_ipv4: 0,
             vrps_ipv6: 0,
             failures: 0,
@@ -733,6 +749,7 @@ impl<S: ValidationSink> Worker<S> {
             synced_on_conn: false,
             fresh_session: true,
             published: None,
+            source: None,
             counts: (0, 0),
             held_expires: None,
             down_since: None,
@@ -752,6 +769,7 @@ impl<S: ValidationSink> Worker<S> {
         self.counts = count(&held.vrps);
         self.published = Some(held.vrps);
         self.held_expires = held.expires_at;
+        self.source = held.source;
         self.tell_held();
         self.publish_status(true);
     }
@@ -1188,6 +1206,7 @@ impl<S: ValidationSink> Worker<S> {
         };
         self.fresh_session = false;
         self.held_expires = None;
+        self.source = Some(self.cache().clone());
         self.send_change(vrps, affected, now);
     }
 
@@ -1211,6 +1230,8 @@ impl<S: ValidationSink> Worker<S> {
         );
         let empty = Arc::new(VrpSet::new());
         let affected = AffectedPrefixes::between(&old, &empty);
+        // No cache's data is in use now.
+        self.source = None;
         self.send_change(empty, affected, now);
         self.tell_held();
     }
@@ -1288,6 +1309,7 @@ impl<S: ValidationSink> Worker<S> {
             last_commit: self.last_commit,
             expires_at: self.expires_at(),
             vrps: self.published.clone(),
+            source: self.source.clone(),
             vrps_ipv4: self.counts.0,
             vrps_ipv6: self.counts.1,
             failures: self.failures,

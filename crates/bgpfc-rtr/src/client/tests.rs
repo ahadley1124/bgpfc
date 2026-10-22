@@ -470,6 +470,7 @@ mod net {
         eventually("the status", || client.status().state == State::Idle);
         let status = client.status();
         assert_eq!(status.cache, cache.entry(5));
+        assert_eq!(status.source, Some(cache.entry(5)));
         assert!(status.connected && status.running);
         assert_eq!(status.version, V1);
         assert_eq!((status.session_id, status.serial), (Some(SID), Some(1)));
@@ -826,9 +827,12 @@ mod net {
         let mut router = first.accept();
         assert_eq!(router.recv(), RESET_V1);
         // Until the first cache has sent a full set, the second cache's
-        // data stays in use (§10).
+        // data stays in use (§10), and the status says where it came from.
         assert!(rx.try_recv().is_err());
-        assert_eq!(client.status().vrps.as_deref(), Some(&set(&[a(), b()])));
+        let status = client.status();
+        assert_eq!(status.vrps.as_deref(), Some(&set(&[a(), b()])));
+        assert_eq!(status.cache, first.entry(10));
+        assert_eq!(status.source, Some(second.entry(20)));
         router.send(&[
             response(V1, 9),
             announce(V1, a()),
@@ -846,6 +850,7 @@ mod net {
             let status = client.status();
             status.cache == first.entry(10) && status.session_id == Some(9)
         });
+        assert_eq!(client.status().source, Some(first.entry(10)));
     }
 
     #[test]
@@ -879,6 +884,7 @@ mod net {
             client.status().vrps.as_deref() == Some(&VrpSet::new())
         });
         assert!(client.status().last_error.unwrap().contains("expired"));
+        assert_eq!(client.status().source, None, "no cache's data is in use");
     }
 
     /// A client of `cache` that takes over `held`.
@@ -898,6 +904,7 @@ mod net {
         assert!(old_rx.try_recv().is_err());
         let held = old.status().held().expect("the old client published");
         assert_eq!(*held.vrps, set(&[a(), b()]));
+        assert_eq!(held.source, Some(old_cache.entry(0)));
         assert_eq!(held.expires_at, old.status().expires_at);
         assert!(held.expires_at.is_some());
         let cache = TestCache::new();
@@ -909,6 +916,9 @@ mod net {
         assert_eq!((status.vrps_ipv4, status.vrps_ipv6), (1, 1));
         assert_eq!(status.expires_at, old.status().expires_at);
         assert_eq!(status.last_commit, None);
+        // From the old client's cache, which the new one does not use.
+        assert_eq!(status.source, Some(old_cache.entry(0)));
+        assert_eq!(status.cache, cache.entry(0));
         let mut router = cache.accept();
         assert_eq!(router.recv(), RESET_V1, "a session of its own");
         assert!(rx.try_recv().is_err());
@@ -927,6 +937,7 @@ mod net {
         eventually("the new cache's data", || {
             client.status().vrps.as_deref() == Some(&set(&[a(), c()]))
         });
+        assert_eq!(client.status().source, Some(cache.entry(0)));
     }
 
     #[test]
@@ -936,6 +947,7 @@ mod net {
         let held = Held {
             vrps: Arc::new(set(&[a(), b()])),
             expires_at: Some(Instant::now() + 50 * MS),
+            source: Some(Cache::new("192.0.2.9")),
         };
         let (client, rx) = start_holding(&cache, held);
         let mut router = cache.accept();
@@ -950,9 +962,10 @@ mod net {
             status.vrps.as_deref() == Some(&VrpSet::new()) && status.expires_at.is_none()
         });
         assert!(client.status().last_error.unwrap().contains("expired"));
-        // What it holds now is nothing, for good.
+        // What it holds now is nothing, for good, and from no cache.
         let held = client.status().held().unwrap();
         assert!(held.vrps.is_empty() && held.expires_at.is_none());
+        assert_eq!(held.source, None);
     }
 
     #[test]
@@ -964,6 +977,7 @@ mod net {
         let held = Held {
             vrps: Arc::new(set(&[a(), b()])),
             expires_at: Some(Instant::now() + 3_600 * SEC),
+            source: None,
         };
         let (tx, _rx): (Sender<ValidationChange>, _) = mpsc::channel();
         let client = Client::start_holding(config(vec![gone]), tx, Some(held)).unwrap();

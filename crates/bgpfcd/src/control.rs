@@ -1626,6 +1626,10 @@ mod tests {
                 last_commit: now.checked_sub(Duration::from_secs(12)),
                 expires_at: Some(now + Duration::from_secs(7_188)),
                 vrps: Some(Arc::new(set)),
+                source: Some(Cache {
+                    preference: 10,
+                    ..Cache::new("rtr.example.net")
+                }),
                 vrps_ipv4: 2,
                 vrps_ipv6: 1,
                 failures: 0,
