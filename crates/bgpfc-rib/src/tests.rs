@@ -1,10 +1,12 @@
 //! Decision-process tests per tie-break step (AGENTS.md §5, `bgpfc-rib`
 //! row), export rules, update packing and RIB bookkeeping.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bgpfc_rpki::{AspaState, RovState};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -19,6 +21,9 @@ use crate::decision::{Candidate, best};
 use crate::export::{Source, export, prepend};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
+
+mod adj_rib_in;
+mod validation;
 
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
@@ -93,7 +98,11 @@ fn candidate(info: &PeerInfo, a: PathAttrs) -> Candidate {
         kind: info.kind,
         router_id: info.router_id.to_u32(),
         remote_as: info.remote_as,
+        received: Arc::new(a.clone()),
         attrs: Arc::new(a),
+        rov: RovState::Disabled,
+        aspa: AspaState::Disabled,
+        held: false,
     }
 }
 
@@ -1243,10 +1252,24 @@ fn reexport_sends_only_the_difference() {
     use crate::{Policies, Verdict};
     struct DropOdd;
     impl Policies for DropOdd {
-        fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             Verdict::Accept
         }
-        fn export(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> Verdict {
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            p: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             if p == self::p("192.0.2.0/24") {
                 Verdict::Reject
             } else {
@@ -1306,14 +1329,28 @@ fn limit_hits(out: &[Output]) -> Vec<(IpAddr, AddressFamily, u32)> {
 struct RejectOne(Prefix);
 
 impl crate::Policies for RejectOne {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, p: Prefix, _: &PathAttrs) -> crate::Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
         if p == self.0 {
             crate::Verdict::Reject
         } else {
             crate::Verdict::Accept
         }
     }
-    fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> crate::Verdict {
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
         crate::Verdict::Accept
     }
 }
@@ -1386,6 +1423,8 @@ fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
     assert_eq!(rib.candidates(V4, p("203.0.113.0/24")).len(), 0);
     assert!(rib.peer(e1.addr).is_none());
     assert_eq!(rib.peer_stats(e1.addr), None);
+    // Nothing of e1 is left.
+    assert!(rib.tables.values().all(BTreeMap::is_empty));
     // What e1 sends until its session is down is ignored, and the end of
     // the session has nothing left to remove.
     let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), now());
@@ -1734,10 +1773,24 @@ fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
     /// Exports everything with a community.
     struct Tag;
     impl Policies for Tag {
-        fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             Verdict::Accept
         }
-        fn export(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, a: &PathAttrs) -> Verdict {
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            a: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
             let mut m = a.clone();
             m.communities = vec![Community::new(65_000, 42)];
             Verdict::Modified(m)

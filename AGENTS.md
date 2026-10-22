@@ -275,7 +275,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-config` | Golden tests: input file → AST/debug output, and input file → error message snapshot. A fuzz target. |
 | `bgpfc-fib` | Netlink encode/decode tests against byte captures from `ip -d monitor` or strace. Miri on the pure parts. A reconcile-logic proptest. |
 | `bgpfc-sys` | Layout assertions. Real-socket tests where no privileges are needed. Mark tests that need privileges `#[ignore]`, and document how to run them. |
-| `bgpfc-rpki` | Validation vectors from RFC 6811 §2 and the RFC 9319 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length. A proptest that checks VRP lookup and validation against a naive linear-scan model. |
+| `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. No Miri and no fuzz target: the crate has no `unsafe` and decodes no bytes. |
 | `bgpfc-rtr` | Unit tests with PDU byte vectors built from RFC 8210 §5. `proptest` round-trips. A fuzz target for the PDU decoder. Miri. Table-driven session tests with injected time, including the RFC 8210 §7 version fallback and the §6 timers. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
 | `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Uses network namespaces and needs root, so it runs in CI and on demand. |
@@ -389,7 +389,10 @@ Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
 Steps 0–9 are complete: they built v1. Their text stays as a record of what
-v1 covers. Work continues at step 10.
+v1 covers. Steps 10 and 11 are complete as well, and their text stays as a
+record of what they added; step 11 also did the part of step 13 that
+re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4). Work
+continues at step 12.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.

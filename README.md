@@ -84,14 +84,21 @@ Only single best path, with no ECMP. Linux only.
 
 ### Next: RPKI route origin validation
 
-Planned, not built yet ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14): route
-origin validation (RFC 6811) against VRPs fetched over RTR (RFC 8210, falling
-back to version 0, RFC 6810), either from external caches or from an optional
-Routinator that bgpfcd starts and supervises as a child process. Routinator is
-a separate program; bgpfc neither bundles nor links it. The plan drops Invalid
-routes by default, offers a non-enforcing prefer-valid mode, and lets policy
-match on the validation state (RFC 6811 §3). RTR will run over plain TCP only
-(RFC 8210 §9), so the cache belongs on loopback or a trusted network.
+In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). The plumbing for
+the validation state has landed (step 11): every route carries its RFC 6811
+origin validation state, which the RIB validates again in place when the
+validation source changes, and which `bgpfcctl show routes` and the HTTP API
+show. bgpfcd has no validation source yet, so every route reads `disabled`,
+and nothing acts on the state.
+
+The RTR client and enforcement come next. The client will fetch VRPs over
+RTR (RFC 8210, falling back to version 0, RFC 6810), either from external
+caches or from an optional Routinator that bgpfcd starts and supervises as a
+child process. Routinator is a separate program; bgpfc neither bundles nor
+links it. Enforcement will drop Invalid routes by default, offer a
+non-enforcing prefer-valid mode, and let policy match on the validation
+state (RFC 6811 §3). RTR will run over plain TCP only (RFC 8210 §9), so the
+cache belongs on loopback or a trusted network.
 
 ### Later
 
@@ -115,6 +122,7 @@ crates/
   bgpfc-sys      the ONLY crate with `unsafe`: hand-written extern "C" decls
   bgpfc-log      leveled stderr logger
   bgpfc-control  Unix-socket protocol, HTTP/1.1 server, JSON writer
+  bgpfc-rpki     VRP set, RFC 6811 origin validation, validation sources (no I/O)
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)

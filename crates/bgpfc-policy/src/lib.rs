@@ -19,7 +19,7 @@ use std::net::IpAddr;
 use bgpfc_config::ast::{Action, CommunityOp, Config, Match, SetAction};
 use bgpfc_config::error::Pos;
 use bgpfc_rib::export::prepend;
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Verdict};
+use bgpfc_rib::{PathAttrs, PeerInfo, Policies, RovState, Verdict};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::NextHop;
@@ -322,6 +322,8 @@ impl Engine {
     }
 }
 
+/// No clause matches on the validation state yet, so `rov` is accepted
+/// and not read: the RFC 6811 §3 row in COMPLIANCE.md says what is left.
 impl Policies for Engine {
     fn import(
         &self,
@@ -329,6 +331,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        _rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -347,6 +350,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        _rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,

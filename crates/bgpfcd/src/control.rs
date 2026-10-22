@@ -474,12 +474,8 @@ fn write_neighbor(
             .field_display("family", family)
             .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
             .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX))
-            .key("limit");
-        match limit {
-            Some(l) => j.number(l),
-            None => j.null(),
-        };
-        j.end_object();
+            .field_opt_num("limit", limit)
+            .end_object();
     }
     j.end_array();
     j.key("session");
@@ -536,7 +532,8 @@ fn render_neighbors(
             "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
             r.addr,
             r.remote_as.0,
-            r.state,
+            // `State` writes itself without the padding a width asks for.
+            r.state.to_string(),
             r.since.as_secs(),
             received,
             advertised
@@ -620,22 +617,25 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
 
 fn render_routes(routes: &[RouteReport]) -> Reply {
     let mut lines = vec![format!(
-        "{:<44} {:<40} {:<8} {:>5} {:>7} path",
-        "prefix", "next-hop", "origin", "lpref", "med"
+        "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} path",
+        "prefix", "next-hop", "origin", "lpref", "med", "rov"
     )];
     let mut j = Json::new();
     j.begin_array();
     for r in routes {
         let a = &r.attrs;
         let path: Vec<String> = a.as_path.asns().map(|x| x.0.to_string()).collect();
+        // `Prefix` and `Origin` write themselves without the padding a
+        // width asks for, so they are padded as strings.
         lines.push(format!(
-            "{}{:<43} {:<40} {:<8} {:>5} {:>7} {} via {}",
+            "{}{:<43} {:<40} {:<8} {:>5} {:>7} {:<9} {} via {}",
             if r.best { "*" } else { " " },
-            r.prefix,
+            r.prefix.to_string(),
             a.next_hop_addr(),
-            a.origin,
+            a.origin.to_string(),
             a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
             a.med.map_or("-".to_owned(), |v| v.to_string()),
+            r.rov.as_str(),
             if path.is_empty() {
                 "-".to_owned()
             } else {
@@ -647,10 +647,11 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
             .field_display("prefix", r.prefix)
             .field_display("next_hop", a.next_hop_addr())
             .field_display("origin", a.origin)
-            .field_opt("local_pref", a.local_pref)
-            .field_opt("med", a.med)
+            .field_opt_num("local_pref", a.local_pref)
+            .field_opt_num("med", a.med)
             .field_display("peer", r.peer)
             .field_bool("best", r.best)
+            .field_str("rov", r.rov.as_str())
             .key("as_path")
             .begin_array();
         for asn in a.as_path.asns() {
@@ -682,9 +683,10 @@ fn render_fib(f: &FibReport) -> Reply {
         .begin_array();
     for (prefix, gateway) in &f.desired {
         let installed = f.installed.get(prefix) == Some(gateway);
+        // `Prefix` writes itself without the padding a width asks for.
         lines.push(format!(
             "{:<44} via {:<40} {}",
-            prefix,
+            prefix.to_string(),
             gateway,
             if installed { "installed" } else { "pending" }
         ));
@@ -696,7 +698,10 @@ fn render_fib(f: &FibReport) -> Reply {
     }
     for (prefix, gateway) in &f.installed {
         if !f.desired.contains_key(prefix) {
-            lines.push(format!("{prefix:<44} via {gateway:<40} stale"));
+            lines.push(format!(
+                "{:<44} via {gateway:<40} stale",
+                prefix.to_string()
+            ));
             j.begin_object()
                 .field_display("prefix", prefix)
                 .field_display("gateway", gateway)
@@ -839,6 +844,7 @@ fn http_respond(ctx: &Ctx, req: &http::Request) -> http::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bgpfc_rib::RovState;
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
@@ -1021,6 +1027,155 @@ mod tests {
             "{}",
             r.json
         );
+    }
+
+    #[test]
+    fn neighbors_and_fib_render_in_columns() {
+        let report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Idle,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbors(&[report], &[]);
+        assert_eq!(
+            r.lines[1],
+            format!(
+                "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
+                "192.0.2.2", "65001", "Idle", "5", "0", "0"
+            )
+        );
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        let gw: IpAddr = "198.51.100.1".parse().unwrap();
+        let report = FibReport {
+            mode: Mode::Install,
+            desired: [(p("192.0.2.0/24"), gw), (p("198.51.100.0/24"), gw)].into(),
+            installed: [(p("192.0.2.0/24"), gw), (p("203.0.113.0/24"), gw)].into(),
+        };
+        let r = render_fib(&report);
+        assert_eq!(
+            r.lines[1..],
+            [
+                format!(
+                    "{:<44} via {:<40} installed",
+                    "192.0.2.0/24", "198.51.100.1"
+                ),
+                format!(
+                    "{:<44} via {:<40} pending",
+                    "198.51.100.0/24", "198.51.100.1"
+                ),
+                format!("{:<44} via {:<40} stale", "203.0.113.0/24", "198.51.100.1"),
+            ]
+        );
+    }
+
+    /// A route to `prefix` from `peer` along `path`, not the best, and
+    /// not validated.
+    fn route(
+        prefix: &str,
+        peer: &str,
+        path: &[u32],
+        local_pref: Option<u32>,
+        med: Option<u32>,
+    ) -> RouteReport {
+        use bgpfc_wire::as_path::AsPath;
+        use bgpfc_wire::attribute::Origin;
+        use bgpfc_wire::community::Community;
+        use bgpfc_wire::mp::NextHop;
+        let peer: std::net::Ipv4Addr = peer.parse().unwrap();
+        let path: Vec<Asn> = path.iter().map(|&a| Asn(a)).collect();
+        RouteReport {
+            prefix: prefix.parse().unwrap(),
+            peer: IpAddr::V4(peer),
+            attrs: Arc::new(bgpfc_rib::PathAttrs {
+                origin: Origin::Igp,
+                as_path: AsPath::sequence(&path),
+                next_hop: NextHop::Ipv4(peer),
+                med,
+                local_pref,
+                atomic_aggregate: false,
+                aggregator: None,
+                communities: vec![Community(0xFBFF_0064)],
+                ext_communities: Vec::new(),
+                large_communities: Vec::new(),
+                unknown: Vec::new(),
+            }),
+            best: false,
+            rov: RovState::Disabled,
+        }
+    }
+
+    #[test]
+    fn routes_render_as_lines_and_json() {
+        // Two routes to one destination, from different origin ASes: a
+        // VRP for AS 64496 makes one valid and the other invalid. The
+        // invalid one stays a candidate (RFC 6811 §2).
+        let mut best = route(
+            "192.0.2.0/24",
+            "198.51.100.1",
+            &[64_511, 64_496],
+            Some(100),
+            None,
+        );
+        best.best = true;
+        best.rov = RovState::Valid;
+        let mut other = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, Some(50));
+        other.rov = RovState::Invalid;
+        let r = render_routes(&[best, other]);
+        // Every column starts where its header does; `*` marks the best.
+        assert_eq!(
+            r.lines,
+            [
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} path",
+                    "prefix", "next-hop", "origin", "lpref", "med", "rov"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64511 64496 via 198.51.100.1",
+                    "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-", "valid"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2",
+                    " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50", "invalid"
+                ),
+            ]
+        );
+        // docs/control.md: `local_pref` and `med` are numbers, or null;
+        // `rov` is the state's name.
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
+                r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
+                r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
+                r#""large_communities":[]},"#,
+                r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
+                r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
+                r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
+                r#""large_communities":[]}]"#
+            )
+        );
+        // Every state, by its name, both ways.
+        for rov in RovState::ALL {
+            let mut r = route("2001:db8::/32", "198.51.100.1", &[], None, None);
+            r.rov = rov;
+            let out = render_routes(&[r]);
+            assert!(
+                out.lines[1].contains(&format!(" {:<9} - via ", rov.as_str())),
+                "{:?}",
+                out.lines
+            );
+            assert!(
+                out.json.contains(&format!(r#""rov":"{rov}""#)),
+                "{}",
+                out.json
+            );
+        }
     }
 
     #[test]
