@@ -33,6 +33,8 @@ failure, 2 on a usage error.
 | `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
 | `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed`, `pending` or `stale` |
+| `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
+| `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
@@ -67,6 +69,8 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/neighbors/{addr}` | `show neighbor ADDR` (`404` if unknown) |
 | `GET /v1/routes?family=ipv4\|ipv6[&prefix=P]` | `show routes` |
 | `GET /v1/fib` | `show fib` |
+| `GET /v1/rpki` | `show rpki` |
+| `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
 | `POST /v1/reload` | `reload` |
 | `POST /v1/neighbors/{addr}/clear[?soft=1][&message=TEXT]` | `clear neighbor` |
 | `POST /v1/fib/mode/install`, `POST /v1/fib/mode/dry-run` | `fib mode` |
@@ -91,6 +95,14 @@ Example objects:
   "large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
+
+{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true}],
+ "running":true,"state":"idle","connected":true,"version":1,"session_id":4242,"serial":17,
+ "synced_seconds_ago":12,"expires_in_seconds":7188,"vrps":{"ipv4":512340,"ipv6":121877},
+ "failures":0,"last_error":null,"last_error_seconds_ago":null}
+
+{"prefix":"192.0.2.0/24","origin":64496,"rov":"valid",
+ "vrps":[{"prefix":"192.0.2.0/24","max_length":24,"asn":64496,"matches":true}]}
 ```
 
 ## Validation state
@@ -117,8 +129,35 @@ policy, and follows the validation source when it changes. It is shown
 for information only: it does not yet change whether a route is used or
 which one is chosen.
 
+`show rpki validate` answers the question for any route, held or not,
+from the same VRPs the RIB validates with.
+
 Routes also carry an ASPA verdict. Until ASPA verification exists, its
 only value is `disabled`, so it is not shown.
+
+## RPKI
+
+`show rpki` and `GET /v1/rpki` report the `rpki` block (`docs/config.md`,
+"RPKI") and its RTR client. bgpfcd uses one cache of the list at a time
+(RFC 8210 §10); `in_use` marks it.
+
+| Member | Line | Meaning |
+|---|---|---|
+| `mode` | `mode` | `disabled` or `external` |
+| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` |
+| `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
+| `state` | `state` | the session with the cache in use: `disconnected`, `connecting`, `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
+| `connected` | `connected` | whether a TCP connection to it is open |
+| `version` | `version` | the RTR protocol version spoken: 1 (RFC 8210), or 0 (RFC 6810) after a fallback (RFC 8210 §7) or with `version 0` |
+| `session_id`, `serial` | `session-id`, `serial` | the cache's Session ID and the Serial Number of the data, while the client can ask for changes since then (RFC 8210 §5.1) |
+| `synced_seconds_ago` | `last sync` | since the cache's last End of Data |
+| `vrps` | `vrps` | the VRPs in use, per family; `null` (`none yet`) before any cache sent data, when every route is `disabled` |
+| `expires_in_seconds` | `expire in` | until those VRPs expire unless a cache refreshes them (RFC 8210 §6); then every route becomes `not-found` |
+| `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
+| `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, and how long ago |
+
+Without a client, in `mode disabled`, every member but `mode` and
+`caches` is `null`, `false` or 0, and the text lists only those two.
 
 ## Reload
 

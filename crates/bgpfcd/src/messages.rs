@@ -192,6 +192,16 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
 }
 
+/// What the coordinator reports about the `rpki` block.
+#[derive(Clone, Debug)]
+pub(crate) struct RpkiReport {
+    /// The running block.
+    pub(crate) config: bgpfc_config::ast::Rpki,
+    /// The RTR client's status, if one runs. Its VRPs are the data the
+    /// RIB validates with.
+    pub(crate) status: Option<bgpfc_rtr::client::Status>,
+}
+
 /// Each neighbor's configured `advertisement-interval` (RFC 4271
 /// §9.2.1.1); `None` takes the RFC 4271 §10 default for the session type.
 pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;

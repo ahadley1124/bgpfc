@@ -201,6 +201,9 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
                 coord.shutdown();
                 return;
             }
+            CoordMsg::Rpki(reply) => {
+                let _ = reply.send(coord.rpki_report());
+            }
             CoordMsg::Reload(reply) => {
                 let r = coord.reload();
                 match &r {
@@ -422,6 +425,14 @@ impl Coordinator<'_> {
         );
         self.config = new;
         Ok(summary)
+    }
+
+    /// The running `rpki` block and its client's status.
+    fn rpki_report(&self) -> messages::RpkiReport {
+        messages::RpkiReport {
+            config: self.config.rpki.clone(),
+            status: self.rpki.status(),
+        }
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative

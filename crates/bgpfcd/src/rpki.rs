@@ -44,7 +44,7 @@ use std::sync::mpsc::SyncSender;
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
-use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held};
+use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held, Status};
 use bgpfc_rtr::session;
 use bgpfc_wire::types::RouterId;
 
@@ -247,6 +247,11 @@ impl Rpki {
     pub(crate) fn stop(&mut self) {
         self.stop_client();
     }
+
+    /// The client's status, if one runs.
+    pub(crate) fn status(&self) -> Option<Status> {
+        self.client.as_ref().map(Client::status)
+    }
 }
 
 #[cfg(test)]
@@ -288,10 +293,6 @@ mod tests {
             Ok(RibMsg::Validation(change)) => change,
             other => panic!("expected a validation change, got {other:?}"),
         }
-    }
-
-    fn status(rpki: &Rpki) -> Option<client::Status> {
-        rpki.client.as_ref().map(Client::status)
     }
 
     fn eventually(what: &str, mut done: impl FnMut() -> bool) {
@@ -488,11 +489,11 @@ mod tests {
         assert_eq!(rov(&change, "192.0.2.0/24", 64_497), RovState::Invalid);
         assert_eq!(rov(&change, "198.51.100.0/24", 64_496), RovState::NotFound);
         eventually("the client in sync", || {
-            status(&rpki).is_some_and(|s| s.synced_at.is_some())
+            rpki.status().is_some_and(|s| s.synced_at.is_some())
         });
-        assert_eq!(status(&rpki).unwrap().vrps_ipv4, 1);
+        assert_eq!(rpki.status().unwrap().vrps_ipv4, 1);
         rpki.stop();
-        assert!(status(&rpki).is_none());
+        assert!(rpki.status().is_none());
         assert!(closed(&mut conn), "no client is left");
         assert!(rx.try_recv().is_err());
     }
@@ -502,7 +503,7 @@ mod tests {
         let (tx, rx) = sync_channel(4);
         let cfg = config("rpki { mode disabled; cache 127.0.0.1; }");
         let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
-        assert!(status(&rpki).is_none());
+        assert!(rpki.status().is_none());
         rpki.stop();
         assert!(rx.try_recv().is_err());
     }
@@ -538,7 +539,7 @@ mod tests {
             Some(ErrorKind::WouldBlock)
         );
         assert!(rx.try_recv().is_err());
-        assert!(status(&rpki).is_some_and(|s| s.connected));
+        assert!(rpki.status().is_some_and(|s| s.connected));
         rpki.stop();
     }
 
@@ -562,7 +563,7 @@ mod tests {
         // data stays in use; the RIB hears nothing.
         let (mut conn, query) = second.accept();
         assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
-        let held = status(&rpki).unwrap();
+        let held = rpki.status().unwrap();
         assert_eq!(held.vrps.as_deref().map(bgpfc_rpki::VrpSet::len), Some(2));
         assert!(held.expires_at.is_some());
         assert!(rx.try_recv().is_err());
@@ -614,7 +615,7 @@ mod tests {
             rpki.reconfigure(&old.rpki, &new.rpki),
             Ok("rpki: validation disabled")
         );
-        assert!(status(&rpki).is_none());
+        assert!(rpki.status().is_none());
         assert!(closed(&mut conn));
         // ValidationChange::disabled: no source, for every route.
         let change = next_change(&rx);
