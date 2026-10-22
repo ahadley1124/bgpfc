@@ -11,6 +11,15 @@
 //! source, every route `disabled`, and the client's first full set
 //! replaces that for every route.
 //!
+//! A reload that changes the block stops the client and starts another
+//! with the new settings, which keeps the data the old one published until
+//! a cache sends a full set, or until it expires (RFC 8210 §10, §6; see
+//! [`Client::start_holding`]): the routes keep their states meanwhile, and
+//! a new set validates again only the routes it judges differently. A
+//! change to `mode disabled` sends [`ValidationChange::disabled`] instead,
+//! so that every route is `disabled` again. A reload that leaves the block
+//! alone leaves the client alone.
+//!
 //! [`Rpki::stop`] joins the client thread, which may be waiting for room
 //! on the RIB channel. The RIB thread makes that room as long as it runs,
 //! and it runs until the process exits, so the coordinator stops the
@@ -24,8 +33,9 @@
 //! Implements: RFC 8210 §6 (the Expire Interval cap and the reconnect
 //! back-off configured), §7 (the version offered first), §9 (unprotected
 //! TCP to the configured port, 323 by default), §10 (the cache list with
-//! preferences); RFC 6811 §4 (each change of the VRPs reaches the RIB,
-//! which validates the affected routes again).
+//! preferences; the data kept across a new cache list); RFC 6811 §4 (each
+//! change of the VRPs reaches the RIB, which validates the affected routes
+//! again).
 
 use std::io;
 use std::net::ToSocketAddrs as _;
@@ -34,7 +44,7 @@ use std::sync::mpsc::SyncSender;
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
-use bgpfc_rtr::client::{self, Backoff, Cache, Client};
+use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held};
 use bgpfc_rtr::session;
 use bgpfc_wire::types::RouterId;
 
@@ -128,6 +138,8 @@ fn sink(rib: SyncSender<RibMsg>) -> impl ValidationSink {
 /// The running `rpki` block: the RTR client, if its mode has one.
 #[derive(Debug)]
 pub(crate) struct Rpki {
+    rib: SyncSender<RibMsg>,
+    router_id: RouterId,
     client: Option<Client>,
 }
 
@@ -142,8 +154,19 @@ impl Rpki {
         router_id: RouterId,
         rib: SyncSender<RibMsg>,
     ) -> io::Result<Rpki> {
-        let Some(client_config) = client_config(config, router_id) else {
-            return Ok(Rpki { client: None });
+        let mut rpki = Rpki {
+            rib,
+            router_id,
+            client: None,
+        };
+        rpki.client = rpki.spawn(config, None)?;
+        Ok(rpki)
+    }
+
+    /// A client for `config`, holding `held`, if its mode runs one.
+    fn spawn(&self, config: &ast::Rpki, held: Option<Held>) -> io::Result<Option<Client>> {
+        let Some(client_config) = client_config(config, self.router_id) else {
+            return Ok(None);
         };
         bgpfc_log::info!(
             "rpki: starting the rtr client",
@@ -153,20 +176,76 @@ impl Rpki {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-            version = config.version
+            version = config.version,
+            held_vrps = held.as_ref().map_or(0, |h| h.vrps.len())
         );
-        let client = Client::start(client_config, sink(rib))?;
-        Ok(Rpki {
-            client: Some(client),
-        })
+        let client = Client::start_holding(client_config, sink(self.rib.clone()), held)?;
+        Ok(Some(client))
+    }
+
+    /// Apply `new`, the block of a reloaded configuration, in place of
+    /// `old`, the running one; what was done, for the reload's summary.
+    /// The caller has checked with [`resolve`] that the new caches can be
+    /// found.
+    ///
+    /// # Errors
+    /// The new client thread could not be spawned. Validation is then
+    /// off, as with `mode disabled`, since nothing would expire the data
+    /// the old client left in the RIB.
+    pub(crate) fn reconfigure(
+        &mut self,
+        old: &ast::Rpki,
+        new: &ast::Rpki,
+    ) -> Result<&'static str, String> {
+        if old == new {
+            return Ok("rpki unchanged");
+        }
+        let ran = self.client.is_some();
+        let held = self.stop_client();
+        match self.spawn(new, held) {
+            Ok(Some(client)) => {
+                self.client = Some(client);
+                Ok(if ran {
+                    "rpki: rtr client restarted"
+                } else {
+                    "rpki: rtr client started"
+                })
+            }
+            Ok(None) if ran => {
+                self.disable();
+                Ok("rpki: validation disabled")
+            }
+            Ok(None) => Ok("rpki: validation stays disabled"),
+            Err(e) => {
+                self.disable();
+                Err(format!(
+                    "rpki: cannot start the rtr client ({e}); validation disabled"
+                ))
+            }
+        }
+    }
+
+    /// Stop the client, if one runs, and return what it published.
+    fn stop_client(&mut self) -> Option<Held> {
+        let mut client = self.client.take()?;
+        client.stop();
+        // Read once the thread has ended: it publishes nothing after.
+        client.status().held()
+    }
+
+    /// Turn validation off in the RIB: every route `disabled`.
+    fn disable(&self) {
+        bgpfc_log::info!("rpki: validation disabled; every route is disabled again");
+        // A RIB thread that is gone has no routes to tell.
+        let _ = self
+            .rib
+            .send(RibMsg::Validation(ValidationChange::disabled()));
     }
 
     /// Stop the client for good, at shutdown. It returns once the client
     /// thread has ended; see the module documentation.
     pub(crate) fn stop(&mut self) {
-        if let Some(mut client) = self.client.take() {
-            client.stop();
-        }
+        self.stop_client();
     }
 }
 
@@ -426,6 +505,138 @@ mod tests {
         assert!(status(&rpki).is_none());
         rpki.stop();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A client in sync with `cache`, which sent `vrps`, and the RIB
+    /// channel it publishes to.
+    fn in_sync(cache: &StubCache, vrps: &[Vrp]) -> (Rpki, Receiver<RibMsg>, TcpStream) {
+        let cfg = config(&cache.block());
+        let (tx, rx) = sync_channel(4);
+        let rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+        let conn = cache.serve(vrps);
+        assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
+        (rpki, rx, conn)
+    }
+
+    #[test]
+    fn an_unchanged_block_leaves_the_client_alone() {
+        let cache = StubCache::new();
+        let (mut rpki, rx, mut conn) = in_sync(&cache, &[vrp("192.0.2.0/24", 24, 64_496)]);
+        let cfg = config(&cache.block());
+        assert_eq!(rpki.reconfigure(&cfg.rpki, &cfg.rpki), Ok("rpki unchanged"));
+        // The same session goes on: no new connection, nothing published.
+        conn.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0; 16];
+        let quiet = conn.read(&mut buf).unwrap_err().kind();
+        assert!(
+            matches!(quiet, ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "{quiet:?}"
+        );
+        assert_eq!(
+            cache.listener.accept().map_err(|e| e.kind()).err(),
+            Some(ErrorKind::WouldBlock)
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(status(&rpki).is_some_and(|s| s.connected));
+        rpki.stop();
+    }
+
+    #[test]
+    fn a_new_cache_list_keeps_the_old_data_until_a_full_set() {
+        let first = StubCache::new();
+        let (a, b, c) = (
+            vrp("192.0.2.0/24", 24, 64_496),
+            vrp("198.51.100.0/24", 24, 64_497),
+            vrp("203.0.113.0/24", 24, 64_498),
+        );
+        let (mut rpki, rx, mut old_conn) = in_sync(&first, &[a, b]);
+        let second = StubCache::new();
+        let (old, new) = (config(&first.block()), config(&second.block()));
+        assert_eq!(
+            rpki.reconfigure(&old.rpki, &new.rpki),
+            Ok("rpki: rtr client restarted")
+        );
+        assert!(closed(&mut old_conn), "the old client is gone");
+        // RFC 8210 §10: until the new cache has sent a full set, the old
+        // data stays in use; the RIB hears nothing.
+        let (mut conn, query) = second.accept();
+        assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
+        let held = status(&rpki).unwrap();
+        assert_eq!(held.vrps.as_deref().map(bgpfc_rpki::VrpSet::len), Some(2));
+        assert!(held.expires_at.is_some());
+        assert!(rx.try_recv().is_err());
+        // The new cache's set replaces it, and only the routes the two
+        // sets disagree on are validated again.
+        let version = query.version();
+        let mut out = Pdu::CacheResponse {
+            version,
+            session_id: SID,
+        }
+        .encode();
+        for vrp in [a, c] {
+            Pdu::Prefix {
+                version,
+                announce: true,
+                vrp,
+            }
+            .encode_into(&mut out);
+        }
+        Pdu::EndOfData {
+            session_id: SID,
+            serial: 1,
+            intervals: Some(Intervals::DEFAULT),
+        }
+        .encode_into(&mut out);
+        conn.write_all(&out).unwrap();
+        let change = next_change(&rx);
+        let p = |s: &str| s.parse().unwrap();
+        assert!(!change.affected.covers(p("192.0.2.0/24")));
+        assert!(change.affected.covers(p("198.51.100.0/24")));
+        assert!(change.affected.covers(p("203.0.113.0/24")));
+        assert_eq!(rov(&change, "198.51.100.0/24", 64_497), RovState::NotFound);
+        assert_eq!(rov(&change, "203.0.113.0/24", 64_498), RovState::Valid);
+        rpki.stop();
+    }
+
+    #[test]
+    fn switching_to_disabled_sends_the_disabled_change() {
+        let cache = StubCache::new();
+        let (mut rpki, rx, mut conn) = in_sync(&cache, &[vrp("192.0.2.0/24", 24, 64_496)]);
+        let (old, new) = (
+            config(&cache.block()),
+            config(&format!(
+                "rpki {{ mode disabled; cache 127.0.0.1 port {}; }}",
+                cache.port()
+            )),
+        );
+        assert_eq!(
+            rpki.reconfigure(&old.rpki, &new.rpki),
+            Ok("rpki: validation disabled")
+        );
+        assert!(status(&rpki).is_none());
+        assert!(closed(&mut conn));
+        // ValidationChange::disabled: no source, for every route.
+        let change = next_change(&rx);
+        assert_eq!(change.affected, AffectedPrefixes::All);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
+        assert!(rx.try_recv().is_err());
+        // From disabled to disabled nothing is sent; back to external
+        // starts a client, whose first set is for every route again.
+        assert_eq!(
+            rpki.reconfigure(&new.rpki, &config("").rpki),
+            Ok("rpki: validation stays disabled")
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            rpki.reconfigure(&new.rpki, &old.rpki),
+            Ok("rpki: rtr client started")
+        );
+        let _conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        let change = next_change(&rx);
+        assert_eq!(change.affected, AffectedPrefixes::All);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Valid);
+        rpki.stop();
     }
 
     #[test]

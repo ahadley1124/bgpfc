@@ -133,6 +133,9 @@ difference; a changed `advertisement-interval` applies to the running
 session without a reset, and so does a changed `maximum-prefix` (a session
 already over its new limit ends with Cease / Maximum Number of Prefixes
 Reached); a changed `fib { mode }` is applied; a changed
-`log { level }` takes effect at once. `router-id` and `local-as` changes
-are refused, and `listen`, `control`, `fib { table }`, `fib { protocol }`
-and `rpki` changes are noted for the next restart.
+`log { level }` takes effect at once; a changed `rpki` block restarts the
+RTR client, which keeps the VRPs it had until a cache of the new list has
+sent a full set, or stops it with `mode disabled`, every route `disabled`
+again. `router-id` and `local-as` changes are refused, and `listen`,
+`control`, `fib { table }` and `fib { protocol }` changes are noted for the
+next restart.

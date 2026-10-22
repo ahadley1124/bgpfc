@@ -322,14 +322,23 @@ impl Coordinator<'_> {
     fn reload(&mut self) -> Result<String, String> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
+        // Issue #60: a new cache that cannot be found fails the reload
+        // before anything changes, as it fails the start.
+        if diff.global.contains(&GlobalChange::Rpki) {
+            rpki::resolve(&new.rpki)?;
+        }
         let mut notes = Vec::new();
         for g in &diff.global {
             match g {
                 GlobalChange::Identity => {
                     return Err("router-id or local-as changed: restart the daemon".to_owned());
                 }
-                GlobalChange::Listen | GlobalChange::Control | GlobalChange::Rpki => {
+                GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
+                }
+                GlobalChange::Rpki => {
+                    let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
+                    notes.push(done.map_or_else(|e| e, str::to_owned));
                 }
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
                 GlobalChange::Fib => {
