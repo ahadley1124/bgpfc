@@ -64,8 +64,8 @@ rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
              | "response-timeout" u32 ";"             (* default 60 *)
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
-             | "max-vrps" u32 ";"                     (* default 4000000 *)
-             | "backoff" u32 u32 ";" ;                (* 1-7200 each; default 1 600 *)
+             | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
+             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
 
@@ -308,11 +308,11 @@ The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
 router MUST NOT retain the data past the time indicated by this
 parameter"), so the setting can only shorten it; it lies in 600–172800, the
 range §6 gives the Expire Interval, and the default leaves the cache's
-value. When the data expires, every route becomes `not-found`. `max-vrps`
-is the most VRPs an answer may leave bgpfcd holding; an answer that would
-exceed it is refused with an Internal Error (RFC 8210 §12) and the data
-before it stays in use. The default, four million, is several times what
-the whole RPKI holds.
+value. When the data expires, every route becomes `not-found`. `max-vrps`,
+at least 1, is the most VRPs an answer may leave bgpfcd holding; an answer
+that would exceed it is refused with an Internal Error (RFC 8210 §12) and
+the data before it stays in use. The default, four million, is several
+times what the whole RPKI holds.
 
 With `mode external`, bgpfcd looks every cache up as it starts and
 refuses to start, naming the cache, if one has no address: a typo must not
@@ -331,11 +331,12 @@ answers No Data Available, bgpfcd waits MIN seconds, doubling with
 each such failure in a row up to MAX, and then up to half as long again,
 by a jitter seeded from the `router-id`, so that routers that lost a cache
 together do not return together. Each bound lies in 1–7200, the range of
-the Retry Interval it stands in for. RFC 8210 §6 says a router SHOULD NOT
-retry sooner than the cache's Retry Interval, 600 seconds by default;
-bgpfcd's default, `backoff 1 600`, does, so that a validator that restarts
-is picked up within seconds (issue #57), and reaches 600 seconds by the
-eleventh failure in a row. `backoff 600 600` keeps to the RFC's default.
+the Retry Interval it stands in for, and MAX must not be below MIN. RFC
+8210 §6 says a router SHOULD NOT retry sooner than the cache's Retry
+Interval, 600 seconds by default; bgpfcd's default, `backoff 1 600`, does,
+so that a validator that restarts is picked up within seconds (issue #57),
+and reaches 600 seconds by the eleventh failure in a row. `backoff 600
+600` keeps to the RFC's default.
 
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
@@ -344,8 +345,9 @@ has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` only for a family in
 `families`; an `rpki` block has a `mode`, at least one `cache` with `mode
-external`, no cache twice, and `connect-timeout` ≤ `response-timeout` ≤
-`reply-timeout`.
+external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
+its MIN.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
