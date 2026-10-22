@@ -11,6 +11,7 @@
     reason = "C names, as in the headers they are cited from"
 )]
 
+use std::ffi::c_long;
 use std::ffi::{c_int, c_uint, c_ulong, c_ushort, c_void};
 
 /// `uid_t` / `gid_t`: `__kernel_uid32_t`, `<asm-generic/posix_types.h>`.
@@ -25,6 +26,13 @@ pub(crate) type ssize_t = isize;
 pub(crate) type socklen_t = c_uint;
 /// `__kernel_sa_family_t`, `<linux/socket.h>`.
 pub(crate) type sa_family_t = c_ushort;
+/// `pid_t`: `__kernel_pid_t`, `<asm-generic/posix_types.h>`.
+pub(crate) type pid_t = c_int;
+/// `id_t`: `__id_t`, an unsigned 32-bit integer (`<bits/typesizes.h>`).
+pub(crate) type id_t = c_uint;
+/// `idtype_t`: an enum in `<sys/wait.h>` with the values of
+/// `<linux/wait.h>`, so as wide as an `unsigned int`.
+pub(crate) type idtype_t = c_uint;
 
 // <bits/socket.h>
 pub(crate) const AF_NETLINK: c_int = 16;
@@ -39,7 +47,35 @@ pub(crate) const SO_RCVBUF: c_int = 8;
 // <asm-generic/signal.h>
 pub(crate) const SIGHUP: c_int = 1;
 pub(crate) const SIGINT: c_int = 2;
+pub(crate) const SIGKILL: c_int = 9;
 pub(crate) const SIGTERM: c_int = 15;
+// <asm-generic/errno-base.h>
+pub(crate) const ESRCH: c_int = 3;
+pub(crate) const EINVAL: c_int = 22;
+// <linux/prctl.h>
+pub(crate) const PR_SET_PDEATHSIG: c_int = 1;
+pub(crate) const PR_CAP_AMBIENT: c_int = 47;
+pub(crate) const PR_CAP_AMBIENT_CLEAR_ALL: c_ulong = 4;
+// <asm-generic/fcntl.h>
+pub(crate) const F_SETFD: c_int = 2;
+pub(crate) const FD_CLOEXEC: c_int = 1;
+// `_SC_OPEN_MAX`: <bits/confname.h> in glibc, <unistd.h> in musl.
+pub(crate) const SC_OPEN_MAX: c_int = 4;
+// <linux/wait.h>
+pub(crate) const WEXITED: c_int = 0x0000_0004;
+pub(crate) const WNOWAIT: c_int = 0x0100_0000;
+pub(crate) const P_PID: idtype_t = 1;
+// <asm-generic/siginfo.h>
+pub(crate) const SI_MAX_SIZE: usize = 128;
+
+/// `siginfo_t`, `<asm-generic/siginfo.h>`: a union padded to
+/// `SI_MAX_SIZE` bytes on every architecture, aligned like the `long` and
+/// pointer members it holds. `waitid` fills it in and nothing here reads
+/// it, so it is declared by size and alignment only.
+#[repr(C)]
+pub(crate) struct siginfo_t {
+    pub(crate) opaque: [c_ulong; SI_MAX_SIZE / size_of::<c_ulong>()],
+}
 
 /// `struct sockaddr_nl`, `<linux/netlink.h>`.
 #[repr(C)]
@@ -84,10 +120,29 @@ unsafe extern "C" {
     pub(crate) fn getuid() -> uid_t;
     pub(crate) fn setuid(uid: uid_t) -> c_int;
     pub(crate) fn setgid(gid: gid_t) -> c_int;
+    pub(crate) fn getpid() -> pid_t; // getpid(2)
+    pub(crate) fn getppid() -> pid_t; // getppid(2)
+    pub(crate) fn _exit(status: c_int) -> !; // _exit(2)
     // <grp.h>
     pub(crate) fn setgroups(size: size_t, list: *const gid_t) -> c_int;
     // <signal.h>
     pub(crate) fn signal(signum: c_int, handler: sighandler_t) -> c_ulong;
+    pub(crate) fn kill(pid: pid_t, sig: c_int) -> c_int; // kill(2)
+    // <sys/prctl.h>, prctl(2): variadic there, so variadic here; callers
+    // pass all four `unsigned long` arguments the C wrapper reads.
+    pub(crate) fn prctl(option: c_int, ...) -> c_int;
+    // <fcntl.h>, fcntl(2): variadic there, so variadic here; F_SETFD
+    // reads an `int`.
+    pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    // <unistd.h>, sysconf(3)
+    pub(crate) fn sysconf(name: c_int) -> c_long;
+    // <sys/wait.h>
+    pub(crate) fn waitid(
+        idtype: idtype_t,
+        id: id_t,
+        infop: *mut siginfo_t,
+        options: c_int,
+    ) -> c_int; // waitid(2)
 }
 
 #[cfg(test)]
@@ -103,7 +158,18 @@ mod tests {
         assert_eq!(align_of::<sockaddr_nl>(), 4);
         assert_eq!(size_of::<sa_family_t>(), 2);
         assert_eq!(size_of::<uid_t>(), 4);
+        assert_eq!(size_of::<pid_t>(), 4);
         assert_eq!(size_of::<socklen_t>(), 4);
         assert_eq!(size_of::<size_t>(), size_of::<usize>());
+    }
+
+    /// `waitid(2)`'s types, also under AGENTS.md §1.4.
+    #[test]
+    fn waitid_layouts_match_the_headers() {
+        // sizeof(siginfo_t) == SI_MAX_SIZE == 128 on every Linux target.
+        assert_eq!(size_of::<siginfo_t>(), 128);
+        assert_eq!(align_of::<siginfo_t>(), align_of::<c_ulong>());
+        assert_eq!(size_of::<id_t>(), 4);
+        assert_eq!(size_of::<idtype_t>(), 4);
     }
 }
