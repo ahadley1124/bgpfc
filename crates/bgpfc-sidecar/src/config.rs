@@ -63,7 +63,9 @@ pub struct SidecarConfig {
     /// for an explicit opt-in in 0.12.0 and uses the ARIN TAL by default,
     /// but accepting an agreement is the operator's decision, so bgpfcd
     /// leaves the ARIN TAL out unless this is true. Without it, routes in
-    /// ARIN's address space validate as `NotFound`.
+    /// ARIN's address space validate as `NotFound`. bgpfcd cannot stop a
+    /// [`config_file`](Self::config_file) or an extra TAL directory from
+    /// adding the ARIN TAL.
     pub accept_arin_rpa: bool,
     /// How long Routinator waits after a validation run before the next
     /// (`server --refresh`). Routinator also announces it to RTR clients
@@ -74,8 +76,16 @@ pub struct SidecarConfig {
     /// A Routinator config file (`--config`), for settings bgpfcd does not
     /// model. Absolute. Routinator 0.15 requires such a file to set
     /// `repository-dir` even though bgpfcd passes `--repository-dir`,
-    /// which takes precedence. The command line also overrides its TALs
-    /// and RTR listeners; see [`routinator_args`](crate::routinator_args).
+    /// which takes precedence.
+    ///
+    /// Trusted operator input: bgpfcd does not read the file, and the
+    /// command line overrides only some of it. Whatever else it sets
+    /// applies, including what bgpfcd refuses elsewhere: an RTR-over-TLS
+    /// listener off loopback (`rtr-tls-listen`), a switch to another user
+    /// (`user`, `group`) and, unless the TAL settings name a bundled TAL,
+    /// a `tals` list with ARIN's TAL in it. See "A Routinator config file"
+    /// under [`routinator_args`](crate::routinator_args) for what it must
+    /// not set.
     pub config_file: Option<PathBuf>,
     /// Escape hatch (issue #72): options passed to Routinator verbatim
     /// just before the `server` command, such as `--strict` or

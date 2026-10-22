@@ -116,13 +116,9 @@ const SHORT_WITH_VALUE: &[u8] = b"x";
 /// - The TAL set is spelled out: `--no-rir-tals`, then one `--tal` for
 ///   each RIR TAL in use (ARIN's only with
 ///   [`accept_arin_rpa`](SidecarConfig::accept_arin_rpa)) and for each
-///   further bundled TAL, without duplicates. Command-line `--tal`
-///   replaces a config file's `tals` list, so a config file cannot change
-///   which bundled TALs are used. Its `extra-tals-dir` still applies when
-///   [`extra_dir`](crate::TalConfig::extra_dir) is unset: the command line
-///   cannot remove it.
+///   further bundled TAL, without duplicates.
 /// - Command-line `--rtr` replaces a config file's `rtr-listen` list, so
-///   RTR is served on `rtr` only (issue #71).
+///   the plain RTR listener is on `rtr` only (issue #71).
 /// - No `--detach`: Routinator stays in the foreground and logs to stderr
 ///   (manual page, config file option `log`), and its exit is what the
 ///   supervisor watches.
@@ -130,6 +126,31 @@ const SHORT_WITH_VALUE: &[u8] = b"x";
 ///   before `server` and the extra server arguments last, both verbatim
 ///   and after bgpfcd's own. [`SidecarConfig::validate`] refuses the ones
 ///   that would repeat or contradict an option above.
+///
+/// # A Routinator config file
+///
+/// [`config_file`](SidecarConfig::config_file) is passed as `--config`
+/// and is trusted operator input: bgpfcd does not read it. Routinator
+/// 0.15.2 lets a command-line option replace a config file setting only
+/// when the option is given (`src/config.rs`), so the command line above
+/// replaces the file's `repository-dir`, `rtr-listen` and `refresh`, its
+/// `tals` only when at least one `--tal` is passed, and its
+/// `extra-tals-dir` only when [`extra_dir`](crate::TalConfig::extra_dir)
+/// is set. Everything else the file sets applies, so it must not set:
+///
+/// - `rtr-tls-listen`: RTR over TLS on any address, outside the loopback
+///   rule of issue #71;
+/// - `systemd-listen`: the child gets no sockets from systemd, so every
+///   start fails;
+/// - `user` or `group`: Routinator would switch users, which clears its
+///   parent-death signal (`prctl(2)`);
+/// - `tals` while the TAL settings name no bundled TAL (only an
+///   [`extra_dir`](crate::TalConfig::extra_dir)), or `extra-tals-dir`
+///   while `extra_dir` is unset: those would add trust anchors bgpfcd's
+///   settings do not show, ARIN's whatever
+///   [`accept_arin_rpa`](SidecarConfig::accept_arin_rpa) says;
+/// - `log` or `log-file` pointing away from stderr, unless the operator
+///   wants Routinator's messages out of bgpfcd's log.
 ///
 /// `rtr` is where to serve, with a configured port 0 already replaced by
 /// the port bgpfcd picked; `--rtr` would otherwise bind an ephemeral port
