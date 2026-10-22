@@ -852,6 +852,89 @@ mod net {
         assert!(client.status().last_error.unwrap().contains("expired"));
     }
 
+    /// A client of `cache` that takes over `held`.
+    fn start_holding(cache: &TestCache, held: Held) -> (Client, Receiver<ValidationChange>) {
+        let (tx, rx): (Sender<ValidationChange>, _) = mpsc::channel();
+        let config = config(vec![cache.entry(0)]);
+        (Client::start_holding(config, tx, Some(held)).unwrap(), rx)
+    }
+
+    #[test]
+    fn a_new_client_keeps_the_old_one_s_data_until_a_cache_sends_a_full_set() {
+        // A reconfiguration: the client in sync with one cache stops, and
+        // one for another cache takes over what it published.
+        let old_cache = TestCache::new();
+        let (mut old, old_rx, _router) = in_sync(&old_cache);
+        old.stop();
+        assert!(old_rx.try_recv().is_err());
+        let held = old.status().held().expect("the old client published");
+        assert_eq!(*held.vrps, set(&[a(), b()]));
+        assert_eq!(held.expires_at, old.status().expires_at);
+        assert!(held.expires_at.is_some());
+        let cache = TestCache::new();
+        let (client, rx) = start_holding(&cache, held);
+        // RFC 8210 §10: the old data stays in use, and shows, until the new
+        // cache has sent a full set.
+        let status = client.status();
+        assert_eq!(status.vrps.as_deref(), Some(&set(&[a(), b()])));
+        assert_eq!((status.vrps_ipv4, status.vrps_ipv6), (1, 1));
+        assert_eq!(status.expires_at, old.status().expires_at);
+        assert_eq!(status.last_commit, None);
+        let mut router = cache.accept();
+        assert_eq!(router.recv(), RESET_V1, "a session of its own");
+        assert!(rx.try_recv().is_err());
+        router.send(&[
+            response(V1, 9),
+            announce(V1, a()),
+            announce(V1, c()),
+            eod(9, 1),
+        ]);
+        // The new set replaces the old one whole; only the routes the two
+        // disagree on are validated again.
+        let change = next_change(&rx);
+        assert!(covers(&change, "2001:db8::/32") && covers(&change, "198.51.100.0/24"));
+        assert!(!covers(&change, "192.0.2.0/24"));
+        assert_eq!(rov(&change, "198.51.100.0/24", 64_498), RovState::Valid);
+        eventually("the new cache's data", || {
+            client.status().vrps.as_deref() == Some(&set(&[a(), c()]))
+        });
+    }
+
+    #[test]
+    fn data_a_new_client_takes_over_expires_without_a_full_set() {
+        // The new cache takes the connection and never answers.
+        let cache = TestCache::new();
+        let held = Held {
+            vrps: Arc::new(set(&[a(), b()])),
+            expires_at: Some(Instant::now() + 50 * MS),
+        };
+        let (client, rx) = start_holding(&cache, held);
+        let mut router = cache.accept();
+        assert_eq!(router.recv(), RESET_V1);
+        // RFC 8210 §6: not past its Expire Interval, whichever client holds
+        // it.
+        let change = next_change(&rx);
+        assert!(covers(&change, "192.0.2.0/24") && covers(&change, "2001:db8::/32"));
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::NotFound);
+        eventually("the status to show no data", || {
+            let status = client.status();
+            status.vrps.as_deref() == Some(&VrpSet::new()) && status.expires_at.is_none()
+        });
+        assert!(client.status().last_error.unwrap().contains("expired"));
+        // What it holds now is nothing, for good.
+        let held = client.status().held().unwrap();
+        assert!(held.vrps.is_empty() && held.expires_at.is_none());
+    }
+
+    #[test]
+    fn a_client_that_never_published_hands_nothing_over() {
+        let cache = TestCache::new();
+        let (mut client, _rx) = start(vec![cache.entry(0)]);
+        drop(cache.accept());
+        client.stop();
+        assert_eq!(client.status().held(), None);
+    }
+
     fn no_data() -> Pdu {
         Pdu::ErrorReport(ErrorReport::new(
             V1,

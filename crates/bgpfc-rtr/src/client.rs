@@ -29,6 +29,12 @@
 //! (§10, §6). Each cache gets a session of its own, so the new cache is
 //! asked with a Reset Query.
 //!
+//! The same holds across clients. When the router's cache list or the
+//! client's settings change, the old client is stopped and a new one
+//! started; [`Client::start_holding`] gives the new one the data the old
+//! one published ([`Status::held`]), which it treats like data from a
+//! cache it moved away from.
+//!
 //! A cache that answers No Data Available is left for the next cache, as
 //! after a failed attempt (§8.4: "the router SHOULD attempt to connect to
 //! any other caches in its cache list, in preference order"). One that
@@ -66,10 +72,10 @@
 //! Reset or No Data Available), §9 (unprotected TCP to the rpki-rtr port,
 //! 323), §10 (the list of caches in order of preference; the data from one
 //! cache at a time, replaced only by a full set from another; the
-//! previous cache's data kept until then), §6 (data not kept past its
-//! Expire Interval across a move to another cache; the reconnect delay,
-//! see [`Backoff`]); RFC 6810 §7 (port 323 for version 0), §8 (the cache
-//! list).
+//! previous cache's data kept until then, also across a new cache list),
+//! §6 (data not kept past its Expire Interval across a move to another
+//! cache or client; the reconnect delay, see [`Backoff`]); RFC 6810 §7
+//! (port 323 for version 0), §8 (the cache list).
 
 #[cfg(test)]
 mod tests;
@@ -297,6 +303,39 @@ pub struct Status {
     pub running: bool,
 }
 
+impl Status {
+    /// What a client started after this one must keep using:
+    /// [`Status::vrps`] until [`Status::expires_at`]. `None` if this client
+    /// never published, in which case the RIB has no data from it.
+    ///
+    /// Read it once the client has stopped, so that nothing it publishes
+    /// later is missed.
+    #[must_use]
+    pub fn held(&self) -> Option<Held> {
+        self.vrps.as_ref().map(|vrps| Held {
+            vrps: Arc::clone(vrps),
+            expires_at: self.expires_at,
+        })
+    }
+}
+
+/// Data a client starts with because the RIB validates with it already:
+/// what an earlier client published (see [`Client::start_holding`]).
+///
+/// RFC 8210 §10: "If a client loses connectivity to a cache it is using or
+/// otherwise decides to switch to a new cache, it SHOULD retain the data
+/// from the previous cache until it has a full set of data from one or
+/// more other caches." A new cache list is such a decision. §6: the data
+/// still expires when its Expire Interval says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The data, as the RIB has it.
+    pub vrps: Arc<VrpSet>,
+    /// When it expires. `None` for data that has nothing left to expire:
+    /// the empty set a client publishes once its data expired.
+    pub expires_at: Option<Instant>,
+}
+
 /// A cloneable reader of a [`Client`]'s [`Status`], for the control
 /// thread. It stays valid after the client is gone, with
 /// [`Status::running`] false.
@@ -425,10 +464,32 @@ impl Client {
     where
         S: ValidationSink + 'static,
     {
-        Client::spawn(config, sink, Clock::default())
+        Client::start_holding(config, sink, None)
     }
 
-    fn spawn<S>(config: Config, sink: S, clock: Clock) -> io::Result<Client>
+    /// [`Client::start`] for a client that takes over from an earlier one,
+    /// whose data, `held`, the RIB validates with: what
+    /// [`Status::held`] of the stopped client gives.
+    ///
+    /// The new client keeps that data, as it keeps the data of a cache it
+    /// moved away from (RFC 8210 §10): its status shows it, and the first
+    /// full set a cache sends replaces it, affecting only the routes the
+    /// two sets judge differently. If no cache sends one before
+    /// [`Held::expires_at`], the client publishes an empty set then, so
+    /// that every route is `NotFound` (§6). With `held` `None` it is
+    /// [`Client::start`]: the first set replaces whatever source the RIB
+    /// has, and affects every route.
+    ///
+    /// # Errors
+    /// As [`Client::start`].
+    pub fn start_holding<S>(config: Config, sink: S, held: Option<Held>) -> io::Result<Client>
+    where
+        S: ValidationSink + 'static,
+    {
+        Client::spawn(config, sink, held, Clock::default())
+    }
+
+    fn spawn<S>(config: Config, sink: S, held: Option<Held>, clock: Clock) -> io::Result<Client>
     where
         S: ValidationSink + 'static,
     {
@@ -441,7 +502,10 @@ impl Client {
         let shared = Arc::new(Shared::default());
         #[cfg(test)]
         let client_clock = clock.clone();
-        let worker = Worker::new(config, sink, Arc::clone(&shared), clock);
+        let mut worker = Worker::new(config, sink, Arc::clone(&shared), clock);
+        if let Some(held) = held {
+            worker.hold(held);
+        }
         let status = Arc::clone(&worker.status);
         let thread = thread::Builder::new()
             .name("rtr-client".to_owned())
@@ -620,6 +684,17 @@ impl<S: ValidationSink> Worker<S> {
             pending_error: None,
             exit: false,
         }
+    }
+
+    /// Start out with `held`, the data an earlier client published, as if
+    /// it came from a cache this client moved away from (RFC 8210 §10):
+    /// the first commit replaces it with only the routes the two sets
+    /// disagree on affected, and it expires at its time (§6).
+    fn hold(&mut self, held: Held) {
+        self.counts = count(&held.vrps);
+        self.published = Some(held.vrps);
+        self.held_expires = held.expires_at;
+        self.publish_status(true);
     }
 
     fn cache(&self) -> &Cache {
