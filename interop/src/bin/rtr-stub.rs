@@ -4,9 +4,10 @@
 //!
 //! A cache that restarts starts a new session with a new Session ID
 //! (RFC 8210 §5.1), and the router resumes with a Serial Query for the
-//! old one (§8.1). `StayRTR` 0.5.1 closes the connection on that query
-//! without a word, so the router never syncs with it again until its data
-//! expires. This stub answers as RFC 8210 §8.3 has a cache that "cannot
+//! old one (§8.1). `StayRTR` 0.5.1 answers that query with an Error Report
+//! but closes the connection at the same time, so whether the router
+//! reloads or keeps asking depends on which arrives first. This stub
+//! answers, every time, as RFC 8210 §8.3 has a cache that "cannot
 //! supply an incremental update from the Serial Number specified by the
 //! router" answer, for instance because it "has lost state": with a Cache
 //! Reset, after which the router asks for everything with a Reset Query.

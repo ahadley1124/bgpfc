@@ -6,7 +6,8 @@
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
-//! 0.5.1 cannot do (see `a_restarted_cache_brings_bgpfcd_back_in_sync`).
+//! 0.5.1 does only when its Error Report wins a race with its own close
+//! (see `a_restarted_cache_brings_bgpfcd_back_in_sync`).
 //! Another lists a cache whose address swallows every packet, so that a
 //! connection attempt to it hangs until its timeout.
 //!
@@ -585,23 +586,35 @@ fn the_vrps_outlive_a_restarted_stayrtr() {
         "no `{query}`:\n{}",
         s.report()
     );
-    // NOTE(interop): StayRTR 0.5.1 has a new Session ID now and closes the
-    // connection on that query, without the Error Report (RFC 8210 §5.1)
-    // or the Cache Reset (§8.3) that would have bgpfcd load its data
-    // afresh. So bgpfcd, like BIRD 2.14, keeps its VRPs and asks again
-    // until they expire (§6). `a_restarted_cache_brings_bgpfcd_back_in_sync`
-    // shows the rest against a cache that answers.
+    // NOTE(interop): StayRTR 0.5.1 has a new Session ID now. It answers
+    // that query with an Error Report (Corrupt Data, "Session ID
+    // mismatch") rather than the Cache Reset of RFC 8210 §8.3, but closes
+    // the connection at the same time, so the report reaches bgpfcd in
+    // some runs and is lost in others. With the report, the session ends
+    // (§5.11) and bgpfcd loads the data afresh with a Reset Query; with a
+    // bare close, bgpfcd keeps its VRPs and asks again, as BIRD 2.14 does,
+    // until they expire (§6) or another cache answers. Either way the VRPs
+    // stay in use and no route changes state, which is what this test is
+    // about; `a_restarted_cache_brings_bgpfcd_back_in_sync` covers the
+    // reload against a cache that answers with a Cache Reset.
     let refused = format!("Invalid request (client asked for session {id} but server is at");
+    let mut out = String::new();
     assert!(
-        wait_for(RECONNECT, || s.caches[0]
-            .daemon
-            .log_text()
-            .contains(&refused)),
-        "{}",
+        wait_for(RECONNECT, || {
+            out = s.ctl(&["show", "rpki"]).0;
+            let reloaded = out.contains("state idle, connected, version 1")
+                && out.contains("vrps ipv4 2 ipv6 0 from 127.0.0.1:3323,")
+                && session_line(&out).starts_with("session-id ")
+                && session_line(&out) != session;
+            let asked_again = s.caches[0].daemon.log_text().matches(&refused).count() >= 2
+                && !out.contains(", connected")
+                && session_line(&out) == session
+                && out.contains("vrps ipv4 2 ipv6 0 from 127.0.0.1:3323, expire in");
+            reloaded || asked_again
+        }),
+        "{out}\n{}",
         s.report()
     );
-    let out = s.wait_for_lost_cache(RECONNECT);
-    assert_eq!(session_line(&out), session, "{out}");
     s.wait_for_states(Duration::ZERO, &VALIDATED);
 }
 
@@ -612,8 +625,8 @@ fn the_vrps_outlive_a_restarted_stayrtr() {
 /// no route changes state at any point.
 ///
 /// The cache is this crate's `rtr-stub`: `StayRTR` 0.5.1 answers that
-/// Serial Query by closing the connection (see
-/// `the_vrps_outlive_a_restarted_stayrtr`).
+/// Serial Query with an Error Report that its own close of the connection
+/// sometimes loses (see `the_vrps_outlive_a_restarted_stayrtr`).
 #[test]
 #[ignore = "needs root, bird, curl and iproute2"]
 fn a_restarted_cache_brings_bgpfcd_back_in_sync() {
