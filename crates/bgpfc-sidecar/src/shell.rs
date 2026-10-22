@@ -822,13 +822,14 @@ mod tests {
         }
     }
 
-    /// Settings for a stub: backoff from 50 ms doubling to 200 ms, stable
-    /// after 10 s, the alarm after three failures, a 5 s stop timeout.
+    /// Settings for a stub: backoff from 50 ms doubling to 1 s, the
+    /// shortest settings allowed, stable after 10 s, the alarm after three
+    /// failures, a 5 s stop timeout.
     fn config(dir: &TempDir, binary: PathBuf) -> SidecarConfig {
         let mut config = SidecarConfig::new(binary, dir.join("repo"));
         config.backoff = BackoffConfig {
-            initial: ms(50),
-            cap: ms(200),
+            initial: SidecarConfig::MIN_BACKOFF,
+            cap: SidecarConfig::MIN_BACKOFF_CAP,
             stable: Duration::from_secs(10),
         };
         config.stop_timeout = Duration::from_secs(5);

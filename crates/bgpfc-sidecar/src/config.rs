@@ -98,7 +98,9 @@ pub struct SidecarConfig {
     /// verbatim at the end of the command line, such as
     /// `--http=127.0.0.1:8323`.
     pub extra_server_args: Vec<OsString>,
-    /// Restart delays after a failure. The cap is at most
+    /// Restart delays after a failure. The initial delay is at least
+    /// [`MIN_BACKOFF`](Self::MIN_BACKOFF), the cap at least
+    /// [`MIN_BACKOFF_CAP`](Self::MIN_BACKOFF_CAP) and at most
     /// [`MAX_DELAY`](Self::MAX_DELAY), the stable period at most
     /// [`MAX_STABLE`](Self::MAX_STABLE).
     pub backoff: BackoffConfig,
@@ -121,6 +123,19 @@ impl SidecarConfig {
 
     /// Default consecutive-failure threshold.
     pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+    /// Shortest initial backoff. A delay far shorter than it takes the
+    /// child to start and fail restarts a crashing child as fast as it can
+    /// fail (jitter, which can halve a delay, turns one of a nanosecond
+    /// into none at all); from 50 ms the doubling reaches the cap after a
+    /// handful of quick retries.
+    pub const MIN_BACKOFF: Duration = Duration::from_millis(50);
+
+    /// Shortest backoff cap. A validator that keeps failing is retried at
+    /// the cap for as long as it fails (issue #70), each time with a
+    /// spawn, three threads and an error line; a second, jittered down to
+    /// half of it at most, keeps that from becoming a busy loop.
+    pub const MIN_BACKOFF_CAP: Duration = Duration::from_secs(1);
 
     /// Longest backoff cap and graceful-stop timeout. A validator retried
     /// less often than hourly, or a stop that may take longer, is not
@@ -209,16 +224,22 @@ impl SidecarConfig {
 
     fn validate_supervision(&self) -> Result<(), SidecarError> {
         let b = &self.backoff;
-        if b.initial.is_zero() {
+        if b.initial < Self::MIN_BACKOFF {
             return Err(SidecarError::OutOfRange {
                 setting: "initial backoff",
-                expected: "longer than zero",
+                expected: "at least 50 ms",
             });
         }
         if b.cap < b.initial {
             return Err(SidecarError::OutOfRange {
                 setting: "backoff cap",
                 expected: "at least the initial backoff",
+            });
+        }
+        if b.cap < Self::MIN_BACKOFF_CAP {
+            return Err(SidecarError::OutOfRange {
+                setting: "backoff cap",
+                expected: "at least a second",
             });
         }
         if b.cap > Self::MAX_DELAY {
@@ -361,6 +382,10 @@ mod tests {
             ("longest refresh", |c| c.refresh = Duration::from_secs(7199)),
             ("backoff at its cap from the start", |c| {
                 c.backoff.cap = c.backoff.initial;
+            }),
+            ("shortest backoffs", |c| {
+                c.backoff.initial = SidecarConfig::MIN_BACKOFF;
+                c.backoff.cap = SidecarConfig::MIN_BACKOFF_CAP;
             }),
             ("longest durations", |c| {
                 c.backoff.initial = SidecarConfig::MAX_DELAY;
@@ -523,7 +548,29 @@ mod tests {
             (
                 "zero initial backoff",
                 |c| c.backoff.initial = Duration::ZERO,
-                out_of_range("initial backoff", "longer than zero"),
+                out_of_range("initial backoff", "at least 50 ms"),
+            ),
+            (
+                // Jitter would round it to nothing: a restart loop.
+                "nanosecond backoff",
+                |c| {
+                    c.backoff.initial = Duration::from_nanos(1);
+                    c.backoff.cap = Duration::from_nanos(1);
+                },
+                out_of_range("initial backoff", "at least 50 ms"),
+            ),
+            (
+                "initial backoff just below the floor",
+                |c| c.backoff.initial = Duration::from_micros(49_999),
+                out_of_range("initial backoff", "at least 50 ms"),
+            ),
+            (
+                "cap below a second",
+                |c| {
+                    c.backoff.initial = Duration::from_millis(50);
+                    c.backoff.cap = Duration::from_millis(999);
+                },
+                out_of_range("backoff cap", "at least a second"),
             ),
             (
                 "cap below the initial backoff",
