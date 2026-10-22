@@ -26,6 +26,7 @@ dependencies = [
  "arbitrary",
  "bgpfc-config",
  "bgpfc-policy",
+ "bgpfc-rpki",
  "bgpfc-rtr",
  "bgpfc-wire",
  "libfuzzer-sys",
@@ -62,6 +63,7 @@ dependencies = [
 name = "bgpfc-rtr"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-log",
  "bgpfc-rpki",
  "bgpfc-wire",
 ]
