@@ -21,7 +21,9 @@
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In or the decision process), §3 (policy sees
-//! the validation state, see [`Policies`]).
+//! the validation state, see [`Policies`]), §4 (the affected routes are
+//! validated again when the validation source changes, see
+//! [`Rib::validation_changed`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -35,6 +37,7 @@ pub mod pacing;
 pub mod peer;
 #[cfg(test)]
 mod tests;
+mod validation;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
@@ -42,14 +45,14 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rpki::{NullSource, RouteOrigin, ValidationSource};
+use bgpfc_rpki::{NullSource, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
-pub use bgpfc_rpki::{AspaState, RovState};
+pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::Candidate;
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
@@ -179,6 +182,22 @@ pub enum Output {
         /// The routes.
         prefixes: Vec<Prefix>,
     },
+    /// The RFC 6811 validation state of a route in an Adj-RIB-In changed
+    /// with the validation source (see [`Rib::validation_changed`]). The
+    /// caller logs it (issue #59). The state a route gets on arrival is
+    /// its first, not a change, and is not reported.
+    RovStateChanged {
+        /// The peer the route came from.
+        peer: IpAddr,
+        /// The route's destination.
+        prefix: Prefix,
+        /// Its Route Origin ASN (RFC 6811 §2).
+        origin: RouteOrigin,
+        /// The state it had.
+        from: RovState,
+        /// The state it has now.
+        to: RovState,
+    },
 }
 
 /// The best route to a destination.
@@ -300,7 +319,8 @@ pub struct Rib {
     tables: HashMap<AddressFamily, BTreeMap<Prefix, Destination>>,
     interner: Interner,
     /// Where validation states come from (issue #56): [`NullSource`],
-    /// every route `Disabled`.
+    /// every route `Disabled`, until [`Rib::validation_changed`] says
+    /// otherwise.
     validation: Arc<dyn ValidationSource>,
     /// Pending wake-ups, earliest first. Each `AdjRibOut` knows the one
     /// live entry per destination; an entry an earlier one replaced stays
@@ -321,7 +341,8 @@ impl Rib {
     }
 
     /// An empty RIB for a speaker in `local_as` with the given policies.
-    /// Validation is off ([`NullSource`]: every route `Disabled`).
+    /// Validation is off ([`NullSource`]: every route `Disabled`) until
+    /// [`Rib::validation_changed`] gives it a source.
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {

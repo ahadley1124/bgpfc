@@ -5,7 +5,8 @@
 //! releases the advertisements that were held back; the pacing itself is
 //! `bgpfc_rib`'s. A peer over its RFC 4271 §6.7 prefix limit is told to
 //! end its session. Routes the RIB ignored for a semantically incorrect
-//! next hop are logged (RFC 4271 §6.3).
+//! next hop are logged (RFC 4271 §6.3), as is every change of a route's
+//! RFC 6811 validation state (issue #59).
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Rib};
+use bgpfc_rib::{Output, PeerInfo, Rib, RouteOrigin, RovState};
+use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::PeerKind;
 
@@ -343,12 +345,45 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                     prefixes = sample(&prefixes)
                 );
             }
+            Output::RovStateChanged {
+                peer,
+                prefix,
+                origin,
+                from,
+                to,
+            } => {
+                // Issue #59: every change of a route's validation state.
+                let fields = rov_change(&peer, &prefix, &origin, &from, &to);
+                bgpfc_log::log(bgpfc_log::Level::Info, ROV_CHANGED, &fields);
+            }
         }
     }
 }
 
+/// The message of the line logged for each change of a route's RFC 6811
+/// validation state.
+const ROV_CHANGED: &str = "rib: validation state changed";
+
+/// The fields of that line: the route (`peer`, `prefix`), its Route
+/// Origin ASN (RFC 6811 §2), and its state before and after.
+fn rov_change<'a>(
+    peer: &'a IpAddr,
+    prefix: &'a Prefix,
+    origin: &'a RouteOrigin,
+    from: &'a RovState,
+    to: &'a RovState,
+) -> [bgpfc_log::Field<'a>; 5] {
+    [
+        ("peer", peer),
+        ("prefix", prefix),
+        ("origin", origin),
+        ("from", from),
+        ("to", to),
+    ]
+}
+
 /// The first few of `prefixes` for a log line, `...` marking the rest.
-fn sample(prefixes: &[bgpfc_wire::prefix::Prefix]) -> String {
+fn sample(prefixes: &[Prefix]) -> String {
     const SHOWN: usize = 8;
     let mut s = prefixes
         .iter()
@@ -926,5 +961,34 @@ mod tests {
         drop(tx);
         assert!(matches!(next(&rx, None), Err(Closed)));
         assert!(matches!(next(&rx, later), Err(Closed)));
+    }
+
+    #[test]
+    fn a_validation_state_change_is_one_info_line() {
+        // Issue #59: msg, peer, prefix, origin, from, to.
+        let line = |origin: RouteOrigin, from: RovState, to: RovState| {
+            let (peer, prefix) = (ip("192.0.2.1"), "198.51.100.0/24".parse().unwrap());
+            let fields = rov_change(&peer, &prefix, &origin, &from, &to);
+            bgpfc_log::format_line(
+                std::time::UNIX_EPOCH,
+                bgpfc_log::Level::Info,
+                ROV_CHANGED,
+                &fields,
+            )
+        };
+        assert_eq!(
+            line(
+                RouteOrigin::As(Asn(64_496)),
+                RovState::NotFound,
+                RovState::Valid
+            ),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation state changed\" \
+             peer=192.0.2.1 prefix=198.51.100.0/24 origin=AS64496 from=not-found to=valid\n"
+        );
+        assert_eq!(
+            line(RouteOrigin::None, RovState::Disabled, RovState::Invalid),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation state changed\" \
+             peer=192.0.2.1 prefix=198.51.100.0/24 origin=none from=disabled to=invalid\n"
+        );
     }
 }
