@@ -242,7 +242,7 @@ is `done`.
 | 7.6 | `ATOMIC_AGGREGATE` length ≠ 0 → discard | SHALL | done | wire/update.rs | update.rs `attribute_length_and_flag_errors` |
 | 7.7 | AGGREGATOR length 6 (two-octet) / 8 (four-octet) else discard | SHALL | done | wire/update.rs `decode_aggregator` | update.rs |
 | 7.8 | COMMUNITIES length non-zero multiple of 4 else treat-as-withdraw | SHALL | done | wire/community.rs | update.rs `communities_round_trip_and_length_errors` |
-| 7.11 | `MP_REACH_NLRI` next hop length inconsistent → session reset / AFI-SAFI disable | MUST | done (expected: 4 for IPv4 unicast, also 16 or 32 once RFC 8950 is negotiated; 16 or 32 for IPv6 unicast) | wire/mp.rs `NextHop::decode`, wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family`, `ipv4_routes_with_an_ipv6_next_hop_need_rfc8950` |
+| 7.11 | `MP_REACH_NLRI` next hop length inconsistent → session reset / AFI-SAFI disable | MUST | done (expected: 4 for IPv4 unicast, also 16 or 32 once we advertised RFC 8950 Extended Next Hop Encoding for it, an extension in use whether or not the peer advertised it too; 16 or 32 for IPv6 unicast) | wire/mp.rs `NextHop::decode`, wire/update.rs `mp_failure`, bgpfcd/peer.rs `decode_context` | update.rs `mp_attribute_errors_disable_the_family`, `ipv4_routes_with_an_ipv6_next_hop_need_rfc8950`, bgpfcd/peer.rs `ipv6_next_hops_for_ipv4_routes_are_taken_once_we_advertised_rfc8950` |
 | 7.14 | Extended Communities length non-zero multiple of 8 else treat-as-withdraw; unknown types never an error | SHALL / MUST | done | wire/community.rs | community.rs `extended_communities` |
 
 ## RFC 8654 — Extended Messages
