@@ -21,6 +21,10 @@
 //!    [`ValidationSink`](bgpfc_rpki::ValidationSink), see
 //!    [`Commit::into_change`].
 //!
+//! After a failure the session reconnects when the cache's Retry Interval
+//! has run out (RFC 8210 §6), unless the shell paces reconnects itself
+//! with [`Session::set_retry_delay`].
+//!
 //! # What the RIB sees
 //!
 //! Nothing but whole data sets (issue #58). The PDUs of a reply are
@@ -361,12 +365,18 @@ pub struct Session {
     synced_at: Option<Instant>,
     /// The serial of a Serial Notify that arrived while a query was out.
     notified: Option<u32>,
+    /// The shell's delay before reconnecting after a failure, in place of
+    /// the Retry Interval (see [`Session::set_retry_delay`]).
+    retry_delay: Option<Duration>,
 }
 
 impl Session {
-    /// A session that connects to the cache at the first step.
+    /// A session whose first step at or after `connect_at` returns
+    /// [`Action::Connect`]. That is usually the current time; a shell that
+    /// moves to another cache after a back-off passes the time it means to
+    /// connect.
     #[must_use]
-    pub fn new(config: Config, now: Instant) -> Session {
+    pub fn new(config: Config, connect_at: Instant) -> Session {
         let config = Config {
             max_expire: config
                 .max_expire
@@ -378,7 +388,7 @@ impl Session {
             version: config.version,
             config,
             phase: Phase::Disconnected,
-            deadline: Some(now),
+            deadline: Some(connect_at),
             negotiated: None,
             connection_session_id: None,
             position: None,
@@ -390,7 +400,23 @@ impl Session {
             expire_at: None,
             synced_at: None,
             notified: None,
+            retry_delay: None,
         }
+    }
+
+    /// Wait `delay` after a failure before the next [`Action::Connect`],
+    /// in place of the Retry Interval; `None`, the default, goes back to
+    /// the Retry Interval (RFC 8210 §6).
+    ///
+    /// This is for an I/O shell that paces its reconnects itself, with a
+    /// back-off, say. It sets the delay before each step, so that
+    /// [`Session::next_deadline`] and the `retry_in` of the session's log
+    /// lines follow its schedule. A failure the session has already
+    /// handled keeps the time it got.
+    /// Queries on an open connection, such as the periodic Reset Queries
+    /// after No Data Available (§8.4), still wait the Retry Interval.
+    pub fn set_retry_delay(&mut self, delay: Option<Duration>) {
+        self.retry_delay = delay;
     }
 
     /// The configuration, as clamped by [`Session::new`].
@@ -611,8 +637,15 @@ impl Session {
         }
         // RFC 8210 §6 Retry Interval: "Countdown for this timer starts upon
         // failure of the query and restarts after each subsequent failure
-        // until a query succeeds."
-        self.deadline = after(now, secs(self.intervals.retry));
+        // until a query succeeds." Or the shell's own delay.
+        self.deadline = after(now, self.reconnect_delay());
+    }
+
+    /// How long to wait after a failure before connecting again: the
+    /// shell's delay, or the Retry Interval (RFC 8210 §6).
+    fn reconnect_delay(&self) -> Duration {
+        self.retry_delay
+            .unwrap_or_else(|| secs(self.intervals.retry))
     }
 
     /// Close the connection and open a new one at once: RFC 8210 §6 Retry
@@ -1284,7 +1317,7 @@ impl Session {
     /// how long (issue #57).
     fn log_stale(&self, level: Level, message: &'static str, now: Instant, out: &mut Vec<Action>) {
         let mut fields = self.stale_fields(now);
-        fields.push(field("retry_in", Secs(secs(self.intervals.retry))));
+        fields.push(field("retry_in", Secs(self.reconnect_delay())));
         log(out, level, message, fields);
     }
 
