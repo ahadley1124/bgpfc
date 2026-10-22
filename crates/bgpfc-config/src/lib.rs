@@ -6,7 +6,10 @@
 //! neighbor), §9.2.1.1 (`advertisement-interval`); RFC 7607 §2 (AS 0 is
 //! rejected); RFC 9687 §4.4 (`send-hold-time`); RFC 9774 §3
 //! (`allow-as-set`); RFC 8950 §4 (`extended-next-hop`); RFC 4486 §4
-//! (`restart-limit`); RFC 4271 §6.7 (`maximum-prefix`).
+//! (`restart-limit`); RFC 4271 §6.7 (`maximum-prefix`); RFC 8210 §6, §7,
+//! §9 and §10 (the `rpki` block: the Expire Interval cap and the
+//! back-off within their ranges, the protocol version, the rpki-rtr port,
+//! the cache list with preferences).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

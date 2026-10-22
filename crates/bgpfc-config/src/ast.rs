@@ -30,6 +30,8 @@ pub struct Config {
     pub fib: Fib,
     /// `control { ... }`.
     pub control: Control,
+    /// `rpki { ... }`; [`RpkiMode::Disabled`] when there is none.
+    pub rpki: Rpki,
     /// `prefix-list NAME { ... }` blocks, in file order.
     pub prefix_lists: Vec<PrefixList>,
     /// `policy NAME { ... }` blocks, in file order.
@@ -116,6 +118,134 @@ pub struct Http {
     pub writes: bool,
     /// `token-file`: when set, every request needs the bearer token.
     pub token_file: Option<PathBuf>,
+}
+
+/// How routes get their RFC 6811 origin validation state: the `rpki`
+/// block.
+///
+/// The durations are whole seconds. Every field has its default when the
+/// block leaves it out, and the defaults are those of the RTR client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rpki {
+    /// `mode`: required in the block.
+    pub mode: RpkiMode,
+    /// `cache` statements in file order: the router's cache list
+    /// (RFC 8210 §10). At least one in [`RpkiMode::External`].
+    pub caches: Vec<RpkiCache>,
+    /// `version`: the RTR protocol version offered first, 0 or 1
+    /// (RFC 8210 §7). Version 1 falls back to 0 for a cache that only
+    /// speaks 0; `version 0` is for a cache that mishandles version 1.
+    pub version: u8,
+    /// `connect-timeout`: the longest a connection attempt may take.
+    pub connect_timeout: Duration,
+    /// `response-timeout`: the longest the cache may take to start
+    /// answering a query, and between two PDUs of an answer.
+    pub response_timeout: Duration,
+    /// `reply-timeout`: the longest a whole answer may take, from the
+    /// query to its End of Data.
+    pub reply_timeout: Duration,
+    /// `max-expire`: the longest VRPs that cannot be refreshed are kept.
+    /// The cache's Expire Interval applies when it is shorter (RFC 8210
+    /// §6), so this can only shorten it; between [`Rpki::MIN_EXPIRE`] and
+    /// [`Rpki::MAX_EXPIRE`].
+    pub max_expire: Duration,
+    /// `max-vrps`: the most VRPs an answer may leave the router holding.
+    pub max_vrps: u32,
+    /// `backoff MIN MAX`: the delay before the first reconnect after a
+    /// failure, doubling with each failure in a row up to the second.
+    pub backoff_min: Duration,
+    /// The longest reconnect delay.
+    pub backoff_max: Duration,
+}
+
+impl Rpki {
+    /// The rpki-rtr port (RFC 8210 §9, RFC 6810 §7).
+    pub const DEFAULT_PORT: u16 = 323;
+    /// The default `connect-timeout`.
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The default `response-timeout`.
+    pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_mins(1);
+    /// The default `reply-timeout`.
+    pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_mins(30);
+    /// The shortest `max-expire`: RFC 8210 §6, Expire Interval, "Minimum
+    /// allowed value: 600 seconds".
+    pub const MIN_EXPIRE: Duration = Duration::from_mins(10);
+    /// The longest `max-expire`, and the default, which leaves the cache's
+    /// Expire Interval alone: RFC 8210 §6, "Maximum allowed value: 172800
+    /// seconds".
+    pub const MAX_EXPIRE: Duration = Duration::from_hours(48);
+    /// The default `max-vrps`.
+    pub const DEFAULT_MAX_VRPS: u32 = 4_000_000;
+    /// The default first reconnect delay.
+    pub const DEFAULT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+    /// The default longest reconnect delay: the default Retry Interval of
+    /// RFC 8210 §6.
+    pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_mins(10);
+    /// The longest reconnect delay that may be configured: the largest
+    /// Retry Interval RFC 8210 §6 allows a cache to ask for, "Maximum
+    /// allowed value: 7200 seconds".
+    pub const MAX_BACKOFF: Duration = Duration::from_hours(2);
+}
+
+impl Default for Rpki {
+    /// No `rpki` block: disabled.
+    fn default() -> Rpki {
+        Rpki {
+            mode: RpkiMode::Disabled,
+            caches: Vec::new(),
+            version: 1,
+            connect_timeout: Rpki::DEFAULT_CONNECT_TIMEOUT,
+            response_timeout: Rpki::DEFAULT_RESPONSE_TIMEOUT,
+            reply_timeout: Rpki::DEFAULT_REPLY_TIMEOUT,
+            max_expire: Rpki::MAX_EXPIRE,
+            max_vrps: Rpki::DEFAULT_MAX_VRPS,
+            backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
+            backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
+        }
+    }
+}
+
+/// Where VRPs come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpkiMode {
+    /// No origin validation: every route's state is `disabled`.
+    Disabled,
+    /// VRPs from the configured RTR caches (RFC 8210).
+    External,
+}
+
+impl std::fmt::Display for RpkiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RpkiMode::Disabled => "disabled",
+            RpkiMode::External => "external",
+        })
+    }
+}
+
+/// A `cache` statement: one entry of the router's cache list (RFC 8210
+/// §10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpkiCache {
+    /// "The IP address or fully qualified domain name of the cache", as
+    /// written.
+    pub host: String,
+    /// `port`: [`Rpki::DEFAULT_PORT`] unless given.
+    pub port: u16,
+    /// `preference`: "the lower the value, the more preferred"; 0 unless
+    /// given.
+    pub preference: u32,
+}
+
+impl std::fmt::Display for RpkiCache {
+    /// `host:port`, with an IPv6 address in brackets.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// A prefix with optional length bounds, as in a prefix list or a

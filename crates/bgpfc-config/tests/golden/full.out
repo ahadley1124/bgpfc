@@ -29,6 +29,34 @@ Config {
             },
         ),
     },
+    rpki: Rpki {
+        mode: External,
+        caches: [
+            RpkiCache {
+                host: "127.0.0.1",
+                port: 323,
+                preference: 0,
+            },
+            RpkiCache {
+                host: "rtr.example.net.",
+                port: 3323,
+                preference: 10,
+            },
+            RpkiCache {
+                host: "2001:db8::10",
+                port: 8282,
+                preference: 5,
+            },
+        ],
+        version: 0,
+        connect_timeout: 5s,
+        response_timeout: 30s,
+        reply_timeout: 600s,
+        max_expire: 3600s,
+        max_vrps: 1000000,
+        backoff_min: 2s,
+        backoff_max: 300s,
+    },
     prefix_lists: [
         PrefixList {
             pos: Pos {

@@ -1,0 +1,9 @@
+rpki-errors.conf:4:1: `mode external` needs at least one `cache`
+  rpki {
+  ^
+rpki-errors.conf:4:1: connect-timeout 90s exceeds response-timeout 60s
+  rpki {
+  ^
+rpki-errors.conf:4:1: reply-timeout 30s is below response-timeout 60s
+  rpki {
+  ^
