@@ -110,6 +110,10 @@ pub struct Config {
     pub response_timeout: Duration,
 }
 
+/// The longest time between two queries in a version 0 session:
+/// RFC 6810 §6.1, "no less frequently than once an hour".
+const VERSION_0_POLL: Duration = Duration::from_secs(3_600);
+
 impl Config {
     /// The shortest Expire Interval RFC 8210 §6 allows: "Minimum allowed
     /// value: 600 seconds (10 minutes)".
@@ -363,6 +367,8 @@ pub struct Session {
     expire_at: Option<Instant>,
     /// When the last End of Data arrived.
     synced_at: Option<Instant>,
+    /// When the last query went out.
+    queried_at: Option<Instant>,
     /// The serial of a Serial Notify that arrived while a query was out.
     notified: Option<u32>,
     /// The shell's delay before reconnecting after a failure, in place of
@@ -399,6 +405,7 @@ impl Session {
             intervals: Intervals::DEFAULT,
             expire_at: None,
             synced_at: None,
+            queried_at: None,
             notified: None,
             retry_delay: None,
         }
@@ -704,6 +711,7 @@ impl Session {
         out.push(Action::Send(pdu));
         self.phase = Phase::Querying(query);
         self.notified = None;
+        self.queried_at = Some(now);
         self.deadline = after(now, self.config.response_timeout);
     }
 
@@ -1114,7 +1122,17 @@ impl Session {
         // RFC 8210 §6, for both Refresh and Expire: "Countdown for this
         // timer starts upon receipt of the containing End Of Data PDU."
         self.expire_at = after(now, self.expire_interval());
-        self.deadline = after(now, secs(self.intervals.refresh));
+        self.deadline = match intervals {
+            Some(_) => after(now, secs(self.intervals.refresh)),
+            // RFC 6810 §6.1: "a router MUST send either a Serial Query or a
+            // Reset Query no less frequently than once an hour", since "the
+            // cache MAY not keep updates for little more than one hour".
+            // Version 0 has no Refresh Interval to count from End of Data,
+            // so the hour counts from the query this End of Data answers:
+            // however long the reply took, the next query goes out within
+            // the hour of the last, or at once if the hour has passed.
+            None => after(self.queried_at.unwrap_or(now), VERSION_0_POLL).map(|at| at.max(now)),
+        };
         log(
             out,
             Level::Info,
@@ -1141,8 +1159,9 @@ impl Session {
         match intervals {
             // Version 0 has no timing parameters: the RFC 8210 §6 defaults
             // apply. They agree with RFC 6810: a poll "no less frequently
-            // than once an hour" (§6.1), and data deleted after "twice the
-            // polling period" (§8).
+            // than once an hour" (§6.1), which on_end_of_data counts from
+            // the query, and data deleted after "twice the polling period"
+            // (§8).
             None => self.intervals = Intervals::DEFAULT,
             Some(intervals) => {
                 if !intervals.within_limits() {
