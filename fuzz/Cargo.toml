@@ -17,6 +17,7 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 bgpfc-config = { path = "../crates/bgpfc-config" }
 bgpfc-policy = { path = "../crates/bgpfc-policy" }
+bgpfc-rpki = { path = "../crates/bgpfc-rpki" }
 bgpfc-rtr = { path = "../crates/bgpfc-rtr" }
 bgpfc-wire = { path = "../crates/bgpfc-wire" }
 
@@ -85,6 +86,13 @@ bench = false
 [[bin]]
 name = "rtr_pdu"
 path = "fuzz_targets/rtr_pdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtr_session"
+path = "fuzz_targets/rtr_session.rs"
 test = false
 doc = false
 bench = false
