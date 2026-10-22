@@ -5,8 +5,9 @@
 //! releases the advertisements that were held back; the pacing itself is
 //! `bgpfc_rib`'s. A peer over its RFC 4271 §6.7 prefix limit is told to
 //! end its session. Routes the RIB ignored for a semantically incorrect
-//! next hop are logged (RFC 4271 §6.3), as is every change of a route's
-//! RFC 6811 validation state (issue #59).
+//! next hop are logged (RFC 4271 §6.3), and so is what a change of the
+//! validation source did to the routes' RFC 6811 states, in one line per
+//! change.
 //!
 //! Changes of the validation source arrive on the same channel, from
 //! whoever holds a [`RibSink`], and go the way an UPDATE goes (RFC 6811
@@ -21,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Rib, RouteOrigin, RovState};
+use bgpfc_rib::{Output, PeerInfo, Revalidation, Rib};
 use bgpfc_rpki::{AffectedPrefixes, RpkiError, ValidationChange, ValidationSink};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -405,53 +406,63 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                     prefixes = sample(&prefixes)
                 );
             }
-            Output::RovStateChanged {
-                peer,
-                prefix,
-                origin,
-                from,
-                to,
-            } => {
-                // Issue #59: every change of a route's validation state.
-                let fields = rov_change(&peer, &prefix, &origin, &from, &to);
-                bgpfc_log::log(bgpfc_log::Level::Info, ROV_CHANGED, &fields);
+            Output::Revalidated(r) => {
+                // RFC 6811 §4: the routes a change of the validation source
+                // moved, counted. One line per change, however many routes
+                // it moved: turning validation on or off moves every route
+                // of the table, and a line per route would hold the RIB
+                // thread and flood the log.
+                let values = revalidated(&r);
+                let fields: Vec<bgpfc_log::Field<'_>> = values
+                    .iter()
+                    .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
+                    .collect();
+                bgpfc_log::log(bgpfc_log::Level::Info, REVALIDATED, &fields);
             }
         }
     }
 }
 
-/// The message of the line logged for each change of a route's RFC 6811
-/// validation state.
-const ROV_CHANGED: &str = "rib: validation state changed";
+/// The message of the line logged for what a change of the validation
+/// source did to the routes' RFC 6811 states.
+const REVALIDATED: &str = "rib: validation states changed";
 
-/// The fields of that line: the route (`peer`, `prefix`), its Route
-/// Origin ASN (RFC 6811 §2), and its state before and after.
-fn rov_change<'a>(
-    peer: &'a IpAddr,
-    prefix: &'a Prefix,
-    origin: &'a RouteOrigin,
-    from: &'a RovState,
-    to: &'a RovState,
-) -> [bgpfc_log::Field<'a>; 5] {
+/// The fields of that line: the routes validated again, how many of them
+/// changed state, those per change of state (`disabled->valid:1000,...`),
+/// the destinations they are for with the first few of them, and the
+/// destinations whose best route changed.
+fn revalidated(r: &Revalidation) -> [(&'static str, String); 6] {
+    let changes = r
+        .changes
+        .iter()
+        .map(|(from, to, n)| format!("{from}->{to}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
     [
-        ("peer", peer),
-        ("prefix", prefix),
-        ("origin", origin),
-        ("from", from),
-        ("to", to),
+        ("routes", r.routes.to_string()),
+        ("changed", r.changed().to_string()),
+        ("changes", changes),
+        ("destinations", r.destinations.to_string()),
+        ("prefixes", listed(&r.sample, r.destinations)),
+        ("best_changed", r.best_changed.to_string()),
     ]
 }
 
 /// The first few of `prefixes` for a log line, `...` marking the rest.
 fn sample(prefixes: &[Prefix]) -> String {
     const SHOWN: usize = 8;
-    let mut s = prefixes
+    listed(&prefixes[..prefixes.len().min(SHOWN)], prefixes.len())
+}
+
+/// `shown`, the first of `total` prefixes, for a log line, `...` marking
+/// the rest.
+fn listed(shown: &[Prefix], total: usize) -> String {
+    let mut s = shown
         .iter()
-        .take(SHOWN)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    if prefixes.len() > SHOWN {
+    if total > shown.len() {
         s.push_str(",...");
     }
     s
@@ -531,6 +542,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
 mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;
+
+    use bgpfc_rib::RovState;
 
     use bgpfc_wire::types::{Asn, HoldTime, RouterId};
 
@@ -1054,16 +1067,14 @@ mod tests {
         }
     }
 
-    /// The validation state changes among `out`.
-    fn rov_changes(out: &[Output]) -> Vec<(String, RovState, RovState)> {
+    /// The changes of state reported among `out`.
+    fn rov_changes(out: &[Output]) -> Vec<(RovState, RovState, usize)> {
         out.iter()
-            .filter_map(|o| match o {
-                Output::RovStateChanged {
-                    prefix, from, to, ..
-                } => Some((prefix.to_string(), *from, *to)),
+            .find_map(|o| match o {
+                Output::Revalidated(r) => Some(r.changes.clone()),
                 _ => None,
             })
-            .collect()
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1094,41 +1105,45 @@ mod tests {
         );
         let (tx, rx) = sync_channel(4);
         let mut sink = RibSink::new(tx);
-        let mut apply = |change| {
+        let mut apply = |rib: &mut Rib, change| {
             sink.publish(change).unwrap();
-            handle(&mut rib, &mut settings, rx.try_recv().unwrap(), now)
+            handle(rib, &mut settings, rx.try_recv().unwrap(), now)
         };
         // Validation on: AS 65001 may originate the first prefix, and only
         // AS 64496 the second.
         let gone = vrp("203.0.113.0/24", 24, 64_496);
-        let out = apply(all(&[vrp("198.51.100.0/24", 24, 65_001), gone]));
-        let c = |p: &str, from, to| (p.to_owned(), from, to);
+        let out = apply(&mut rib, all(&[vrp("198.51.100.0/24", 24, 65_001), gone]));
         assert_eq!(
             rov_changes(&out),
-            [
-                c("198.51.100.0/24", Disabled, Valid),
-                c("203.0.113.0/24", Disabled, Invalid)
-            ]
+            [(Disabled, Valid, 1), (Disabled, Invalid, 1)]
+        );
+        assert_eq!(
+            states(&rib),
+            [s("198.51.100.0/24", Valid), s("203.0.113.0/24", Invalid)]
         );
         // A delta: the VRP that made the second route invalid goes, and
         // only that route is validated again.
-        let out = apply(ValidationChange {
-            source: std::sync::Arc::new(
-                [vrp("198.51.100.0/24", 24, 65_001)]
-                    .into_iter()
-                    .collect::<bgpfc_rpki::VrpSet>(),
-            ),
-            affected: AffectedPrefixes::from_vrps([gone]),
-        });
-        assert_eq!(rov_changes(&out), [c("203.0.113.0/24", Invalid, NotFound)]);
+        let out = apply(
+            &mut rib,
+            ValidationChange {
+                source: std::sync::Arc::new(
+                    [vrp("198.51.100.0/24", 24, 65_001)]
+                        .into_iter()
+                        .collect::<bgpfc_rpki::VrpSet>(),
+                ),
+                affected: AffectedPrefixes::from_vrps([gone]),
+            },
+        );
+        assert_eq!(rov_changes(&out), [(Invalid, NotFound, 1)]);
+        assert_eq!(
+            states(&rib),
+            [s("198.51.100.0/24", Valid), s("203.0.113.0/24", NotFound)]
+        );
         // Off again.
-        let out = apply(ValidationChange::disabled());
+        let out = apply(&mut rib, ValidationChange::disabled());
         assert_eq!(
             rov_changes(&out),
-            [
-                c("198.51.100.0/24", Valid, Disabled),
-                c("203.0.113.0/24", NotFound, Disabled)
-            ]
+            [(Valid, Disabled, 1), (NotFound, Disabled, 1)]
         );
         assert_eq!(
             states(&rib),
@@ -1253,31 +1268,57 @@ mod tests {
     }
 
     #[test]
-    fn a_validation_state_change_is_one_info_line() {
-        // Issue #59: msg, peer, prefix, origin, from, to.
-        let line = |origin: RouteOrigin, from: RovState, to: RovState| {
-            let (peer, prefix) = (ip("192.0.2.1"), "198.51.100.0/24".parse().unwrap());
-            let fields = rov_change(&peer, &prefix, &origin, &from, &to);
+    fn a_validation_change_is_one_info_line_however_many_routes_it_moved() {
+        let line = |r: &Revalidation| {
+            let values = revalidated(r);
+            let fields: Vec<bgpfc_log::Field<'_>> = values
+                .iter()
+                .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
+                .collect();
             bgpfc_log::format_line(
                 std::time::UNIX_EPOCH,
                 bgpfc_log::Level::Info,
-                ROV_CHANGED,
+                REVALIDATED,
                 &fields,
             )
         };
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        // A full table turned on: counts, and the first destinations.
+        let sample: Vec<Prefix> = (0..8).map(|i| p(&format!("1.0.{i}.0/24"))).collect();
+        let on = Revalidation {
+            routes: 1_250_000,
+            changes: vec![
+                (RovState::Disabled, RovState::Valid, 600_000),
+                (RovState::Disabled, RovState::Invalid, 50_000),
+                (RovState::Disabled, RovState::NotFound, 600_000),
+            ],
+            destinations: 1_000_000,
+            sample,
+            best_changed: 2,
+        };
         assert_eq!(
-            line(
-                RouteOrigin::As(Asn(64_496)),
-                RovState::NotFound,
-                RovState::Valid
-            ),
-            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation state changed\" \
-             peer=192.0.2.1 prefix=198.51.100.0/24 origin=AS64496 from=not-found to=valid\n"
+            line(&on),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
+             routes=1250000 changed=1250000 \
+             changes=disabled->valid:600000,disabled->invalid:50000,disabled->not-found:600000 \
+             destinations=1000000 \
+             prefixes=1.0.0.0/24,1.0.1.0/24,1.0.2.0/24,1.0.3.0/24,1.0.4.0/24,1.0.5.0/24,\
+             1.0.6.0/24,1.0.7.0/24,... best_changed=2\n"
         );
+        // A small delta: every destination named.
+        let delta = Revalidation {
+            routes: 3,
+            changes: vec![(RovState::NotFound, RovState::Invalid, 2)],
+            destinations: 1,
+            sample: vec![p("2001:db8::/32")],
+            best_changed: 0,
+        };
         assert_eq!(
-            line(RouteOrigin::None, RovState::Disabled, RovState::Invalid),
-            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation state changed\" \
-             peer=192.0.2.1 prefix=198.51.100.0/24 origin=none from=disabled to=invalid\n"
+            line(&delta),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
+             routes=3 changed=2 changes=not-found->invalid:2 destinations=1 \
+             prefixes=2001:db8::/32 best_changed=0\n"
         );
+        assert_eq!(listed(&[], 0), "");
     }
 }

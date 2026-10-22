@@ -9,7 +9,7 @@ use bgpfc_rpki::{AffectedPrefixes, PrefixSet, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::update::EncodeContext;
 
 use super::*;
-use crate::{Policies, RouteOrigin, Verdict};
+use crate::{Policies, Revalidation, Verdict};
 
 /// What a policy was asked about, and the validation state it was told.
 type Seen = Arc<Mutex<Vec<(&'static str, Prefix, RovState)>>>;
@@ -148,22 +148,32 @@ fn held(rib: &Rib, family: AddressFamily, prefix: &str) -> Vec<(IpAddr, RovState
         .unwrap_or_default()
 }
 
-type Change = (IpAddr, Prefix, RouteOrigin, RovState, RovState);
+/// The report of the validation states that changed, if `out` has one;
+/// it never has two.
+fn report(out: &[Output]) -> Option<&Revalidation> {
+    let mut reports = out.iter().filter_map(|o| match o {
+        Output::Revalidated(r) => Some(r),
+        _ => None,
+    });
+    let first = reports.next();
+    assert!(reports.next().is_none(), "two reports in {out:?}");
+    first
+}
 
-/// The validation state changes reported in `out`.
-fn changes(out: &[Output]) -> Vec<Change> {
-    out.iter()
-        .filter_map(|o| match o {
-            Output::RovStateChanged {
-                peer,
-                prefix,
-                origin,
-                from,
-                to,
-            } => Some((*peer, *prefix, *origin, *from, *to)),
-            _ => None,
-        })
-        .collect()
+/// `routes` validated again, `changes` among them, at `destinations`.
+fn revalidation(
+    routes: usize,
+    changes: &[(RovState, RovState, usize)],
+    destinations: &[&str],
+    best_changed: usize,
+) -> Revalidation {
+    Revalidation {
+        routes,
+        changes: changes.to_vec(),
+        destinations: destinations.len(),
+        sample: destinations.iter().map(|d| p(d)).collect(),
+        best_changed,
+    }
 }
 
 /// The COMMUNITIES of a sent UPDATE.
@@ -175,10 +185,6 @@ fn communities(m: &UpdateMessage) -> Vec<Community> {
             _ => None,
         })
         .unwrap_or_default()
-}
-
-fn by(asn: u32) -> RouteOrigin {
-    RouteOrigin::As(Asn(asn))
 }
 
 /// Import policy that rejects Invalid routes; export policy that tags
@@ -251,7 +257,7 @@ fn states_are_set_on_arrival_from_the_source() {
         now(),
     );
     // A route's first state is not a change.
-    assert_eq!(changes(&out), vec![]);
+    assert_eq!(report(&out), None);
     rib.update(
         e1.addr,
         &announce(
@@ -352,16 +358,17 @@ fn only_the_affected_routes_are_validated_again_in_place() {
         },
         now(),
     );
+    let not_found_invalid = [(RovState::NotFound, RovState::Invalid, 1)];
     assert_eq!(
-        changes(&out),
-        vec![(
-            e1.addr,
-            p("198.51.100.0/24"),
-            by(64_496),
-            RovState::NotFound,
-            RovState::Invalid
-        )]
+        report(&out),
+        Some(&revalidation(
+            1,
+            &not_found_invalid,
+            &["198.51.100.0/24"],
+            0
+        ))
     );
+    assert!(matches!(out[..], [Output::Revalidated(_)]), "{out:?}");
     assert_eq!(
         held(&rib, V4, "198.51.100.0/24"),
         vec![(e1.addr, RovState::Invalid)]
@@ -389,14 +396,8 @@ fn only_the_affected_routes_are_validated_again_in_place() {
         now(),
     );
     assert_eq!(
-        changes(&out),
-        vec![(
-            e1.addr,
-            p("203.0.113.0/24"),
-            by(64_496),
-            RovState::NotFound,
-            RovState::Invalid
-        )]
+        report(&out),
+        Some(&revalidation(1, &not_found_invalid, &["203.0.113.0/24"], 0))
     );
     // Nothing affected: the source changes and no route is looked at.
     let out = rib.validation_changed(
@@ -415,6 +416,7 @@ fn only_the_affected_routes_are_validated_again_in_place() {
 
 #[test]
 fn all_validates_every_route_again() {
+    use RovState::{Disabled, Invalid, NotFound, Valid};
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
@@ -442,28 +444,43 @@ fn all_validates_every_route_again() {
     // Turning validation on: every route leaves Disabled, both peers'
     // routes to a destination included, in prefix order.
     let out = rib.validation_changed(all(set.clone()), now());
-    let d = RovState::Disabled;
+    let dests = ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/32"];
     assert_eq!(
-        changes(&out),
-        vec![
-            (e1.addr, p("192.0.2.0/24"), by(64_496), d, RovState::Valid),
-            (e2.addr, p("192.0.2.0/24"), by(64_497), d, RovState::Invalid),
-            (
-                e1.addr,
-                p("198.51.100.0/24"),
-                by(64_496),
-                d,
-                RovState::NotFound
-            ),
-            (e1.addr, p("2001:db8::/32"), by(64_496), d, RovState::Valid),
-        ]
+        report(&out),
+        Some(&revalidation(
+            4,
+            &[
+                (Disabled, Valid, 2),
+                (Disabled, Invalid, 1),
+                (Disabled, NotFound, 1)
+            ],
+            &dests,
+            0
+        ))
     );
+    assert_eq!(
+        held(&rib, V4, "192.0.2.0/24"),
+        vec![(e1.addr, Valid), (e2.addr, Invalid)]
+    );
+    assert_eq!(held(&rib, V4, "198.51.100.0/24"), vec![(e1.addr, NotFound)]);
+    assert_eq!(held(&rib, V6, "2001:db8::/32"), vec![(e1.addr, Valid)]);
     // The same source again: no route changes, nothing to do.
     assert_eq!(rib.validation_changed(all(set), now()), vec![]);
     // Turning it off again.
     let out = rib.validation_changed(ValidationChange::disabled(), now());
-    assert_eq!(changes(&out).len(), 4);
-    assert!(changes(&out).iter().all(|c| c.4 == RovState::Disabled));
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(
+            4,
+            &[
+                (Valid, Disabled, 2),
+                (Invalid, Disabled, 1),
+                (NotFound, Disabled, 1)
+            ],
+            &dests,
+            0
+        ))
+    );
     for (family, prefix) in [
         (V4, "192.0.2.0/24"),
         (V4, "198.51.100.0/24"),
@@ -504,17 +521,12 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
     // what export policy adds to a Valid route. No ROUTE-REFRESH needed.
     let ours = vrps(&[("192.0.2.0/24", 24, 64_496)]);
     let out = rib.validation_changed(delta(&other_as, ours.clone()), now());
+    let invalid_valid = [(RovState::Invalid, RovState::Valid, 1)];
     assert_eq!(
-        changes(&out),
-        vec![(
-            e1.addr,
-            p("192.0.2.0/24"),
-            by(64_496),
-            RovState::Invalid,
-            RovState::Valid
-        )]
+        report(&out),
+        Some(&revalidation(1, &invalid_valid, &["192.0.2.0/24"], 1))
     );
-    assert!(matches!(out[0], Output::RovStateChanged { .. }));
+    assert!(matches!(out[0], Output::Revalidated(_)));
     assert_eq!(
         fib(&out),
         vec![FibChange {
@@ -532,7 +544,11 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
 
     // And back: withdrawn from the FIB and from e2, still held.
     let out = rib.validation_changed(delta(&ours, other_as), now());
-    assert_eq!(changes(&out).len(), 1);
+    let valid_invalid = [(RovState::Valid, RovState::Invalid, 1)];
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(1, &valid_invalid, &["192.0.2.0/24"], 1))
+    );
     assert_eq!(
         fib(&out),
         vec![FibChange {
@@ -569,7 +585,11 @@ fn a_new_state_of_the_best_route_alone_runs_export_policy_again() {
     // it is, but export policy now tags it, so e2 hears it again.
     let set = vrps(&[("192.0.2.0/24", 24, 64_496)]);
     let out = rib.validation_changed(delta(&VrpSet::new(), set), now());
-    assert_eq!(changes(&out).len(), 1);
+    let not_found_valid = [(RovState::NotFound, RovState::Valid, 1)];
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(1, &not_found_valid, &["192.0.2.0/24"], 0))
+    );
     assert_eq!(fib(&out), vec![]);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
@@ -599,7 +619,7 @@ fn validation_changes_are_paced_like_updates() {
     let set = vrps(&[("192.0.2.0/24", 24, 64_496)]);
     let t1 = t0 + Duration::from_secs(1);
     let out = rib.validation_changed(delta(&VrpSet::new(), set), t1);
-    assert_eq!(changes(&out).len(), 1);
+    assert_eq!(report(&out).map(Revalidation::changed), Some(1));
     assert!(sends(&out, e2.addr).is_empty(), "held by the interval");
     let due = rib.next_deadline().unwrap();
     assert!(due >= t0 + Duration::from_secs(30), "{:?}", due - t0);
@@ -641,15 +661,10 @@ fn withdrawn_routes_and_those_of_a_peer_gone_are_not_validated_again() {
         vec![(e1.addr, RovState::Invalid)]
     );
     let out = rib.validation_changed(ValidationChange::disabled(), now());
+    let invalid_disabled = [(RovState::Invalid, RovState::Disabled, 1)];
     assert_eq!(
-        changes(&out),
-        vec![(
-            e1.addr,
-            p("192.0.3.0/24"),
-            by(64_496),
-            RovState::Invalid,
-            RovState::Disabled
-        )]
+        report(&out),
+        Some(&revalidation(1, &invalid_disabled, &["192.0.3.0/24"], 1))
     );
     // Taken now that it is no longer Invalid.
     assert_eq!(fib(&out).len(), 1);
@@ -688,15 +703,27 @@ fn a_small_delta_against_a_large_table_finds_exactly_its_routes() {
             },
             now(),
         );
-        let got: Vec<Prefix> = changes(&out).iter().map(|c| c.1).collect();
         let expected: Vec<Prefix> = refs
             .iter()
             .map(|s| p(s))
             .filter(|q| changed.covers(*q))
             .collect();
         assert_ne!(expected.len(), 0);
-        assert_eq!(got, expected);
-        assert!(changes(&out).iter().all(|c| c.4 == RovState::Invalid));
+        // Exactly the covered routes were looked at, and each changed.
+        let n = expected.len();
+        let r = report(&out).unwrap();
+        assert_eq!(r.routes, n);
+        assert_eq!(r.changes, vec![(RovState::NotFound, RovState::Invalid, n)]);
+        assert_eq!(r.destinations, n);
+        assert_eq!(r.sample, expected[..n.min(Revalidation::SAMPLE)]);
+        for q in &refs {
+            let state = if changed.covers(p(q)) {
+                RovState::Invalid
+            } else {
+                RovState::NotFound
+            };
+            assert_eq!(held(&rib, V4, q), vec![(e1.addr, state)], "{q}");
+        }
         // And back.
         let out = rib.validation_changed(
             ValidationChange {
@@ -705,6 +732,63 @@ fn a_small_delta_against_a_large_table_finds_exactly_its_routes() {
             },
             now(),
         );
-        assert_eq!(changes(&out).len(), expected.len());
+        let r = report(&out).unwrap();
+        assert_eq!(r.changes, vec![(RovState::Invalid, RovState::NotFound, n)]);
     }
+}
+
+#[test]
+fn a_change_that_moves_every_route_is_one_report() {
+    // Turning validation on or off moves every route of the table; what
+    // comes out is one report with counts and a short sample, and the
+    // FIB changes and UPDATEs that follow, never an entry per route.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    rib.peer_up(e1.clone(), now());
+    rib.peer_up(e2.clone(), now());
+    let prefixes: Vec<String> = (0..600u32)
+        .map(|i| format!("10.{}.{}.0/24", i >> 8, i & 0xff))
+        .collect();
+    let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    rib.update(
+        e1.addr,
+        &announce(&refs, &attrs(&[65_001, 64_496], "10.0.0.1")),
+        now(),
+    );
+    rib.update(
+        e2.addr,
+        &announce(&refs, &attrs(&[65_002, 64_497], "10.0.0.2")),
+        now(),
+    );
+    // Every one of them may come from AS 64496 only.
+    let set = vrps(&[("10.0.0.0/8", 24, 64_496)]);
+    let out = rib.validation_changed(all(set), now());
+    assert!(matches!(out[0], Output::Revalidated(_)));
+    assert!(
+        out[1..]
+            .iter()
+            .all(|o| !matches!(o, Output::Revalidated(_)))
+    );
+    let r = report(&out).unwrap();
+    assert_eq!(r.routes, 1200);
+    assert_eq!(
+        r.changes,
+        vec![
+            (RovState::Disabled, RovState::Valid, 600),
+            (RovState::Disabled, RovState::Invalid, 600)
+        ]
+    );
+    assert_eq!(r.changed(), 1200);
+    assert_eq!(r.destinations, 600);
+    let first: Vec<Prefix> = refs[..Revalidation::SAMPLE].iter().map(|s| p(s)).collect();
+    assert_eq!(r.sample, first);
+    // e1's routes stay best (lower router ID): no FIB change, and no
+    // UPDATE, as AcceptAll exports them as before.
+    assert_eq!(r.best_changed, 0);
+    assert_eq!(out.len(), 1, "{:?}", &out[1..]);
+    assert_eq!(
+        held(&rib, V4, "10.2.87.0/24"),
+        vec![(e1.addr, RovState::Valid), (e2.addr, RovState::Invalid)]
+    );
 }

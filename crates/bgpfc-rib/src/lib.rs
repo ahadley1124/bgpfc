@@ -56,6 +56,7 @@ pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::Candidate;
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
+pub use validation::Revalidation;
 
 use pacing::{AdjRibOut, Clock, Jitter, Now, Pace, Step, Tick};
 
@@ -182,22 +183,12 @@ pub enum Output {
         /// The routes.
         prefixes: Vec<Prefix>,
     },
-    /// The RFC 6811 validation state of a route in an Adj-RIB-In changed
-    /// with the validation source (see [`Rib::validation_changed`]). The
-    /// caller logs it (issue #59). The state a route gets on arrival is
-    /// its first, not a change, and is not reported.
-    RovStateChanged {
-        /// The peer the route came from.
-        peer: IpAddr,
-        /// The route's destination.
-        prefix: Prefix,
-        /// Its Route Origin ASN (RFC 6811 §2).
-        origin: RouteOrigin,
-        /// The state it had.
-        from: RovState,
-        /// The state it has now.
-        to: RovState,
-    },
+    /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
+    /// the validation source (see [`Rib::validation_changed`]): one report
+    /// per change of the source, counted rather than listed, however many
+    /// routes it moved. The caller logs it. The state a route gets on
+    /// arrival is its first, not a change, and is not reported.
+    Revalidated(Revalidation),
 }
 
 /// The best route to a destination.

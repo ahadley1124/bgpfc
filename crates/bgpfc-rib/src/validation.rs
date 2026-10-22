@@ -17,7 +17,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use bgpfc_rpki::{AffectedPrefixes, PrefixSet, RouteOrigin, ValidationChange, ValidationSource};
+use bgpfc_rpki::{
+    AffectedPrefixes, PrefixSet, RouteOrigin, RovState, ValidationChange, ValidationSource,
+};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
@@ -31,17 +33,99 @@ use crate::{Destination, Interner, Output, PeerState, Policies, Rib, import};
 /// (`benches/rib.rs`, `revalidate_*`).
 const DENSE: usize = 16;
 
+/// What validating routes again after a change of the validation source
+/// did (RFC 6811 §4), for the caller to log: counts and a short sample,
+/// never an entry per route, so that a change that moves every route of
+/// a full table, as turning validation on or off does, costs one small
+/// report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Revalidation {
+    /// Routes held in the Adj-RIBs-In that the change affected, each
+    /// validated again.
+    pub routes: usize,
+    /// How many of them moved from one RFC 6811 state to another:
+    /// `(from, to, routes)` for each pair that occurred, in the order of
+    /// [`RovState::ALL`] by `from`, then by `to`.
+    pub changes: Vec<(RovState, RovState, usize)>,
+    /// Destinations with a route whose state changed.
+    pub destinations: usize,
+    /// The first of those destinations, at most [`Revalidation::SAMPLE`]
+    /// of them, IPv4 before IPv6 and each in prefix order.
+    pub sample: Vec<Prefix>,
+    /// Destinations where the decision process then chose another route,
+    /// or none: the FIB changes the report comes with.
+    pub best_changed: usize,
+}
+
+impl Revalidation {
+    /// The most destinations [`Revalidation::sample`] names.
+    pub const SAMPLE: usize = 8;
+
+    /// Routes whose state changed.
+    #[must_use]
+    pub fn changed(&self) -> usize {
+        self.changes.iter().map(|c| c.2).sum()
+    }
+}
+
+/// The counts of a [`Revalidation`] as the pass gathers them.
+#[derive(Default)]
+struct Tally {
+    routes: usize,
+    /// Routes per (from, to), indexed by [`slot`].
+    moved: [[usize; 4]; 4],
+    destinations: usize,
+    sample: Vec<Prefix>,
+}
+
+impl Tally {
+    /// The report, with `best_changed` from the decision process that
+    /// followed; `None` when no route changed state.
+    fn finish(self, best_changed: usize) -> Option<Revalidation> {
+        let mut changes = Vec::new();
+        for from in RovState::ALL {
+            for to in RovState::ALL {
+                let n = self.moved[slot(from)][slot(to)];
+                if n > 0 {
+                    changes.push((from, to, n));
+                }
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
+        Some(Revalidation {
+            routes: self.routes,
+            changes,
+            destinations: self.destinations,
+            sample: self.sample,
+            best_changed,
+        })
+    }
+}
+
+/// The index of `state` in [`RovState::ALL`].
+fn slot(state: RovState) -> usize {
+    match state {
+        RovState::Valid => 0,
+        RovState::Invalid => 1,
+        RovState::NotFound => 2,
+        RovState::Disabled => 3,
+    }
+}
+
 impl Rib {
     /// The validation source changed (issue #56): use `change.source` from
     /// now on, and validate again every route held in an Adj-RIB-In that
     /// `change.affected` covers (RFC 6811 §4), in place. Each route whose
-    /// state changed is reported as an [`Output::RovStateChanged`] and
-    /// goes through import policy again, which sees the new state, and
-    /// its destination through the decision process. What follows comes
-    /// out as it does for an UPDATE, after the reports: FIB changes, and
-    /// UPDATEs sent or held back by the RFC 4271 §9.2.1.1 pacing. Routes
-    /// import policy rejected are validated again too, since the new
-    /// state may make policy accept them.
+    /// state changed goes through import policy again, which sees the new
+    /// state, and its destination through the decision process. What
+    /// follows comes out as it does for an UPDATE, after one
+    /// [`Output::Revalidated`] that counts the changes, if any route's
+    /// state changed: FIB changes, and UPDATEs sent or held back by the
+    /// RFC 4271 §9.2.1.1 pacing. Routes import policy rejected are
+    /// validated again too, since the new state may make policy accept
+    /// them.
     ///
     /// Changes must be given in the order the producer made them; a run
     /// of them may be given as one, with the last source and every
@@ -68,7 +152,7 @@ impl Rib {
             AffectedPrefixes::All => None,
             AffectedPrefixes::CoveredBy(changed) => Some(covered_ranges(changed)),
         };
-        let mut out = Vec::new();
+        let mut tally = Tally::default();
         let mut dirty = Vec::new();
         let mut families: Vec<AddressFamily> = self.tables.keys().copied().collect();
         families.sort_unstable();
@@ -76,14 +160,14 @@ impl Rib {
             let Some(table) = self.tables.get_mut(&family) else {
                 continue;
             };
-            let mut pass = Revalidation {
+            let mut pass = Pass {
                 family,
                 local_as: self.local_as,
                 source: &*self.validation,
                 peers: &self.peers,
                 policies: &*self.policies,
                 interner: &mut self.interner,
-                out: &mut out,
+                tally: &mut tally,
                 dirty: &mut dirty,
             };
             let mut visit =
@@ -100,31 +184,43 @@ impl Rib {
                 }
             }
         }
-        out.extend(self.reconsider(&dirty, now));
+        let decided = self.reconsider(&dirty, now);
+        let best_changed = decided
+            .iter()
+            .filter(|o| matches!(o, Output::Fib(_)))
+            .count();
+        let mut out: Vec<Output> = tally
+            .finish(best_changed)
+            .map(Output::Revalidated)
+            .into_iter()
+            .collect();
+        out.extend(decided);
         out
     }
 }
 
 /// What validating routes again needs of the RIB, borrowed apart from
 /// the table being walked.
-struct Revalidation<'a> {
+struct Pass<'a> {
     family: AddressFamily,
     local_as: Asn,
     source: &'a dyn ValidationSource,
     peers: &'a HashMap<IpAddr, PeerState>,
     policies: &'a dyn Policies,
     interner: &'a mut Interner,
-    out: &'a mut Vec<Output>,
+    tally: &'a mut Tally,
     dirty: &'a mut Vec<(AddressFamily, Prefix)>,
 }
 
-impl Revalidation<'_> {
+impl Pass<'_> {
     /// Validate again the routes held for `prefix`, in place, and run
     /// import policy again on those whose state changed; `dirty` gets the
     /// destination if its candidates changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let mut changed = false;
+        let mut restated = false;
         for i in 0..dest.received.len() {
+            self.tally.routes += 1;
             let route = &mut dest.received[i];
             // RFC 6811 §2, on the route as received, as on its arrival.
             let origin = RouteOrigin::from_as_path(&route.attrs.as_path, self.local_as);
@@ -134,13 +230,8 @@ impl Revalidation<'_> {
                 continue;
             }
             if rov != route.rov {
-                self.out.push(Output::RovStateChanged {
-                    peer: route.peer,
-                    prefix,
-                    origin,
-                    from: route.rov,
-                    to: rov,
-                });
+                self.tally.moved[slot(route.rov)][slot(rov)] += 1;
+                restated = true;
             }
             route.rov = rov;
             route.aspa = aspa;
@@ -157,6 +248,12 @@ impl Revalidation<'_> {
                 &dest.received[i],
                 &mut dest.candidates,
             );
+        }
+        if restated {
+            self.tally.destinations += 1;
+            if self.tally.sample.len() < Revalidation::SAMPLE {
+                self.tally.sample.push(prefix);
+            }
         }
         if changed {
             self.dirty.push((self.family, prefix));
