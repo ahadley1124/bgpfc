@@ -57,11 +57,15 @@
 //! # Stopping
 //!
 //! [`Client::stop`], or dropping the [`Client`], shuts the connection
-//! down and joins the thread. It returns once the thread has left the
-//! blocking call it is in, if that call is one a socket shutdown cannot
-//! cut short: a connection attempt (at most [`Config::connect_timeout`])
-//! with the name lookup before it, or a [`ValidationSink::publish`] that
-//! waits for room in a full queue.
+//! down and joins the thread, which a stop wakes from any wait but one: a
+//! [`ValidationSink::publish`] that waits for room in a full queue, until
+//! the consumer makes some. Neither a connection attempt nor the name
+//! lookup before it can be cut short, and an attempt may take as long as
+//! [`Config::connect_timeout`], a lookup longer; so each runs on a thread
+//! of its own, which the client thread waits for unless it is stopped. A
+//! stopped client leaves an attempt under way to end by itself and closes
+//! whatever connection it makes. So a stop, and with it a new
+//! configuration, never waits for a cache that does not answer.
 //!
 //! RFC 8210 §9 says routers SHOULD enable TCP keep-alives. std offers no
 //! way to set the socket option, so the client does without: the polls
@@ -359,11 +363,21 @@ impl StatusHandle {
 struct Shared {
     /// Set by [`Client::stop`].
     stop: AtomicBool,
-    /// A clone of the thread's connection, for [`Client::stop`] to shut
-    /// down; and the mutex the thread sleeps on.
-    stream: Mutex<Option<TcpStream>>,
-    /// Wakes the thread from its sleep.
+    /// What a stop must reach, under the mutex the thread waits on.
+    slot: Mutex<Slot>,
+    /// Wakes the thread from its sleep, or from its wait for a connection
+    /// attempt.
     wake: Condvar,
+}
+
+/// See [`Shared::slot`].
+#[derive(Debug, Default)]
+struct Slot {
+    /// A clone of the thread's connection, for [`Client::stop`] to shut
+    /// down.
+    stream: Option<TcpStream>,
+    /// The outcome of the connection attempt under way, once it has one.
+    attempt: Option<io::Result<TcpStream>>,
 }
 
 impl Shared {
@@ -374,32 +388,34 @@ impl Shared {
     /// Stop the thread: wake it, and cut short any read or write on its
     /// connection.
     fn stop(&self) {
-        let mut stream = lock(&self.stream);
+        let mut slot = lock(&self.slot);
         self.stop.store(true, Ordering::Release);
-        if let Some(stream) = stream.take() {
+        if let Some(stream) = slot.stream.take() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        // A connection the thread will not take now is closed.
+        slot.attempt = None;
         self.wake.notify_all();
     }
 
     /// Make the connection `stream` is a clone of one that a stop shuts
     /// down. False if the client is stopping already.
     fn register(&self, stream: TcpStream) -> bool {
-        let mut slot = lock(&self.stream);
+        let mut slot = lock(&self.slot);
         if self.stopping() {
             return false;
         }
-        *slot = Some(stream);
+        slot.stream = Some(stream);
         true
     }
 
     fn unregister(&self) {
-        lock(&self.stream).take();
+        lock(&self.slot).stream.take();
     }
 
     /// Sleep for `timeout`, or until a stop or a nudge.
     fn sleep(&self, timeout: Option<Duration>) {
-        let guard = lock(&self.stream);
+        let guard = lock(&self.slot);
         if self.stopping() {
             return;
         }
@@ -408,6 +424,46 @@ impl Shared {
         match timeout {
             Some(timeout) => drop(self.wake.wait_timeout(guard, timeout)),
             None => drop(self.wake.wait(guard)),
+        }
+    }
+
+    /// Connect to `cache` within `timeout`, as [`open`] does, and return
+    /// the outcome, or `None` once the client is stopped.
+    ///
+    /// Neither the connection attempt nor the name lookup before it can be
+    /// cut short, so they run on a thread of their own, and a stop wakes
+    /// the client thread from its wait at once. The attempt then ends by
+    /// itself, within `timeout` once the name is looked up, and the
+    /// connection it may make is closed.
+    fn connect(
+        self: &Arc<Self>,
+        cache: &Cache,
+        timeout: Duration,
+    ) -> Option<io::Result<TcpStream>> {
+        let shared = Arc::clone(self);
+        let cache = cache.clone();
+        let spawned = thread::Builder::new()
+            .name("rtr-connect".to_owned())
+            .spawn(move || {
+                let outcome = open(&cache, timeout);
+                let mut slot = lock(&shared.slot);
+                if !shared.stopping() {
+                    slot.attempt = Some(outcome);
+                }
+                shared.wake.notify_all();
+            });
+        if let Err(e) = spawned {
+            return Some(Err(e));
+        }
+        let mut slot = lock(&self.slot);
+        loop {
+            if self.stopping() {
+                return None;
+            }
+            if let Some(outcome) = slot.attempt.take() {
+                return Some(outcome);
+            }
+            slot = self.wake.wait(slot).unwrap_or_else(PoisonError::into_inner);
         }
     }
 }
@@ -555,7 +611,7 @@ impl Client {
     fn advance(&self, by: Duration) {
         let nanos = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
         self.clock.skew.fetch_add(nanos, Ordering::AcqRel);
-        let _guard = lock(&self.shared.stream);
+        let _guard = lock(&self.shared.slot);
         self.shared.wake.notify_all();
     }
 }
@@ -1041,7 +1097,9 @@ impl<S: ValidationSink> Worker<S> {
         if self.shared.stopping() {
             return None;
         }
-        let stream = match open(self.cache(), self.connect_timeout) {
+        // The control plane sees the attempt while it lasts.
+        self.publish_status(true);
+        let stream = match self.shared.connect(self.cache(), self.connect_timeout)? {
             Ok(stream) => stream,
             Err(e) => {
                 self.pending_error = Some(e.to_string());

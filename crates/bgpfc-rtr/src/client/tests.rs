@@ -1068,6 +1068,45 @@ mod net {
         client.stop();
     }
 
+    /// A listener that never accepts, with its accept queue full: the
+    /// kernel drops a new SYN for it, so a connection attempt hangs until
+    /// its timeout, like one to a cache whose host is gone.
+    fn unanswered() -> (TcpListener, Vec<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut queued = Vec::new();
+        loop {
+            match TcpStream::connect_timeout(&addr, 200 * MS) {
+                Ok(stream) => queued.push(stream),
+                Err(e) if e.kind() == ErrorKind::TimedOut => return (listener, queued),
+                Err(e) => panic!("filling the accept queue: {e}"),
+            }
+            assert!(queued.len() < 4_096, "the accept queue never filled");
+        }
+    }
+
+    #[test]
+    fn a_stop_cuts_a_connection_attempt_short() {
+        let (listener, _queued) = unanswered();
+        let mut config = config(vec![Cache {
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().unwrap().port(),
+            preference: 0,
+        }]);
+        config.connect_timeout = 30 * SEC;
+        config.session.response_timeout = 60 * SEC;
+        let (mut client, rx) = start_with(config);
+        // The status shows the attempt while it lasts.
+        eventually("the attempt", || client.status().state == State::Connecting);
+        thread::sleep(100 * MS);
+        assert_eq!(client.status().state, State::Connecting);
+        let started = Instant::now();
+        client.stop();
+        assert!(started.elapsed() < SEC, "{:?}", started.elapsed());
+        assert!(!client.status().running);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn dropping_the_client_stops_it_while_it_backs_off() {
         let cache = TestCache::new();
