@@ -9,6 +9,10 @@
 //! is the router's side of the protocol with one cache: a pure state
 //! machine, with time injected, that sends the queries, stages each reply
 //! until it is complete, commits whole VRP sets and runs the timers.
+//! [`client`] is the thread around it: TCP to the configured caches in
+//! order of preference, reconnects with a back-off, and every commit
+//! published to the RIB through a
+//! [`ValidationSink`](bgpfc_rpki::ValidationSink).
 //!
 //! Both protocol versions are supported: version 0 (RFC 6810) and
 //! version 1 (RFC 8210), which adds the Router Key PDU and the timing
@@ -20,17 +24,21 @@
 //! §5.1 (header fields, Flags, Max Length, Length, Session ID),
 //! §5.2–§5.11 (every PDU), §6 (timing parameters), §7 (version
 //! negotiation, unsupported and unexpected versions, Serial Notify during
-//! negotiation), §8 (protocol sequences), §10 (keeping the data while the
-//! cache is away), §12 (error codes), §14 (PDU types per version);
-//! RFC 6810 §5 (version 0 PDUs), §6.1 (version 0 polling), §8 (deleting
-//! data that cannot be refreshed), §10 (error codes).
+//! negotiation), §8 (protocol sequences), §9 (TCP to the rpki-rtr port),
+//! §10 (keeping the data while the cache is away; the cache list in order
+//! of preference), §12 (error codes), §14 (PDU types per version);
+//! RFC 6810 §5 (version 0 PDUs), §6.1 (version 0 polling), §7 (the
+//! port), §8 (deleting data that cannot be refreshed; the cache list),
+//! §10 (error codes).
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod error;
 pub mod framer;
 pub mod pdu;
 pub mod session;
 
+pub use client::Client;
 pub use error::{ErrorCode, RtrError};
 pub use framer::Framer;
 pub use pdu::{ErrorReport, Intervals, MAX_PDU_LEN, Pdu, PduType, RouterKey, Version};
