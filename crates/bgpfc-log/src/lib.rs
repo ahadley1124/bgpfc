@@ -158,8 +158,20 @@ pub fn format_line(now: SystemTime, level: Level, msg: &str, fields: &[Field<'_>
     line
 }
 
-/// Append `value`, quoting it only when needed.
-fn push_value(out: &mut String, value: &str) {
+/// Append `value` as a field value of a log line: as it is, or in double
+/// quotes with `"`, `\` and control characters escaped when it is empty
+/// or holds one of them, whitespace or `=`.
+///
+/// For text that repeats a line's fields elsewhere, such as a status the
+/// control plane shows: a value from outside the daemon, with a newline
+/// in it say, then stays on its line there as it does in the log.
+///
+/// ```
+/// let mut text = String::from("error=");
+/// bgpfc_log::push_value(&mut text, "two\nlines");
+/// assert_eq!(text, r#"error="two\nlines""#);
+/// ```
+pub fn push_value(out: &mut String, value: &str) {
     let plain = !value.is_empty()
         && value
             .chars()
