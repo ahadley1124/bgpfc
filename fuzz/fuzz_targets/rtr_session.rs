@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_rpki::VrpSet;
 use bgpfc_rtr::session::{Action, Config, Event};
-use bgpfc_rtr::{Framer, Pdu, Session, Version};
+use bgpfc_rtr::{Framer, Pdu, Received, Session, Version};
 use libfuzzer_sys::fuzz_target;
 
 /// The shell around a session.
@@ -35,19 +35,33 @@ struct Shell {
     framer: Option<Framer>,
     /// What the RIB was last given.
     rib: Option<Arc<VrpSet>>,
+    /// The octets of the PDU, or of the PDU in error, being stepped.
+    received: Option<Vec<u8>>,
 }
 
 impl Shell {
-    fn step(&mut self, event: Event) {
+    fn step(&mut self, event: Event<'_>) {
         // Issue #58: only End of Data commits a reply; anything else that
         // commits is a flush, which commits the empty set.
-        let end_of_data = matches!(event, Event::Pdu(Pdu::EndOfData { .. }));
+        let end_of_data = matches!(
+            event,
+            Event::Pdu(Received {
+                pdu: Pdu::EndOfData { .. },
+                ..
+            })
+        );
         for action in self.session.step(event, self.now) {
             match action {
                 Action::Connect => {}
                 Action::Send(pdu) => {
                     let octets = pdu.encode();
                     assert_eq!(Pdu::decode(&octets).as_ref(), Ok(&pdu));
+                    // RFC 8210 §5.11: the PDU in error as it arrived.
+                    if let Pdu::ErrorReport(report) = &pdu
+                        && let Some(received) = &self.received
+                    {
+                        assert!(received.starts_with(report.erroneous_pdu()));
+                    }
                 }
                 Action::Close => self.framer = None,
                 Action::Negotiated(version) => {
@@ -79,19 +93,29 @@ impl Shell {
             let Some(framer) = &mut self.framer else {
                 return;
             };
-            match framer.next_pdu() {
-                Ok(Some(pdu)) => self.step(Event::Pdu(pdu)),
+            match framer.next_received() {
+                Ok(Some(Received { pdu, octets })) => {
+                    let octets = octets.to_vec();
+                    self.received = Some(octets.clone());
+                    self.step(Event::Pdu(Received {
+                        pdu,
+                        octets: &octets,
+                    }));
+                }
                 Ok(None) => return,
                 Err(error) => {
                     let erroneous_pdu = framer.erroneous_pdu().to_vec();
                     self.framer = None;
+                    self.received = Some(erroneous_pdu.clone());
                     self.step(Event::DecodeError {
                         error,
-                        erroneous_pdu,
+                        erroneous_pdu: &erroneous_pdu,
                     });
+                    self.received = None;
                     return;
                 }
             }
+            self.received = None;
         }
     }
 }
@@ -115,6 +139,7 @@ fuzz_target!(|data: &[u8]| {
         now,
         framer: None,
         rib: None,
+        received: None,
     };
     shell.step(Event::Tick);
     while let Some((&command, rest)) = script.split_first() {

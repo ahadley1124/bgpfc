@@ -9,6 +9,7 @@ use bgpfc_rpki::{AffectedPrefixes, RouteOrigin, RovState, ValidationChange, Vrp,
 use bgpfc_wire::types::Asn;
 
 use super::*;
+use crate::framer::Framer;
 use crate::pdu::RouterKey;
 
 const V0: Version = Version::V0;
@@ -119,12 +120,20 @@ impl H {
         }
     }
 
-    fn step(&mut self, event: Event) -> Vec<Action> {
+    fn step(&mut self, event: Event<'_>) -> Vec<Action> {
         self.s.step(event, self.now)
     }
 
+    /// Hand over a PDU as a cache that keeps to the protocol sends it:
+    /// its canonical encoding.
     fn pdu(&mut self, pdu: Pdu) -> Vec<Action> {
-        self.step(Event::Pdu(pdu))
+        let octets = pdu.encode();
+        self.raw(pdu, &octets)
+    }
+
+    /// Hand over a PDU that arrived as `octets`.
+    fn raw(&mut self, pdu: Pdu, octets: &[u8]) -> Vec<Action> {
+        self.step(Event::Pdu(Received { pdu, octets }))
     }
 
     /// Hand over several PDUs; all their actions.
@@ -287,48 +296,102 @@ fn no_data() -> H {
 
 // ------------------------------------------------------------- table
 
+/// An event for the tables, holding the octets an [`Event`] borrows.
+#[derive(Clone, Debug)]
+enum Input {
+    Tick,
+    Connected,
+    Disconnected,
+    Decode(RtrError, Vec<u8>),
+    /// A PDU and its octets. Those of a Prefix PDU have reserved bits and
+    /// an address bit beyond the prefix length set, so that its canonical
+    /// encoding differs from what arrived.
+    Pdu(Pdu, Vec<u8>),
+}
+
+impl Input {
+    fn pdu(pdu: Pdu) -> Input {
+        let mut octets = pdu.encode();
+        if let Pdu::Prefix { .. } = pdu {
+            // RFC 8210 §5: reserved, "MUST be ignored on receipt".
+            octets[2] = 0xab;
+            octets[8] |= 0x80;
+            octets[11] = 0xcd;
+            // The last address octet: beyond /24 and /32 both.
+            let last = if octets.len() == 20 { 15 } else { 27 };
+            octets[last] |= 1;
+        }
+        assert_eq!(Pdu::decode(&octets).as_ref(), Ok(&pdu));
+        Input::Pdu(pdu, octets)
+    }
+
+    fn event(&self) -> Event<'_> {
+        match self {
+            Input::Tick => Event::Tick,
+            Input::Connected => Event::Connected,
+            Input::Disconnected => Event::Disconnected,
+            Input::Decode(error, octets) => Event::DecodeError {
+                error: error.clone(),
+                erroneous_pdu: octets,
+            },
+            Input::Pdu(pdu, octets) => Event::Pdu(Received {
+                pdu: pdu.clone(),
+                octets,
+            }),
+        }
+    }
+
+    /// The octets that arrived, which an Error Report about them carries.
+    fn octets(&self) -> Option<&[u8]> {
+        match self {
+            Input::Decode(_, octets) | Input::Pdu(_, octets) => Some(octets),
+            _ => None,
+        }
+    }
+}
+
 /// Every event: the timer tick, the transport events, a decoding error,
 /// and every PDU type of RFC 8210 §5 (version 1), with Error Reports of a
 /// non-fatal and a fatal code (§12).
-fn every_event() -> Vec<(&'static str, Event)> {
+fn every_event() -> Vec<(&'static str, Input)> {
     vec![
-        ("tick", Event::Tick),
-        ("connected", Event::Connected),
-        ("disconnected", Event::Disconnected),
+        ("tick", Input::Tick),
+        ("connected", Input::Connected),
+        ("disconnected", Input::Disconnected),
         (
             "decode-error",
-            Event::DecodeError {
-                error: RtrError::TooShort {
+            Input::Decode(
+                RtrError::TooShort {
                     pdu_type: 4,
                     length: 12,
                     min: 20,
                 },
-                erroneous_pdu: vec![1, 4, 0, 0, 0, 0, 0, 12],
-            },
+                vec![1, 4, 0, 0, 0, 0, 0, 12],
+            ),
         ),
-        ("serial-notify", Event::Pdu(notify(V1, SID, 6))),
+        ("serial-notify", Input::pdu(notify(V1, SID, 6))),
         (
             "serial-query",
-            Event::Pdu(Pdu::SerialQuery {
+            Input::pdu(Pdu::SerialQuery {
                 version: V1,
                 session_id: SID,
                 serial: 5,
             }),
         ),
-        ("reset-query", Event::Pdu(Pdu::ResetQuery { version: V1 })),
-        ("cache-response", Event::Pdu(response(V1, SID))),
-        ("ipv4-prefix", Event::Pdu(announce(V1, c()))),
-        ("ipv6-prefix", Event::Pdu(withdraw(V1, b()))),
-        ("end-of-data", Event::Pdu(eod(SID, 6))),
-        ("cache-reset", Event::Pdu(Pdu::CacheReset { version: V1 })),
-        ("router-key", Event::Pdu(router_key())),
+        ("reset-query", Input::pdu(Pdu::ResetQuery { version: V1 })),
+        ("cache-response", Input::pdu(response(V1, SID))),
+        ("ipv4-prefix", Input::pdu(announce(V1, c()))),
+        ("ipv6-prefix", Input::pdu(withdraw(V1, b()))),
+        ("end-of-data", Input::pdu(eod(SID, 6))),
+        ("cache-reset", Input::pdu(Pdu::CacheReset { version: V1 })),
+        ("router-key", Input::pdu(router_key())),
         (
             "no-data",
-            Event::Pdu(report(V1, ErrorCode::NoDataAvailable)),
+            Input::pdu(report(V1, ErrorCode::NoDataAvailable)),
         ),
         (
             "error-report",
-            Event::Pdu(report(V1, ErrorCode::InternalError)),
+            Input::pdu(report(V1, ErrorCode::InternalError)),
         ),
     ]
 }
@@ -337,23 +400,22 @@ type Row = (&'static str, State, &'static [&'static str]);
 
 /// Run every event against a fresh session from `setup` and compare with
 /// the table, which must name every event. Every Error Report sent
-/// carries the octets of the PDU in error (RFC 8210 §5.11).
+/// carries the octets of the PDU in error as they arrived (RFC 8210
+/// §5.11).
 fn check_table(name: &str, setup: fn() -> H, table: &[Row]) {
     let events = every_event();
     assert_eq!(table.len(), events.len(), "{name}: one row per event");
-    for (label, event) in events {
+    for (label, input) in events {
         let Some(&(_, state, expected)) = table.iter().find(|r| r.0 == label) else {
             panic!("{name}: no row for {label}");
         };
         let mut h = setup();
-        let actions = h.step(event.clone());
+        let actions = h.step(input.event());
         assert_eq!(tags(&actions), expected, "{name} + {label}: actions");
         assert_eq!(h.s.state(), state, "{name} + {label}: state");
         for r in reports(&actions) {
-            let octets = match &event {
-                Event::Pdu(pdu) => pdu.encode(),
-                Event::DecodeError { erroneous_pdu, .. } => erroneous_pdu.clone(),
-                other => panic!("{name} + {label}: report on {other:?}"),
+            let Some(octets) = input.octets() else {
+                panic!("{name} + {label}: report on {input:?}");
             };
             assert_eq!(r.erroneous_pdu(), octets, "{name} + {label}");
             assert!(!r.text().is_empty(), "{name} + {label}");
@@ -1091,7 +1153,7 @@ fn decoding_errors_are_reported_and_drop_the_session() {
             length: 12,
             min: 20,
         },
-        erroneous_pdu: octets.clone(),
+        erroneous_pdu: &octets,
     });
     assert_eq!(tags(&actions), ["report v1 code 0", "close"]);
     let r = reports(&actions)[0];
@@ -1109,16 +1171,58 @@ fn decoding_errors_are_reported_and_drop_the_session() {
             version: 2,
             pdu_type: 3,
         },
-        erroneous_pdu: vec![2, 3, 0, 7, 0, 0, 0, 8],
+        erroneous_pdu: &[2, 3, 0, 7, 0, 0, 0, 8],
     });
     assert_eq!(tags(&actions), ["report v1 code 4", "close"]);
     // No Error Report about an Error Report (§5.11).
     let mut h = idle();
     let actions = h.step(Event::DecodeError {
         error: RtrError::ErrorTextNotUtf8,
-        erroneous_pdu: vec![1, 10, 0, 0, 0, 0, 0, 17],
+        erroneous_pdu: &[1, 10, 0, 0, 0, 0, 0, 17],
     });
     assert_eq!(tags(&actions), ["close"]);
+}
+
+#[test]
+fn an_error_report_carries_the_pdu_as_received() {
+    // RFC 8210 §5.11: the Erroneous PDU field is the PDU in error. The
+    // decoder ignores reserved fields and clears address bits beyond the
+    // prefix length, so the canonical encoding is not what arrived.
+    let first = [
+        1, 4, 0, 0, 0, 0, 0, 20, 1, 24, 24, 0, 192, 0, 2, 0, 0, 0, 0xfb, 0xf0,
+    ];
+    let mut second = first;
+    // 192.0.2.1/24, which is the prefix 192.0.2.0/24, and a reserved field.
+    second[15] = 1;
+    second[2] = 0x5a;
+    let mut framer = Framer::new();
+    framer.set_version(V1);
+    framer.feed(&first);
+    framer.feed(&second);
+    let mut h = receiving_reset();
+    let received = framer.next_received().unwrap().unwrap();
+    assert_eq!(received.octets, first);
+    let vrp = received.pdu.clone();
+    assert_eq!(tags(&h.step(Event::Pdu(received))), NONE);
+    let received = framer.next_received().unwrap().unwrap();
+    assert_eq!(received.pdu, vrp, "the same record");
+    assert_ne!(received.pdu.encode(), second);
+    let actions = h.step(Event::Pdu(received));
+    assert_eq!(tags(&actions), ["report v1 code 7", "close"]);
+    let report = reports(&actions)[0];
+    assert_eq!(report.erroneous_pdu(), second);
+    assert!(
+        report.text().contains("192.0.2.0/24-24 AS64496"),
+        "{}",
+        report.text()
+    );
+    // Any PDU reported on: an unexpected Cache Reset with its reserved
+    // field set.
+    let mut h = idle();
+    let octets = [1, 8, 0xff, 0xff, 0, 0, 0, 8];
+    let actions = h.raw(Pdu::CacheReset { version: V1 }, &octets);
+    assert_eq!(tags(&actions), ["report v1 code 0", "close"]);
+    assert_eq!(reports(&actions)[0].erroneous_pdu(), octets);
 }
 
 #[test]

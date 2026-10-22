@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_rpki::{AffectedPrefixes, Vrp, VrpSet};
 use bgpfc_rtr::session::{Action, Commit, Config, Event, State};
-use bgpfc_rtr::{ErrorCode, ErrorReport, Intervals, Pdu, Session, Version};
+use bgpfc_rtr::{ErrorCode, ErrorReport, Intervals, Pdu, Received, Session, Version};
 use bgpfc_wire::types::Asn;
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -250,7 +250,7 @@ impl Sim {
         }
     }
 
-    fn step(&mut self, event: Event, expect: Expect) {
+    fn step(&mut self, event: Event<'_>, expect: Expect) {
         let actions = self.session.step(event, self.now);
         self.carry_out(actions, expect);
         // The session's own view matches what it committed.
@@ -334,7 +334,14 @@ impl Sim {
                 } => Expect::Snapshot(session_id, serial),
                 _ => Expect::Nothing,
             };
-            self.step(Event::Pdu(pdu), expect);
+            let octets = pdu.encode();
+            self.step(
+                Event::Pdu(Received {
+                    pdu,
+                    octets: &octets,
+                }),
+                expect,
+            );
         }
     }
 

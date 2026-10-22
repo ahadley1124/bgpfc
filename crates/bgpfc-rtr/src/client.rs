@@ -81,7 +81,7 @@ use bgpfc_log::{Field, Level};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSink, VrpSet};
 use bgpfc_wire::prefix::Prefix;
 
-use crate::framer::Framer;
+use crate::framer::{Framer, Received};
 use crate::pdu::{Pdu, Version};
 use crate::session::{self, Action, Commit, Event, LogLine, Session, State};
 
@@ -519,6 +519,8 @@ struct Worker<S> {
     next_conn_id: u64,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
+    /// The octets of the PDU being handed to the session.
+    pdu_buf: Vec<u8>,
     /// Consecutive failed attempts, for the back-off.
     failures: u32,
     /// Whether the current connection has brought the router in sync.
@@ -594,6 +596,7 @@ impl<S: ValidationSink> Worker<S> {
             next_conn_id: 0,
             read_buf: vec![0; READ_BUFFER],
             write_buf: Vec::new(),
+            pdu_buf: Vec::new(),
             failures: 0,
             synced_on_conn: false,
             fresh_session: true,
@@ -676,18 +679,36 @@ impl<S: ValidationSink> Worker<S> {
     /// Hand the session every PDU the framer has, in order, until the
     /// connection they came on is gone.
     fn drain(&mut self) {
+        // The session needs each PDU's octets for an Error Report about it
+        // (RFC 8210 §5.11). They are copied out of the framer, which the
+        // step may close, into one buffer used over and over: no
+        // allocation per PDU.
+        let mut octets = std::mem::take(&mut self.pdu_buf);
         while let Some(conn) = &mut self.conn {
             let id = conn.id;
-            let event = match conn.framer.next_pdu() {
-                Ok(None) => return,
-                Ok(Some(pdu)) => Event::Pdu(pdu),
+            octets.clear();
+            let decoded = match conn.framer.next_received() {
+                Ok(None) => break,
+                Ok(Some(received)) => {
+                    octets.extend_from_slice(received.octets);
+                    Ok(received.pdu)
+                }
+                Err(error) => {
+                    octets.extend_from_slice(conn.framer.erroneous_pdu());
+                    Err(error)
+                }
+            };
+            let failed = decoded.is_err();
+            self.handle(match decoded {
+                Ok(pdu) => Event::Pdu(Received {
+                    pdu,
+                    octets: &octets,
+                }),
                 Err(error) => Event::DecodeError {
                     error,
-                    erroneous_pdu: conn.framer.erroneous_pdu().to_vec(),
+                    erroneous_pdu: &octets,
                 },
-            };
-            let failed = matches!(event, Event::DecodeError { .. });
-            self.handle(event);
+            });
             // After a decoding error nothing more can be framed (RFC 8210
             // §12: the error is fatal), and PDUs still buffered from a
             // connection the session let go of are not read.
@@ -696,9 +717,10 @@ impl<S: ValidationSink> Worker<S> {
                 || self.shared.stopping()
                 || self.conn.as_ref().map(|c| c.id) != Some(id)
             {
-                return;
+                break;
             }
         }
+        self.pdu_buf = octets;
     }
 
     /// The transport failed: close it and tell the session.
@@ -716,7 +738,7 @@ impl<S: ValidationSink> Worker<S> {
 
     /// Step the session with `event`, and with whatever follows from its
     /// actions, until nothing does.
-    fn handle(&mut self, event: Event) {
+    fn handle(&mut self, event: Event<'_>) {
         let mut next = Some(event);
         while let Some(event) = next.take() {
             if self.exit {
@@ -729,7 +751,7 @@ impl<S: ValidationSink> Worker<S> {
     /// One step of the session and its actions. Returns the event that
     /// follows: the outcome of a connection attempt, or the loss of a
     /// connection that failed while the step wrote to it.
-    fn step(&mut self, event: Event) -> Option<Event> {
+    fn step(&mut self, event: Event<'_>) -> Option<Event<'static>> {
         let now = self.clock.now();
         self.step_level = None;
         self.expire_held(now);
@@ -863,7 +885,7 @@ impl<S: ValidationSink> Worker<S> {
 
     /// Open a connection to the current cache. `None` if the client is
     /// stopping.
-    fn connect(&mut self) -> Option<Event> {
+    fn connect(&mut self) -> Option<Event<'static>> {
         if self.shared.stopping() {
             return None;
         }
