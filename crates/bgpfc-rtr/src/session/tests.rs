@@ -1312,6 +1312,40 @@ fn an_expire_interval_of_zero_drops_the_data_at_once() {
 }
 
 #[test]
+fn version_0_queries_at_least_hourly() {
+    // RFC 6810 §6.1: "a router MUST send either a Serial Query or a Reset
+    // Query no less frequently than once an hour". The hour counts from
+    // the query, not from the End of Data that answers it.
+    let mut h = querying_cold();
+    let asked = h.now;
+    h.now += Duration::from_secs(20);
+    h.pdus(&[response(V0, SID), announce(V0, a()), eod0(SID, 1)]);
+    assert_eq!(
+        h.s.next_deadline(),
+        Some(asked + Duration::from_secs(3_600))
+    );
+    h.now = asked + Duration::from_secs(3_599);
+    assert_eq!(tags(&h.step(Event::Tick)), NONE);
+    h.now = asked + Duration::from_secs(3_600);
+    assert_eq!(tags(&h.step(Event::Tick)), ["serial-query v0 7/1"]);
+    // A reply that takes longer than the hour, each PDU within the
+    // response timeout, is followed by the next query at once.
+    let mut h = querying_cold();
+    h.now += Duration::from_secs(59);
+    h.pdu(response(V0, SID));
+    for i in 0..61 {
+        h.now += Duration::from_secs(59);
+        let vrp = vrp(&format!("10.{i}.0.0/16"), 16, 64_496);
+        assert_eq!(tags(&h.pdu(announce(V0, vrp))), NONE);
+    }
+    h.now += Duration::from_secs(59);
+    let actions = h.pdu(eod0(SID, 1));
+    assert_eq!(tags(&actions), ["commit 61 all", "serial-query v0 7/1"]);
+    // Version 1 counts the Refresh Interval from End of Data (RFC 8210
+    // §6), as cold_start_commits_only_at_end_of_data checks.
+}
+
+#[test]
 fn version_0_uses_the_default_intervals() {
     let mut h = querying_cold();
     h.pdus(&[response(V0, SID), eod0(SID, 1)]);
