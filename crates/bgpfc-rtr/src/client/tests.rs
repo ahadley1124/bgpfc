@@ -749,6 +749,35 @@ mod net {
     }
 
     #[test]
+    fn the_last_error_quotes_what_the_cache_wrote() {
+        // RFC 8210 §5.11: the Error Text is any UTF-8, so a newline, a line
+        // of its own after it, or a terminal escape. The last error reads
+        // as the log line does: such a value quoted and escaped.
+        let cache = TestCache::new();
+        let (client, _rx, mut router) = in_sync(&cache);
+        router.send(&[Pdu::ErrorReport(ErrorReport::new(
+            V1,
+            ErrorCode::InternalError,
+            &[],
+            "boom\n.\nstate idle\u{1b}[2J",
+        ))]);
+        router.expect_close();
+        let _router = cache.accept();
+        let error = client.status().last_error.unwrap();
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(
+            error.starts_with("rtr cache reported an error; dropping the session cache=127.0.0.1:"),
+            "{error}"
+        );
+        assert!(
+            error.ends_with(
+                r#" code="Internal Error (1)" version=1 text="boom\n.\nstate idle\u{001b}[2J""#
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn data_expires_when_no_cache_answers() {
         let cache = TestCache::new();
         let (client, rx, router) = in_sync(&cache);

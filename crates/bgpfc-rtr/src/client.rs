@@ -80,7 +80,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -294,7 +294,9 @@ pub struct Status {
     /// connection that was in sync and that the cache or the network then
     /// closed does not count.
     pub failures: u32,
-    /// The last warning or error the client logged, with its fields.
+    /// The last warning or error the client logged: its message, then its
+    /// fields as the log line has them, each value quoted and escaped
+    /// where it holds whitespace, a quote or a control character.
     pub last_error: Option<String>,
     /// When it was logged.
     pub last_error_at: Option<Instant>,
@@ -1166,10 +1168,10 @@ impl<S: ValidationSink> Worker<S> {
             self.step_level = Some(line.level);
             let mut text = line.message.to_owned();
             for (key, value) in &context {
-                let _ = write!(text, " {key}={value}");
+                push_field(&mut text, key, &value.to_string());
             }
             for (key, value) in &line.fields {
-                let _ = write!(text, " {key}={value}");
+                push_field(&mut text, key, value);
             }
             self.last_error = Some((now, text));
         }
@@ -1251,6 +1253,18 @@ fn count(vrps: &VrpSet) -> (usize, usize) {
 
 fn field(key: &'static str, value: impl fmt::Display) -> (&'static str, String) {
     (key, value.to_string())
+}
+
+/// Append ` key=value` to `text` as the log line has it: the value quoted
+/// and escaped where it needs to be. Text from the cache, an Error
+/// Report's say, may hold anything UTF-8 allows (RFC 8210 §5.11), a
+/// newline included; [`Status::last_error`] keeps it on one line, as the
+/// log does.
+fn push_field(text: &mut String, key: &str, value: &str) {
+    text.push(' ');
+    text.push_str(key);
+    text.push('=');
+    bgpfc_log::push_value(text, value);
 }
 
 /// A duration for the log: `1.5s`, `250ms`.
