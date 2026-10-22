@@ -210,10 +210,14 @@ more than 1000 IPv4 unicast routes in the RIB (RFC 4271 §6.7): bgpfcd
 sends Cease / Maximum Number of Prefixes Reached with the family and the
 limit in its data (RFC 4486 §4), drops every route the neighbor sent
 (none of the UPDATE that crossed the limit is passed on), and logs an
-error. Counted are the routes accepted: those that passed the AS loop
-check and the import policy, which is what `show neighbor` reports as
-received. Routes the import policy rejects are not kept and not counted,
-as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
+error. Counted are the routes received: every route the neighbor
+advertised and has not withdrawn, before the import policy, less those
+the AS loop check drops, which is what `show neighbor` reports as
+received. The RIB keeps the routes the import policy rejects, so that
+the policy can run on them again, and counts them, so the limit bounds
+the memory they take; a change of policy never moves the count. This is
+BIRD's `receive limit`; FRR's `maximum-prefix` and BIRD's `import limit`
+count only the routes the import policy accepts. The limit must
 be at least 1 and its family one of the neighbor's `families`. The
 neighbor then restarts like after any other damped failure, so a peer
 that keeps sending too many routes is retried `restart-limit` times and

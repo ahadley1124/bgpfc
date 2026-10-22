@@ -2,7 +2,8 @@
 //! (AGENTS.md §3, "RIB thread": the only owner of all RIB state, driven
 //! by messages, no I/O).
 //!
-//! Implements: RFC 4271 §3.2 (the three RIBs), §9.1 (the decision
+//! Implements: RFC 4271 §3.2 (the three RIBs; the Adj-RIBs-In hold routes
+//! as received, before import policy), §9.1 (the decision
 //! process: Phase 1 degree of preference, Phase 2 route selection,
 //! Phase 3 route dissemination), §9.1.2 (AS loop exclusion), §9.1.4
 //! (overlapping routes are independent destinations), §9.2 (update
@@ -165,11 +166,37 @@ pub struct BestRoute {
     pub attrs: Arc<PathAttrs>,
 }
 
-/// One destination: every eligible route to it and the chosen one.
+/// A route in an Adj-RIB-In: what a peer advertised for a destination,
+/// before import policy (RFC 4271 §3.2: "unprocessed routing
+/// information").
+#[derive(Clone, Debug)]
+struct Received {
+    /// The peer that sent it.
+    peer: IpAddr,
+    /// Its attributes as received, interned.
+    attrs: Arc<PathAttrs>,
+}
+
+/// One destination: the route each peer sent for it, those import policy
+/// accepted, and the chosen one.
 #[derive(Debug, Default)]
 struct Destination {
+    /// The Adj-RIBs-In for this destination: at most one route per peer,
+    /// kept whatever import policy makes of it, so that policy can run
+    /// again on what the peer sent.
+    received: Vec<Received>,
+    /// What import policy accepted of `received`, with the attributes it
+    /// gave them: the routes Phase 2 chooses from (RFC 4271 §9.1.1).
     candidates: Vec<Candidate>,
     best: Option<BestRoute>,
+}
+
+impl Destination {
+    /// Nothing is held for the destination and nothing was chosen, so
+    /// there is nothing left to decide or to withdraw: it can go.
+    fn is_unused(&self) -> bool {
+        self.received.is_empty() && self.best.is_none()
+    }
 }
 
 struct PeerState {
@@ -180,7 +207,9 @@ struct PeerState {
     /// Adj-RIB-Out: what the peer was last told, per family, with the
     /// RFC 4271 §9.2.1.1 pacing state.
     adj_out: HashMap<AddressFamily, AdjRibOut>,
-    /// Routes held in the Adj-RIB-In per family (for statistics).
+    /// Routes of each family in the Adj-RIB-In, accepted by import policy
+    /// or not: what [`PeerStats::received`] reports and the RFC 4271 §6.7
+    /// limit counts.
     adj_in_count: HashMap<AddressFamily, usize>,
 }
 
@@ -196,7 +225,9 @@ impl PeerState {
 /// Counters about one peer, for the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerStats {
-    /// Routes accepted from the peer, per family it may send.
+    /// Routes the peer sent that the Adj-RIB-In holds, per family it may
+    /// send, whether import policy accepted them or not: what the
+    /// RFC 4271 §6.7 limit counts.
     pub received: Vec<(AddressFamily, usize)>,
     /// Routes advertised to the peer, per negotiated family.
     pub advertised: Vec<(AddressFamily, usize)>,
@@ -217,8 +248,9 @@ pub struct Rib {
     local_as: Asn,
     policies: Box<dyn Policies>,
     peers: HashMap<IpAddr, PeerState>,
-    /// Adj-RIBs-In and Loc-RIB together: every candidate per destination
-    /// and the best among them.
+    /// Adj-RIBs-In and Loc-RIB together, per family and in prefix order:
+    /// every route received for a destination, the candidates import
+    /// policy made of them, and the best among those.
     tables: HashMap<AddressFamily, BTreeMap<Prefix, Destination>>,
     interner: Interner,
     /// Pending wake-ups, earliest first. Each `AdjRibOut` knows the one
@@ -313,11 +345,7 @@ impl Rib {
         shrink_heap(&mut self.deadlines);
         let mut dirty: Vec<(AddressFamily, Prefix)> = Vec::new();
         for (family, table) in &mut self.tables {
-            for (prefix, dest) in table.iter_mut() {
-                if remove_candidate(dest, addr) {
-                    dirty.push((*family, *prefix));
-                }
-            }
+            drop_peer_routes(*family, table, addr, &mut dirty);
         }
         dirty
     }
@@ -392,11 +420,7 @@ impl Rib {
         }
         state.adj_in_count.insert(family, 0);
         if let Some(table) = self.tables.get_mut(&family) {
-            for (prefix, dest) in table.iter_mut() {
-                if remove_candidate(dest, addr) {
-                    dirty.push((family, *prefix));
-                }
-            }
+            drop_peer_routes(family, table, addr, dirty);
         }
     }
 
@@ -652,9 +676,9 @@ impl Rib {
             // own address is semantically incorrect, and RFC 4760 §3 holds
             // MP_REACH_NLRI next hops to the same rule. "The error SHOULD
             // be logged, and the route SHOULD be ignored", with no
-            // NOTIFICATION: the caller logs the output. Ignored like a
-            // route import policy rejects, so one the peer sent before for
-            // the prefix goes too; the new announcement replaced it, and
+            // NOTIFICATION: the caller logs the output. Ignored, so not
+            // kept in the Adj-RIB-In, and one the peer sent before for the
+            // prefix goes too; the new announcement replaced it, and
             // keeping it would keep what the peer no longer advertises
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
@@ -672,18 +696,39 @@ impl Rib {
             let attrs = self
                 .interner
                 .intern(PathAttrs::from_update(&update.message, next_hop));
+            // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an
+            // AS loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC
+            // 7606 §7.2: on an external session the leftmost AS must be the
+            // peer's, else the route is treated as withdrawn. Neither kind
+            // is kept in the Adj-RIB-In: no import policy can make it
+            // usable, and our AS is fixed for the life of the RIB.
+            if !self.usable(&info, &attrs) {
+                for &prefix in prefixes {
+                    self.remove_route(addr, family, prefix, &mut dirty);
+                }
+                continue;
+            }
             let limit = info.prefix_limit(family);
             for &prefix in prefixes {
-                self.announce(addr, &info, family, prefix, &attrs, &mut dirty);
+                let route = Received {
+                    peer: addr,
+                    attrs: Arc::clone(&attrs),
+                };
+                self.announce(&info, family, prefix, route, &mut dirty);
                 // RFC 4271 §6.7: "the number of address prefixes received
                 // from the neighbor exceeds the locally-configured, upper
-                // bound". Counted are the routes the Adj-RIB-In holds after
-                // the loop checks and import policy, the ones "the speaker
-                // is willing to accept" (§6.7): a rejected route is not
-                // stored, so counting it would take the memory the limit
-                // is there to bound.
-                // NOTE(interop): FRR's `maximum-prefix` without `force`
-                // and BIRD's `import limit` count accepted routes too.
+                // bound". Counted are the routes the Adj-RIB-In holds,
+                // whether import policy accepted them or not: every route
+                // the peer advertises and has not withdrawn, less those
+                // the loop checks above drop. The Adj-RIB-In keeps what
+                // import policy rejects, so that policy can run again when
+                // its input changes, and those routes take the memory the
+                // limit is there to bound. Counted this way, only the
+                // peer's UPDATEs move the count: a change of policy never
+                // ends a session.
+                // NOTE(interop): BIRD's `receive limit` counts the same
+                // routes; BIRD's `import limit` and FRR's `maximum-prefix`
+                // without `force` count only those import policy accepts.
                 if let Some(limit) = limit
                     && self.received(addr, family) > u64::from(limit)
                 {
@@ -697,8 +742,9 @@ impl Rib {
         ignored
     }
 
-    /// Drop the route `addr` sent for `prefix`, if any; `dirty` gets the
-    /// destination when there was one.
+    /// Drop the route `addr` sent for `prefix` from the Adj-RIB-In, if
+    /// there is one; `dirty` gets the destination when that changes its
+    /// candidates.
     fn remove_route(
         &mut self,
         addr: IpAddr,
@@ -706,15 +752,22 @@ impl Rib {
         prefix: Prefix,
         dirty: &mut Vec<(AddressFamily, Prefix)>,
     ) {
-        if let Some(dest) = self
-            .tables
-            .get_mut(&family)
-            .and_then(|t| t.get_mut(&prefix))
-            && remove_candidate(dest, addr)
-        {
-            self.count(addr, family, -1);
+        let Some(table) = self.tables.get_mut(&family) else {
+            return;
+        };
+        let Some(dest) = table.get_mut(&prefix) else {
+            return;
+        };
+        let Some(i) = dest.received.iter().position(|r| r.peer == addr) else {
+            return;
+        };
+        dest.received.remove(i);
+        if remove_candidate(dest, addr) {
             dirty.push((family, prefix));
+        } else if dest.is_unused() {
+            table.remove(&prefix);
         }
+        self.count(addr, family, -1);
     }
 
     /// Routes of `family` from `addr` in the Adj-RIB-In.
@@ -722,63 +775,55 @@ impl Rib {
         self.peers.get(&addr).map_or(0, |s| s.received(family))
     }
 
-    /// One announced route from `addr` into the Adj-RIB-In, after the loop
-    /// checks and import policy; `dirty` gets the destination if anything
-    /// changed.
+    /// Whether routes from `info`'s peer with `attrs` pass the checks no
+    /// policy can override: no AS loop (RFC 4271 §9.1.2), and on an
+    /// external session the peer's AS leftmost (RFC 4271 §6.3, RFC 7606
+    /// §7.2).
+    fn usable(&self, info: &PeerInfo, attrs: &PathAttrs) -> bool {
+        let leftmost_ok =
+            info.kind == PeerKind::Internal || attrs.as_path.first_asn() == Some(info.remote_as);
+        leftmost_ok && !attrs.as_path.contains(self.local_as)
+    }
+
+    /// `route`, announced by `info`'s peer for `prefix`, into the
+    /// Adj-RIB-In in place of any route the peer sent for it before, and
+    /// through import policy into the candidates; `dirty` gets the
+    /// destination if its candidates changed.
     fn announce(
         &mut self,
-        addr: IpAddr,
         info: &PeerInfo,
         family: AddressFamily,
         prefix: Prefix,
-        attrs: &Arc<PathAttrs>,
+        route: Received,
         dirty: &mut Vec<(AddressFamily, Prefix)>,
     ) {
-        // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an AS
-        // loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC 7606
-        // §7.2: on an external session the leftmost AS must be the peer's,
-        // else the route is treated as withdrawn. Neither kind is stored.
-        let leftmost_ok =
-            info.kind == PeerKind::Internal || attrs.as_path.first_asn() == Some(info.remote_as);
-        // RFC 4271 §9.1.1: import policy decides what enters, and may
-        // change attributes (the degree of preference among them).
-        let accepted = if attrs.as_path.contains(self.local_as) || !leftmost_ok {
-            None
-        } else {
-            match self.policies.import(info, family, prefix, attrs) {
-                Verdict::Accept => Some(Arc::clone(attrs)),
-                Verdict::Modified(a) => Some(self.interner.intern(a)),
-                Verdict::Reject => None,
-            }
-        };
-        let Some(attrs) = accepted else {
-            self.remove_route(addr, family, prefix, dirty);
-            return;
-        };
+        let peer = route.peer;
         let dest = self
             .tables
             .entry(family)
             .or_default()
             .entry(prefix)
             .or_default();
-        let candidate = Candidate {
-            peer: addr,
-            kind: info.kind,
-            router_id: info.router_id.to_u32(),
-            remote_as: info.remote_as,
-            attrs,
-        };
-        if let Some(c) = dest.candidates.iter_mut().find(|c| c.peer == addr) {
-            if Arc::ptr_eq(&c.attrs, &candidate.attrs) {
-                // An implicit re-announcement of the same route.
-                return;
-            }
-            *c = candidate;
+        let (held, fresh) = if let Some(i) = dest.received.iter().position(|r| r.peer == peer) {
+            dest.received[i] = route;
+            (i, false)
         } else {
-            dest.candidates.push(candidate);
-            self.count(addr, family, 1);
+            push_one(&mut dest.received, route);
+            (dest.received.len() - 1, true)
+        };
+        if import(
+            &*self.policies,
+            &mut self.interner,
+            info,
+            (family, prefix),
+            &dest.received[held],
+            &mut dest.candidates,
+        ) {
+            dirty.push((family, prefix));
         }
-        dirty.push((family, prefix));
+        if fresh {
+            self.count(peer, family, 1);
+        }
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
@@ -888,13 +933,13 @@ impl Rib {
             if !changed {
                 // A destination created and emptied before it was ever
                 // decided (a prefix limit drops the UPDATE's own routes).
-                if dest.candidates.is_empty() {
+                if dest.is_unused() {
                     table.remove(&prefix);
                 }
                 continue;
             }
             dest.best.clone_from(&new_best);
-            if dest.candidates.is_empty() {
+            if dest.is_unused() {
                 table.remove(&prefix);
             }
             out.push(Output::Fib(FibChange {
@@ -1073,4 +1118,86 @@ fn remove_candidate(dest: &mut Destination, peer: IpAddr) -> bool {
     let before = dest.candidates.len();
     dest.candidates.retain(|c| c.peer != peer);
     dest.candidates.len() != before
+}
+
+/// Remove every route `peer` sent from `table`, a table of `family`:
+/// `dirty` gets the destinations whose candidates changed, and those left
+/// with nothing to decide go.
+fn drop_peer_routes(
+    family: AddressFamily,
+    table: &mut BTreeMap<Prefix, Destination>,
+    peer: IpAddr,
+    dirty: &mut Vec<(AddressFamily, Prefix)>,
+) {
+    table.retain(|prefix, dest| {
+        dest.received.retain(|r| r.peer != peer);
+        if remove_candidate(dest, peer) {
+            dirty.push((family, *prefix));
+        }
+        // One with a best route stays for the decision process, which
+        // withdraws it and then removes the destination.
+        !dest.is_unused()
+    });
+}
+
+/// Push onto a per-destination list. Most destinations are heard from one
+/// peer, so the first entry gets room for itself alone rather than the
+/// four a `Vec` would make; a second one grows it as usual.
+fn push_one<T>(list: &mut Vec<T>, item: T) {
+    if list.capacity() == 0 {
+        list.reserve_exact(1);
+    }
+    list.push(item);
+}
+
+/// RFC 4271 §9.1.1: import policy decides whether `route`, as the
+/// Adj-RIB-In holds it for `prefix` of `family`, is a candidate for
+/// Phase 2, and with which attributes. `candidates` gets the outcome in
+/// place of what it held for the route's peer; whether that changed them.
+///
+/// Every route reaches the candidates through here, whatever made it
+/// worth deciding again.
+fn import(
+    policies: &dyn Policies,
+    interner: &mut Interner,
+    info: &PeerInfo,
+    (family, prefix): (AddressFamily, Prefix),
+    route: &Received,
+    candidates: &mut Vec<Candidate>,
+) -> bool {
+    let accepted = match policies.import(info, family, prefix, &route.attrs) {
+        Verdict::Accept => Some(Arc::clone(&route.attrs)),
+        Verdict::Modified(a) => Some(interner.intern(a)),
+        Verdict::Reject => None,
+    };
+    let held = candidates.iter().position(|c| c.peer == route.peer);
+    match (accepted, held) {
+        (None, None) => false,
+        (None, Some(i)) => {
+            candidates.remove(i);
+            true
+        }
+        (Some(attrs), Some(i)) => {
+            let c = &mut candidates[i];
+            if Arc::ptr_eq(&c.attrs, &attrs) {
+                // An implicit re-announcement of the same route.
+                return false;
+            }
+            c.attrs = attrs;
+            true
+        }
+        (Some(attrs), None) => {
+            push_one(
+                candidates,
+                Candidate {
+                    peer: route.peer,
+                    kind: info.kind,
+                    router_id: info.router_id.to_u32(),
+                    remote_as: info.remote_as,
+                    attrs,
+                },
+            );
+            true
+        }
+    }
 }

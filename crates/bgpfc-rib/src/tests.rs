@@ -1,6 +1,7 @@
 //! Decision-process tests per tie-break step (AGENTS.md §5, `bgpfc-rib`
 //! row), export rules, update packing and RIB bookkeeping.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,8 @@ use crate::decision::{Candidate, best};
 use crate::export::{Source, export, prepend};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
+
+mod adj_rib_in;
 
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
@@ -1319,28 +1322,31 @@ impl crate::Policies for RejectOne {
 }
 
 #[test]
-fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
+fn prefix_limit_counts_received_routes_and_ends_the_session() {
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOne(p("192.0.2.128/25"))));
-    let e1 = limited(peer("10.0.0.1", 65_001, 1), V4, 2);
+    let e1 = limited(peer("10.0.0.1", 65_001, 1), V4, 3);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    assert_eq!(e1.prefix_limit(V4), Some(2));
+    assert_eq!(e1.prefix_limit(V4), Some(3));
     assert_eq!(e1.prefix_limit(V6), None);
     rib.peer_up(e1.clone(), now());
     rib.peer_up(e2.clone(), now());
     let a = attrs(&[65_001], "10.0.0.1");
     // Up to the limit is fine: RFC 4271 §6.7 acts when it is exceeded.
+    // The route import policy rejects is held in the Adj-RIB-In and
+    // counted like the others.
     let out = rib.update(
         e1.addr,
-        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+        &announce(&["192.0.2.0/24", "198.51.100.0/24", "192.0.2.128/25"], &a),
         now(),
     );
     assert_eq!(limit_hits(&out), vec![]);
-    // Not counted: a replacement, routes the RIB does not keep (import
-    // policy rejects, an AS loop, a leftmost AS that is not the peer's),
-    // and another family's routes.
+    assert_eq!(rib.loc_rib(V4).count(), 2);
+    // Not counted: a replacement, of an accepted or a rejected route;
+    // routes the RIB does not keep (an AS loop, a leftmost AS that is not
+    // the peer's); and another family's routes.
     let routes: [(&str, &[u32]); 4] = [
         ("192.0.2.0/24", &[65_001, 9]),
-        ("192.0.2.128/25", &[65_001]),
+        ("192.0.2.128/25", &[65_001, 9]),
         ("203.0.113.0/24", &[65_001, LOCAL_AS.0]),
         ("203.0.113.0/24", &[65_009]),
     ];
@@ -1357,17 +1363,21 @@ fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
     rib.update(e1.addr, &announce(&v6_prefixes, &v6), now());
     assert_eq!(
         rib.peer_stats(e1.addr).unwrap().received,
+        vec![(V4, 3), (V6, 3)]
+    );
+    // A withdrawal makes room again, that of a rejected route too.
+    rib.update(e1.addr, &withdraw(&["192.0.2.128/25"]), now());
+    assert_eq!(
+        rib.peer_stats(e1.addr).unwrap().received,
         vec![(V4, 2), (V6, 3)]
     );
-    // A withdrawal makes room again.
-    rib.update(e1.addr, &withdraw(&["198.51.100.0/24"]), now());
-    let out = rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now());
+    let out = rib.update(e1.addr, &announce(&["192.0.2.128/25"], &a), now());
     assert_eq!(limit_hits(&out), vec![]);
     // One route over: the session ends (RFC 4271 §6.7 (b)), which is
     // reported first, and every route from e1 goes at once, in both
     // families, from the FIB and from e2.
     let out = rib.update(e1.addr, &announce(&["203.0.113.0/24"], &a), now());
-    assert_eq!(limit_hits(&out), vec![(e1.addr, V4, 2)]);
+    assert_eq!(limit_hits(&out), vec![(e1.addr, V4, 3)]);
     assert!(matches!(out[0], Output::PrefixLimitExceeded { .. }));
     let f = fib(&out);
     assert_eq!(f.len(), 5);
@@ -1386,6 +1396,8 @@ fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
     assert_eq!(rib.candidates(V4, p("203.0.113.0/24")).len(), 0);
     assert!(rib.peer(e1.addr).is_none());
     assert_eq!(rib.peer_stats(e1.addr), None);
+    // Nothing of e1 is left, the rejected route included.
+    assert!(rib.tables.values().all(BTreeMap::is_empty));
     // What e1 sends until its session is down is ignored, and the end of
     // the session has nothing left to remove.
     let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), now());
@@ -1395,7 +1407,7 @@ fn prefix_limit_counts_accepted_routes_and_ends_the_session() {
     rib.peer_up(e1.clone(), now());
     let out = rib.update(
         e1.addr,
-        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+        &announce(&["192.0.2.0/24", "198.51.100.0/24", "192.0.2.128/25"], &a),
         now(),
     );
     assert_eq!(limit_hits(&out), vec![]);
