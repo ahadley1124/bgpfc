@@ -1120,25 +1120,32 @@ mod tests {
         let binary = dir.script("routinator", &body);
         let capture = Capture::default();
         let mut options = capture.options();
-        options.version_timeout = ms(300);
+        // Nothing tells the test when the stub has started its background
+        // process, so the timeout leaves it ample time to: a few
+        // milliseconds of CPU suffice, but a loaded machine may grant
+        // that little in a second.
+        let timeout = Duration::from_secs(3);
+        options.version_timeout = timeout;
         let threads = Threads::default();
         let before = Instant::now();
         let err = check_version(&config(&dir, binary.clone()), &options, &threads).unwrap_err();
-        assert!(
-            before.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            before.elapsed()
-        );
-        let timeout = ms(300);
+        let took = before.elapsed();
+        assert!(took >= timeout, "gave up after {took:?}");
+        // Not the 30 s the stub would take.
+        assert!(took < timeout + Duration::from_secs(10), "took {took:?}");
         assert_eq!(err, SidecarError::VersionTimeout { binary, timeout });
         assert!(
             err.to_string()
-                .ends_with("--version` did not finish within 300ms and was killed")
+                .ends_with("--version` did not finish within 3s and was killed")
         );
         assert_eq!(threads.load(Ordering::Acquire), 0, "the reader was ended");
 
-        let read_pid =
-            |path: &PathBuf| -> u32 { fs::read_to_string(path).unwrap().trim().parse().unwrap() };
+        let read_pid = |path: &PathBuf| -> u32 {
+            let text = fs::read_to_string(path).unwrap_or_else(|e| {
+                panic!("the stub did not get to write {}: {e}", path.display())
+            });
+            text.trim().parse().unwrap()
+        };
         assert!(!zombie(read_pid(&me)), "the version check was reaped");
         // Killed with the group; its new parent may not have reaped it yet.
         let bg = read_pid(&bg);
