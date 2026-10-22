@@ -92,6 +92,16 @@ pub(crate) enum PeerInput {
     RequestRoutes,
     /// Report the session's state on the sender.
     Report(SyncSender<PeerReport>),
+    /// The RIB found more routes of `family` than the neighbor's
+    /// `maximum-prefix` allows and dropped them (RFC 4271 §6.7): end the
+    /// session with Cease / Maximum Number of Prefixes Reached (RFC 4486
+    /// §4).
+    PrefixLimit {
+        /// The family over its limit.
+        family: AddressFamily,
+        /// The limit.
+        limit: u32,
+    },
 }
 
 /// What a peer thread reports about itself.
@@ -183,6 +193,19 @@ pub(crate) enum RibReply {
 /// §9.2.1.1); `None` takes the RFC 4271 §10 default for the session type.
 pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;
 
+/// Each neighbor's `maximum-prefix` limits per family (RFC 4271 §6.7).
+pub(crate) type PrefixLimits = HashMap<IpAddr, Vec<(AddressFamily, u32)>>;
+
+/// The per-neighbor settings the RIB thread applies to sessions as they
+/// come up, and to running ones after a reload.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RibSettings {
+    /// `advertisement-interval`s.
+    pub(crate) intervals: Intervals,
+    /// `maximum-prefix` limits.
+    pub(crate) prefix_limits: PrefixLimits,
+}
+
 /// What peer threads tell the RIB thread.
 #[derive(Debug)]
 pub(crate) enum RibMsg {
@@ -236,6 +259,9 @@ pub(crate) enum RibMsg {
     /// The advertisement intervals after a reload: sessions that are up
     /// follow at once, without a reset; later sessions start with them.
     SetIntervals(Intervals),
+    /// The prefix limits after a reload, applied like the intervals; a
+    /// session already over a new limit ends (RFC 4271 §6.7).
+    SetPrefixLimits(PrefixLimits),
     /// Re-send the Adj-RIB-Out of every family to `peer` in full (a soft
     /// reset, RFC 2918 §4).
     Resend {

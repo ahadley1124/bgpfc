@@ -7,7 +7,7 @@ use bgpfc_fsm::{Config, Damping, SendHoldTime};
 use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::types::{Afi, Asn, RouterId};
 
-use crate::messages::Intervals;
+use crate::messages::{Intervals, PrefixLimits, RibSettings};
 use crate::peer::PeerConfig;
 
 /// The per-peer configuration for `n`.
@@ -68,6 +68,24 @@ pub(crate) fn advertisement_intervals(config: &bgpfc_config::Config) -> Interval
         .iter()
         .map(|n| (n.addr, n.advertisement_interval))
         .collect()
+}
+
+/// Every neighbor's `maximum-prefix` limits (RFC 4271 §6.7), for the RIB
+/// thread.
+pub(crate) fn prefix_limits(config: &bgpfc_config::Config) -> PrefixLimits {
+    config
+        .neighbors
+        .iter()
+        .map(|n| (n.addr, n.maximum_prefix.clone()))
+        .collect()
+}
+
+/// What the RIB thread needs to know about every neighbor.
+pub(crate) fn rib_settings(config: &bgpfc_config::Config) -> RibSettings {
+    RibSettings {
+        intervals: advertisement_intervals(config),
+        prefix_limits: prefix_limits(config),
+    }
 }
 
 /// A jitter seed that differs per process and per `salt` (a peer's
@@ -189,5 +207,33 @@ mod tests {
         // Not configured: the RIB thread picks the RFC 4271 §10 default.
         assert_eq!(i.get(&"192.0.2.3".parse::<IpAddr>().unwrap()), Some(&None));
         assert_ne!(jitter_seed(&"rib"), 0);
+    }
+
+    #[test]
+    fn prefix_limits_reach_the_rib_per_neighbor() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 {
+                 remote-as 65001; import A; export A;
+                 maximum-prefix ipv6-unicast 20; maximum-prefix ipv4-unicast 10;
+             }
+             neighbor 192.0.2.3 { remote-as 65000; import A; export A; }",
+        )
+        .unwrap();
+        let s = rib_settings(&cfg);
+        assert_eq!(s.intervals.len(), 2);
+        assert_eq!(
+            s.prefix_limits.get(&"192.0.2.2".parse::<IpAddr>().unwrap()),
+            Some(&vec![
+                (AddressFamily::IPV6_UNICAST, 20),
+                (AddressFamily::IPV4_UNICAST, 10)
+            ])
+        );
+        assert_eq!(
+            s.prefix_limits.get(&"192.0.2.3".parse::<IpAddr>().unwrap()),
+            Some(&Vec::new())
+        );
     }
 }

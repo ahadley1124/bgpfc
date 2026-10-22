@@ -11,9 +11,9 @@
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,12 @@ pub(crate) struct PeerHandle {
     /// dropped: the peer thread resets the session rather than leave the
     /// peer with a partial view (AGENTS.md §3, backpressure).
     pub(crate) overrun: Arc<AtomicBool>,
+    /// Set by the RIB thread when the peer exceeded a prefix limit and
+    /// [`PeerInput::PrefixLimit`] did not fit in the full queue: the peer
+    /// thread, busy with what fills it, ends the session after its
+    /// current input (RFC 4271 §6.7), with the right Cease rather than
+    /// the overrun's.
+    pub(crate) prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
 }
 
 struct Conn {
@@ -91,6 +97,7 @@ pub(crate) struct Peer {
     session: Option<Session>,
     write_failed: bool,
     overrun: Arc<AtomicBool>,
+    prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -102,10 +109,12 @@ pub(crate) struct Peer {
 pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
     let overrun = Arc::new(AtomicBool::new(false));
+    let prefix_limit = Arc::new(Mutex::new(None));
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
         overrun: Arc::clone(&overrun),
+        prefix_limit: Arc::clone(&prefix_limit),
     };
     let fsm = Fsm::new(cfg.fsm.clone());
     let peer = Peer {
@@ -121,6 +130,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         session: None,
         write_failed: false,
         overrun,
+        prefix_limit,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -383,6 +393,18 @@ impl Peer {
                     restart_limit_reached: !self.fsm.automatic_start_allowed(),
                 });
             }
+            PeerInput::PrefixLimit { family, limit } => self.prefix_limit(family, limit, now),
+        }
+        self.flags(now);
+        true
+    }
+
+    /// What the RIB thread flagged because the queue was full when it had
+    /// something to say.
+    fn flags(&mut self, now: Instant) {
+        let pending = self.prefix_limit.lock().ok().and_then(|mut p| p.take());
+        if let Some((family, limit)) = pending {
+            self.prefix_limit(family, limit, now);
         }
         if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
             // RFC 4486 §4: Out of Resources. The peer restarts and gets a
@@ -396,7 +418,30 @@ impl Peer {
                 now,
             );
         }
-        true
+    }
+
+    /// The RIB dropped this peer's routes for exceeding its `maximum-prefix`
+    /// for `family`: end the session (RFC 4271 §6.7 (b)). Only while
+    /// Established; otherwise the session it was about has ended already.
+    fn prefix_limit(&mut self, family: AddressFamily, limit: u32, now: Instant) {
+        if self.fsm.state() != State::Established {
+            return;
+        }
+        // RFC 4271 §6.7: "The speaker MAY also log this locally."
+        bgpfc_log::error!(
+            "maximum prefixes reached, closing session",
+            peer = self.cfg.addr,
+            family = family,
+            limit = limit
+        );
+        // RFC 4486 §4: Cease / Maximum Number of Prefixes Reached, with the
+        // AFI, SAFI and upper bound of Figure 1 as its data. The FSM goes
+        // to Idle through AutomaticStop (RFC 4271 §8.2.2), damped, so the
+        // restart-limit bounds a peer that keeps sending too much.
+        self.event(
+            Event::AutomaticStop(NotificationMessage::max_prefixes_reached(family, limit)),
+            now,
+        );
     }
 
     /// RFC 2918 §4: ask for every negotiated family again, only if the

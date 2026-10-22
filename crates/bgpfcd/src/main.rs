@@ -158,7 +158,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
     rib::spawn(
         rib,
-        wiring::advertisement_intervals(&config),
+        wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
@@ -345,6 +345,11 @@ impl Coordinator<'_> {
         let _ = self
             .rib_tx
             .send(RibMsg::SetIntervals(wiring::advertisement_intervals(&new)));
+        // RFC 4271 §6.7: so do the prefix limits; a session already over a
+        // lowered limit ends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -363,12 +368,13 @@ impl Coordinator<'_> {
             p.start();
         }
         let summary = format!(
-            "added {} removed {} reset {} policy {} interval {} unchanged {}{}",
+            "added {} removed {} reset {} policy {} interval {} limit {} unchanged {}{}",
             diff.added.len(),
             diff.removed.len(),
             diff.reset.len(),
             diff.policy_changed.len(),
             diff.interval_changed.len(),
+            diff.prefix_limit_changed.len(),
             diff.unchanged.len(),
             if notes.is_empty() {
                 String::new()
