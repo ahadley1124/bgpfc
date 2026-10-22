@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
 use bgpfc_sys::{
@@ -120,7 +120,8 @@ pub(crate) fn stdio(end: UnixStream) -> Stdio {
 
 /// The wait status to report for a child that [`ChildProc::finish`] could
 /// not reap, which only happens if something else in the process reaped
-/// it (`ECHILD`). `0xffff` means "continued" (`WIFCONTINUED`), never how a
+/// it (`ECHILD`), or if `SIGCHLD` is ignored, which makes the kernel reap
+/// it. `0xffff` means "continued" (`WIFCONTINUED`), never how a
 /// process ends, so it reads as [`ExitReason::Other`](crate::ExitReason)
 /// rather than as an exit code or a signal the child never had.
 pub(crate) fn unknown_status() -> ExitStatus {
@@ -170,10 +171,18 @@ struct Reader<T> {
 /// child and no other process, and signalling it is safe. Dropping it
 /// without `finish` kills the child and cleans up as `finish(true)`
 /// does, so a panic leaves neither a zombie nor an orphan behind.
+///
+/// That rests on nothing else in the process reaping the child. If
+/// something does, the waiter's [`wait_for_exit`] fails with `ECHILD`,
+/// and from then on the id and the process group id may name newer
+/// processes: [`finish`](Self::finish) then signals neither.
 pub(crate) struct ChildProc<T: Send + 'static> {
     child: Child,
     pid: u32,
     waiter: Option<JoinHandle<()>>,
+    /// Set by the waiter, before it calls `notify`, when waiting failed:
+    /// the child was reaped elsewhere, so its ids are no longer its own.
+    lost: Arc<AtomicBool>,
     readers: Vec<Reader<T>>,
     done: bool,
 }
@@ -192,18 +201,35 @@ impl<T: Send + 'static> ChildProc<T> {
         threads: &Threads,
         notify: impl FnOnce(u32, io::Result<()>) + Send + 'static,
     ) -> io::Result<ChildProc<T>> {
+        Self::spawn_with(cmd, threads, wait_for_exit, notify)
+    }
+
+    /// [`spawn`](Self::spawn), with the waiter calling `wait` instead of
+    /// [`wait_for_exit`], so a test can make waiting fail.
+    fn spawn_with(
+        cmd: &mut Command,
+        threads: &Threads,
+        wait: fn(u32) -> io::Result<()>,
+        notify: impl FnOnce(u32, io::Result<()>) + Send + 'static,
+    ) -> io::Result<ChildProc<T>> {
         let child = cmd.spawn()?;
         let pid = child.id();
+        let lost = Arc::new(AtomicBool::new(false));
         let mut proc = ChildProc {
             child,
             pid,
             waiter: None,
+            lost: Arc::clone(&lost),
             readers: Vec::new(),
             done: false,
         };
         // On an error `proc` is dropped, which kills and reaps the child.
         let waiter = spawn_thread("sidecar-wait", threads, move || {
-            notify(pid, wait_for_exit(pid));
+            let result = wait(pid);
+            if result.is_err() {
+                lost.store(true, Ordering::Release);
+            }
+            notify(pid, result);
         })?;
         proc.waiter = Some(waiter);
         Ok(proc)
@@ -236,6 +262,11 @@ impl<T: Send + 'static> ChildProc<T> {
         self.pid
     }
 
+    /// Whether the waiter found the child reaped by someone else.
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
     /// End the child's life: after the waiter has reported its exit, or
     /// with `kill` at any time.
     ///
@@ -246,6 +277,12 @@ impl<T: Send + 'static> ChildProc<T> {
     /// output stream, so every reader reads what is queued and then
     /// stops; join the readers.
     ///
+    /// If the waiter reported that waiting failed, something else reaped
+    /// the child, and its id and its group's may already name newer
+    /// processes. Neither signal is sent then, even with `kill`; reaping
+    /// fails with `ECHILD`, and whatever the child left in its group runs
+    /// on.
+    ///
     /// Returns the result of reaping the child, its wait status, and what
     /// each reader returned, `None` for one that panicked.
     pub(crate) fn finish(mut self, kill: bool) -> (io::Result<ExitStatus>, Vec<Option<T>>) {
@@ -254,20 +291,24 @@ impl<T: Send + 'static> ChildProc<T> {
 
     fn end(&mut self, kill: bool) -> (io::Result<ExitStatus>, Vec<Option<T>>) {
         self.done = true;
-        if kill {
+        if kill && !self.lost() {
             // The child is unreaped, so the id is its own; if it has
             // exited already, the zombie takes the signal to no effect.
             let _ = send_signal(self.pid, ChildSignal::Kill);
         }
         if let Some(waiter) = self.waiter.take() {
-            // The waiter returns once the child has exited. If waiting
-            // failed instead, the group signal below ends the child, which
-            // leads its group, and `wait` reaps it.
+            // The waiter returns once the child has exited, or once
+            // waiting has failed, which `waitid(2)` does only for a child
+            // that is gone: reaped elsewhere, or by the kernel while
+            // `SIGCHLD` is ignored.
             let _ = waiter.join();
         }
-        // ESRCH: nothing left in the group. Every other error leaves only
-        // processes this one may not signal, which it cannot help.
-        let _ = send_signal_to_group(self.pid, ChildSignal::Kill);
+        if !self.lost() {
+            // ESRCH: nothing left in the group. Every other error leaves
+            // only processes this one may not signal, which it cannot help.
+            let _ = send_signal_to_group(self.pid, ChildSignal::Kill);
+        }
+        // Does not block for a lost child: it is gone, and this fails.
         let status = self.child.wait();
         let outputs = self
             .readers
@@ -346,5 +387,95 @@ mod tests {
         let handle = spawn_thread("sidecar-test", &threads, || -> u8 { panic!("boom") }).unwrap();
         assert!(handle.join().is_err());
         assert_eq!(threads.load(Ordering::Acquire), 0);
+    }
+
+    /// Live tests of what [`ChildProc::finish`] signals.
+    #[cfg(not(miri))]
+    mod live {
+        use super::super::*;
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        /// `ECHILD`, `<asm-generic/errno-base.h>`.
+        const ECHILD: i32 = 10;
+
+        /// Start time (clock ticks after boot, `proc_pid_stat(5)` field
+        /// 22) of `pid` while it runs; `None` once it is gone or a zombie.
+        fn running_since(pid: u32) -> Option<u64> {
+            let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // The command name (field 2) may hold spaces and parentheses.
+            let (_, rest) = text.rsplit_once(')')?;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?;
+            let start = fields.nth(18)?.parse().ok()?;
+            (!matches!(state, "Z" | "X" | "x")).then_some(start)
+        }
+
+        /// Waits like [`wait_for_exit`], then fails as it does for a child
+        /// that something else reaped. The child is in fact a zombie still,
+        /// so `finish` can reap it and the test leaks nothing.
+        fn wait_then_lose(pid: u32) -> io::Result<()> {
+            wait_for_exit(pid)?;
+            Err(io::Error::from_raw_os_error(ECHILD))
+        }
+
+        /// A child in its own group leaves a `sleep` behind and exits 3,
+        /// its waiter calls `wait`, and then `finish(true)` runs. Returns
+        /// whether the `sleep` still runs a while later (and kills it if
+        /// so), whether the waiter reported success, and how the child
+        /// ended.
+        fn leftover_after_finish(wait: fn(u32) -> io::Result<()>) -> (bool, bool, ExitStatus) {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30 > /dev/null 2>&1 & echo $!; exit 3"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .process_group(0);
+            let threads = Threads::default();
+            let (tx, rx) = mpsc::channel();
+            let mut proc = ChildProc::<()>::spawn_with(&mut cmd, &threads, wait, move |_, r| {
+                let _ = tx.send(r.is_ok());
+            })
+            .unwrap();
+            let mut line = String::new();
+            let stdout = proc.child.stdout.take().unwrap();
+            BufReader::new(stdout).read_line(&mut line).unwrap();
+            let leftover: u32 = line.trim().parse().unwrap();
+            let start = running_since(leftover).expect("the leftover runs");
+            let waited = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (status, outputs) = proc.finish(true);
+            assert_eq!(outputs, [], "no readers were added");
+            assert_eq!(threads.load(Ordering::Acquire), 0);
+            // A SIGKILL, if one was sent, has arrived by the deadline.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while running_since(leftover) == Some(start) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let survived = running_since(leftover) == Some(start);
+            if survived {
+                // Reparented, but still this user's to signal.
+                send_signal(leftover, ChildSignal::Kill).unwrap();
+            }
+            (survived, waited, status.unwrap())
+        }
+
+        /// The control: the group signal ends what the child left behind.
+        #[test]
+        fn finish_ends_what_the_child_left_in_its_group() {
+            let (survived, waited, status) = leftover_after_finish(wait_for_exit);
+            assert!(waited);
+            assert_eq!(status.code(), Some(3));
+            assert!(!survived, "the group signal missed the leftover");
+        }
+
+        /// Once waiting failed, the child's id and group id may belong to
+        /// newer processes, so `finish` signals neither, even with `kill`.
+        #[test]
+        fn a_child_reaped_elsewhere_is_not_signalled() {
+            let (survived, waited, status) = leftover_after_finish(wait_then_lose);
+            assert!(!waited);
+            assert_eq!(status.code(), Some(3));
+            assert!(survived, "the group of a lost child was signalled");
+        }
     }
 }

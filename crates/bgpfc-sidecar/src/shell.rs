@@ -103,9 +103,11 @@ impl Options {
 ///   does not matter to the death signal. As only the supervisor thread
 ///   reaps, a signal it sends always names its own child, even when the
 ///   child exits at the same moment, and never a process that reused the
-///   id after a reap the supervisor thread has not heard of yet. Nothing
-///   polls: the supervisor thread sleeps until a message arrives or the
-///   supervisor's next deadline.
+///   id after a reap the supervisor thread has not heard of yet. That
+///   needs nothing else in bgpfcd to reap children: if something does,
+///   waiting fails, and the child's id and process group are not signalled
+///   any more. Nothing polls: the supervisor thread sleeps until a message
+///   arrives or the supervisor's next deadline.
 /// - **Two reader threads per child** log what it prints, line by line,
 ///   through bgpfc-log, with the fields `sidecar=routinator`, `pid` and
 ///   `stream`: stdout at info, stderr at warn, where Routinator writes
@@ -395,18 +397,17 @@ impl Shell {
             return;
         };
         let pid = child.pid();
-        let kill = match result {
-            Ok(()) => false,
-            Err(error) => {
-                self.log(
-                    Level::Error,
-                    "could not wait for the RPKI sidecar; killing it",
-                    &[("pid", &pid), ("error", &error)],
-                );
-                true
-            }
-        };
-        let (status, _) = child.finish(kill);
+        if let Err(error) = result {
+            // `waitid` fails only for a child that is gone, so its id, and
+            // its group's, may name other processes now: `finish` signals
+            // neither.
+            self.log(
+                Level::Error,
+                "lost the RPKI sidecar: something else reaped it; not signalling its id or process group",
+                &[("pid", &pid), ("error", &error)],
+            );
+        }
+        let (status, _) = child.finish(false);
         let status = status.unwrap_or_else(|error| {
             self.log(
                 Level::Error,
