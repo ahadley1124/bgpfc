@@ -32,6 +32,8 @@
 //! §10 (error codes).
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod capture;
 pub mod client;
 pub mod error;
 pub mod framer;

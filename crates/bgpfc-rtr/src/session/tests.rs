@@ -1018,6 +1018,71 @@ fn a_version_0_reply_to_a_reset_query_downgrades() {
     assert_eq!(tags(&h.step(Event::Connected)), ["serial-query v0 7/1"]);
 }
 
+/// The octets of the PDUs a step sends.
+fn sent(actions: &[Action]) -> Vec<Vec<u8>> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send(pdu) => Some(pdu.encode()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Feed `stream` from the cache through a framer to the session, as the
+/// client does; all the actions.
+fn replay(h: &mut H, framer: &mut Framer, stream: &[u8]) -> Vec<Action> {
+    framer.feed(stream);
+    let mut actions = Vec::new();
+    while let Some(received) = framer.next_received().unwrap() {
+        let step = h.step(Event::Pdu(received));
+        for action in &step {
+            if let Action::Negotiated(version) = action {
+                framer.set_version(*version);
+            }
+        }
+        actions.extend(step);
+    }
+    actions
+}
+
+#[test]
+fn a_real_version_0_exchange() {
+    // A router and rpki.realmv6.org in 2013 (crate::capture): the queries
+    // this session sends match the router's octet for octet, and it
+    // follows the cache's replies, of which the Prefix PDUs are a
+    // selection.
+    use crate::capture;
+    let mut h = H::with(Config {
+        version: V0,
+        ..Config::default()
+    });
+    h.wait(0);
+    assert_eq!(sent(&h.step(Event::Connected)), [capture::RESET_QUERY]);
+    let mut stream = capture::CACHE_RESPONSE.to_vec();
+    for (octets, ..) in capture::PREFIXES {
+        stream.extend_from_slice(octets);
+    }
+    stream.extend_from_slice(&capture::END_OF_DATA);
+    let mut framer = Framer::new();
+    let actions = replay(&mut h, &mut framer, &stream);
+    assert_eq!(tags(&actions), ["negotiated v0", "commit 8 all"]);
+    let expected: VrpSet = capture::PREFIXES
+        .iter()
+        .map(|&(_, prefix, max_len, asn)| vrp(prefix, max_len, asn))
+        .collect();
+    assert_eq!(h.vrps(), expected);
+    assert_eq!(h.s.session_id(), Some(capture::SESSION_ID));
+    assert_eq!(h.s.serial(), Some(capture::SERIAL));
+    // RFC 6810 §6.1: the next query within the hour.
+    assert_eq!(sent(&h.wait(3_600)), [capture::SERIAL_QUERY]);
+    // Nothing new: a Cache Response and the same End of Data.
+    let reply = [&capture::CACHE_RESPONSE[..], &capture::END_OF_DATA].concat();
+    assert_eq!(tags(&replay(&mut h, &mut framer, &reply)), NONE);
+    assert_eq!(h.s.state(), State::Idle);
+    assert_eq!(h.s.serial(), Some(capture::SERIAL));
+}
+
 #[test]
 fn a_version_0_reply_to_a_serial_query_downgrades_and_reloads() {
     // The query's serial belongs to the version 1 session (§5.1), so the
