@@ -50,8 +50,11 @@ pub(crate) const SIGKILL: c_int = 9;
 pub(crate) const SIGTERM: c_int = 15;
 // <asm-generic/errno-base.h>
 pub(crate) const ESRCH: c_int = 3;
+pub(crate) const EINVAL: c_int = 22;
 // <linux/prctl.h>
 pub(crate) const PR_SET_PDEATHSIG: c_int = 1;
+pub(crate) const PR_CAP_AMBIENT: c_int = 47;
+pub(crate) const PR_CAP_AMBIENT_CLEAR_ALL: c_ulong = 4;
 // <linux/wait.h>
 pub(crate) const WEXITED: c_int = 0x0000_0004;
 pub(crate) const WNOWAIT: c_int = 0x0100_0000;

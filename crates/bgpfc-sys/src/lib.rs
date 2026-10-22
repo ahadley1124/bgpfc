@@ -13,16 +13,20 @@
 //! Also implements, for the supervised RPKI sidecar, the child-process
 //! controls std lacks: a parent-death signal (`prctl(2)`) and sending a
 //! chosen signal (`kill(2)`).
+//!
+//! It also keeps bgpfcd's ambient capabilities from the child.
 #![cfg(target_os = "linux")]
 
 mod caps;
 mod ffi;
+mod inherit;
 mod netlink;
 mod privilege;
 mod process;
 mod signal;
 
 pub use caps::{Capability, Effective};
+pub use inherit::clear_ambient_capabilities;
 pub use netlink::NetlinkSocket;
 pub use privilege::{Identity, drop_to, is_root, lookup_group, lookup_user};
 pub use process::send_signal_to_group;
