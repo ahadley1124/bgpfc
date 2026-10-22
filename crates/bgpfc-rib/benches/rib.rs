@@ -60,13 +60,15 @@ fn updates(n: u32, v6: bool, peer_as: u32, origin: u32) -> Vec<DecodedUpdate> {
         let nlri: Vec<Prefix> = (i..(i + 200).min(n))
             .map(|k| {
                 if v6 {
-                    let [_, _, hi, lo] = k.to_be_bytes();
+                    // One /48 each, from 2001:db8::/32 on: the third group
+                    // takes the low 16 bits of `k`, the second the rest.
+                    let [_, hi, mid, lo] = k.to_be_bytes();
                     Prefix::new(
                         IpAddr::V6(Ipv6Addr::new(
                             0x2001,
-                            0xdb8,
-                            u16::from(hi),
-                            u16::from(lo),
+                            0xdb8 + u16::from(hi),
+                            u16::from_be_bytes([mid, lo]),
+                            0,
                             0,
                             0,
                             0,
