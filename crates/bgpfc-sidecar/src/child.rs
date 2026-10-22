@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
 use bgpfc_sys::{
-    ChildSignal, send_signal, send_signal_to_group, set_parent_death_signal, wait_for_exit,
+    ChildSignal, clear_ambient_capabilities, send_signal, send_signal_to_group,
+    set_parent_death_signal, wait_for_exit,
 };
 
 use crate::config::SidecarConfig;
@@ -68,7 +69,8 @@ pub(crate) const CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 /// refuses to start with (`Changelog.md`), locale and proxy settings
 /// (Routinator takes RRDP proxies from its config file, `rrdp-proxies`),
 /// and whatever bgpfcd was started with. The child's behaviour then
-/// depends on bgpfcd's settings alone.
+/// depends on bgpfcd's settings alone. [`command`] also keeps bgpfcd's
+/// ambient capabilities from it.
 pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
     [
         (
@@ -81,13 +83,24 @@ pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
 
 /// A command for the configured binary, without arguments or output yet:
 /// the environment of [`child_env`], `/` as working directory, standard
-/// input from `/dev/null`, a process group of its own, and
-/// [`DEATH_SIGNAL`] as the parent-death signal.
+/// input from `/dev/null`, a process group of its own, no ambient
+/// capabilities, and [`DEATH_SIGNAL`] as the parent-death signal.
 ///
 /// Its own process group keeps a terminal's Ctrl-C, which goes to the
 /// whole foreground group, from reaching the child at the same moment as
 /// bgpfcd (its exit would look like a crash), and lets
 /// [`ChildProc::finish`] clean up what the child started.
+///
+/// bgpfcd may hold `CAP_NET_BIND_SERVICE` and `CAP_NET_ADMIN` as ambient
+/// capabilities (README, "Option A"), which an unprivileged program it
+/// starts would otherwise hold as effective ones: Routinator, and every
+/// `rsync` it runs, parsing data from the internet with the power to
+/// rewrite the routing table. Clearing the ambient set leaves the child
+/// none, as long as bgpfcd itself is not root: a root child gets every
+/// capability at `execve` whatever the ambient set, so start the sidecar
+/// only after dropping root (README, "Option B"). The child also cannot
+/// bind a port below 1024 then, unless the host's
+/// `net.ipv4.ip_unprivileged_port_start` allows it.
 pub(crate) fn command(config: &SidecarConfig) -> Command {
     let mut cmd = Command::new(&config.binary);
     cmd.env_clear()
@@ -95,6 +108,9 @@ pub(crate) fn command(config: &SidecarConfig) -> Command {
         .current_dir("/")
         .stdin(Stdio::null())
         .process_group(0);
+    clear_ambient_capabilities(&mut cmd);
+    // Last, so no hook can change the child's credentials after it, which
+    // would clear the death signal (prctl(2)).
     set_parent_death_signal(&mut cmd, DEATH_SIGNAL);
     cmd
 }
@@ -476,6 +492,124 @@ mod tests {
             assert!(!waited);
             assert_eq!(status.code(), Some(3));
             assert!(survived, "the group of a lost child was signalled");
+        }
+
+        /// Set by [`run_probe`] for the copy of this test binary that
+        /// plays bgpfcd and spawns the children.
+        const PROBE_ENV: &str = "BGPFC_SIDECAR_TEST_PROBE";
+
+        /// `setpriv(1)` options that raise `CAP_NET_BIND_SERVICE` (bit
+        /// 10) as an ambient capability, as systemd's
+        /// `AmbientCapabilities=` does for bgpfcd.
+        const RAISE: [&str; 2] = [
+            "--inh-caps=+net_bind_service",
+            "--ambient-caps=+net_bind_service",
+        ];
+
+        /// `CAP_NET_BIND_SERVICE`, `<linux/capability.h>`.
+        const NET_BIND_SERVICE: u64 = 1 << 10;
+
+        /// The `CapAmb` mask in `/proc/<pid>/status` text
+        /// (`proc_pid_status(5)`).
+        fn ambient(status: &str) -> u64 {
+            let value = status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapAmb:"))
+                .expect("a CapAmb line");
+            u64::from_str_radix(value.trim(), 16).unwrap()
+        }
+
+        /// The ambient set that `/bin/sh`, spawned by `cmd`, starts with.
+        fn child_ambient(mut cmd: Command) -> u64 {
+            let out = cmd
+                .args(["-c", "cat /proc/$$/status"])
+                .stdin(Stdio::null())
+                .output()
+                .expect("spawn /bin/sh");
+            assert!(out.status.success(), "{out:?}");
+            ambient(&String::from_utf8(out.stdout).unwrap())
+        }
+
+        /// Not a test on its own: [`run_probe`] runs this test binary
+        /// again with [`PROBE_ENV`] set, and this function then prints the
+        /// ambient sets of itself, of a child of a plain [`Command`] and
+        /// of a child of [`command`]. Without the variable it returns at
+        /// once.
+        #[test]
+        fn probe_intermediate() {
+            if std::env::var_os(PROBE_ENV).is_none() {
+                return;
+            }
+            let own = ambient(&std::fs::read_to_string("/proc/self/status").unwrap());
+            let bare = child_ambient(Command::new("/bin/sh"));
+            let sidecar = child_ambient(command(&SidecarConfig::new("/bin/sh", "/")));
+            println!("probe {own:x} {bare:x} {sidecar:x}");
+        }
+
+        /// Run [`probe_intermediate`] as `wrapper` followed by this test
+        /// binary, and return the words it printed after `probe`.
+        fn run_probe(wrapper: &[&str]) -> Vec<String> {
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = match wrapper.split_first() {
+                Some((program, args)) => {
+                    let mut cmd = Command::new(program);
+                    cmd.args(args).arg(exe);
+                    cmd
+                }
+                None => Command::new(exe),
+            };
+            let out = cmd
+                .args([
+                    "--exact",
+                    "child::tests::live::probe_intermediate",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(PROBE_ENV, "1")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{out:?}");
+            // The harness prints the test's name first, on the same line.
+            let words = stdout
+                .lines()
+                .find_map(|l| l.split_once("probe ").map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("no result in {stdout:?}"));
+            words.split(' ').map(str::to_owned).collect()
+        }
+
+        /// bgpfcd with `CAP_NET_BIND_SERVICE` as an ambient capability:
+        /// a child of a plain `Command` inherits it, the control, and the
+        /// sidecar's child does not.
+        ///
+        /// Raising an ambient capability needs it in the permitted set, so
+        /// this checks nothing for a test run without
+        /// `CAP_NET_BIND_SERVICE`, such as an unprivileged user's; it says
+        /// so on stderr. Root has it.
+        #[test]
+        fn the_child_gets_no_ambient_capabilities() {
+            let probe = Command::new("setpriv")
+                .args(RAISE)
+                .arg("/bin/true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if !matches!(probe, Ok(s) if s.success()) {
+                eprintln!("skipped: setpriv cannot raise an ambient capability here: {probe:?}");
+                return;
+            }
+            let words = run_probe(&["setpriv", RAISE[0], RAISE[1]]);
+            let masks: Vec<u64> = words
+                .iter()
+                .map(|w| u64::from_str_radix(w, 16).unwrap())
+                .collect();
+            let [own, bare, sidecar] = masks[..] else {
+                panic!("three masks expected: {words:?}");
+            };
+            assert_ne!(own & NET_BIND_SERVICE, 0, "setpriv raised nothing");
+            assert_eq!(bare, own, "the control inherits the ambient set");
+            assert_eq!(sidecar, 0, "the sidecar's child has ambient capabilities");
         }
     }
 }

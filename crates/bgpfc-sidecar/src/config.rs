@@ -51,7 +51,10 @@ pub struct SidecarConfig {
     pub binary: PathBuf,
     /// Where Routinator serves RTR: a loopback address only (issue #71).
     /// Port 0 asks bgpfcd to pick a free ephemeral port when it starts the
-    /// sidecar.
+    /// sidecar. Routinator runs without capabilities, so a port below 1024,
+    /// such as RTR's 323, binds only where the host's
+    /// `net.ipv4.ip_unprivileged_port_start` allows it or bgpfcd runs as
+    /// root; Routinator otherwise fails at every start.
     pub rtr_listen: SocketAddr,
     /// Routinator's repository directory, its cache of RPKI data
     /// (`--repository-dir`). Absolute.

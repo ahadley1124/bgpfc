@@ -136,6 +136,14 @@ impl Options {
 /// 0.15.2 refuses to start with, and proxy and locale settings: the
 /// child's behaviour depends on bgpfcd's settings only.
 ///
+/// The child gets no ambient capabilities, so the `CAP_NET_ADMIN` and
+/// `CAP_NET_BIND_SERVICE` that bgpfcd may hold that way (README, "Option
+/// A") do not reach a validator that parses data from the internet. That
+/// leaves it unprivileged only if bgpfcd is not root: a child of root gets
+/// every capability when it executes. Start the sidecar after dropping
+/// root (README, "Option B"), and configure an RTR port of 1024 or more
+/// (or 0), which an unprivileged process may bind.
+///
 /// When the child exits, `SIGKILL` goes to its process group before it is
 /// reaped, while its id still names the group, so nothing it started,
 /// such as an `rsync`, is left behind as an orphan holding the repository
