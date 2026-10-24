@@ -1,0 +1,17 @@
+[package]
+name = "bgpfc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Load generator, benchmark harness and micro-benchmarks for bgpfcd (docs/PROFILING.md)"
+
+# Development tooling, never linked by the daemon. Std-only all the same:
+# it lives under crates/ and check-deps.sh covers it.
+[dependencies]
+bgpfc-wire.workspace = true
+
+[lints]
+workspace = true
