@@ -13,6 +13,7 @@ description = "Load generator, benchmark harness and micro-benchmarks for bgpfcd
 [dependencies]
 bgpfc-log.workspace = true
 bgpfc-prof.workspace = true
+bgpfc-rib.workspace = true
 bgpfc-wire.workspace = true
 
 [[bin]]
@@ -22,6 +23,11 @@ path = "src/bin/bgp_loadgen.rs"
 [[bin]]
 name = "bgp_bench"
 path = "src/bin/bgp_bench.rs"
+
+# std-only micro-benchmarks; `harness = false` because #[bench] is unstable.
+[[bench]]
+name = "micro"
+harness = false
 
 [lints]
 workspace = true
