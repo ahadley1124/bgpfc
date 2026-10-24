@@ -352,10 +352,16 @@ impl Rib {
                 match self.s.exported(family, *prefix, dest.best(), id) {
                     Some(a) => match adj_out.insert(*prefix, Arc::clone(&a)) {
                         Some(old) if Arc::ptr_eq(&old, &a) => {}
-                        _ => batch.announce(&a, *prefix),
+                        old => {
+                            if let Some(old) = old {
+                                self.s.cx.interner.release(old);
+                            }
+                            batch.announce(&a, *prefix);
+                        }
                     },
                     None => {
-                        if adj_out.remove(prefix).is_some() {
+                        if let Some(old) = adj_out.remove(prefix) {
+                            self.s.cx.interner.release(old);
                             batch.withdraw.push(*prefix);
                         }
                     }
@@ -386,6 +392,9 @@ impl Rib {
         };
         let info = &state.info;
         let mut dirty = Vec::new();
+        // Attribute sets of the routes removed or replaced, released from
+        // the interner once nothing else of this UPDATE holds them.
+        let mut released = Vec::new();
         let mut delta: FamilyMap<isize> = FamilyMap::default();
         for (family, prefix) in update.withdrawals() {
             #[cfg(feature = "profiling")]
@@ -401,7 +410,7 @@ impl Rib {
                     prefix,
                     old: dest.best().cloned(),
                 });
-                dest.remove(i);
+                released.push(dest.remove(i).attrs);
                 *delta.or_default(family) -= 1;
             }
         }
@@ -450,7 +459,7 @@ impl Rib {
                         prefix,
                         old: dest.best().cloned(),
                     });
-                    dest.remove(i);
+                    released.push(dest.remove(i).attrs);
                     *delta.or_default(family) -= 1;
                 }
                 continue;
@@ -463,7 +472,7 @@ impl Rib {
                     // An implicit re-announcement of the same route.
                     continue;
                 }
-                dest.routes_mut()[i] = route;
+                released.push(std::mem::replace(&mut dest.routes_mut()[i], route).attrs);
             } else {
                 dest.push(route);
                 *delta.or_default(family) += 1;
@@ -480,6 +489,10 @@ impl Rib {
             *n = n.saturating_add_signed(*d);
         }
         self.reconsider(&dirty, out);
+        drop((dirty, attrs_for));
+        for a in released {
+            self.s.cx.interner.release(a);
+        }
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
@@ -611,7 +624,11 @@ impl Sessions {
     /// Forget `addr`; its slot is free once its routes are removed.
     fn remove(&mut self, addr: IpAddr) -> Option<PeerId> {
         let id = self.by_addr.remove(&addr)?;
-        self.peers[id.index()] = None;
+        if let Some(state) = self.peers[id.index()].take() {
+            for a in state.adj_out.into_values().flat_map(HashMap::into_values) {
+                self.cx.interner.release(a);
+            }
+        }
         Some(id)
     }
 
@@ -649,8 +666,11 @@ impl Sessions {
             return true;
         };
         let old = dest.best().cloned();
-        dest.remove(i);
-        self.settle(family, prefix, dest, old.as_ref(), batches, out)
+        let removed = dest.remove(i);
+        let keep = self.settle(family, prefix, dest, old.as_ref(), batches, out);
+        drop(old);
+        self.cx.interner.release(removed.attrs);
+        keep
     }
 
     /// Phase 2 for a destination whose routes changed, then Phase 3 if
@@ -707,7 +727,9 @@ impl Sessions {
                 Some(a) => {
                     let same = adj_out.get(&prefix).is_some_and(|old| Arc::ptr_eq(old, &a));
                     if !same {
-                        adj_out.insert(prefix, Arc::clone(&a));
+                        if let Some(old) = adj_out.insert(prefix, Arc::clone(&a)) {
+                            self.cx.interner.release(old);
+                        }
                         batches
                             .entry((to_addr, family))
                             .or_default()
@@ -715,7 +737,8 @@ impl Sessions {
                     }
                 }
                 None => {
-                    if adj_out.remove(&prefix).is_some() {
+                    if let Some(old) = adj_out.remove(&prefix) {
+                        self.cx.interner.release(old);
                         batches
                             .entry((to_addr, family))
                             .or_default()

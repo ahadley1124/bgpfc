@@ -693,7 +693,8 @@ fn large_batches_are_packed_within_the_message_limit() {
     assert!(msgs.len() > 1);
     let total: usize = msgs.iter().map(|m| m.withdrawn.len()).sum();
     assert_eq!(total, 3000);
-    assert!(rib.attribute_sets() >= 1);
+    // Nothing uses an attribute set any more, and none is kept.
+    assert_eq!(rib.attribute_sets(), 0);
 }
 
 #[test]
@@ -888,4 +889,72 @@ fn best_route_is_listed_first() {
     let out = outputs(|o| rib.update(e1.addr, &withdraw(&["192.0.2.0/24"]), o));
     assert!(out.is_empty(), "{out:?}");
     assert_eq!(order(&rib), vec![e3.addr]);
+}
+
+#[test]
+fn interner_releases_a_set_with_its_last_holder() {
+    let mut i = crate::attrs::Interner::default();
+    let a = i.intern(attrs(&[1], "10.0.0.1"));
+    let b = i.intern(attrs(&[1], "10.0.0.1"));
+    // Another holder remains: the set stays.
+    i.release(a);
+    assert_eq!(i.len(), 1);
+    i.release(b);
+    assert_eq!(i.len(), 0);
+    // Equal attributes in an allocation the interner does not hold leave
+    // its entry alone.
+    let held = i.intern(attrs(&[2], "10.0.0.1"));
+    let stranger = Arc::new(attrs(&[2], "10.0.0.1"));
+    i.release(Arc::clone(&stranger));
+    assert_eq!(i.len(), 1);
+    drop(stranger);
+    i.release(held);
+    assert_eq!(i.len(), 0);
+}
+
+#[test]
+fn attribute_sets_go_with_their_last_route() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i3 = peer("10.0.0.3", 65_000, 3);
+    for p in [&e1, &e2, &i3] {
+        outputs(|o| rib.peer_up(p.clone(), o));
+    }
+    let a = attrs(&[65_001, 7], "10.0.0.1");
+    let b = attrs(&[65_002], "10.0.0.2");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            o,
+        );
+    });
+    outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
+    // Received sets a and b, and what each is exported as to the others.
+    assert!(rib.attribute_sets() >= 4, "{}", rib.attribute_sets());
+    // Replacing a route lets its old set go once nothing uses it.
+    let a2 = attrs(&[65_001, 8], "10.0.0.1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a2),
+            o,
+        );
+    });
+    let held = rib.attribute_sets();
+    outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
+    assert!(rib.attribute_sets() < held);
+    outputs(|o| {
+        rib.update(e1.addr, &withdraw(&["192.0.2.0/24", "198.51.100.0/24"]), o);
+    });
+    assert_eq!(rib.attribute_sets(), 0);
+
+    // The same through peer down, including what the peer was sent.
+    outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
+    outputs(|o| rib.update(e2.addr, &announce(&["198.51.100.0/24"], &b), o));
+    assert!(rib.attribute_sets() > 0);
+    outputs(|o| rib.peer_down(e1.addr, o));
+    outputs(|o| rib.peer_down(e2.addr, o));
+    assert_eq!(rib.attribute_sets(), 0);
 }

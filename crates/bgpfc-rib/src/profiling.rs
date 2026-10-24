@@ -106,8 +106,9 @@ pub struct Duplication {
     /// Distinct attribute sets by value. Equal to `attr_sets` while the
     /// interner works: no two allocations hold equal attributes.
     pub attr_values: usize,
-    /// Attribute sets the interner holds, including those no route uses
-    /// any more (they go at the next sweep, when the set has doubled).
+    /// Attribute sets the interner holds. A set goes with its last route;
+    /// one still held elsewhere at that moment (a control-plane reply,
+    /// say) goes at the next sweep, when the set has doubled.
     pub interned: usize,
     /// Distinct `AS_PATH`s among the attribute sets.
     pub as_paths: usize,

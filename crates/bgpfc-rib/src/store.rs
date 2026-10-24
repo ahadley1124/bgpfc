@@ -190,6 +190,12 @@ impl<T> FamilyMap<T> {
     }
 }
 
+impl<T> FamilyMap<T> {
+    pub(crate) fn into_values(self) -> impl Iterator<Item = T> {
+        self.0.into_iter().map(|(_, v)| v)
+    }
+}
+
 impl<T: Default> FamilyMap<T> {
     pub(crate) fn or_default(&mut self, family: AddressFamily) -> &mut T {
         let i = if let Some(i) = self.0.iter().position(|(f, _)| *f == family) {

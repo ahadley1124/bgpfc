@@ -242,6 +242,23 @@ impl Interner {
         a
     }
 
+    /// Give back one holder's share of `attrs`, and drop the entry as well
+    /// when that was the last one outside the interner. Removing a route
+    /// through here frees its attribute set with the route, rather than at
+    /// the next sweep; the sweep remains for sets released otherwise.
+    pub fn release(&mut self, attrs: Arc<PathAttrs>) {
+        // Two holders: the interner and `attrs`. No other thread can take
+        // a new one from nothing, so the count cannot rise meanwhile.
+        if Arc::strong_count(&attrs) == 2
+            && let Some(held) = self.set.take(&*attrs)
+            && !Arc::ptr_eq(&held, &attrs)
+        {
+            // Equal attributes in another allocation: not ours to drop.
+            self.set.insert(held);
+        }
+        drop(attrs);
+    }
+
     /// Drop entries no route uses any more.
     pub fn sweep(&mut self) {
         self.set.retain(|a| Arc::strong_count(a) > 1);
