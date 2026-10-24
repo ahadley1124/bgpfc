@@ -42,6 +42,11 @@ const RIB_QUEUE: usize = 1024;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "profiling")]
+    if argv.iter().any(|a| a == "--print-sizes") {
+        profiling::print_sizes();
+        return;
+    }
     let opts = match args::parse(&argv) {
         Ok(a) => a,
         Err(msg) => {
@@ -49,6 +54,8 @@ fn main() {
                 eprintln!("bgpfcd: {msg}");
             }
             eprint!("{}", args::USAGE);
+            #[cfg(feature = "profiling")]
+            eprint!("{}", args::PROFILING_USAGE);
             std::process::exit(2);
         }
     };

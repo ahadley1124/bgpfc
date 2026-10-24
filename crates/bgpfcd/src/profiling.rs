@@ -315,6 +315,7 @@ impl Loads {
             emit(&report("eor", |l| {
                 l.field("peer", peer).field("family", family);
             }));
+            emit(&duplication(peer, rib));
             return;
         }
         p.pending.retain(|f| *f != family);
@@ -372,6 +373,68 @@ impl Loads {
                 .field("live_before", live_before)
                 .field("bytes_per_prefix", per_prefix);
         }));
+        // After the load line, so the walk's own allocations are not in
+        // its peak.
+        emit(&duplication(peer, rib));
+    }
+}
+
+/// The duplication report (`event=duplication`): how often attribute sets
+/// and `AS_PATH`s repeat in the RIB as it is now.
+fn duplication(peer: IpAddr, rib: &Rib) -> Line {
+    let started = Instant::now();
+    let d = rib.duplication();
+    let mut l = Line::new("duplication");
+    l.field("peer", peer)
+        .field("destinations", d.destinations)
+        .field("routes", d.routes)
+        .field("attr_sets", d.attr_sets)
+        .field("attr_values", d.attr_values)
+        .field("interned", d.interned)
+        .field("as_paths", d.as_paths)
+        .field("as_path_bytes", d.as_path_bytes)
+        .field("as_path_bytes_if_interned", d.as_path_bytes_if_interned)
+        .field("candidate_bytes", d.candidate_bytes)
+        .field("adj_rib_out", d.adj_rib_out)
+        .field("adj_rib_out_bytes", d.adj_rib_out_bytes)
+        .field("walk_ms", started.elapsed().as_millis());
+    l
+}
+
+/// `--print-sizes`: `size_of` of what a route, a message and a peer are
+/// made of.
+pub(crate) fn print_sizes() {
+    use std::mem::size_of;
+    let mut rows = bgpfc_rib::profiling::type_sizes();
+    rows.extend([
+        (
+            "(Prefix, IpAddr) [FIB table entry]",
+            size_of::<(bgpfc_wire::prefix::Prefix, IpAddr)>(),
+        ),
+        (
+            "UpdateMessage",
+            size_of::<bgpfc_wire::update::UpdateMessage>(),
+        ),
+        ("DecodedUpdate", size_of::<DecodedUpdate>()),
+        (
+            "PathAttribute",
+            size_of::<bgpfc_wire::attribute::PathAttribute>(),
+        ),
+        ("RibMsg [RIB queue slot]", size_of::<RibMsg>()),
+        (
+            "FibMsg [FIB queue slot]",
+            size_of::<crate::messages::FibMsg>(),
+        ),
+        (
+            "PeerInput [peer queue slot]",
+            size_of::<crate::messages::PeerInput>(),
+        ),
+        ("Peer [peer thread state]", size_of::<crate::peer::Peer>()),
+        ("PeerHandle", size_of::<crate::peer::PeerHandle>()),
+    ]);
+    println!("{:48} {:>6}", "type", "bytes");
+    for (name, size) in rows {
+        println!("{name:48} {size:>6}");
     }
 }
 
@@ -422,6 +485,16 @@ mod tests {
             ..UpdateMessage::default()
         };
         assert_eq!(end_of_rib(&decoded(v6_withdraw)), None);
+    }
+
+    #[test]
+    fn duplication_report_parses() {
+        let rib = Rib::new(bgpfc_wire::types::Asn(65_000));
+        let text = duplication("192.0.2.1".parse().unwrap(), &rib).to_string();
+        assert!(text.starts_with("event=duplication "), "{text}");
+        for key in ["routes", "attr_sets", "as_paths", "interned", "walk_ms"] {
+            assert_eq!(bgpfc_prof::report::get_u64(&text, key), Some(0), "{key}");
+        }
     }
 
     #[test]
