@@ -178,8 +178,8 @@ impl Fib {
     }
 
     /// Change the desired route for `prefix` (`None` deletes) and apply
-    /// what follows.
-    pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Vec<Applied> {
+    /// what follows: at most one operation.
+    pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Option<Applied> {
         let previous = self.routes.set_desired(prefix, gateway);
         // Dry-run installs nothing, so what it reports is the change to
         // the desired table itself: what install mode would have done.
@@ -190,12 +190,12 @@ impl Fib {
         };
         // Only this prefix can differ now; a full plan is cheap enough
         // but a single-prefix plan keeps the common case O(log n).
-        let ops = match (gateway, reference) {
-            (Some(d), i) if i != Some(d) => vec![Op::Set { prefix, gateway: d }],
-            (None, Some(i)) => vec![Op::Delete { prefix, gateway: i }],
-            _ => Vec::new(),
+        let op = match (gateway, reference) {
+            (Some(d), i) if i != Some(d) => Op::Set { prefix, gateway: d },
+            (None, Some(i)) => Op::Delete { prefix, gateway: i },
+            _ => return None,
         };
-        self.run(ops)
+        Some(self.run_one(op))
     }
 
     /// Switch modes. Going to install performs a full reconcile (README,
@@ -222,27 +222,26 @@ impl Fib {
     }
 
     fn run(&mut self, ops: Vec<Op>) -> Vec<Applied> {
-        let mut out = Vec::with_capacity(ops.len());
-        for op in ops {
-            if self.mode == Mode::DryRun {
-                out.push(Applied {
-                    op,
-                    result: Ok(()),
-                    dry_run: true,
-                });
-                continue;
-            }
-            let result = self.send_op(&op);
-            if result.is_ok() {
-                self.routes.apply(&op);
-            }
-            out.push(Applied {
+        ops.into_iter().map(|op| self.run_one(op)).collect()
+    }
+
+    fn run_one(&mut self, op: Op) -> Applied {
+        if self.mode == Mode::DryRun {
+            return Applied {
                 op,
-                result,
-                dry_run: false,
-            });
+                result: Ok(()),
+                dry_run: true,
+            };
         }
-        out
+        let result = self.send_op(&op);
+        if result.is_ok() {
+            self.routes.apply(&op);
+        }
+        Applied {
+            op,
+            result,
+            dry_run: false,
+        }
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -351,12 +350,11 @@ mod tests {
     #[test]
     fn dry_run_reports_without_touching_installed() {
         let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1")));
-        assert_eq!(out.len(), 1);
-        assert!(out[0].dry_run);
-        assert!(out[0].result.is_ok());
+        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).unwrap();
+        assert!(out.dry_run);
+        assert!(out.result.is_ok());
         assert_eq!(
-            out[0].op,
+            out.op,
             Op::Set {
                 prefix: p("192.0.2.0/24"),
                 gateway: ip("10.0.0.1")
@@ -365,14 +363,12 @@ mod tests {
         assert_eq!(fib.desired().len(), 1);
         assert_eq!(fib.installed().len(), 0);
         // Same again: no change to report.
-        assert_eq!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).len(), 0);
+        assert!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).is_none());
         // A new gateway, then the delete, are each reported once.
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.2")));
-        assert_eq!(out.len(), 1);
-        let out = fib.set(p("192.0.2.0/24"), None);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].op, Op::Delete { .. }));
-        assert_eq!(fib.set(p("192.0.2.0/24"), None).len(), 0);
+        assert!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.2"))).is_some());
+        let out = fib.set(p("192.0.2.0/24"), None).unwrap();
+        assert!(matches!(out.op, Op::Delete { .. }));
+        assert!(fib.set(p("192.0.2.0/24"), None).is_none());
         assert_eq!(fib.desired().len(), 0);
         assert_eq!(fib.mode(), Mode::DryRun);
         assert_eq!(Mode::Install.to_string(), "install");
@@ -383,9 +379,9 @@ mod tests {
     #[test]
     fn install_without_a_socket_fails_cleanly() {
         let mut fib = Fib::new(Mode::Install, route::RT_TABLE_MAIN, route::RTPROT_BGP);
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1")));
-        assert!(matches!(out[0].result, Err(FibError::Io(_))));
-        assert!(!out[0].dry_run);
+        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).unwrap();
+        assert!(matches!(out.result, Err(FibError::Io(_))));
+        assert!(!out.dry_run);
         assert_eq!(fib.installed().len(), 0);
         let e = FibError::Kernel(101).to_string();
         assert!(e.contains("kernel refused"), "{e}");

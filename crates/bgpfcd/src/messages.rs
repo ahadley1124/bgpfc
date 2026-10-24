@@ -120,8 +120,8 @@ pub(crate) struct PeerReport {
 /// asks it.
 #[derive(Debug)]
 pub(crate) enum FibMsg {
-    /// A Loc-RIB change (RFC 4271 §9.3).
-    Change(bgpfc_rib::FibChange),
+    /// Loc-RIB changes, in order (RFC 4271 §9.3).
+    Changes(Vec<bgpfc_rib::FibChange>),
     /// Switch between dry-run and install; the reply says what was done.
     SetMode(bgpfc_fib::Mode, SyncSender<usize>),
     /// Report the tables on the sender.

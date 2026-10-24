@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Policies, Rib, Sink};
+use bgpfc_rib::{FibChange, Output, PeerInfo, Policies, Rib, Sink};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
@@ -37,7 +37,11 @@ fn run(
     fib: &SyncSender<FibMsg>,
 ) {
     let mut rib = Rib::with_policies(local_as, policies);
-    let mut out = Deliver { peers, fib };
+    let mut out = Deliver {
+        peers,
+        fib,
+        changes: Vec::new(),
+    };
     #[cfg(feature = "profiling")]
     let mut loads = crate::profiling::Loads::from_env();
     loop {
@@ -118,6 +122,7 @@ fn run(
                 }
             }
         }
+        out.flush();
         #[cfg(feature = "profiling")]
         loads.after(seen, &rib);
     }
@@ -136,25 +141,45 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session) -> PeerInfo {
     }
 }
 
-/// Hands each RIB output to the FIB or peer thread as the RIB produces it.
+/// FIB changes sent in one message at most: one per channel operation
+/// costs the RIB thread more than the change itself.
+pub(crate) const FIB_BATCH: usize = 256;
+
+/// Hands RIB outputs to the FIB and peer threads as the RIB produces them;
+/// FIB changes go in batches, sent when full and after each input.
 struct Deliver<'a> {
     peers: &'a PeerTable,
     fib: &'a SyncSender<FibMsg>,
+    changes: Vec<FibChange>,
+}
+
+impl Deliver<'_> {
+    fn flush(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+        // The next input likely changes about as many destinations.
+        let next = Vec::with_capacity(self.changes.len());
+        let changes = std::mem::replace(&mut self.changes, next);
+        // A bounded channel: a slow kernel slows the RIB rather than
+        // growing memory (AGENTS.md §3 backpressure).
+        if self.fib.send(FibMsg::Changes(changes)).is_err() {
+            bgpfc_log::error!("fib thread gone");
+        }
+    }
 }
 
 impl Sink for Deliver<'_> {
     fn put(&mut self, output: Output) {
-        let Deliver { peers, fib } = self;
         match output {
             Output::Fib(c) => {
-                // A bounded channel: a slow kernel slows the RIB rather
-                // than growing memory (AGENTS.md §3 backpressure).
-                if fib.send(FibMsg::Change(c)).is_err() {
-                    bgpfc_log::error!("fib thread gone");
+                self.changes.push(c);
+                if self.changes.len() >= FIB_BATCH {
+                    self.flush();
                 }
             }
             Output::Send { peer, messages } => {
-                let handle = peers.read().ok().and_then(|t| t.get(&peer).cloned());
+                let handle = self.peers.read().ok().and_then(|t| t.get(&peer).cloned());
                 let Some(handle) = handle else {
                     return;
                 };
