@@ -89,6 +89,8 @@ crates/
   bgpfc-sys      the ONLY crate with `unsafe`: hand-written extern "C" decls
   bgpfc-log      leveled stderr logger
   bgpfc-control  Unix-socket protocol, HTTP/1.1 server, JSON writer
+  bgpfc-prof     profiling counters and histograms (only with --features profiling)
+  bgpfc-bench    load generator, benchmark harness, micro-benchmarks (dev tooling)
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
@@ -104,6 +106,12 @@ cargo build --release
 ```
 
 The binaries are written to `target/release/bgpfcd` and `target/release/bgpfcctl`.
+
+For time and memory measurements, `cargo build --profile profiling --features
+profiling` adds counters, latency histograms and a counting allocator, plus a
+load generator and a benchmark harness that records results in
+`bench/results.csv`. [`docs/PROFILING.md`](docs/PROFILING.md) describes them;
+the default build contains none of it.
 
 ## Configure
 
