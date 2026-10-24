@@ -115,6 +115,7 @@ dependencies = [
  "bgpfc-fsm",
  "bgpfc-log",
  "bgpfc-policy",
+ "bgpfc-prof",
  "bgpfc-rib",
  "bgpfc-sys",
  "bgpfc-wire",

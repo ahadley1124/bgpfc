@@ -34,6 +34,8 @@ pub(crate) fn run(
             let _ = tx.send(PeerInput::Closed { conn });
             return;
         }
+        #[cfg(feature = "profiling")]
+        bgpfc_prof::metrics::BYTES_RECEIVED.add(HEADER_LEN);
         let message = match Header::decode(&header, extended.load(Ordering::Relaxed)) {
             Ok(h) => {
                 body.resize(h.body_len(), 0);
@@ -41,6 +43,8 @@ pub(crate) fn run(
                     let _ = tx.send(PeerInput::Closed { conn });
                     return;
                 }
+                #[cfg(feature = "profiling")]
+                bgpfc_prof::metrics::BYTES_RECEIVED.add(body.len());
                 decode(h.kind, &body)
             }
             Err(e) => Err(e),

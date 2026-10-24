@@ -37,7 +37,19 @@ fn run(
     fib: &SyncSender<FibMsg>,
 ) {
     let mut rib = Rib::with_policies(local_as, policies);
-    while let Ok(msg) = rx.recv() {
+    #[cfg(feature = "profiling")]
+    let mut loads = crate::profiling::Loads::from_env();
+    loop {
+        #[cfg(not(feature = "profiling"))]
+        let Ok(msg) = rx.recv() else {
+            return;
+        };
+        #[cfg(feature = "profiling")]
+        let Some(msg) = loads.recv(rx, &rib) else {
+            return;
+        };
+        #[cfg(feature = "profiling")]
+        let seen = loads.before(&msg);
         let outputs = match msg {
             RibMsg::PeerUp {
                 peer,
@@ -57,7 +69,7 @@ fn run(
                 );
                 rib.peer_up(peer_info(peer, local_addr, &session))
             }
-            RibMsg::Update { peer, update } => {
+            RibMsg::Update { peer, update, .. } => {
                 log_update(peer, &update);
                 rib.update(peer, &update)
             }
@@ -111,6 +123,8 @@ fn run(
             }
         };
         deliver(outputs, peers, fib);
+        #[cfg(feature = "profiling")]
+        loads.after(seen, &rib);
     }
 }
 

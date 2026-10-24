@@ -14,6 +14,8 @@ mod fib;
 mod messages;
 mod peer;
 mod privileges;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod reader;
 mod rib;
 mod wiring;
@@ -61,6 +63,8 @@ fn main() {
         return;
     }
     bgpfc_log::init(config.log_level);
+    #[cfg(feature = "profiling")]
+    profiling::init();
     bgpfc_log::info!(
         "bgpfcd starting",
         version = env!("CARGO_PKG_VERSION"),
@@ -394,6 +398,8 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
+        #[cfg(feature = "profiling")]
+        profiling::emit(&profiling::report("shutdown", |_| {}));
         bgpfc_log::info!("bgpfcd stopped");
     }
 }
