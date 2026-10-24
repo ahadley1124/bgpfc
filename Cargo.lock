@@ -79,6 +79,7 @@ version = "0.1.0"
 name = "bgpfc-rib"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-prof",
  "bgpfc-wire",
  "criterion",
  "proptest",

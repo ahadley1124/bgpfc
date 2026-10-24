@@ -66,6 +66,11 @@ pub fn path_length(attrs: &PathAttrs) -> usize {
 /// Identifier; lowest peer address.
 #[must_use]
 pub fn best(candidates: &[Candidate]) -> Option<usize> {
+    #[cfg(feature = "profiling")]
+    let _span = {
+        bgpfc_prof::metrics::BEST_PATH_RUNS.inc();
+        bgpfc_prof::Timer::start(&bgpfc_prof::metrics::BEST_PATH)
+    };
     if candidates.is_empty() {
         return None;
     }

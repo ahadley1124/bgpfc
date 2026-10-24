@@ -10,12 +10,18 @@
 //! and RFC 7606 §7.2 (leftmost AS of an external route is the peer's);
 //! RFC 4760 §5, §7 (per-family RIBs, family disable); RFC 2918 §4
 //! (route refresh re-sends the Adj-RIB-Out).
+//!
+//! With the `profiling` feature, the work per route is timed into
+//! `bgpfc-prof` histograms and the `profiling` module reports the RIB's
+//! size and how much its attributes repeat (`docs/PROFILING.md`).
 #![forbid(unsafe_code)]
 
 pub mod attrs;
 pub mod decision;
 pub mod export;
 pub mod peer;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 #[cfg(test)]
 mod tests;
 
@@ -215,6 +221,8 @@ impl Rib {
 
     /// The session left Established: forget the peer and its routes.
     pub fn peer_down(&mut self, addr: IpAddr) -> Vec<Output> {
+        #[cfg(feature = "profiling")]
+        let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_PEER_DOWN);
         let Some(state) = self.peers.remove(&addr) else {
             return Vec::new();
         };
@@ -341,6 +349,8 @@ impl Rib {
         let disabled = state.disabled.clone();
         let mut dirty = Vec::new();
         for (family, prefix) in update.withdrawals() {
+            #[cfg(feature = "profiling")]
+            let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_REMOVE);
             if disabled.contains(&family) {
                 continue;
             }
@@ -356,6 +366,8 @@ impl Rib {
         }
         let mut attrs_for: HashMap<AddressFamily, Option<Arc<PathAttrs>>> = HashMap::new();
         for (family, prefix) in update.announcements() {
+            #[cfg(feature = "profiling")]
+            let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_INSERT);
             if disabled.contains(&family) {
                 continue;
             }

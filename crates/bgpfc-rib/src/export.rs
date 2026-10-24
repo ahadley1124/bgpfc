@@ -174,6 +174,8 @@ impl Batch {
         family: AddressFamily,
         to: &PeerInfo,
     ) -> Result<Vec<Vec<u8>>, EncodeError> {
+        #[cfg(feature = "profiling")]
+        let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::ADJ_RIB_OUT_BUILD);
         let ctx = EncodeContext {
             four_octet_as: to.four_octet_as,
         };
