@@ -15,6 +15,7 @@ rust-version = "1.99"
 # Workspace crates are added here as they gain their first dependant, so
 # cargo can warn about unused entries.
 [workspace.dependencies]
+bgpfc-bench = { path = "crates/bgpfc-bench" }
 bgpfc-config = { path = "crates/bgpfc-config" }
 bgpfc-control = { path = "crates/bgpfc-control" }
 bgpfc-fib = { path = "crates/bgpfc-fib" }

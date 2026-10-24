@@ -118,6 +118,7 @@ dependencies = [
 name = "bgpfcd"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-bench",
  "bgpfc-config",
  "bgpfc-control",
  "bgpfc-fib",

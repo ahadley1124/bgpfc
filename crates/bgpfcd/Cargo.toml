@@ -19,6 +19,10 @@ bgpfc-rib.workspace = true
 bgpfc-sys.workspace = true
 bgpfc-wire.workspace = true
 
+# docs/PROFILING.md: the load generator for tests/loadgen.rs.
+[dev-dependencies]
+bgpfc-bench.workspace = true
+
 [features]
 # docs/PROFILING.md: counters, histograms and the counting allocator. Off by
 # default; the default build contains none of it.
