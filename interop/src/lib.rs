@@ -314,6 +314,9 @@ pub struct NeighborOpts {
     pub import: String,
     /// Export policy name.
     pub export: String,
+    /// More statements for the `neighbor` block, such as
+    /// `connect-retry-time 5;`.
+    pub extra: String,
 }
 
 impl NeighborOpts {
@@ -328,6 +331,7 @@ impl NeighborOpts {
             passive: false,
             import: "ANY".to_owned(),
             export: "ANY".to_owned(),
+            extra: String::new(),
         }
     }
 }
@@ -381,14 +385,15 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
     for n in &opts.neighbors {
         let _ = writeln!(
             text,
-            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {}; }}",
+            "neighbor {} {{ remote-as {}; port {}; hold-time {}; passive {}; import {}; export {}; {} }}",
             n.addr,
             n.remote_as,
             n.port,
             n.hold_time,
             if n.passive { "yes" } else { "no" },
             n.import,
-            n.export
+            n.export,
+            n.extra
         );
     }
     fs::write(&cfg, text).expect("bgpfcd config");
