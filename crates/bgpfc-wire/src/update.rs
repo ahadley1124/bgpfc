@@ -193,6 +193,8 @@ impl UpdateMessage {
     /// AFI/SAFI disable. Treat-as-withdraw and attribute discard are not
     /// errors; see [`DecodedUpdate`].
     pub fn decode(body: &[u8], ctx: &DecodeContext) -> Result<DecodedUpdate, UpdateError> {
+        #[cfg(feature = "profiling")]
+        let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::MSG_PARSE_UPDATE);
         let (withdrawn_bytes, attr_bytes, nlri_bytes) = split_fields(body)?;
         // RFC 7606 §3 i) and §5.3: both prefix fields are checked for syntax,
         // and RFC 7606 §3 j): if the NLRI cannot be parsed, treat-as-withdraw
@@ -322,6 +324,8 @@ enum Outcome {
 }
 
 fn decode_attributes(bytes: &[u8], ctx: DecodeContext, st: &mut State) -> Result<(), UpdateError> {
+    #[cfg(feature = "profiling")]
+    let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::ATTR_PARSE);
     let mut r = Reader::new(bytes);
     while !r.is_empty() {
         let Ok(raw) = parse_raw(&mut r) else {
