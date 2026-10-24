@@ -1031,3 +1031,60 @@ fn a_prefix_listed_twice_in_an_update_changes_once() {
     assert_eq!(sent[0].nlri, vec![p("192.0.2.0/24"), p("198.51.100.0/24")]);
     assert_eq!(rib.loc_rib(V4).count(), 2);
 }
+
+#[test]
+fn attribute_hash_follows_every_field() {
+    use bgpfc_wire::community::{ExtendedCommunity, LargeCommunity};
+    use std::hash::BuildHasher;
+    let hasher = std::collections::hash_map::RandomState::new();
+    let mut base = attrs(&[65_001, 7], "10.0.0.1");
+    base.med = Some(5);
+    base.local_pref = Some(100);
+    base.aggregator = Some(bgpfc_wire::attribute::Aggregator {
+        asn: Asn(65_001),
+        address: Ipv4Addr::new(1, 1, 1, 1),
+    });
+    base.communities = vec![Community::new(65_001, 1)];
+    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)];
+    base.large_communities = vec![LargeCommunity {
+        global: 1,
+        local1: 2,
+        local2: 3,
+    }];
+    base.unknown = vec![crate::attrs::UnknownAttribute {
+        flags: 0xc0,
+        code: 200,
+        value: vec![1, 2],
+    }];
+    assert_eq!(hasher.hash_one(&base), hasher.hash_one(base.clone()));
+    let changes: Vec<fn(&mut PathAttrs)> = vec![
+        |a| a.origin = Origin::Egp,
+        |a| a.as_path = AsPath::sequence(&[Asn(65_001), Asn(8)]),
+        |a| a.as_path = AsPath::sequence(&[Asn(65_001)]),
+        |a| a.next_hop = NextHop::Ipv4(Ipv4Addr::new(10, 0, 0, 2)),
+        |a| a.med = None,
+        |a| a.local_pref = Some(5),
+        |a| a.atomic_aggregate = true,
+        |a| a.aggregator = None,
+        |a| a.communities.push(Community::new(65_001, 2)),
+        |a| a.ext_communities.clear(),
+        |a| a.large_communities[0].local2 = 4,
+        |a| a.unknown[0].value.push(3),
+        |a| {
+            a.next_hop = NextHop::Ipv6 {
+                global: "2001:db8::1".parse().unwrap(),
+                link_local: Some("fe80::1".parse().unwrap()),
+            };
+        },
+    ];
+    for (i, change) in changes.iter().enumerate() {
+        let mut other = base.clone();
+        change(&mut other);
+        assert_ne!(other, base, "change {i}");
+        assert_ne!(
+            hasher.hash_one(&other),
+            hasher.hash_one(&base),
+            "change {i}"
+        );
+    }
+}
