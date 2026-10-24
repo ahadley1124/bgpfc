@@ -72,6 +72,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bgpfc-prof"
+version = "0.1.0"
+
+[[package]]
 name = "bgpfc-rib"
 version = "0.1.0"
 dependencies = [
