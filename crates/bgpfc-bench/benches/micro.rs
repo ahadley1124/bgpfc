@@ -18,7 +18,7 @@ use bgpfc_bench::pack::Packer;
 use bgpfc_bench::stats::summarize;
 use bgpfc_bench::synth::{SynthOpts, generate};
 use bgpfc_bench::table::Table;
-use bgpfc_rib::decision::{Candidate, best};
+use bgpfc_rib::decision::{Candidate, Neighbor, best};
 use bgpfc_rib::{Interner, PathAttrs, PeerInfo, Rib};
 use bgpfc_wire::header::HEADER_LEN;
 use bgpfc_wire::prefix::Prefix;
@@ -221,13 +221,12 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
             .expect("the synthetic UPDATE has a next hop"),
     );
     for n in [1u8, 2, 4, 8, 16] {
-        let candidates: Vec<Candidate> = (1..=n)
-            .map(|i| Candidate {
-                peer: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
+        let neighbors: Vec<Neighbor> = (1..=n)
+            .map(|i| Neighbor {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
                 kind: PeerKind::External,
                 router_id: u32::from(i),
                 remote_as: Asn(65_001),
-                attrs: Arc::clone(&attrs),
             })
             .collect();
         bench(
@@ -235,7 +234,11 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
             &format!("best_path_{n}_candidates"),
             timed(|| {
                 for _ in 0..10_000 {
-                    black_box(best(black_box(&candidates)));
+                    let neighbors = black_box(&neighbors);
+                    black_box(best(neighbors.len(), |i| Candidate {
+                        from: neighbors[i],
+                        attrs: &attrs,
+                    }));
                 }
                 10_000
             }),

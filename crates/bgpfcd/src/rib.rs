@@ -221,11 +221,10 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .map(|(_, b)| b.peer);
                 RibReply::Routes(
                     rib.candidates(*family, *prefix)
-                        .iter()
                         .map(|c| RouteReport {
                             prefix: *prefix,
                             peer: c.peer,
-                            attrs: std::sync::Arc::clone(&c.attrs),
+                            attrs: std::sync::Arc::clone(c.attrs),
                             best: best == Some(c.peer),
                         })
                         .collect(),
@@ -236,7 +235,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .map(|(prefix, b)| RouteReport {
                         prefix,
                         peer: b.peer,
-                        attrs: std::sync::Arc::clone(&b.attrs),
+                        attrs: std::sync::Arc::clone(b.attrs),
                         best: true,
                     })
                     .collect(),

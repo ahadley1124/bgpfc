@@ -12,9 +12,9 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Asn;
 
 use crate::attrs::PathAttrs;
-use crate::decision::Candidate;
 use crate::peer::PeerInfo;
-use crate::{BestRoute, Destination, PeerState, Rib};
+use crate::store::{Destination, Route};
+use crate::{PeerState, Rib};
 
 /// Table sizes, cheap to compute: one addition per family and peer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,13 +35,17 @@ impl Rib {
         Sizes {
             destinations: self.tables.values().map(BTreeMap::len).sum(),
             adj_rib_in: self
+                .s
                 .peers
-                .values()
+                .iter()
+                .flatten()
                 .flat_map(|p| p.adj_in_count.values())
                 .sum(),
             adj_rib_out: self
+                .s
                 .peers
-                .values()
+                .iter()
+                .flatten()
                 .flat_map(|p| p.adj_out.values())
                 .map(HashMap::len)
                 .sum(),
@@ -54,7 +58,7 @@ impl Rib {
     #[must_use]
     pub fn duplication(&self) -> Duplication {
         let mut d = Duplication {
-            interned: self.interner.len(),
+            interned: self.s.cx.interner.len(),
             ..Duplication::default()
         };
         let mut by_ptr: HashSet<usize> = HashSet::new();
@@ -63,8 +67,8 @@ impl Rib {
         for table in self.tables.values() {
             d.destinations += table.len();
             for dest in table.values() {
-                d.candidate_bytes += dest.candidates.capacity() * size_of::<Candidate>();
-                for c in &dest.candidates {
+                d.candidate_bytes += dest.heap_bytes();
+                for c in dest.routes() {
                     d.routes += 1;
                     if by_ptr.insert(Arc::as_ptr(&c.attrs).addr()) {
                         by_value.insert(&c.attrs);
@@ -78,7 +82,7 @@ impl Rib {
         d.attr_values = by_value.len();
         d.as_paths = paths.len();
         d.as_path_bytes_if_interned = paths.iter().map(|p| as_path_heap_bytes(p)).sum();
-        for p in self.peers.values() {
+        for p in self.s.peers.iter().flatten() {
             for out in p.adj_out.values() {
                 d.adj_rib_out += out.len();
                 // hashbrown: one entry and one control octet per bucket.
@@ -111,7 +115,8 @@ pub struct Duplication {
     pub as_path_bytes: usize,
     /// Heap octets if every distinct `AS_PATH` were stored once.
     pub as_path_bytes_if_interned: usize,
-    /// Heap octets of the per-destination candidate vectors.
+    /// Heap octets of the per-destination route vectors: destinations
+    /// with routes from two or more peers (one route is held inline).
     pub candidate_bytes: usize,
     /// Routes in all Adj-RIBs-Out: a copy of the exported table per peer.
     pub adj_rib_out: usize,
@@ -138,8 +143,7 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
             size_of::<(Prefix, Destination)>(),
         ),
         ("Destination", size_of::<Destination>()),
-        ("Candidate [Adj-RIB-In route]", size_of::<Candidate>()),
-        ("BestRoute", size_of::<BestRoute>()),
+        ("Route [Adj-RIB-In route]", size_of::<Route>()),
         ("PathAttrs", size_of::<PathAttrs>()),
         (
             "Arc<PathAttrs> allocation",
@@ -231,7 +235,8 @@ mod tests {
         assert_eq!(d.as_paths, 2);
         assert!(d.as_path_bytes > d.as_path_bytes_if_interned);
         assert!(d.interned >= d.attr_sets);
-        assert!(d.candidate_bytes >= 4 * size_of::<Candidate>());
+        // Only 192.0.2.0/24 has two routes; the others hold theirs inline.
+        assert_eq!(d.candidate_bytes, 2 * size_of::<Route>());
         // A has the lower BGP Identifier and wins all three destinations
         // (RFC 4271 §9.1.2.2 f), so only B is sent routes.
         assert_eq!(d.adj_rib_out, 3);
@@ -250,6 +255,6 @@ mod tests {
             println!("{name:48} {size:5}");
             assert!(*size > 0, "{name}");
         }
-        assert!(sizes.iter().any(|(n, _)| n.starts_with("Candidate")));
+        assert!(sizes.iter().any(|(n, _)| n.starts_with("Route")));
     }
 }
