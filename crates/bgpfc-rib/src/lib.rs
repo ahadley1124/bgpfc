@@ -231,7 +231,10 @@ struct Dirty {
 #[derive(Default)]
 struct Scratch {
     dirty: Vec<Dirty>,
-    /// Indices into `dirty`, for finding a destination listed twice.
+    /// How many of `dirty` the UPDATE's withdrawals made; the rest come
+    /// from its announcements.
+    withdrawn: usize,
+    /// Indices of the entries the withdrawals made, sorted by destination.
     order: Vec<u32>,
     /// Attribute sets of the routes removed or replaced, released from
     /// the interner once nothing else of the UPDATE holds them.
@@ -449,6 +452,7 @@ impl Rib {
                 withdraw(peers, table, family, prefix, id, scratch);
             }
         }
+        scratch.withdrawn = scratch.dirty.len();
         // The attribute set of the family being announced: an UPDATE has
         // one per family, and lists each family's prefixes together.
         let mut current: Option<(AddressFamily, Option<Arc<PathAttrs>>)> = None;
@@ -518,7 +522,7 @@ impl Rib {
     /// Phase 3 for every destination whose best route an UPDATE changed,
     /// then the UPDATEs that follow; release what the UPDATE let go of.
     fn finish(&mut self, scratch: &mut Scratch, out: &mut impl Sink) {
-        merge_repeats(&mut scratch.dirty, &mut scratch.order);
+        merge_repeats(&mut scratch.dirty, scratch.withdrawn, &mut scratch.order);
         for d in &scratch.dirty {
             if !d.merged {
                 self.s.changed(
@@ -921,37 +925,29 @@ fn announce(
     });
 }
 
-/// Merge the entries for a destination an UPDATE lists more than once
-/// (in its withdrawn routes and its NLRI, say) into the first: the best
-/// route before the first change and after the last. Sorting indices
-/// keeps this O(n log n) whatever a peer sends.
-fn merge_repeats(dirty: &mut [Dirty], order: &mut Vec<u32>) {
-    if dirty.len() < 2 {
+/// Merge the entries for a destination an UPDATE touched twice into the
+/// first: the best route before the first change and after the last.
+/// Only a withdrawal and then an announcement of the same prefix touch a
+/// destination twice (a prefix in both the withdrawn routes and the NLRI,
+/// say): withdrawing again finds no route, and announcing again the same
+/// interned route changes nothing. So the entries of the first
+/// `withdrawn` are sorted and each later one looked up among them, which
+/// costs nothing for an UPDATE that only announces or only withdraws.
+fn merge_repeats(dirty: &mut [Dirty], withdrawn: usize, order: &mut Vec<u32>) {
+    if withdrawn == 0 || withdrawn == dirty.len() {
         return;
     }
+    let key = |d: &Dirty| (d.family, d.prefix);
     order.clear();
     // invariant: one UPDATE has fewer than 2^32 prefixes.
-    order.extend(0..u32::try_from(dirty.len()).unwrap());
-    order.sort_unstable_by_key(|&i| {
-        let d = &dirty[i as usize];
-        (d.family, d.prefix, i)
-    });
-    let mut run = 0;
-    while run < order.len() {
-        let first = order[run] as usize;
-        let mut last = first;
-        let mut next = run + 1;
-        while next < order.len()
-            && dirty[order[next] as usize].family == dirty[first].family
-            && dirty[order[next] as usize].prefix == dirty[first].prefix
-        {
-            last = order[next] as usize;
-            dirty[last].merged = true;
-            next += 1;
+    order.extend(0..u32::try_from(withdrawn).unwrap());
+    order.sort_unstable_by_key(|&i| key(&dirty[i as usize]));
+    for j in withdrawn..dirty.len() {
+        let found = order.binary_search_by_key(&key(&dirty[j]), |&i| key(&dirty[i as usize]));
+        if let Ok(k) = found {
+            let first = order[k] as usize;
+            dirty[first].new = dirty[j].new.take();
+            dirty[j].merged = true;
         }
-        if last != first {
-            dirty[first].new = dirty[last].new.take();
-        }
-        run = next;
     }
 }
