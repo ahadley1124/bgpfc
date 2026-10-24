@@ -43,3 +43,9 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
+
+# docs/PROFILING.md: optimised like release, with full debug info for perf
+# and heaptrack: `cargo build --profile profiling --features profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true

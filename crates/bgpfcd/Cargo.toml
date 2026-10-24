@@ -18,5 +18,10 @@ bgpfc-rib.workspace = true
 bgpfc-sys.workspace = true
 bgpfc-wire.workspace = true
 
+[features]
+# docs/PROFILING.md: counters, histograms and the counting allocator. Off by
+# default; the default build contains none of it.
+profiling = ["bgpfc-sys/profiling"]
+
 [lints]
 workspace = true

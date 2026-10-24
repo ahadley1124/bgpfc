@@ -30,6 +30,11 @@ use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
 use crate::messages::{FibMsg, PeerInput, RibMsg};
 
+/// docs/PROFILING.md: a profiling build counts every allocation.
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static ALLOCATOR: bgpfc_sys::alloc::Counting = bgpfc_sys::alloc::Counting::new();
+
 /// Updates the RIB thread may have queued before peers block.
 const RIB_QUEUE: usize = 1024;
 
