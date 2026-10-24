@@ -35,6 +35,28 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  profiling:
+    # The same gates with the instrumentation compiled in (docs/PROFILING.md),
+    # the load generator against the daemon, and one short benchmark run so
+    # the tools keep working. Its figures are not compared: CI machines vary.
+    name: profiling (clippy, test, loadgen, bench smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: profiling-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - run: cargo clippy --workspace --all-targets --features profiling -- -D warnings
+      - run: cargo test --workspace --features profiling
+      - run: cargo test -p bgpfcd --features profiling -- --ignored
+      - run: cargo build --profile profiling --features profiling
+      - run: target/profiling/bgp_bench --runs 1 --prefixes 50000 --results "$RUNNER_TEMP/results.csv"
+
   miri:
     name: miri (wire, sys, fib)
     runs-on: ubuntu-latest
