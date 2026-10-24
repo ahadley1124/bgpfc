@@ -7,6 +7,7 @@
 //! - [`pack`]: UPDATE packing to the negotiated message size, with the
 //!   daemon's own encoder.
 //! - [`scenario`]: the `load`, `churn`, `withdraw-all` and `flap` drivers.
+//! - [`results`] and [`stats`]: what the benchmark harness records.
 //!
 //! Development tooling only; the daemon never links it.
 //!
@@ -19,8 +20,10 @@
 pub mod cli;
 pub mod mrt;
 pub mod pack;
+pub mod results;
 pub mod rng;
 pub mod scenario;
 pub mod speaker;
+pub mod stats;
 pub mod synth;
 pub mod table;
