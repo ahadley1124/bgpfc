@@ -284,6 +284,29 @@ const ENC2: EncodeContext = EncodeContext {
 
 // ---------------------------------------------------------------- round trips
 
+/// The order `Prefix` had when it was derived: variant, then the address
+/// octets, then the length.
+fn field_order(p: &Prefix) -> (u8, Vec<u8>, u8) {
+    match p.addr() {
+        std::net::IpAddr::V4(a) => (0, a.octets().to_vec(), p.prefix_len()),
+        std::net::IpAddr::V6(a) => (1, a.octets().to_vec(), p.prefix_len()),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn prefix_order_is_variant_then_address_then_length(
+        a in prop_oneof![prefix_v4(), prefix_v6()],
+        b in prop_oneof![prefix_v4(), prefix_v6()],
+    ) {
+        prop_assert_eq!(a.cmp(&b), field_order(&a).cmp(&field_order(&b)));
+        prop_assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+        prop_assert_eq!(a.cmp(&b) == std::cmp::Ordering::Equal, a == b);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
