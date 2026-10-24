@@ -247,3 +247,52 @@ fn engine_applies_each_neighbors_policies() {
     assert_eq!(engine.import(&stranger, V4, p, &a), Verdict::Reject);
     assert_eq!(engine.export(&stranger, V4, p, &a), Verdict::Reject);
 }
+
+#[test]
+fn engine_keeps_each_neighbors_policies_apart() {
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy LOW { term t { set local-pref 50; action accept; } }
+         policy HIGH { term t { set local-pref 200; action accept; } }
+         policy NONE { term t { action reject; } }
+         neighbor 10.0.0.1 { remote-as 65001; import LOW; export NONE; }
+         neighbor 10.0.0.2 { remote-as 65002; import HIGH; export NONE; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let peer = |addr: &str| PeerInfo {
+        addr: ip(addr),
+        local_addr: ip("10.0.0.254"),
+        remote_as: Asn(65_001),
+        router_id: RouterId::new(1).unwrap(),
+        kind: PeerKind::External,
+        families: vec![V4],
+        four_octet_as: true,
+        extended_messages: false,
+    };
+    let local_pref = |v: Verdict| match v {
+        Verdict::Modified(m) => m.local_pref,
+        other => panic!("{other:?}"),
+    };
+    let a = attrs(&[65_001]);
+    let p: Prefix = "203.0.113.0/24".parse().unwrap();
+    // Alternate, and go through an unknown peer in between: each
+    // neighbor's own policy every time.
+    for _ in 0..2 {
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a)),
+            Some(50)
+        );
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a)),
+            Some(50)
+        );
+        assert_eq!(engine.import(&peer("10.0.0.9"), V4, p, &a), Verdict::Reject);
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.2"), V4, p, &a)),
+            Some(200)
+        );
+        assert_eq!(engine.export(&peer("10.0.0.2"), V4, p, &a), Verdict::Reject);
+    }
+}
