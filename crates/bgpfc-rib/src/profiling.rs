@@ -216,16 +216,25 @@ mod tests {
         let mut rib = Rib::new(Asn(65_000));
         let a = peer(1, PeerKind::External);
         let b = peer(2, PeerKind::External);
-        rib.peer_up(a.clone());
-        rib.peer_up(b.clone());
+        rib.peer_up(a.clone(), &mut Vec::new());
+        rib.peer_up(b.clone(), &mut Vec::new());
         // Two attribute sets from A that share an AS_PATH and differ in MED.
         rib.update(
             a.addr,
             &update(&[65_001, 7], None, &["192.0.2.0/24", "198.51.100.0/24"]),
+            &mut Vec::new(),
         );
-        rib.update(a.addr, &update(&[65_001, 7], Some(5), &["203.0.113.0/24"]));
+        rib.update(
+            a.addr,
+            &update(&[65_001, 7], Some(5), &["203.0.113.0/24"]),
+            &mut Vec::new(),
+        );
         // One from B, for one of the same destinations.
-        rib.update(b.addr, &update(&[65_002, 7], None, &["192.0.2.0/24"]));
+        rib.update(
+            b.addr,
+            &update(&[65_002, 7], None, &["192.0.2.0/24"]),
+            &mut Vec::new(),
+        );
 
         let d = rib.duplication();
         assert_eq!(d.destinations, 3);

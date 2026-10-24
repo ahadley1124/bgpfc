@@ -121,6 +121,21 @@ pub enum Output {
     },
 }
 
+/// Where the RIB puts what an input produces, in order. A `Vec` collects
+/// it; the daemon hands each output on as it comes, so that a peer with a
+/// full table going down does not first build a list of a million FIB
+/// changes.
+pub trait Sink {
+    /// Take the next output.
+    fn put(&mut self, output: Output);
+}
+
+impl Sink for Vec<Output> {
+    fn put(&mut self, output: Output) {
+        self.push(output);
+    }
+}
+
 /// A route the RIB holds: the peer it came from and its attributes.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteRef<'a> {
@@ -227,7 +242,7 @@ impl Rib {
     /// A session reached Established: remember the peer and send it the
     /// Loc-RIB for every negotiated family (RFC 4271 §9.2: the initial
     /// Adj-RIB-Out).
-    pub fn peer_up(&mut self, info: PeerInfo) -> Vec<Output> {
+    pub fn peer_up(&mut self, info: PeerInfo, out: &mut impl Sink) {
         let addr = info.addr;
         let families = info.families.clone();
         self.s.add(PeerState {
@@ -237,65 +252,59 @@ impl Rib {
             adj_out: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
         });
-        let mut out = Vec::new();
         for family in families {
-            out.extend(self.refresh(addr, family));
+            self.refresh(addr, family, out);
         }
-        out
     }
 
     /// The session left Established: forget the peer and its routes.
-    pub fn peer_down(&mut self, addr: IpAddr) -> Vec<Output> {
+    pub fn peer_down(&mut self, addr: IpAddr, out: &mut impl Sink) {
         #[cfg(feature = "profiling")]
         let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_PEER_DOWN);
         let Some(id) = self.s.remove(addr) else {
-            return Vec::new();
+            return;
         };
-        let mut out = Vec::new();
         let mut batches = Batches::new();
         // Every table, not only the negotiated families: the slot is free
         // for another peer once this returns, so no route may still name it.
         for (family, table) in self.tables.iter_mut() {
             table.retain(|prefix, dest| {
                 self.s
-                    .remove_route(family, *prefix, dest, id, &mut batches, &mut out)
+                    .remove_route(family, *prefix, dest, id, &mut batches, out)
             });
         }
-        self.s.emit(&batches, &mut out);
-        out
+        self.s.emit(&batches, out);
     }
 
     /// Stop accepting `family` from `addr` and drop what it sent
     /// (RFC 4760 §7).
-    pub fn family_disabled(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    pub fn family_disabled(&mut self, addr: IpAddr, family: AddressFamily, out: &mut impl Sink) {
         let Some(id) = self.s.id(addr) else {
-            return Vec::new();
+            return;
         };
         let state = self.s.peer_mut(id);
         if !state.disabled.contains(&family) {
             state.disabled.push(family);
         }
         state.adj_in_count.insert(family, 0);
-        let mut out = Vec::new();
         let mut batches = Batches::new();
         if let Some(table) = self.tables.get_mut(family) {
             table.retain(|prefix, dest| {
                 self.s
-                    .remove_route(family, *prefix, dest, id, &mut batches, &mut out)
+                    .remove_route(family, *prefix, dest, id, &mut batches, out)
             });
         }
-        self.s.emit(&batches, &mut out);
-        out
+        self.s.emit(&batches, out);
     }
 
     /// The peer asked for `family` again (RFC 2918 §4): resend the
     /// Adj-RIB-Out in full. Also used to build the initial one.
-    pub fn refresh(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    pub fn refresh(&mut self, addr: IpAddr, family: AddressFamily, out: &mut impl Sink) {
         let Some(id) = self.s.id(addr) else {
-            return Vec::new();
+            return;
         };
         if !self.s.peer(id).info.speaks(family) {
-            return Vec::new();
+            return;
         }
         let mut batch = Batch::default();
         // Refill the map in place: its capacity is the table's already.
@@ -316,18 +325,18 @@ impl Rib {
         }
         let state = self.s.peer_mut(id);
         state.adj_out.insert(family, adj_out);
-        Sessions::encode(&state.info, family, &batch)
+        Sessions::encode(&state.info, family, &batch, out);
     }
 
     /// Re-run export for `addr` and `family` after a policy change: only
     /// what differs from the Adj-RIB-Out is sent (announcements for new
     /// or changed routes, withdrawals for routes no longer exported).
-    pub fn reexport(&mut self, addr: IpAddr, family: AddressFamily) -> Vec<Output> {
+    pub fn reexport(&mut self, addr: IpAddr, family: AddressFamily, out: &mut impl Sink) {
         let Some(id) = self.s.id(addr) else {
-            return Vec::new();
+            return;
         };
         if !self.s.peer(id).info.speaks(family) {
-            return Vec::new();
+            return;
         }
         let mut batch = Batch::default();
         let mut adj_out = self
@@ -355,7 +364,7 @@ impl Rib {
         }
         let state = self.s.peer_mut(id);
         state.adj_out.insert(family, adj_out);
-        Sessions::encode(&state.info, family, &batch)
+        Sessions::encode(&state.info, family, &batch, out);
     }
 
     /// What the RIB knows about peer `addr`, if it is up.
@@ -367,13 +376,13 @@ impl Rib {
     /// An UPDATE from `addr`: apply its withdrawals and announcements to
     /// the Adj-RIB-In, rerun the decision process for the destinations
     /// touched, and produce the FIB changes and UPDATEs that follow.
-    pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate) -> Vec<Output> {
+    pub fn update(&mut self, addr: IpAddr, update: &DecodedUpdate, out: &mut impl Sink) {
         let Some(id) = self.s.id(addr) else {
-            return Vec::new();
+            return;
         };
         let Sessions { cx, peers, .. } = &mut self.s;
         let Some(state) = peers[id.index()].as_ref() else {
-            return Vec::new();
+            return;
         };
         let info = &state.info;
         let mut dirty = Vec::new();
@@ -470,7 +479,7 @@ impl Rib {
             let n = state.adj_in_count.or_default(family);
             *n = n.saturating_add_signed(*d);
         }
-        self.reconsider(&dirty)
+        self.reconsider(&dirty, out);
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
@@ -538,8 +547,7 @@ impl Rib {
 
     /// Rerun Phase 2 for each dirty destination and Phase 3 for every
     /// destination whose best route changed.
-    fn reconsider(&mut self, dirty: &[Dirty]) -> Vec<Output> {
-        let mut out = Vec::new();
+    fn reconsider(&mut self, dirty: &[Dirty], out: &mut impl Sink) {
         let mut batches = Batches::new();
         let mut seen = HashSet::new();
         for d in dirty {
@@ -554,19 +562,14 @@ impl Rib {
             let Some(dest) = table.get_mut(&d.prefix) else {
                 continue;
             };
-            if !self.s.settle(
-                d.family,
-                d.prefix,
-                dest,
-                d.old.as_ref(),
-                &mut batches,
-                &mut out,
-            ) {
+            if !self
+                .s
+                .settle(d.family, d.prefix, dest, d.old.as_ref(), &mut batches, out)
+            {
                 table.remove(&d.prefix);
             }
         }
-        self.s.emit(&batches, &mut out);
-        out
+        self.s.emit(&batches, out);
     }
 }
 
@@ -640,7 +643,7 @@ impl Sessions {
         dest: &mut Destination,
         id: PeerId,
         batches: &mut Batches,
-        out: &mut Vec<Output>,
+        out: &mut impl Sink,
     ) -> bool {
         let Some(i) = dest.position(id) else {
             return true;
@@ -659,7 +662,7 @@ impl Sessions {
         dest: &mut Destination,
         old: Option<&Route>,
         batches: &mut Batches,
-        out: &mut Vec<Output>,
+        out: &mut impl Sink,
     ) -> bool {
         self.decide(dest);
         let new = dest.best();
@@ -669,7 +672,7 @@ impl Sessions {
             _ => true,
         };
         if changed {
-            out.push(Output::Fib(FibChange {
+            out.put(Output::Fib(FibChange {
                 family,
                 prefix,
                 next_hop: new.map(|r| r.attrs.next_hop_addr()),
@@ -760,29 +763,29 @@ impl Sessions {
     }
 
     /// Encode the batches, in peer and family order.
-    fn emit(&self, batches: &Batches, out: &mut Vec<Output>) {
+    fn emit(&self, batches: &Batches, out: &mut impl Sink) {
         let mut keys: Vec<_> = batches.keys().copied().collect();
         keys.sort();
         for key in keys {
             if let Some(id) = self.id(key.0) {
-                out.extend(Sessions::encode(&self.peer(id).info, key.1, &batches[&key]));
+                Sessions::encode(&self.peer(id).info, key.1, &batches[&key], out);
             }
         }
     }
 
-    fn encode(to: &PeerInfo, family: AddressFamily, batch: &Batch) -> Vec<Output> {
+    fn encode(to: &PeerInfo, family: AddressFamily, batch: &Batch, out: &mut impl Sink) {
         if batch.is_empty() {
-            return Vec::new();
+            return;
         }
-        match batch.encode(family, to) {
-            Ok(messages) => vec![Output::Send {
+        out.put(match batch.encode(family, to) {
+            Ok(messages) => Output::Send {
                 peer: to.addr,
                 messages,
-            }],
-            Err(error) => vec![Output::EncodeFailed {
+            },
+            Err(error) => Output::EncodeFailed {
                 peer: to.addr,
                 error,
-            }],
-        }
+            },
+        });
     }
 }

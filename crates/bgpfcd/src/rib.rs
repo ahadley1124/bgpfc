@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::thread;
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Policies, Rib};
+use bgpfc_rib::{Output, PeerInfo, Policies, Rib, Sink};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
@@ -37,6 +37,7 @@ fn run(
     fib: &SyncSender<FibMsg>,
 ) {
     let mut rib = Rib::with_policies(local_as, policies);
+    let mut out = Deliver { peers, fib };
     #[cfg(feature = "profiling")]
     let mut loads = crate::profiling::Loads::from_env();
     loop {
@@ -50,7 +51,7 @@ fn run(
         };
         #[cfg(feature = "profiling")]
         let seen = loads.before(&msg);
-        let outputs = match msg {
+        match msg {
             RibMsg::PeerUp {
                 peer,
                 local_addr,
@@ -67,19 +68,19 @@ fn run(
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                rib.peer_up(peer_info(peer, local_addr, &session))
+                rib.peer_up(peer_info(peer, local_addr, &session), &mut out);
             }
             RibMsg::Update { peer, update, .. } => {
                 log_update(peer, &update);
-                rib.update(peer, &update)
+                rib.update(peer, &update, &mut out);
             }
             RibMsg::FamilyDisabled { peer, family } => {
                 bgpfc_log::warn!("rib: family disabled", peer = peer, family = family);
-                rib.family_disabled(peer, family)
+                rib.family_disabled(peer, family, &mut out);
             }
             RibMsg::RouteRefresh { peer, family } => {
                 bgpfc_log::info!("rib: route refresh", peer = peer, family = family);
-                rib.refresh(peer, family)
+                rib.refresh(peer, family, &mut out);
             }
             RibMsg::PeerDown { peer } => {
                 let stats = rib.peer_stats(peer).unwrap_or_default();
@@ -88,15 +89,13 @@ fn run(
                     peer = peer,
                     routes_deleted = stats.received.iter().map(|(_, n)| n).sum::<usize>()
                 );
-                rib.peer_down(peer)
+                rib.peer_down(peer, &mut out);
             }
             RibMsg::Query(q, reply) => {
                 let _ = reply.send(answer(&rib, &q));
-                Vec::new()
             }
             RibMsg::SetPolicies { policies, reexport } => {
                 rib.set_policies(policies.0);
-                let mut out = Vec::new();
                 for peer in reexport {
                     let families: Vec<_> = rib
                         .peer(peer)
@@ -104,25 +103,21 @@ fn run(
                         .unwrap_or_default();
                     for family in families {
                         bgpfc_log::info!("rib: re-export", peer = peer, family = family);
-                        out.extend(rib.reexport(peer, family));
+                        rib.reexport(peer, family, &mut out);
                     }
                 }
-                out
             }
             RibMsg::Resend { peer } => {
                 let families: Vec<_> = rib
                     .peer(peer)
                     .map(|p| p.families.clone())
                     .unwrap_or_default();
-                let mut out = Vec::new();
                 for family in families {
                     bgpfc_log::info!("rib: resend", peer = peer, family = family);
-                    out.extend(rib.refresh(peer, family));
+                    rib.refresh(peer, family, &mut out);
                 }
-                out
             }
-        };
-        deliver(outputs, peers, fib);
+        }
         #[cfg(feature = "profiling")]
         loads.after(seen, &rib);
     }
@@ -141,9 +136,16 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session) -> PeerInfo {
     }
 }
 
-fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
-    for o in outputs {
-        match o {
+/// Hands each RIB output to the FIB or peer thread as the RIB produces it.
+struct Deliver<'a> {
+    peers: &'a PeerTable,
+    fib: &'a SyncSender<FibMsg>,
+}
+
+impl Sink for Deliver<'_> {
+    fn put(&mut self, output: Output) {
+        let Deliver { peers, fib } = self;
+        match output {
             Output::Fib(c) => {
                 // A bounded channel: a slow kernel slows the RIB rather
                 // than growing memory (AGENTS.md §3 backpressure).
@@ -154,7 +156,7 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
             Output::Send { peer, messages } => {
                 let handle = peers.read().ok().and_then(|t| t.get(&peer).cloned());
                 let Some(handle) = handle else {
-                    continue;
+                    return;
                 };
                 bgpfc_log::debug!("rib: send", peer = peer, messages = messages.len());
                 match handle.tx.try_send(PeerInput::Send(messages)) {

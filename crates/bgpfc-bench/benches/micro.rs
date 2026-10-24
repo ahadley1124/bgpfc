@@ -107,9 +107,11 @@ fn decode_all(messages: &[Vec<u8>]) -> Vec<DecodedUpdate> {
 /// A RIB holding `adds` from [`peer`].
 fn loaded(adds: &[DecodedUpdate]) -> Rib {
     let mut rib = Rib::new(Asn(65_000));
-    rib.peer_up(peer());
+    let mut out = Vec::new();
+    rib.peer_up(peer(), &mut out);
     for u in adds {
-        rib.update(peer().addr, u);
+        rib.update(peer().addr, u, &mut out);
+        out.clear();
     }
     rib
 }
@@ -188,25 +190,33 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
     let from = peer().addr;
     bench(filter, "rib_insert_per_route_100k", || {
         let mut rib = Rib::new(Asn(65_000));
-        rib.peer_up(peer());
+        let mut out = Vec::new();
+        rib.peer_up(peer(), &mut out);
         let t = Instant::now();
         for u in &adds {
-            black_box(rib.update(from, u));
+            rib.update(from, u, &mut out);
+            black_box(&out);
+            out.clear();
         }
         (t.elapsed(), routes)
     });
     bench(filter, "rib_withdraw_per_route_100k", || {
         let mut rib = loaded(&adds);
+        let mut out = Vec::new();
         let t = Instant::now();
         for u in &dels {
-            black_box(rib.update(from, u));
+            rib.update(from, u, &mut out);
+            black_box(&out);
+            out.clear();
         }
         (t.elapsed(), routes)
     });
     bench(filter, "rib_peer_down_per_route_100k", || {
         let mut rib = loaded(&adds);
+        let mut out = Vec::new();
         let t = Instant::now();
-        black_box(rib.peer_down(from));
+        rib.peer_down(from, &mut out);
+        black_box(&out);
         (t.elapsed(), routes)
     });
     adds
