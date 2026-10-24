@@ -26,7 +26,8 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::btree_map::Entry as Slot;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -175,6 +176,8 @@ pub struct Rib {
     /// Everything else. Kept apart from the tables so that a table can be
     /// walked while Phase 3 updates the peers' Adj-RIBs-Out.
     s: Sessions,
+    /// Buffers each UPDATE reuses.
+    scratch: Scratch,
 }
 
 struct Sessions {
@@ -192,15 +195,50 @@ struct Context {
     interner: Interner,
 }
 
-/// UPDATEs being built during one input, per peer and family.
-type Batches = HashMap<(IpAddr, AddressFamily), Batch>;
+/// UPDATEs being built during one input, per peer and family. A short
+/// list: an input reaches a handful of peers.
+#[derive(Default)]
+struct Batches(Vec<(PeerId, AddressFamily, Batch)>);
 
-/// A destination whose routes an UPDATE changed, and its best route
-/// before the first change (Phase 3 runs when the best route differs).
+impl Batches {
+    fn get(&mut self, peer: PeerId, family: AddressFamily) -> &mut Batch {
+        let i = if let Some(i) = self
+            .0
+            .iter()
+            .position(|(p, f, _)| *p == peer && *f == family)
+        {
+            i
+        } else {
+            self.0.push((peer, family, Batch::default()));
+            self.0.len() - 1
+        };
+        &mut self.0[i].2
+    }
+}
+
+/// A destination an UPDATE changed: its best route before the first
+/// change and after the last. Phase 3 runs when they differ.
 struct Dirty {
     family: AddressFamily,
     prefix: Prefix,
     old: Option<Route>,
+    new: Option<Route>,
+    /// A later entry for a destination listed earlier, merged into it.
+    merged: bool,
+}
+
+/// Buffers an UPDATE reuses, so that one costs no allocation of its own.
+#[derive(Default)]
+struct Scratch {
+    dirty: Vec<Dirty>,
+    /// Indices into `dirty`, for finding a destination listed twice.
+    order: Vec<u32>,
+    /// Attribute sets of the routes removed or replaced, released from
+    /// the interner once nothing else of the UPDATE holds them.
+    released: Vec<Arc<PathAttrs>>,
+    /// Routes added minus routes removed, per family.
+    delta: FamilyMap<isize>,
+    batches: Batches,
 }
 
 impl Rib {
@@ -224,6 +262,7 @@ impl Rib {
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
             },
+            scratch: Scratch::default(),
         }
     }
 
@@ -264,7 +303,7 @@ impl Rib {
         let Some(id) = self.s.remove(addr) else {
             return;
         };
-        let mut batches = Batches::new();
+        let mut batches = Batches::default();
         // Every table, not only the negotiated families: the slot is free
         // for another peer once this returns, so no route may still name it.
         for (family, table) in self.tables.iter_mut() {
@@ -273,7 +312,7 @@ impl Rib {
                     .remove_route(family, *prefix, dest, id, &mut batches, out)
             });
         }
-        self.s.emit(&batches, out);
+        self.s.emit(&mut batches, out);
     }
 
     /// Stop accepting `family` from `addr` and drop what it sent
@@ -287,14 +326,14 @@ impl Rib {
             state.disabled.push(family);
         }
         state.adj_in_count.insert(family, 0);
-        let mut batches = Batches::new();
+        let mut batches = Batches::default();
         if let Some(table) = self.tables.get_mut(family) {
             table.retain(|prefix, dest| {
                 self.s
                     .remove_route(family, *prefix, dest, id, &mut batches, out)
             });
         }
-        self.s.emit(&batches, out);
+        self.s.emit(&mut batches, out);
     }
 
     /// The peer asked for `family` again (RFC 2918 §4): resend the
@@ -386,48 +425,47 @@ impl Rib {
         let Some(id) = self.s.id(addr) else {
             return;
         };
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.apply(id, update, &mut scratch);
+        self.finish(&mut scratch, out);
+        self.scratch = scratch;
+    }
+
+    /// Apply an UPDATE's withdrawals, then its announcements, to the
+    /// Adj-RIB-In, and run Phase 2 for each destination as it changes.
+    fn apply(&mut self, id: PeerId, update: &DecodedUpdate, scratch: &mut Scratch) {
         let Sessions { cx, peers, .. } = &mut self.s;
         let Some(state) = peers[id.index()].as_ref() else {
             return;
         };
         let info = &state.info;
-        let mut dirty = Vec::new();
-        // Attribute sets of the routes removed or replaced, released from
-        // the interner once nothing else of this UPDATE holds them.
-        let mut released = Vec::new();
-        let mut delta: FamilyMap<isize> = FamilyMap::default();
         for (family, prefix) in update.withdrawals() {
             #[cfg(feature = "profiling")]
             let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_REMOVE);
             if state.disabled.contains(&family) {
                 continue;
             }
-            if let Some(dest) = self.tables.get_mut(family).and_then(|t| t.get_mut(&prefix))
-                && let Some(i) = dest.position(id)
-            {
-                dirty.push(Dirty {
-                    family,
-                    prefix,
-                    old: dest.best().cloned(),
-                });
-                released.push(dest.remove(i).attrs);
-                *delta.or_default(family) -= 1;
+            if let Some(table) = self.tables.get_mut(family) {
+                withdraw(peers, table, family, prefix, id, scratch);
             }
         }
-        let mut attrs_for: FamilyMap<Option<Arc<PathAttrs>>> = FamilyMap::default();
+        // The attribute set of the family being announced: an UPDATE has
+        // one per family, and lists each family's prefixes together.
+        let mut current: Option<(AddressFamily, Option<Arc<PathAttrs>>)> = None;
         for (family, prefix) in update.announcements() {
             #[cfg(feature = "profiling")]
             let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_INSERT);
             if state.disabled.contains(&family) {
                 continue;
             }
-            let attrs = if let Some(a) = attrs_for.get(family) {
-                a.clone()
-            } else {
-                let a =
-                    PathAttrs::from_update(&update.message, family).map(|a| cx.interner.intern(a));
-                attrs_for.insert(family, a.clone());
-                a
+            let attrs = match &current {
+                Some((f, a)) if *f == family => a.clone(),
+                _ => {
+                    let a = PathAttrs::from_update(&update.message, family)
+                        .map(|a| cx.interner.intern(a));
+                    current = Some((family, a.clone()));
+                    a
+                }
             };
             let Some(attrs) = attrs else {
                 continue;
@@ -450,47 +488,52 @@ impl Rib {
                     Verdict::Reject => None,
                 }
             };
-            let Some(attrs) = accepted else {
-                if let Some(dest) = self.tables.get_mut(family).and_then(|t| t.get_mut(&prefix))
-                    && let Some(i) = dest.position(id)
-                {
-                    dirty.push(Dirty {
+            match accepted {
+                Some(attrs) => {
+                    let table = self.tables.or_default(family);
+                    announce(
+                        peers,
+                        table,
                         family,
                         prefix,
-                        old: dest.best().cloned(),
-                    });
-                    released.push(dest.remove(i).attrs);
-                    *delta.or_default(family) -= 1;
+                        Route { attrs, peer: id },
+                        scratch,
+                    );
                 }
-                continue;
-            };
-            let dest = self.tables.or_default(family).entry(prefix).or_default();
-            let old = dest.best().cloned();
-            let route = Route { attrs, peer: id };
-            if let Some(i) = dest.position(id) {
-                if Arc::ptr_eq(&dest.routes()[i].attrs, &route.attrs) {
-                    // An implicit re-announcement of the same route.
-                    continue;
+                None => {
+                    if let Some(table) = self.tables.get_mut(family) {
+                        withdraw(peers, table, family, prefix, id, scratch);
+                    }
                 }
-                released.push(std::mem::replace(&mut dest.routes_mut()[i], route).attrs);
-            } else {
-                dest.push(route);
-                *delta.or_default(family) += 1;
             }
-            dirty.push(Dirty {
-                family,
-                prefix,
-                old,
-            });
         }
         let state = self.s.peer_mut(id);
-        for (family, d) in delta.iter() {
+        for (family, d) in scratch.delta.iter_mut() {
             let n = state.adj_in_count.or_default(family);
             *n = n.saturating_add_signed(*d);
+            *d = 0;
         }
-        self.reconsider(&dirty, out);
-        drop((dirty, attrs_for));
-        for a in released {
+    }
+
+    /// Phase 3 for every destination whose best route an UPDATE changed,
+    /// then the UPDATEs that follow; release what the UPDATE let go of.
+    fn finish(&mut self, scratch: &mut Scratch, out: &mut impl Sink) {
+        merge_repeats(&mut scratch.dirty, &mut scratch.order);
+        for d in &scratch.dirty {
+            if !d.merged {
+                self.s.changed(
+                    d.family,
+                    d.prefix,
+                    d.old.as_ref(),
+                    d.new.as_ref(),
+                    &mut scratch.batches,
+                    out,
+                );
+            }
+        }
+        self.s.emit(&mut scratch.batches, out);
+        scratch.dirty.clear();
+        for a in scratch.released.drain(..) {
             self.s.cx.interner.release(a);
         }
     }
@@ -557,33 +600,6 @@ impl Rib {
     pub fn attribute_sets(&self) -> usize {
         self.s.cx.interner.len()
     }
-
-    /// Rerun Phase 2 for each dirty destination and Phase 3 for every
-    /// destination whose best route changed.
-    fn reconsider(&mut self, dirty: &[Dirty], out: &mut impl Sink) {
-        let mut batches = Batches::new();
-        let mut seen = HashSet::new();
-        for d in dirty {
-            // The first entry for a destination has its best route from
-            // before the UPDATE.
-            if !seen.insert((d.family, d.prefix)) {
-                continue;
-            }
-            let Some(table) = self.tables.get_mut(d.family) else {
-                continue;
-            };
-            let Some(dest) = table.get_mut(&d.prefix) else {
-                continue;
-            };
-            if !self
-                .s
-                .settle(d.family, d.prefix, dest, d.old.as_ref(), &mut batches, out)
-            {
-                table.remove(&d.prefix);
-            }
-        }
-        self.s.emit(&batches, out);
-    }
 }
 
 impl Sessions {
@@ -639,18 +655,6 @@ impl Sessions {
         }
     }
 
-    /// Phase 2: put the best of `dest`'s routes first.
-    fn decide(&self, dest: &mut Destination) {
-        let routes = dest.routes();
-        let best = decision::best(routes.len(), |i| Candidate {
-            from: self.peer(routes[i].peer).neighbor,
-            attrs: &routes[i].attrs,
-        });
-        if let Some(i) = best {
-            dest.promote(i);
-        }
-    }
-
     /// Remove `id`'s route from `dest`, if it has one, and settle the
     /// destination. Whether it still has routes.
     fn remove_route(
@@ -684,8 +688,22 @@ impl Sessions {
         batches: &mut Batches,
         out: &mut impl Sink,
     ) -> bool {
-        self.decide(dest);
-        let new = dest.best();
+        decide(&self.peers, dest);
+        self.changed(family, prefix, old, dest.best(), batches, out);
+        !dest.is_empty()
+    }
+
+    /// Phase 3 and the FIB change when the best route went from `old` to
+    /// `new`; nothing when it is the same route.
+    fn changed(
+        &mut self,
+        family: AddressFamily,
+        prefix: Prefix,
+        old: Option<&Route>,
+        new: Option<&Route>,
+        batches: &mut Batches,
+        out: &mut impl Sink,
+    ) {
         let changed = match (old, new) {
             (None, None) => false,
             (Some(a), Some(b)) => !a.same(b),
@@ -699,7 +717,6 @@ impl Sessions {
             }));
             self.disseminate(family, prefix, new, batches);
         }
-        !dest.is_empty()
     }
 
     /// Phase 3: every peer's Adj-RIB-Out follows the new best route.
@@ -717,9 +734,9 @@ impl Sessions {
             if !to.info.speaks(family) {
                 continue;
             }
-            let to_addr = to.info.addr;
             // invariant: fewer than 2^32 peers.
-            let exported = self.exported(family, prefix, best, PeerId(u32::try_from(i).unwrap()));
+            let id = PeerId(u32::try_from(i).unwrap());
+            let exported = self.exported(family, prefix, best, id);
             // invariant: the slot was occupied above.
             let to = self.peers[i].as_mut().unwrap();
             let adj_out = to.adj_out.or_default(family);
@@ -730,20 +747,17 @@ impl Sessions {
                         if let Some(old) = adj_out.insert(prefix, Arc::clone(&a)) {
                             self.cx.interner.release(old);
                         }
-                        batches
-                            .entry((to_addr, family))
-                            .or_default()
-                            .announce(&a, prefix);
+                        batches.get(id, family).announce(&a, prefix);
                     }
                 }
                 None => {
-                    if let Some(old) = adj_out.remove(&prefix) {
+                    // Not even hashed when nothing was sent: the source
+                    // peer of every route, with a single peer up.
+                    if !adj_out.is_empty()
+                        && let Some(old) = adj_out.remove(&prefix)
+                    {
                         self.cx.interner.release(old);
-                        batches
-                            .entry((to_addr, family))
-                            .or_default()
-                            .withdraw
-                            .push(prefix);
+                        batches.get(id, family).withdraw.push(prefix);
                     }
                 }
             }
@@ -785,15 +799,16 @@ impl Sessions {
         export::export(cx.local_as, family, source, attrs, to).map(|a| cx.interner.intern(a))
     }
 
-    /// Encode the batches, in peer and family order.
-    fn emit(&self, batches: &Batches, out: &mut impl Sink) {
-        let mut keys: Vec<_> = batches.keys().copied().collect();
-        keys.sort();
-        for key in keys {
-            if let Some(id) = self.id(key.0) {
-                Sessions::encode(&self.peer(id).info, key.1, &batches[&key], out);
-            }
+    /// Encode the batches, in peer address and family order, and empty
+    /// them.
+    fn emit(&self, batches: &mut Batches, out: &mut impl Sink) {
+        batches
+            .0
+            .sort_by_key(|(id, family, _)| (self.peer(*id).info.addr, *family));
+        for (id, family, batch) in &batches.0 {
+            Sessions::encode(&self.peer(*id).info, *family, batch, out);
         }
+        batches.0.clear();
     }
 
     fn encode(to: &PeerInfo, family: AddressFamily, batch: &Batch, out: &mut impl Sink) {
@@ -810,5 +825,133 @@ impl Sessions {
                 error,
             },
         });
+    }
+}
+
+/// Phase 2: put the best of `dest`'s routes first.
+fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
+    let routes = dest.routes();
+    let best = decision::best(routes.len(), |i| Candidate {
+        // invariant: a route's peer slot is occupied (Sessions::peer).
+        from: peers[routes[i].peer.index()].as_ref().unwrap().neighbor,
+        attrs: &routes[i].attrs,
+    });
+    if let Some(i) = best {
+        dest.promote(i);
+    }
+}
+
+/// Remove peer `id`'s route to `prefix`, if there is one, and note the
+/// destination's best route before and after.
+fn withdraw(
+    peers: &[Option<PeerState>],
+    table: &mut BTreeMap<Prefix, Destination>,
+    family: AddressFamily,
+    prefix: Prefix,
+    id: PeerId,
+    scratch: &mut Scratch,
+) {
+    let Slot::Occupied(mut slot) = table.entry(prefix) else {
+        return;
+    };
+    let dest = slot.get_mut();
+    let Some(i) = dest.position(id) else {
+        return;
+    };
+    let old = dest.best().cloned();
+    scratch.released.push(dest.remove(i).attrs);
+    decide(peers, dest);
+    let new = dest.best().cloned();
+    if dest.is_empty() {
+        slot.remove();
+    }
+    *scratch.delta.or_default(family) -= 1;
+    scratch.dirty.push(Dirty {
+        family,
+        prefix,
+        old,
+        new,
+        merged: false,
+    });
+}
+
+/// Add or replace `route`'s peer's route to `prefix` and note the
+/// destination's best route before and after.
+fn announce(
+    peers: &[Option<PeerState>],
+    table: &mut BTreeMap<Prefix, Destination>,
+    family: AddressFamily,
+    prefix: Prefix,
+    route: Route,
+    scratch: &mut Scratch,
+) {
+    let (old, new) = match table.entry(prefix) {
+        Slot::Vacant(slot) => {
+            // A new destination: its one route is the best.
+            let new = route.clone();
+            slot.insert(Destination::One(route));
+            *scratch.delta.or_default(family) += 1;
+            (None, new)
+        }
+        Slot::Occupied(mut slot) => {
+            let dest = slot.get_mut();
+            let old = dest.best().cloned();
+            if let Some(i) = dest.position(route.peer) {
+                if Arc::ptr_eq(&dest.routes()[i].attrs, &route.attrs) {
+                    // An implicit re-announcement of the same route.
+                    return;
+                }
+                let replaced = std::mem::replace(&mut dest.routes_mut()[i], route);
+                scratch.released.push(replaced.attrs);
+            } else {
+                dest.push(route);
+                *scratch.delta.or_default(family) += 1;
+            }
+            decide(peers, dest);
+            // invariant: the destination has the route just added.
+            (old, dest.best().unwrap().clone())
+        }
+    };
+    scratch.dirty.push(Dirty {
+        family,
+        prefix,
+        old,
+        new: Some(new),
+        merged: false,
+    });
+}
+
+/// Merge the entries for a destination an UPDATE lists more than once
+/// (in its withdrawn routes and its NLRI, say) into the first: the best
+/// route before the first change and after the last. Sorting indices
+/// keeps this O(n log n) whatever a peer sends.
+fn merge_repeats(dirty: &mut [Dirty], order: &mut Vec<u32>) {
+    if dirty.len() < 2 {
+        return;
+    }
+    order.clear();
+    // invariant: one UPDATE has fewer than 2^32 prefixes.
+    order.extend(0..u32::try_from(dirty.len()).unwrap());
+    order.sort_unstable_by_key(|&i| {
+        let d = &dirty[i as usize];
+        (d.family, d.prefix, i)
+    });
+    let mut run = 0;
+    while run < order.len() {
+        let first = order[run] as usize;
+        let mut last = first;
+        let mut next = run + 1;
+        while next < order.len()
+            && dirty[order[next] as usize].family == dirty[first].family
+            && dirty[order[next] as usize].prefix == dirty[first].prefix
+        {
+            last = order[next] as usize;
+            dirty[last].merged = true;
+            next += 1;
+        }
+        if last != first {
+            dirty[first].new = dirty[last].new.take();
+        }
+        run = next;
     }
 }

@@ -990,3 +990,44 @@ fn attribute_sets_go_with_their_last_route() {
     outputs(|o| rib.peer_down(e2.addr, o));
     assert_eq!(rib.attribute_sets(), 0);
 }
+
+#[test]
+fn a_prefix_listed_twice_in_an_update_changes_once() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(e2.clone(), o));
+    let a = attrs(&[65_001], "10.0.0.1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            o,
+        );
+    });
+    // Withdrawn and announced again unchanged, in one UPDATE: the best
+    // route before and after is the same, so nothing follows.
+    let mut again = announce(&["192.0.2.0/24"], &a);
+    again.message.withdrawn = vec![p("192.0.2.0/24")];
+    let out = outputs(|o| rib.update(e1.addr, &again, o));
+    assert!(out.is_empty(), "{out:?}");
+    // The same with new attributes, the prefix twice in the NLRI too:
+    // one FIB change, one announcement to e2.
+    let longer = attrs(&[65_001, 9], "10.0.0.9");
+    let mut twice = announce(
+        &["192.0.2.0/24", "198.51.100.0/24", "192.0.2.0/24"],
+        &longer,
+    );
+    twice.message.withdrawn = vec![p("192.0.2.0/24")];
+    let out = outputs(|o| rib.update(e1.addr, &twice, o));
+    let changes = fib(&out);
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert_eq!(changes[0].prefix, p("192.0.2.0/24"));
+    assert_eq!(changes[0].next_hop, Some(ip("10.0.0.9")));
+    let sent = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].withdrawn.len(), 0);
+    assert_eq!(sent[0].nlri, vec![p("192.0.2.0/24"), p("198.51.100.0/24")]);
+    assert_eq!(rib.loc_rib(V4).count(), 2);
+}

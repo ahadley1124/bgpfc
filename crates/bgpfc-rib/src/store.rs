@@ -176,6 +176,7 @@ impl<T> FamilyMap<T> {
         Some(self.0.swap_remove(i).1)
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (AddressFamily, &T)> {
         self.0.iter().map(|(f, v)| (*f, v))
     }
