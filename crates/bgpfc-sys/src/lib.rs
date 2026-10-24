@@ -8,9 +8,12 @@
 //!
 //! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`; the
 //! self-pipe signal handler of AGENTS.md §3; the two privilege modes of
-//! the README.
+//! the README; with the `profiling` feature, the counting allocator of
+//! `docs/PROFILING.md`.
 #![cfg(target_os = "linux")]
 
+#[cfg(feature = "profiling")]
+pub mod alloc;
 mod caps;
 mod ffi;
 mod netlink;

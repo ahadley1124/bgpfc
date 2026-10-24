@@ -94,6 +94,8 @@ pub(crate) struct Peer {
     state_since: Instant,
     updates_in: u64,
     updates_out: u64,
+    #[cfg(feature = "profiling")]
+    open_timer: crate::profiling::OpenTimer,
 }
 
 /// Prepare a peer: its handle can go into the peer table before the
@@ -123,6 +125,8 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
+        #[cfg(feature = "profiling")]
+        open_timer: crate::profiling::OpenTimer::default(),
     };
     (handle, peer)
 }
@@ -213,12 +217,20 @@ impl Peer {
                 Action::Connect => self.start_connect(),
                 Action::DropConnection => self.drop_conn(),
                 Action::RejectConnection => {}
-                Action::SendOpen(open) => match open.encode() {
-                    Ok(body) => self.write_message(MessageType::Open, &body),
-                    Err(e) => {
-                        bgpfc_log::error!("cannot encode OPEN", peer = self.cfg.addr, error = e);
+                Action::SendOpen(open) => {
+                    #[cfg(feature = "profiling")]
+                    self.open_timer.open();
+                    match open.encode() {
+                        Ok(body) => self.write_message(MessageType::Open, &body),
+                        Err(e) => {
+                            bgpfc_log::error!(
+                                "cannot encode OPEN",
+                                peer = self.cfg.addr,
+                                error = e
+                            );
+                        }
                     }
-                },
+                }
                 Action::SendKeepalive => self.write_raw(&KEEPALIVE),
                 Action::SendNotification(n) => {
                     bgpfc_log::warn!(
@@ -237,6 +249,8 @@ impl Peer {
                     }
                 }
                 Action::SessionUp(session) => {
+                    #[cfg(feature = "profiling")]
+                    self.open_timer.established();
                     bgpfc_log::info!(
                         "session established",
                         peer = self.cfg.addr,
@@ -262,6 +276,8 @@ impl Peer {
                     });
                 }
                 Action::SessionDown => {
+                    #[cfg(feature = "profiling")]
+                    bgpfc_prof::metrics::SESSIONS_DROPPED.inc();
                     bgpfc_log::info!("session down", peer = self.cfg.addr);
                     self.session = None;
                     self.rib_send(RibMsg::PeerDown {
@@ -310,6 +326,8 @@ impl Peer {
             }
             PeerInput::Send(messages) => {
                 if self.fsm.state() == State::Established {
+                    #[cfg(feature = "profiling")]
+                    bgpfc_prof::metrics::UPDATES_SENT.add(messages.len());
                     for m in &messages {
                         self.write_raw(m);
                     }
@@ -515,6 +533,8 @@ impl Peer {
     }
 
     fn drop_conn(&mut self) {
+        #[cfg(feature = "profiling")]
+        self.open_timer.reset();
         if let Some(c) = self.conn.take() {
             let _ = c.stream.shutdown(Shutdown::Both);
         }
@@ -531,6 +551,9 @@ impl Peer {
         let Some(c) = &mut self.conn else {
             return;
         };
+        // Counted as attempted: a failed write ends the session anyway.
+        #[cfg(feature = "profiling")]
+        bgpfc_prof::metrics::BYTES_SENT.add(bytes.len());
         if let Err(e) = c.stream.write_all(bytes) {
             bgpfc_log::warn!("write failed", peer = self.cfg.addr, error = e);
             self.write_failed = true;
@@ -563,7 +586,11 @@ impl Peer {
     /// A message (or framing error) on the FSM's connection.
     fn primary_message(&mut self, message: Result<Inbound, DecodeError>, now: Instant) {
         match message {
-            Ok(Inbound::Open(open)) => self.event(Event::BgpOpen(open), now),
+            Ok(Inbound::Open(open)) => {
+                #[cfg(feature = "profiling")]
+                self.open_timer.open();
+                self.event(Event::BgpOpen(open), now);
+            }
             Ok(Inbound::Update(body)) => self.update(&body, now),
             Ok(Inbound::Notification(n)) => {
                 match n.shutdown_communication() {
@@ -631,6 +658,10 @@ impl Peer {
     }
 
     fn update(&mut self, body: &[u8], now: Instant) {
+        #[cfg(feature = "profiling")]
+        let started = bgpfc_prof::now();
+        #[cfg(feature = "profiling")]
+        bgpfc_prof::metrics::UPDATES_RECEIVED.inc();
         let ctx = self.decode_context();
         match UpdateMessage::decode(body, &ctx) {
             Ok(decoded) => {
@@ -653,9 +684,17 @@ impl Peer {
                             reason = format!("{:?}", d.reason)
                         );
                     }
+                    #[cfg(feature = "profiling")]
+                    {
+                        use bgpfc_prof::metrics::{PREFIXES_ANNOUNCED, PREFIXES_WITHDRAWN};
+                        PREFIXES_ANNOUNCED.add(decoded.announcements().count());
+                        PREFIXES_WITHDRAWN.add(decoded.withdrawals().count());
+                    }
                     self.rib_send(RibMsg::Update {
                         peer: self.cfg.addr,
                         update: decoded,
+                        #[cfg(feature = "profiling")]
+                        started,
                     });
                 }
             }

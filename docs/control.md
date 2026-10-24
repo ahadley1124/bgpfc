@@ -37,6 +37,7 @@ failure, 2 on a usage error.
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
 | `fib mode dry-run\|install` | switch the FIB mode at runtime; switching to install performs a full reconcile |
+| `stats` | profiling builds only (`docs/PROFILING.md`): the report line of counters, histograms and memory. Not served over HTTP. |
 
 ### Wire format
 

@@ -19,6 +19,13 @@ usage: bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
   --group GROUP           the group to drop to (default: USER's primary group)
 ";
 
+/// The extra flag of a profiling build (docs/PROFILING.md).
+#[cfg(feature = "profiling")]
+pub(crate) const PROFILING_USAGE: &str =
+    "  --print-sizes           (profiling build) print the size of the route,
+                          message and peer structures, then exit
+";
+
 /// Parsed arguments.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Args {

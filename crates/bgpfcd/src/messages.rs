@@ -9,6 +9,8 @@
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
+#[cfg(feature = "profiling")]
+use std::time::Instant;
 
 use bgpfc_fsm::Session;
 use bgpfc_wire::error::{CeaseSubcode, DecodeError};
@@ -195,6 +197,10 @@ pub(crate) enum RibMsg {
         peer: IpAddr,
         /// The decoded message.
         update: DecodedUpdate,
+        /// When the peer thread started decoding it, for `update_total`
+        /// (`docs/PROFILING.md`); `None` with spans off.
+        #[cfg(feature = "profiling")]
+        started: Option<Instant>,
     },
     /// An UPDATE's multiprotocol attribute was unusable (RFC 4760 §7): drop
     /// the family's routes from this peer and ignore it from now on.

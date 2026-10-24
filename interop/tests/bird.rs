@@ -530,6 +530,12 @@ fn control_plane_reload_and_reset() {
         "control {{ socket {}; }} fib {{ mode install; }}",
         socket.display()
     );
+    // The hard reset below reconnects at once (RFC 4271 §8.2.2 Idle,
+    // ManualStart), often before the passive BIRD has finished closing the
+    // old session; BIRD then resets the new connection, and bgpfcd waits
+    // ConnectRetryTime in Active before it tries again. Keep that wait
+    // well inside the test's.
+    opts.neighbors[0].extra = "connect-retry-time 5;".to_owned();
     let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
     assert_established(&lab, &bird, &bgpfcd);
     let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);

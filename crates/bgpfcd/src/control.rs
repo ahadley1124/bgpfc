@@ -81,6 +81,10 @@ pub(crate) enum Command {
     },
     Reload,
     FibMode(Mode),
+    /// The profiling report line (`docs/PROFILING.md`); profiling builds
+    /// only, and only over the Unix socket.
+    #[cfg(feature = "profiling")]
+    Stats,
 }
 
 impl Command {
@@ -145,6 +149,8 @@ impl Command {
             ["reload"] => Ok(Command::Reload),
             ["fib", "mode", "dry-run"] => Ok(Command::FibMode(Mode::DryRun)),
             ["fib", "mode", "install"] => Ok(Command::FibMode(Mode::Install)),
+            #[cfg(feature = "profiling")]
+            ["stats"] => Ok(Command::Stats),
             _ => Err(format!(
                 "unknown command `{}`; see bgpfcctl --help",
                 w.join(" ")
@@ -290,6 +296,13 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
                 .map_err(|_| "fib did not answer".to_owned())?;
             Ok(ok_reply(&format!("fib mode {mode}; {ops} operations")))
         }
+        // The HTTP API never maps a request here: metrics are not exported
+        // over the network (docs/PROFILING.md), so there is no JSON form.
+        #[cfg(feature = "profiling")]
+        Command::Stats => Ok(Reply {
+            lines: vec![crate::profiling::report("stats", |_| {}).to_string()],
+            json: String::new(),
+        }),
     }
 }
 
@@ -834,6 +847,19 @@ mod tests {
             "x".repeat(129),
         ];
         assert!(Command::parse(&long).unwrap_err().contains("RFC 9003"));
+    }
+
+    #[test]
+    fn stats_exists_only_in_profiling_builds() {
+        let parsed = Command::parse(&words("stats"));
+        #[cfg(feature = "profiling")]
+        assert_eq!(parsed, Ok(Command::Stats));
+        #[cfg(not(feature = "profiling"))]
+        assert!(parsed.is_err());
+        // Never over HTTP (docs/PROFILING.md: no network export).
+        let req =
+            http::Request::read_from(&mut "GET /v1/stats HTTP/1.1\r\n\r\n".as_bytes()).unwrap();
+        assert_eq!(Command::from_http(&req).unwrap_err().0, 404);
     }
 
     #[test]
