@@ -408,8 +408,8 @@ pub(crate) fn print_sizes() {
     let mut rows = bgpfc_rib::profiling::type_sizes();
     rows.extend([
         (
-            "(Prefix, IpAddr) [FIB table entry]",
-            size_of::<(bgpfc_wire::prefix::Prefix, IpAddr)>(),
+            "Prefix + gateways [FIB route]",
+            bgpfc_fib::reconcile::ROUTE_SIZE,
         ),
         (
             "UpdateMessage",

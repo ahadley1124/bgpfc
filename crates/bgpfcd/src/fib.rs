@@ -42,8 +42,8 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
             FibMsg::Query(reply) => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    desired: fib.desired().clone(),
-                    installed: fib.installed().clone(),
+                    desired: fib.desired(),
+                    installed: fib.installed(),
                 });
             }
             FibMsg::Shutdown(done) => {

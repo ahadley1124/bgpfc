@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
-pub use reconcile::{Op, Table};
+pub use reconcile::{Op, Routes, Table};
 pub use route::RouteMsg;
 
 /// Whether operations are sent to the kernel.
@@ -100,8 +100,8 @@ pub struct Fib {
     mode: Mode,
     table: u32,
     protocol: u8,
-    desired: Table,
-    installed: Table,
+    /// The desired and the installed routes.
+    routes: Routes,
     seq: u32,
     #[cfg(not(miri))]
     socket: Option<bgpfc_sys::NetlinkSocket>,
@@ -115,8 +115,7 @@ impl Fib {
             mode,
             table,
             protocol,
-            desired: Table::new(),
-            installed: Table::new(),
+            routes: Routes::new(),
             seq: 1,
             #[cfg(not(miri))]
             socket: None,
@@ -129,16 +128,17 @@ impl Fib {
         self.mode
     }
 
-    /// Routes the RIB wants.
+    /// Routes the RIB wants, as a table built for the caller.
     #[must_use]
-    pub fn desired(&self) -> &Table {
-        &self.desired
+    pub fn desired(&self) -> Table {
+        self.routes.desired_table()
     }
 
-    /// Routes believed to be in the kernel with our protocol number.
+    /// Routes believed to be in the kernel with our protocol number, as a
+    /// table built for the caller.
     #[must_use]
-    pub fn installed(&self) -> &Table {
-        &self.installed
+    pub fn installed(&self) -> Table {
+        self.routes.installed_table()
     }
 
     /// Open the netlink socket. Needs no privilege; install mode needs
@@ -173,40 +173,26 @@ impl Fib {
                 }
             }
         }
-        self.installed = installed;
+        self.routes.set_installed(&installed);
         Ok(self.reconcile())
     }
 
     /// Change the desired route for `prefix` (`None` deletes) and apply
     /// what follows.
     pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Vec<Applied> {
-        let previous = self.desired.get(&prefix).copied();
-        match gateway {
-            Some(gw) => {
-                self.desired.insert(prefix, gw);
-            }
-            None => {
-                self.desired.remove(&prefix);
-            }
-        }
+        let previous = self.routes.set_desired(prefix, gateway);
         // Dry-run installs nothing, so what it reports is the change to
         // the desired table itself: what install mode would have done.
         let reference = if self.mode == Mode::DryRun {
             previous
         } else {
-            self.installed.get(&prefix).copied()
+            self.routes.installed(&prefix)
         };
         // Only this prefix can differ now; a full plan is cheap enough
         // but a single-prefix plan keeps the common case O(log n).
-        let ops = match (self.desired.get(&prefix), reference.as_ref()) {
-            (Some(d), i) if i != Some(d) => vec![Op::Set {
-                prefix,
-                gateway: *d,
-            }],
-            (None, Some(i)) => vec![Op::Delete {
-                prefix,
-                gateway: *i,
-            }],
+        let ops = match (gateway, reference) {
+            (Some(d), i) if i != Some(d) => vec![Op::Set { prefix, gateway: d }],
+            (None, Some(i)) => vec![Op::Delete { prefix, gateway: i }],
             _ => Vec::new(),
         };
         self.run(ops)
@@ -225,13 +211,13 @@ impl Fib {
 
     /// Forget every desired route and remove what is installed (shutdown).
     pub fn clear(&mut self) -> Vec<Applied> {
-        self.desired.clear();
+        self.routes.clear_desired();
         self.reconcile()
     }
 
     /// Apply the full plan.
     pub fn reconcile(&mut self) -> Vec<Applied> {
-        let ops = reconcile::plan(&self.desired, &self.installed);
+        let ops = self.routes.plan();
         self.run(ops)
     }
 
@@ -248,7 +234,7 @@ impl Fib {
             }
             let result = self.send_op(&op);
             if result.is_ok() {
-                reconcile::apply(&mut self.installed, &op);
+                self.routes.apply(&op);
             }
             out.push(Applied {
                 op,

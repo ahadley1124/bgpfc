@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use bgpfc_fib::reconcile::{Table, apply, plan};
+use bgpfc_fib::reconcile::{Routes, Table, apply, plan};
 use bgpfc_wire::prefix::Prefix;
 use proptest::prelude::*;
 
@@ -32,5 +32,40 @@ proptest! {
         let extra = installed.keys().filter(|p| !desired.contains_key(*p)).count();
         prop_assert_eq!(ops.len(), desired.len() - untouched + extra);
         prop_assert_eq!(plan(&desired, &now), vec![]);
+    }
+
+    /// The one-map store plans exactly what the two tables do, ends at the
+    /// same place, and gives back no gateway once nothing uses it.
+    #[test]
+    fn routes_plan_like_the_tables(desired in table(), installed in table(), later in table()) {
+        let mut r = Routes::new();
+        r.set_installed(&installed);
+        for (p, g) in &desired {
+            r.set_desired(*p, Some(*g));
+        }
+        prop_assert_eq!(r.desired_table(), desired.clone());
+        prop_assert_eq!(r.installed_table(), installed.clone());
+        let ops = r.plan();
+        prop_assert_eq!(&ops, &plan(&desired, &installed));
+        for op in &ops {
+            r.apply(op);
+        }
+        prop_assert_eq!(r.installed_table(), desired.clone());
+        // Move to another desired table, then to none.
+        for p in desired.keys() {
+            if !later.contains_key(p) {
+                r.set_desired(*p, None);
+            }
+        }
+        for (p, g) in &later {
+            r.set_desired(*p, Some(*g));
+        }
+        prop_assert_eq!(&r.plan(), &plan(&later, &desired));
+        r.clear_desired();
+        for op in r.plan() {
+            r.apply(&op);
+        }
+        prop_assert_eq!(r.gateways(), 0);
+        prop_assert!(r.installed_table().is_empty());
     }
 }
