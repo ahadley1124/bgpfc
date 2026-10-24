@@ -105,6 +105,10 @@ pub struct Fib {
     seq: u32,
     #[cfg(not(miri))]
     socket: Option<bgpfc_sys::NetlinkSocket>,
+    /// The buffer acknowledgements are read into, kept between
+    /// operations: install mode sends one per route.
+    #[cfg(not(miri))]
+    ack: Vec<u8>,
 }
 
 impl Fib {
@@ -119,6 +123,8 @@ impl Fib {
             seq: 1,
             #[cfg(not(miri))]
             socket: None,
+            #[cfg(not(miri))]
+            ack: Vec::new(),
         }
     }
 
@@ -272,10 +278,12 @@ impl Fib {
             ))
         })?;
         socket.send(&bytes)?;
-        let mut buf = vec![0u8; 8192];
+        if self.ack.is_empty() {
+            self.ack = vec![0u8; 8192];
+        }
         loop {
-            let n = socket.recv(&mut buf)?;
-            for m in netlink::parse(&buf[..n])? {
+            let n = socket.recv(&mut self.ack)?;
+            for m in netlink::parse(&self.ack[..n])? {
                 if m.header.seq != seq {
                     continue;
                 }
