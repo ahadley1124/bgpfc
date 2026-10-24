@@ -11,7 +11,12 @@ description = "Load generator, benchmark harness and micro-benchmarks for bgpfcd
 # Development tooling, never linked by the daemon. Std-only all the same:
 # it lives under crates/ and check-deps.sh covers it.
 [dependencies]
+bgpfc-prof.workspace = true
 bgpfc-wire.workspace = true
+
+[[bin]]
+name = "bgp_loadgen"
+path = "src/bin/bgp_loadgen.rs"
 
 [lints]
 workspace = true
