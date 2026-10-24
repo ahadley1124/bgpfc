@@ -237,6 +237,38 @@ fn med_compares_within_the_neighboring_as_only() {
 }
 
 #[test]
+fn med_outcome_does_not_depend_on_candidate_order() {
+    // Pairwise MED comparison is not transitive here: a beats b on MED
+    // (same AS), b beats c on router id (different AS, MED not
+    // compared), c beats a on router id. Ranking each route against all
+    // routes of its AS first makes the winner the same in every order.
+    let e1 = peer("10.0.0.1", 65_001, 3);
+    let e2 = peer("10.0.0.2", 65_001, 1);
+    let e3 = peer("10.0.0.3", 65_003, 2);
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.med = Some(5);
+    let mut b = attrs(&[65_001], "10.0.0.2");
+    b.med = Some(10);
+    let c = attrs(&[65_003], "10.0.0.3");
+    let routes = [(&e1, a), (&e2, b), (&e3, c)];
+    let winner = |order: [usize; 3]| {
+        let r: Vec<_> = order.iter().map(|i| routes[*i].clone()).collect();
+        order[best_of(&r).unwrap()]
+    };
+    // b is out on MED; of a and c, c has the lower router id.
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        assert_eq!(winner(order), 2, "{order:?}");
+    }
+}
+
+#[test]
 fn med_uses_the_leftmost_as_for_internal_routes() {
     // Two internal peers relaying routes from AS 65_001.
     let i1 = peer("10.0.0.1", 65_000, 1);
