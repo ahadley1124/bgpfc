@@ -9,9 +9,9 @@
 //!
 //! The RIB stores no Adj-RIB-Out: what a peer has is what export makes of
 //! the Loc-RIB, every change of which is sent as it happens, except for
-//! the destinations pacing holds back, for which [`Held`] keeps what the
+//! the destinations pacing holds back, for which `Held` keeps what the
 //! peer has meanwhile. So the time of each advertisement is kept only
-//! while it can still hold one back, for an interval: one [`Pacing`] per
+//! while it can still hold one back, for an interval: one `Pacing` per
 //! peer and family has
 //!
 //! - the second the whole Adj-RIB-Out was last sent at once (the initial
@@ -28,7 +28,7 @@
 //!
 //! It never reads the clock: callers pass the time in. Wake-ups go through
 //! one deadline queue owned by [`crate::Rib`], so there is no timer or
-//! thread per destination. A second queue there sweeps each [`Pacing`]
+//! thread per destination. A second queue there sweeps each `Pacing`
 //! when what it remembers expires: the second being filled is sorted once
 //! it has passed, and what can no longer hold anything back is forgotten,
 //! so that a peer that hears nothing more does not keep it.
