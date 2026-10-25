@@ -3,7 +3,7 @@
 
 use std::net::IpAddr;
 
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, RovState, Verdict};
+use bgpfc_rib::{Imported, PathAttrs, PeerInfo, Policies, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, LargeCommunity};
@@ -57,6 +57,7 @@ fn route<'a>(prefix: &str, a: &'a PathAttrs) -> Route<'a> {
         neighbor: ip("10.0.0.1"),
         local_addr: ip("10.0.0.254"),
         extended_next_hop: false,
+        rov: RovState::Disabled,
     }
 }
 
@@ -227,28 +228,141 @@ fn regex_errors_point_at_the_term() {
 }
 
 #[test]
-fn terms_on_the_validation_state_are_refused() {
-    // The engine does not evaluate them, so a file with them does not load.
-    for clause in ["match rpki valid;", "set rpki invalid;"] {
-        let cfg = bgpfc_config::parse_str(
-            "t",
-            &format!(
-                "router-id 192.0.2.1; local-as 65000;
-                 policy P {{ term ok {{ action next; }} term r {{ {clause} action accept; }} }}"
-            ),
-        )
-        .unwrap();
-        let errs = PolicySet::compile(&cfg).unwrap_err();
-        assert_eq!(errs.len(), 1, "{clause}");
-        assert_eq!(errs[0].pos.line, 2, "{clause}");
-        assert!(
-            errs[0]
-                .message
-                .contains("term `r`: the policy engine cannot match or set"),
-            "{}",
-            errs[0]
+fn match_rpki_sees_each_state_and_not_found_holds_for_disabled() {
+    // RFC 6811 §3: policy matches the validation state. Each term marks
+    // the route with a MED of its own.
+    let s = set("policy P {
+        term d { match rpki disabled; set med 4; action accept; }
+        term v { match rpki valid; set med 1; action accept; }
+        term i { match rpki invalid; set med 2; action accept; }
+        term n { match rpki not-found; set med 3; action accept; }
+    }");
+    let a = attrs(&[65_001]);
+    let med = |rov: RovState| {
+        let mut r = route("203.0.113.0/24", &a);
+        r.rov = rov;
+        match s.run("P", &r) {
+            Imported {
+                verdict: Verdict::Modified(m),
+                rov: None,
+            } => m.med,
+            other => panic!("{rov}: {other:?}"),
+        }
+    };
+    assert_eq!(med(RovState::Valid), Some(1));
+    assert_eq!(med(RovState::Invalid), Some(2));
+    assert_eq!(med(RovState::NotFound), Some(3));
+    // `disabled` is told apart where asked for first...
+    assert_eq!(med(RovState::Disabled), Some(4));
+    // ...and otherwise reads as NotFound (RFC 6811 §2).
+    let s = set("policy Q {
+        term n { match rpki not-found; action accept; }
+        term rest { action reject; }
+    }");
+    for rov in RovState::ALL {
+        let mut r = route("203.0.113.0/24", &a);
+        r.rov = rov;
+        let accepted = matches!(rov, RovState::NotFound | RovState::Disabled);
+        assert_eq!(
+            s.evaluate("Q", &r),
+            if accepted {
+                Verdict::Accept
+            } else {
+                Verdict::Reject
+            },
+            "{rov}"
         );
     }
+}
+
+#[test]
+fn set_rpki_is_seen_by_later_terms_and_returned() {
+    let s = set("policy P {
+        term allow { match prefix 198.51.100.0/24; match rpki invalid; set rpki valid; action next; }
+        term mark { match community 65000:666; set rpki invalid; action next; }
+        term v { match rpki valid; set local-pref 200; action accept; }
+        term i { match rpki invalid; action reject; }
+        term rest { action accept; }
+    }");
+    let a = attrs(&[65_001]);
+    let run = |prefix: &str, a: &PathAttrs, rov: RovState| {
+        let mut r = route(prefix, a);
+        r.rov = rov;
+        s.run("P", &r)
+    };
+    let local_pref = |i: &Imported| match &i.verdict {
+        Verdict::Modified(m) => m.local_pref,
+        _ => None,
+    };
+    // The later term sees the state the earlier one set, and it is
+    // returned with the verdict.
+    let i = run("198.51.100.0/24", &a, RovState::Invalid);
+    assert_eq!((local_pref(&i), i.rov), (Some(200), Some(RovState::Valid)));
+    // Elsewhere the looked-up state stands, and none is returned.
+    let i = run("192.0.2.0/24", &a, RovState::Valid);
+    assert_eq!((local_pref(&i), i.rov), (Some(200), None));
+    assert_eq!(
+        run("192.0.2.0/24", &a, RovState::Invalid),
+        Verdict::Reject.into()
+    );
+    assert_eq!(
+        run("192.0.2.0/24", &a, RovState::NotFound),
+        Verdict::Accept.into()
+    );
+    // A later `set rpki` replaces an earlier one; a rejected route has no
+    // state set.
+    let mut marked = a.clone();
+    marked.communities = vec![Community::new(65_000, 666)].into();
+    assert_eq!(
+        run("198.51.100.0/24", &marked, RovState::Invalid),
+        Verdict::Reject.into()
+    );
+    // Within a term the clauses are tested first, so `set rpki` is seen
+    // by later terms only, and the last one in a term wins.
+    let s = set("policy Q {
+        term t { match rpki valid; set rpki invalid; set rpki not-found; action next; }
+        term u { match rpki valid; action reject; }
+        term rest { action accept; }
+    }");
+    let mut r = route("192.0.2.0/24", &a);
+    r.rov = RovState::Valid;
+    assert_eq!(
+        s.run("Q", &r),
+        Imported {
+            verdict: Verdict::Accept,
+            rov: Some(RovState::NotFound)
+        }
+    );
+}
+
+#[test]
+fn a_term_that_only_sets_the_state_keeps_the_attributes() {
+    let s = set("policy P {
+        term t { set rpki valid; action accept; }
+    }");
+    let a = attrs(&[65_001]);
+    let mut r = route("203.0.113.0/24", &a);
+    r.rov = RovState::Invalid;
+    // No copy of the attributes, so the RIB keeps the received set.
+    assert_eq!(
+        s.run("P", &r),
+        Imported {
+            verdict: Verdict::Accept,
+            rov: Some(RovState::Valid)
+        }
+    );
+    // With an attribute change too, both.
+    let both = set("policy P {
+        term t { set rpki valid; set med 5; action accept; }
+    }");
+    let imported = both.run("P", &r);
+    assert_eq!(imported.rov, Some(RovState::Valid));
+    let Verdict::Modified(modified) = imported.verdict else {
+        panic!("{imported:?}");
+    };
+    assert_eq!(modified.med, Some(5));
+    // `evaluate` is the verdict alone.
+    assert_eq!(both.evaluate("P", &r), Verdict::Modified(modified));
 }
 
 #[test]
@@ -306,7 +420,8 @@ fn engine_applies_each_neighbors_policies() {
         Verdict::Reject
     );
     // The engine is given each route's RFC 6811 validation state, and no
-    // clause matches on it: every state gets the same verdicts.
+    // clause of these policies matches on it: every state gets the same
+    // verdicts.
     for rov in RovState::ALL {
         for prefix in [p, other] {
             assert_eq!(
@@ -322,6 +437,97 @@ fn engine_applies_each_neighbors_policies() {
                 "{rov} {prefix}"
             );
         }
+    }
+}
+
+fn peer_at(addr: &str) -> PeerInfo {
+    PeerInfo {
+        addr: ip(addr),
+        local_addr: ip("10.0.0.254"),
+        remote_as: Asn(65_001),
+        router_id: RouterId::new(1).unwrap(),
+        kind: PeerKind::External,
+        families: vec![V4],
+        receive_families: vec![V4],
+        four_octet_as: true,
+        extended_messages: false,
+        extended_next_hop: Vec::new(),
+        advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
+    }
+}
+
+#[test]
+fn engine_import_matches_the_looked_up_state_and_returns_the_set_one() {
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy IN {
+             term allow { match prefix 198.51.100.0/24; match rpki invalid; set rpki valid; action accept; }
+             term i { match rpki invalid; action reject; }
+             term rest { action accept; }
+         }
+         policy OUT { term t { action accept; } }
+         neighbor 10.0.0.1 { remote-as 65001; import IN; export OUT; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let peer = peer_at("10.0.0.1");
+    let a = attrs(&[65_001]);
+    let p = |s: &str| -> Prefix { s.parse().unwrap() };
+    assert_eq!(
+        engine.import(&peer, V4, p("198.51.100.0/24"), &a, RovState::Invalid),
+        Imported {
+            verdict: Verdict::Accept,
+            rov: Some(RovState::Valid)
+        }
+    );
+    assert_eq!(
+        engine.import(&peer, V4, p("192.0.2.0/24"), &a, RovState::Invalid),
+        Verdict::Reject.into()
+    );
+    for rov in [RovState::Valid, RovState::NotFound, RovState::Disabled] {
+        assert_eq!(
+            engine.import(&peer, V4, p("192.0.2.0/24"), &a, rov),
+            Verdict::Accept.into(),
+            "{rov}"
+        );
+    }
+}
+
+#[test]
+fn export_sees_the_state_it_is_given() {
+    // The RIB passes the state the route is used with; export policy
+    // matches it and returns a verdict alone.
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy IN { term t { action accept; } }
+         policy OUT {
+             term i { match rpki invalid; action reject; }
+             term n { match rpki not-found; set med 7; action accept; }
+             term rest { action accept; }
+         }
+         neighbor 10.0.0.1 { remote-as 65001; import IN; export OUT; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let peer = peer_at("10.0.0.1");
+    let a = attrs(&[65_001]);
+    let p: Prefix = "203.0.113.0/24".parse().unwrap();
+    assert_eq!(
+        engine.export(&peer, V4, p, &a, RovState::Invalid),
+        Verdict::Reject
+    );
+    assert_eq!(
+        engine.export(&peer, V4, p, &a, RovState::Valid),
+        Verdict::Accept
+    );
+    for rov in [RovState::NotFound, RovState::Disabled] {
+        let Verdict::Modified(m) = engine.export(&peer, V4, p, &a, rov) else {
+            panic!("{rov}");
+        };
+        assert_eq!(m.med, Some(7), "{rov}");
     }
 }
 
