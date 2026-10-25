@@ -23,7 +23,8 @@
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
 //! alone is kept), §3 (policy sees
-//! the validation state, see [`Policies`]), §4 (the affected routes are
+//! the validation state and may set the one a route is used with, see
+//! [`Policies`] and [`Imported`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]).
 //!
@@ -82,13 +83,36 @@ pub enum Verdict {
     Reject,
 }
 
+/// What import policy made of a route (RFC 4271 §9.1.1, RFC 6811 §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Imported {
+    /// Whether the route is a candidate, and with which attributes.
+    pub verdict: Verdict,
+    /// The validation state policy set, if it set one (RFC 6811 §3: "the
+    /// ability to match and set the validation state of routes"): the
+    /// route is then used with it in place of the one the lookup gave it,
+    /// which it keeps as its own (RFC 6811 §2: "The validation state of
+    /// the Route MUST be set to reflect the result of the lookup").
+    pub rov: Option<RovState>,
+}
+
+impl From<Verdict> for Imported {
+    /// A verdict that sets no validation state.
+    fn from(verdict: Verdict) -> Imported {
+        Imported { verdict, rov: None }
+    }
+}
+
 /// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
 /// policy, §9.1.3 export policy). `peer` is the peer the route came from
 /// on import and the peer it is going to on export. `rov` is the route's
-/// validation state, which policy must be able to match (RFC 6811 §3).
+/// validation state, which policy must be able to match and set (RFC 6811
+/// §3).
 pub trait Policies: Send {
     /// Decide whether and how a route held in the Adj-RIB-In becomes a
-    /// candidate for the decision process.
+    /// candidate for the decision process, and with which validation
+    /// state it is used. `rov` is the state the lookup gave the route
+    /// (RFC 6811 §2).
     fn import(
         &self,
         peer: &PeerInfo,
@@ -96,10 +120,12 @@ pub trait Policies: Send {
         prefix: Prefix,
         attrs: &PathAttrs,
         rov: RovState,
-    ) -> Verdict;
+    ) -> Imported;
 
     /// Decide whether and how a Loc-RIB route is advertised to `peer`,
-    /// before the RFC 4271 §5.1 rewriting for the session.
+    /// before the RFC 4271 §5.1 rewriting for the session. `rov` is the
+    /// state the route is used with: the one import policy set, else the
+    /// one the lookup gave it.
     fn export(
         &self,
         peer: &PeerInfo,
@@ -122,8 +148,8 @@ impl Policies for AcceptAll {
         _: Prefix,
         _: &PathAttrs,
         _: RovState,
-    ) -> Verdict {
-        Verdict::Accept
+    ) -> Imported {
+        Verdict::Accept.into()
     }
 
     fn export(
@@ -227,10 +253,22 @@ pub struct RouteRef<'a> {
     pub peer: IpAddr,
     /// Its attributes.
     pub attrs: &'a Arc<PathAttrs>,
-    /// Its RFC 6811 §2 validation state.
+    /// Its RFC 6811 §2 validation state: what the lookup gave it.
     pub rov: RovState,
+    /// The validation state import policy set, if it set one (RFC 6811
+    /// §3), which the route is used with in place of `rov`.
+    pub rov_set: Option<RovState>,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
+}
+
+impl RouteRef<'_> {
+    /// The validation state the route is used with: the one import policy
+    /// set, else the one the lookup gave it. Export policy sees this one.
+    #[must_use]
+    pub fn effective_rov(&self) -> RovState {
+        self.rov_set.unwrap_or(self.rov)
+    }
 }
 
 struct PeerState {
@@ -1243,6 +1281,7 @@ impl Sessions {
             peer: self.peer(r.peer).neighbor.addr,
             attrs: &r.attrs,
             rov: r.rov,
+            rov_set: r.rov_set,
             aspa: r.aspa,
         }
     }
@@ -1373,7 +1412,9 @@ impl Sessions {
             return None;
         }
         let policies = policies.unwrap_or(&*self.cx.policies);
-        match policies.export(to, family, prefix, &best.attrs, best.rov) {
+        // RFC 6811 §3: the state policy set is the one the route is used
+        // with, here too.
+        match policies.export(to, family, prefix, &best.attrs, best.effective_rov()) {
             Verdict::Reject => None,
             Verdict::Accept => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
@@ -1884,8 +1925,12 @@ fn merge_all(dirty: &mut [Dirty], order: &mut Vec<u32>) {
 
 /// What import policy makes of a route (see [`judge`]).
 enum Judged {
-    /// A candidate for Phase 2, with these attributes.
-    Accepted(Arc<PathAttrs>),
+    /// A candidate for Phase 2, with these attributes, used with the
+    /// validation state policy set, if it set one.
+    Accepted {
+        attrs: Arc<PathAttrs>,
+        rov_set: Option<RovState>,
+    },
     /// Rejected with the route's validation state, accepted with another:
     /// held in the Adj-RIB-In, and no candidate.
     Held,
@@ -1904,9 +1949,9 @@ impl Judged {
         rov: RovState,
         aspa: AspaState,
     ) -> Option<Route> {
-        let (attrs, held) = match self {
-            Judged::Accepted(a) => (a, false),
-            Judged::Held => (Arc::clone(received), true),
+        let (attrs, rov_set, held) = match self {
+            Judged::Accepted { attrs, rov_set } => (attrs, rov_set, false),
+            Judged::Held => (Arc::clone(received), None, true),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -1915,6 +1960,7 @@ impl Judged {
             received,
             peer,
             rov,
+            rov_set,
             aspa,
             held,
         })
@@ -1923,7 +1969,8 @@ impl Judged {
 
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
 /// sent for `prefix` of `family`, with `attrs` as received and validation
-/// state `rov`, is a candidate for Phase 2, and with which attributes.
+/// state `rov`, is a candidate for Phase 2, with which attributes, and,
+/// RFC 6811 §3, with which validation state it is used.
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -1946,13 +1993,23 @@ fn judge(
     attrs: &Arc<PathAttrs>,
     rov: RovState,
 ) -> Judged {
-    match policies.import(info, family, prefix, attrs, rov) {
-        Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+    let Imported {
+        verdict,
+        rov: rov_set,
+    } = policies.import(info, family, prefix, attrs, rov);
+    match verdict {
+        Verdict::Accept => Judged::Accepted {
+            attrs: Arc::clone(attrs),
+            rov_set,
+        },
+        Verdict::Modified(a) => Judged::Accepted {
+            attrs: interner.intern(a),
+            rov_set,
+        },
         Verdict::Reject => {
             let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
                 !matches!(
-                    policies.import(info, family, prefix, attrs, s),
+                    policies.import(info, family, prefix, attrs, s).verdict,
                     Verdict::Reject
                 )
             });

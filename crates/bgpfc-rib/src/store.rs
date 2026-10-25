@@ -41,8 +41,10 @@ pub(crate) struct Route {
     /// The peer it came from.
     pub(crate) peer: PeerId,
     /// Its RFC 6811 §2 validation state, judged on the route as received.
-    /// Phase 2 does not use it; policy does.
     pub(crate) rov: RovState,
+    /// The validation state import policy set, if it set one (RFC 6811
+    /// §3): the one the route is used with, in place of `rov`.
+    pub(crate) rov_set: Option<RovState>,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub(crate) aspa: AspaState,
     /// Import policy rejected the route for its validation state alone:
@@ -57,10 +59,16 @@ impl Route {
         self.peer == other.peer && Arc::ptr_eq(&self.attrs, &other.attrs)
     }
 
-    /// Whether `other` has the same validation verdicts, which export
-    /// policy may look at.
+    /// Whether `other` has the same validation verdicts, and is used with
+    /// the same state, which export policy may look at.
     pub(crate) fn same_state(&self, other: &Route) -> bool {
-        self.rov == other.rov && self.aspa == other.aspa
+        self.rov == other.rov && self.rov_set == other.rov_set && self.aspa == other.aspa
+    }
+
+    /// The validation state the route is used with: the one import policy
+    /// set, else the one the lookup gave it.
+    pub(crate) fn effective_rov(&self) -> RovState {
+        self.rov_set.unwrap_or(self.rov)
     }
 
     /// The attributes as the peer sent them.
@@ -388,6 +396,7 @@ mod tests {
             received: None,
             peer: PeerId(peer),
             rov: RovState::Disabled,
+            rov_set: None,
             aspa: AspaState::Disabled,
             held: false,
         }
@@ -407,9 +416,9 @@ mod tests {
     #[test]
     fn layout_stays_small() {
         // A full table holds one of these per destination and per route:
-        // a route's validation state and the attributes it was received
-        // with fit beside the inline one, as the slice of several routes
-        // leaves room for the variant.
+        // a route's validation states (looked up and set by policy) and
+        // the attributes it was received with fit beside the inline one,
+        // as the slice of several routes leaves room for the variant.
         assert_eq!(size_of::<Route>(), 24);
         assert_eq!(size_of::<Destination>(), 24);
     }
@@ -459,6 +468,14 @@ mod tests {
             ..a.clone()
         };
         assert!(a.same(&valid) && !a.same_state(&valid));
+        // So is one policy set another state for.
+        let set = Route {
+            rov_set: Some(RovState::Valid),
+            ..a.clone()
+        };
+        assert!(a.same(&set) && !a.same_state(&set));
+        assert_eq!(set.effective_rov(), RovState::Valid);
+        assert_eq!(a.effective_rov(), RovState::Disabled);
         assert!(Arc::ptr_eq(a.received(), &a.attrs));
     }
 

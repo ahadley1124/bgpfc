@@ -254,7 +254,7 @@ fn engine_applies_each_neighbors_policies() {
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
-    let Verdict::Modified(m) = engine.import(&peer, V4, p, &a, RovState::Disabled) else {
+    let Verdict::Modified(m) = engine.import(&peer, V4, p, &a, RovState::Disabled).verdict else {
         panic!("import should set local-pref");
     };
     assert_eq!(m.local_pref, Some(50));
@@ -271,7 +271,9 @@ fn engine_applies_each_neighbors_policies() {
     let mut stranger = peer.clone();
     stranger.addr = ip("10.0.0.2");
     assert_eq!(
-        engine.import(&stranger, V4, p, &a, RovState::Disabled),
+        engine
+            .import(&stranger, V4, p, &a, RovState::Disabled)
+            .verdict,
         Verdict::Reject
     );
     assert_eq!(
@@ -283,8 +285,10 @@ fn engine_applies_each_neighbors_policies() {
     for rov in RovState::ALL {
         for prefix in [p, other] {
             assert_eq!(
-                engine.import(&peer, V4, prefix, &a, rov),
-                engine.import(&peer, V4, prefix, &a, RovState::Disabled),
+                engine.import(&peer, V4, prefix, &a, rov).verdict,
+                engine
+                    .import(&peer, V4, prefix, &a, RovState::Disabled)
+                    .verdict,
                 "{rov} {prefix}"
             );
             assert_eq!(
@@ -378,19 +382,33 @@ fn engine_keeps_each_neighbors_policies_apart() {
     // neighbor's own policy every time.
     for _ in 0..2 {
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
+            local_pref(
+                engine
+                    .import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)
+                    .verdict
+            ),
             Some(50)
         );
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
+            local_pref(
+                engine
+                    .import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)
+                    .verdict
+            ),
             Some(50)
         );
         assert_eq!(
-            engine.import(&peer("10.0.0.9"), V4, p, &a, RovState::Disabled),
+            engine
+                .import(&peer("10.0.0.9"), V4, p, &a, RovState::Disabled)
+                .verdict,
             Verdict::Reject
         );
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled)),
+            local_pref(
+                engine
+                    .import(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled)
+                    .verdict
+            ),
             Some(200)
         );
         assert_eq!(

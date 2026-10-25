@@ -293,9 +293,9 @@ impl Pass<'_> {
                 &received,
                 rov,
             );
-            let (attrs, held) = match judged {
-                Judged::Accepted(attrs) => (attrs, false),
-                Judged::Held => (Arc::clone(&received), true),
+            let (attrs, rov_set, held) = match judged {
+                Judged::Accepted { attrs, rov_set } => (attrs, rov_set, false),
+                Judged::Held => (Arc::clone(&received), None, true),
                 // Policy accepted the route with some state when it was
                 // last judged, so only a change of policy since, before
                 // the ROUTE-REFRESH that follows one, can leave none.
@@ -303,13 +303,14 @@ impl Pass<'_> {
                     let n = peer.adj_in_count.or_default(self.family);
                     *n = n.saturating_sub(1);
                     dropped.push(route.peer);
-                    (Arc::clone(&received), true)
+                    (Arc::clone(&received), None, true)
                 }
             };
             let replaced = std::mem::replace(&mut route.attrs, attrs);
             let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
             self.scratch.released.push(replaced);
             route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
+            route.rov_set = rov_set;
             route.held = held;
             // A candidate with a new state or new attributes, or one that
             // came or went.

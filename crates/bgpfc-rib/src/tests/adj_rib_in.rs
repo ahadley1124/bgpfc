@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::{AcceptAll, Policies, Verdict};
+use crate::{AcceptAll, Imported, Policies, Verdict};
 
 /// Import policy that rejects one prefix and gives every other route a
 /// `LOCAL_PREF` of 200.
@@ -21,13 +21,13 @@ impl Policies for RejectOneRaiseRest {
         p: Prefix,
         a: &PathAttrs,
         _: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         if p == self.0 {
-            return Verdict::Reject;
+            return Verdict::Reject.into();
         }
         let mut a = a.clone();
         a.local_pref = Some(200);
-        Verdict::Modified(a)
+        Verdict::Modified(a).into()
     }
     fn export(
         &self,
@@ -61,12 +61,12 @@ impl Policies for RejectUnvalidated {
         p: Prefix,
         _: &PathAttrs,
         rov: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         self.1.lock().unwrap().push((p, rov));
         if self.0.contains(&p) && rov == RovState::Disabled {
-            Verdict::Reject
+            Verdict::Reject.into()
         } else {
-            Verdict::Accept
+            Verdict::Accept.into()
         }
     }
     fn export(

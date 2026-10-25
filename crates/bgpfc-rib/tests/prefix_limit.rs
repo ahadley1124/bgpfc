@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
+use bgpfc_rib::{Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::prefix::Prefix;
@@ -84,12 +84,12 @@ impl Policies for RejectSome {
         p: Prefix,
         _: &PathAttrs,
         rov: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         let named = |by: fn(u8) -> bool| (0..12).any(|i| by(i) && prefix(i) == p);
         if named(rejected) || (named(unvalidated) && rov == RovState::Disabled) {
-            Verdict::Reject
+            Verdict::Reject.into()
         } else {
-            Verdict::Accept
+            Verdict::Accept.into()
         }
     }
 

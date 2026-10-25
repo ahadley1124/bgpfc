@@ -1463,7 +1463,7 @@ fn interner_shares_and_sweeps() {
 
 #[test]
 fn reexport_sends_only_the_difference() {
-    use crate::{Policies, Verdict};
+    use crate::{Imported, Policies, Verdict};
     struct DropOdd;
     impl Policies for DropOdd {
         fn import(
@@ -1473,8 +1473,8 @@ fn reexport_sends_only_the_difference() {
             _: Prefix,
             _: &PathAttrs,
             _: RovState,
-        ) -> Verdict {
-            Verdict::Accept
+        ) -> Imported {
+            Verdict::Accept.into()
         }
         fn export(
             &self,
@@ -1566,11 +1566,11 @@ impl crate::Policies for RejectOne {
         p: Prefix,
         _: &PathAttrs,
         _: RovState,
-    ) -> crate::Verdict {
+    ) -> crate::Imported {
         if p == self.0 {
-            crate::Verdict::Reject
+            crate::Verdict::Reject.into()
         } else {
-            crate::Verdict::Accept
+            crate::Verdict::Accept.into()
         }
     }
     fn export(
@@ -2077,7 +2077,7 @@ fn mrai_zero_sends_every_change_at_once() {
 
 #[test]
 fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
-    use crate::{Policies, Verdict};
+    use crate::{Imported, Policies, Verdict};
     /// Exports everything with a community.
     struct Tag;
     impl Policies for Tag {
@@ -2088,8 +2088,8 @@ fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
             _: Prefix,
             _: &PathAttrs,
             _: RovState,
-        ) -> Verdict {
-            Verdict::Accept
+        ) -> Imported {
+            Verdict::Accept.into()
         }
         fn export(
             &self,

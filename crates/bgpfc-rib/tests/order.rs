@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
+use bgpfc_rib::{Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -203,15 +203,15 @@ impl Policies for ByState {
         _: Prefix,
         a: &PathAttrs,
         rov: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         match rov {
-            RovState::Invalid => Verdict::Reject,
+            RovState::Invalid => Verdict::Reject.into(),
             RovState::Valid => {
                 let mut a = a.clone();
                 a.local_pref = Some(300);
-                Verdict::Modified(a)
+                Verdict::Modified(a).into()
             }
-            RovState::NotFound | RovState::Disabled => Verdict::Accept,
+            RovState::NotFound | RovState::Disabled => Verdict::Accept.into(),
         }
     }
 

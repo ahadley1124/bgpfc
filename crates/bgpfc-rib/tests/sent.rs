@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_rib::attrs::announced;
 use bgpfc_rib::export::rewrite;
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
+use bgpfc_rib::{Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -72,8 +72,8 @@ impl Policies for Picky {
         _: Prefix,
         _: &PathAttrs,
         _: RovState,
-    ) -> Verdict {
-        Verdict::Accept
+    ) -> Imported {
+        Verdict::Accept.into()
     }
 
     fn export(
