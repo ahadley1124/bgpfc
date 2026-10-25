@@ -10,9 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, Instant};
 
+use bgpfc_rib::attrs::announced;
 use bgpfc_rib::export::rewrite;
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, Verdict};
+use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -42,8 +44,14 @@ fn peers() -> Vec<PeerInfo> {
                 PeerKind::Internal
             },
             families: vec![V4],
+            receive_families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
+            extended_next_hop: Vec::new(),
+            // Pacing off: the property is about what is sent, which pacing
+            // only delays; tests/pacing.rs is about when.
+            advertisement_interval: Duration::ZERO,
+            prefix_limits: Vec::new(),
         })
         .collect()
 }
@@ -57,11 +65,25 @@ fn prefix(i: u8) -> Prefix {
 struct Picky(bool);
 
 impl Policies for Picky {
-    fn import(&self, _: &PeerInfo, _: AddressFamily, _: Prefix, _: &PathAttrs) -> Verdict {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         Verdict::Accept
     }
 
-    fn export(&self, peer: &PeerInfo, _: AddressFamily, p: Prefix, attrs: &PathAttrs) -> Verdict {
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        attrs: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
         let octet = match p.addr() {
             IpAddr::V4(a) => a.octets()[2],
             IpAddr::V6(_) => 0,
@@ -137,6 +159,7 @@ fn update(info: &PeerInfo, prefix: Prefix, path: &[u16], med: Option<u32>) -> De
         },
         treated_as_withdraw: None,
         discarded: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 
@@ -151,14 +174,17 @@ fn deliver(out: Vec<Output>, infos: &[PeerInfo], views: &mut [BTreeMap<Prefix, P
             four_octet_as: true,
             peer: infos[i].kind,
             allow_as_set: false,
+            extended_next_hop: false,
         };
         for m in messages {
             let d = UpdateMessage::decode(&m[HEADER_LEN..], &ctx).unwrap();
             for (_, p) in d.withdrawals() {
                 views[i].remove(&p);
             }
-            for (family, p) in d.announcements() {
-                views[i].insert(p, PathAttrs::from_update(&d.message, family).unwrap());
+            for (_, next_hop, prefixes) in announced(&d) {
+                for &p in prefixes {
+                    views[i].insert(p, PathAttrs::from_update(&d.message, next_hop));
+                }
             }
         }
     }
@@ -172,11 +198,12 @@ proptest! {
         steps in proptest::collection::vec(step(), 0..24),
     ) {
         let infos = peers();
+        let now = Instant::now();
         let mut rib = Rib::with_policies(LOCAL_AS, Box::new(Picky(false)));
         let mut views = vec![BTreeMap::new(); infos.len()];
         for (i, info) in infos.iter().enumerate() {
             let mut out = Vec::new();
-            rib.peer_up(info.clone(), &mut out);
+            rib.peer_up(info.clone(), now, &mut out);
             views[i].clear();
             deliver(out, &infos, &mut views);
         }
@@ -186,7 +213,7 @@ proptest! {
             match s {
                 Step::Announce { peer, prefix: n, path, med } => {
                     let info = &infos[usize::from(*peer)];
-                    rib.update(info.addr, &update(info, prefix(*n), path, *med), &mut out);
+                    rib.update(info.addr, &update(info, prefix(*n), path, *med), now, &mut out);
                 }
                 Step::Withdraw { peer, prefix: n } => {
                     let u = DecodedUpdate {
@@ -196,21 +223,22 @@ proptest! {
                         },
                         treated_as_withdraw: None,
                         discarded: Vec::new(),
+                        disabled: Vec::new(),
                     };
-                    rib.update(infos[usize::from(*peer)].addr, &u, &mut out);
+                    rib.update(infos[usize::from(*peer)].addr, &u, now, &mut out);
                 }
                 Step::Reset { peer } => {
                     // The session goes down and comes back: the peer
                     // starts from nothing and is sent the table again.
                     let i = usize::from(*peer);
-                    rib.peer_down(infos[i].addr, &mut out);
+                    rib.peer_down(infos[i].addr, now, &mut out);
                     views[i].clear();
                     deliver(std::mem::take(&mut out), &infos, &mut views);
                     views[i].clear();
-                    rib.peer_up(infos[i].clone(), &mut out);
+                    rib.peer_up(infos[i].clone(), now, &mut out);
                 }
                 Step::Policy(which) => {
-                    rib.set_policies(Box::new(Picky(*which)), &everyone, &mut out);
+                    rib.set_policies(Box::new(Picky(*which)), &everyone, now, &mut out);
                 }
             }
             deliver(out, &infos, &mut views);
@@ -218,7 +246,6 @@ proptest! {
         for (i, info) in infos.iter().enumerate() {
             let expected: BTreeMap<Prefix, PathAttrs> = rib
                 .adj_rib_out(info.addr, V4)
-                .into_iter()
                 .map(|(p, a)| (p, rewrite(LOCAL_AS, V4, &a, info)))
                 .collect();
             prop_assert_eq!(&views[i], &expected, "peer {}", info.addr);

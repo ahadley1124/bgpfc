@@ -4,7 +4,8 @@
 //! threads, one thread per neighbour driving its FSM, the RIB thread, the
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
-//! and reload requests.
+//! and reload requests. Since step 12 the coordinator also runs the RTR
+//! client of the `rpki` block, which feeds the RIB thread.
 #![forbid(unsafe_code)]
 
 mod args;
@@ -18,6 +19,7 @@ mod privileges;
 mod profiling;
 mod reader;
 mod rib;
+mod rpki;
 mod wiring;
 
 use std::collections::HashMap;
@@ -78,8 +80,15 @@ fn main() {
         config = opts.config.display(),
         local_as = config.local_as,
         router_id = config.router_id,
-        fib_mode = config.fib.mode
+        fib_mode = config.fib.mode,
+        rpki = config.rpki.mode
     );
+    // Issue #60: a cache that cannot be found stops the start, before
+    // anything is opened, rather than leaving every route unvalidated.
+    if let Err(e) = rpki::resolve(&config.rpki) {
+        bgpfc_log::error!("cannot start", error = e);
+        std::process::exit(1);
+    }
     run(&opts, config, engine);
 }
 
@@ -169,13 +178,21 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         privileges::drop(user, opts.group.as_deref());
     }
 
+    // No validation source yet (issue #56): every route is `disabled`
+    // until the RTR client sends its first full set.
+    let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
+    // RFC 4271 §10: the advertisement intervals are jittered too.
+    rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
     rib::spawn(
-        config.local_as,
-        Box::new(engine),
+        rib,
+        wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
     );
+    // Before the peers, so that the VRPs often arrive before the routes
+    // and most routes are validated once, on arrival.
+    let rpki = start_rpki(&config, &rib_tx);
     for peer in peers {
         peer.start();
     }
@@ -187,6 +204,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         table,
         rib_tx,
         fib_tx,
+        rpki,
     };
     while let Ok(msg) = coord_rx.recv() {
         match msg {
@@ -199,6 +217,9 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
                 coord.shutdown();
                 return;
             }
+            CoordMsg::Rpki(reply) => {
+                let _ = reply.send(coord.rpki_report());
+            }
             CoordMsg::Reload(reply) => {
                 let r = coord.reload();
                 match &r {
@@ -209,6 +230,18 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
                 }
                 let _ = reply.send(r);
             }
+        }
+    }
+}
+
+/// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
+/// client cannot be started.
+fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpki::Rpki {
+    match rpki::Rpki::start(&config.rpki, config.router_id, rib_tx.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            bgpfc_log::error!("cannot start the rtr client", error = e);
+            std::process::exit(1);
         }
     }
 }
@@ -291,6 +324,8 @@ struct Coordinator<'a> {
     table: PeerTable,
     rib_tx: SyncSender<RibMsg>,
     fib_tx: SyncSender<FibMsg>,
+    /// The `rpki` block at work: the RTR client, if one runs.
+    rpki: rpki::Rpki,
 }
 
 impl Coordinator<'_> {
@@ -306,6 +341,11 @@ impl Coordinator<'_> {
     fn reload(&mut self) -> Result<String, String> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
+        // Issue #60: a new cache that cannot be found fails the reload
+        // before anything changes, as it fails the start.
+        if diff.global.contains(&GlobalChange::Rpki) {
+            rpki::resolve(&new.rpki)?;
+        }
         let mut notes = Vec::new();
         for g in &diff.global {
             match g {
@@ -314,6 +354,10 @@ impl Coordinator<'_> {
                 }
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
+                }
+                GlobalChange::Rpki => {
+                    let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
+                    notes.push(done.map_or_else(|e| e, str::to_owned));
                 }
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
                 GlobalChange::Fib => {
@@ -352,6 +396,17 @@ impl Coordinator<'_> {
             policies: messages::NewPolicies(Box::new(engine)),
             reexport: diff.policy_changed.clone(),
         });
+        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
+        // file without a reset. Sent before new peers start, so their
+        // sessions come up with the new values.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(&new)));
+        // RFC 4271 §6.7: so do the prefix limits; a session already over a
+        // lowered limit ends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -370,11 +425,13 @@ impl Coordinator<'_> {
             p.start();
         }
         let summary = format!(
-            "added {} removed {} reset {} policy {} unchanged {}{}",
+            "added {} removed {} reset {} policy {} interval {} limit {} unchanged {}{}",
             diff.added.len(),
             diff.removed.len(),
             diff.reset.len(),
             diff.policy_changed.len(),
+            diff.interval_changed.len(),
+            diff.prefix_limit_changed.len(),
             diff.unchanged.len(),
             if notes.is_empty() {
                 String::new()
@@ -386,9 +443,18 @@ impl Coordinator<'_> {
         Ok(summary)
     }
 
+    /// The running `rpki` block and its client's status.
+    fn rpki_report(&self) -> messages::RpkiReport {
+        messages::RpkiReport {
+            config: self.config.rpki.clone(),
+            status: self.rpki.status(),
+        }
+    }
+
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown) and remove our routes from the kernel.
-    fn shutdown(&self) {
+    /// Shutdown), remove our routes from the kernel, then stop the RTR
+    /// client.
+    fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
                 let _ = handle
@@ -405,6 +471,9 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
+        // Last: neither the Ceases nor the FIB cleanup need it, and it may
+        // first have to hand the RIB thread a change (see `rpki`).
+        self.rpki.stop();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));
         bgpfc_log::info!("bgpfcd stopped");

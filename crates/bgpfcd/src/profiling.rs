@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_prof::Line;
@@ -34,6 +34,7 @@ use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::DecodedUpdate;
 
 use crate::messages::RibMsg;
+use crate::rib::Closed;
 
 /// How long a table load may go without an UPDATE before it is taken as
 /// finished, when the peer sends no End-of-RIB.
@@ -145,6 +146,7 @@ pub(crate) fn end_of_rib(u: &DecodedUpdate) -> Option<AddressFamily> {
         || !m.attributes.is_empty()
         || m.mp_reach.is_some()
         || u.treated_as_withdraw.is_some()
+        || !u.disabled.is_empty()
     {
         return None;
     }
@@ -214,15 +216,28 @@ impl Loads {
         }
     }
 
-    /// The next message, waking up now and then to end idle table loads;
-    /// `None` when every sender is gone.
-    pub(crate) fn recv(&mut self, rx: &Receiver<RibMsg>, rib: &Rib) -> Option<RibMsg> {
+    /// The next message (`Some`), or `None` once `deadline`, when there
+    /// is one, passes first (`crate::rib::next`), waking up now and then
+    /// to end idle table loads.
+    ///
+    /// # Errors
+    /// When every sender is gone.
+    pub(crate) fn recv(
+        &mut self,
+        rx: &Receiver<RibMsg>,
+        rib: &Rib,
+        deadline: Option<Instant>,
+    ) -> Result<Option<RibMsg>, Closed> {
         loop {
-            match rx.recv_timeout(TICK) {
-                Ok(m) => return Some(m),
-                Err(RecvTimeoutError::Timeout) => self.check_idle(rib),
-                Err(RecvTimeoutError::Disconnected) => return None,
+            let tick = Instant::now() + TICK;
+            let wake = deadline.map_or(tick, |d| d.min(tick));
+            if let Some(m) = crate::rib::next(rx, Some(wake))? {
+                return Ok(Some(m));
             }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(None);
+            }
+            self.check_idle(rib);
         }
     }
 
@@ -396,6 +411,8 @@ fn duplication(peer: IpAddr, rib: &Rib) -> Line {
         .field("as_path_bytes_if_interned", d.as_path_bytes_if_interned)
         .field("candidate_bytes", d.candidate_bytes)
         .field("adj_rib_out", d.adj_rib_out)
+        .field("pre_policy", d.pre_policy)
+        .field("pacing_bytes", d.pacing_bytes)
         .field("walk_ms", started.elapsed().as_millis());
     l
 }
@@ -452,8 +469,7 @@ mod tests {
     fn decoded(message: UpdateMessage) -> DecodedUpdate {
         DecodedUpdate {
             message,
-            treated_as_withdraw: None,
-            discarded: Vec::new(),
+            ..DecodedUpdate::default()
         }
     }
 
@@ -491,7 +507,15 @@ mod tests {
         let rib = Rib::new(bgpfc_wire::types::Asn(65_000));
         let text = duplication("192.0.2.1".parse().unwrap(), &rib).to_string();
         assert!(text.starts_with("event=duplication "), "{text}");
-        for key in ["routes", "attr_sets", "as_paths", "interned", "walk_ms"] {
+        for key in [
+            "routes",
+            "attr_sets",
+            "as_paths",
+            "interned",
+            "pre_policy",
+            "pacing_bytes",
+            "walk_ms",
+        ] {
             assert_eq!(bgpfc_prof::report::get_u64(&text, key), Some(0), "{key}");
         }
     }

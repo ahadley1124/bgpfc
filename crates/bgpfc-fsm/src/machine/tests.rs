@@ -3,11 +3,11 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::Capability;
+use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, UpdateSubcode};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId};
 
 use super::*;
 use crate::{Damping, PeerKind};
@@ -46,6 +46,11 @@ fn peer_open() -> OpenMessage {
     )
 }
 
+/// The Cease of a plain operator stop (RFC 4486 §4).
+fn shutdown() -> NotificationMessage {
+    NotificationMessage::cease(CeaseSubcode::AdministrativeShutdown)
+}
+
 fn cease() -> NotificationMessage {
     NotificationMessage::cease(CeaseSubcode::OtherConfigurationChange)
 }
@@ -67,9 +72,10 @@ fn update_err() -> DecodeError {
 fn every_event() -> Vec<(u8, Event)> {
     vec![
         (1, Event::ManualStart),
-        (2, Event::ManualStop),
+        (2, Event::ManualStop(shutdown())),
         (3, Event::AutomaticStart),
         (4, Event::ManualStartPassive),
+        (5, Event::AutomaticStartPassive),
         (8, Event::AutomaticStop(cease())),
         (9, Event::ConnectRetryTimerExpires),
         (10, Event::HoldTimerExpires),
@@ -109,6 +115,7 @@ fn tags(actions: &[Action]) -> Vec<String> {
             Action::SessionUp(_) => "up".to_owned(),
             Action::SessionDown => "down".to_owned(),
             Action::LogError(_) => "log".to_owned(),
+            Action::RestartLimitReached { failures } => format!("limit {failures}"),
         })
         .collect()
 }
@@ -175,6 +182,7 @@ fn idle_state_table() {
             (2, Idle, &[]),
             (3, Connect, &["connect"]),
             (4, State::Active, &[]),
+            (5, State::Active, &[]),
             (8, Idle, &[]),
             (9, Idle, &[]),
             (10, Idle, &[]),
@@ -211,6 +219,7 @@ fn connect_state_table() {
             (2, Idle, &["drop"]),
             (3, Connect, &[]),
             (4, Connect, &[]),
+            (5, Connect, &[]),
             (8, Idle, &["drop"]),
             (9, Connect, &["drop", "connect"]),
             (10, Idle, &["drop"]),
@@ -250,6 +259,7 @@ fn active_state_table() {
             (2, Idle, &["drop"]),
             (3, Active, &[]),
             (4, Active, &[]),
+            (5, Active, &[]),
             (8, Idle, &["drop"]),
             (9, Active, &[]),
             (10, Idle, &["drop"]),
@@ -286,6 +296,7 @@ fn open_sent_state_table() {
             (2, Idle, &["notif 6/2", "drop"]),
             (3, OpenSent, &[]),
             (4, OpenSent, &[]),
+            (5, OpenSent, &[]),
             (8, Idle, &["notif 6/6", "drop"]),
             (9, Idle, &["notif 5/0", "log", "drop"]),
             (10, Idle, &["notif 4/0", "drop"]),
@@ -323,6 +334,7 @@ fn open_confirm_state_table() {
             (2, Idle, &["notif 6/2", "drop"]),
             (3, OpenConfirm, &[]),
             (4, OpenConfirm, &[]),
+            (5, OpenConfirm, &[]),
             (8, Idle, &["notif 6/6", "drop"]),
             (9, Idle, &["notif 5/0", "log", "drop"]),
             (10, Idle, &["notif 4/0", "drop"]),
@@ -359,6 +371,7 @@ fn established_state_table() {
             (2, Idle, &["notif 6/2", "down", "drop"]),
             (3, Established, &[]),
             (4, Established, &[]),
+            (5, Established, &[]),
             (8, Idle, &["notif 6/6", "down", "drop"]),
             (9, Idle, &["notif 5/0", "log", "down", "drop"]),
             (10, Idle, &["notif 4/0", "down", "drop"]),
@@ -432,8 +445,16 @@ fn open_negotiation() {
     // RFC 8654 §4: only we advertised Extended Message.
     assert!(!s.extended_messages);
     assert!(s.route_refresh);
-    // RFC 4760 §8: only IPv4 unicast on both sides.
+    // RFC 4760 §8: only IPv4 unicast on both sides; we take IPv6 unicast
+    // routes too, since we advertised it.
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+    assert_eq!(
+        s.receive_families,
+        vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
+    );
+    // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
+    assert_eq!(s.extended_next_hop_receive, vec![]);
+    assert_eq!(s.extended_next_hop_send, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
     assert_eq!(
         f.timer(TimerKind::Keepalive).deadline(),
@@ -470,6 +491,180 @@ fn internal_session_and_old_speaker() {
     assert!(!s.route_refresh);
     assert_eq!(s.hold_time, hold(90));
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
+}
+
+#[test]
+fn routes_are_taken_for_every_family_we_advertised() {
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    let session = |ours: &[AddressFamily], theirs: &[AddressFamily]| {
+        let mut cfg = config();
+        cfg.capabilities = ours.iter().map(|f| Capability::Multiprotocol(*f)).collect();
+        let (mut f, now) = fsm_at(State::OpenSent, cfg);
+        let caps = theirs
+            .iter()
+            .map(|f| Capability::Multiprotocol(*f))
+            .collect();
+        f.handle(
+            Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+            now,
+        );
+        let s = f.session().unwrap();
+        (s.families.clone(), s.receive_families.clone())
+    };
+    // RFC 4760 §8: both ways only where both sides advertised the family;
+    // RFC 5492 §3: the peer may send what we advertised.
+    assert_eq!(session(&[v4, v6], &[v4, v6]), (vec![v4, v6], vec![v4, v6]));
+    assert_eq!(session(&[v4, v6], &[v6]), (vec![v6], vec![v4, v6]));
+    assert_eq!(session(&[v6], &[v4, v6]), (vec![v6], vec![v6]));
+    // No Multiprotocol capability means IPv4 unicast alone, on either side.
+    assert_eq!(session(&[], &[]), (vec![v4], vec![v4]));
+    assert_eq!(session(&[v4, v6], &[]), (vec![v4], vec![v4, v6]));
+    assert_eq!(session(&[], &[v4, v6]), (vec![v4], vec![v4]));
+}
+
+fn enh(triples: &[NextHopEncoding]) -> Capability {
+    Capability::ExtendedNextHop(triples.to_vec())
+}
+
+/// RFC 8950 §4 between `config()` with `ours` added and a peer advertising
+/// `theirs`: (families taking an IPv6 next hop from the peer, families
+/// sending one to it, families both ways).
+fn negotiated_enh(
+    ours: Vec<Capability>,
+    theirs: Vec<Capability>,
+) -> (Vec<AddressFamily>, Vec<AddressFamily>, Vec<AddressFamily>) {
+    let mut cfg = config();
+    cfg.capabilities.extend(ours);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    (
+        s.extended_next_hop_receive.clone(),
+        s.extended_next_hop_send.clone(),
+        s.families.clone(),
+    )
+}
+
+#[test]
+fn extended_next_hop_is_taken_once_we_advertise_it_and_sent_once_both_do() {
+    let v4_via_v6 = NextHopEncoding::IPV4_UNICAST_VIA_IPV6;
+    let negotiated = negotiated_enh;
+    let v4 = || vec![AddressFamily::IPV4_UNICAST];
+    let mp = Capability::Multiprotocol;
+    // RFC 8950 §4: both sides list <1, 1, 2>: IPv6 next hops both ways.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (v4(), v4(), v4())
+    );
+    // Only we list it: the peer may send us IPv6 next hops, since our
+    // triple says we take them, but is sent none.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST)]
+        ),
+        (v4(), vec![], v4())
+    );
+    // Only the peer lists it: we did not ask for the extension, so it is
+    // used neither way.
+    assert_eq!(
+        negotiated(
+            vec![],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (vec![], vec![], v4())
+    );
+    // Other triples do not stand in for <1, 1, 2>: VPN-IPv4 (§6.2), an
+    // IPv4 next hop, a SAFI that does not fit one octet.
+    let others = [
+        NextHopEncoding {
+            nlri_safi: 128,
+            ..v4_via_v6
+        },
+        NextHopEncoding {
+            next_hop_afi: Afi::Ipv4,
+            ..v4_via_v6
+        },
+        NextHopEncoding {
+            nlri_safi: 0x0101,
+            ..v4_via_v6
+        },
+    ];
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&others)]
+        ),
+        (v4(), vec![], v4())
+    );
+    assert_eq!(
+        negotiated(
+            vec![enh(&others)],
+            vec![mp(AddressFamily::IPV4_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (vec![], vec![], v4())
+    );
+    // RFC 5492 §4: the triple may come in a second instance.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![
+                mp(AddressFamily::IPV4_UNICAST),
+                enh(&others),
+                enh(&[v4_via_v6])
+            ]
+        ),
+        (v4(), v4(), v4())
+    );
+    // A peer without any Multiprotocol capability speaks IPv4 unicast
+    // implicitly (RFC 4760 §8), so the triple applies.
+    assert_eq!(
+        negotiated(vec![enh(&[v4_via_v6])], vec![enh(&[v4_via_v6])]),
+        (v4(), v4(), v4())
+    );
+}
+
+#[test]
+fn extended_next_hop_follows_the_ipv4_unicast_family() {
+    let v4_via_v6 = NextHopEncoding::IPV4_UNICAST_VIA_IPV6;
+    let negotiated = negotiated_enh;
+    let v4 = || vec![AddressFamily::IPV4_UNICAST];
+    let mp = Capability::Multiprotocol;
+    // RFC 8950 §4: the capability does not make IPv4 unicast usable; only
+    // the Multiprotocol capability does (RFC 4760 §8). We advertised IPv4
+    // unicast, so the peer may still send it to us, with IPv6 next hops.
+    assert_eq!(
+        negotiated(
+            vec![enh(&[v4_via_v6])],
+            vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])]
+        ),
+        (v4(), vec![], vec![AddressFamily::IPV6_UNICAST])
+    );
+    // Nor when we did not advertise IPv4 unicast.
+    let mut cfg = config();
+    cfg.capabilities = vec![mp(AddressFamily::IPV6_UNICAST), enh(&[v4_via_v6])];
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let theirs = vec![
+        mp(AddressFamily::IPV4_UNICAST),
+        mp(AddressFamily::IPV6_UNICAST),
+        enh(&[v4_via_v6]),
+    ];
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(
+        (&s.extended_next_hop_receive, &s.extended_next_hop_send),
+        (&vec![], &vec![])
+    );
 }
 
 #[test]
@@ -664,7 +859,7 @@ fn send_notification_without_open() {
     let (mut f, now) = fsm_at(State::Active, cfg);
     f.handle(Event::TcpConnectionConfirmed, now);
     assert!(f.timer(TimerKind::DelayOpen).is_running());
-    let a = f.handle(Event::ManualStop, now);
+    let a = f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(tags(&a), ["notif 6/2", "drop"]);
 }
 
@@ -701,13 +896,16 @@ fn damping_doubles_the_idle_hold_and_a_session_resets_it() {
     // RFC 4271 §8.2.2 Idle: every start zeroes the counter, so only the
     // last failure is counted.
     assert_eq!(f.connect_retry_counter(), 1);
-    // Establish once: damping resets.
+    assert_eq!(f.damped_failures(), 6);
+    // Establish once and stay up for `forget_after`: damping resets.
     f.handle(Event::IdleHoldTimerExpires, now);
     f.handle(Event::TcpCrAcked, now);
     f.handle(Event::BgpOpen(peer_open()), now);
     f.handle(Event::KeepAliveMsg, now);
     assert_eq!(f.state(), State::Established);
+    now += Damping::default().forget_after;
     f.handle(Event::TcpConnectionFails, now);
+    assert_eq!(f.damped_failures(), 0);
     assert_eq!(
         f.timer(TimerKind::IdleHold).deadline(),
         Some(now + Duration::from_secs(10))
@@ -733,7 +931,7 @@ fn damping_doubles_the_idle_hold_and_a_session_resets_it() {
 #[test]
 fn manual_stop_holds_the_peer_down_until_manual_start() {
     let (mut f, now) = fsm_at(State::Established, config());
-    f.handle(Event::ManualStop, now);
+    f.handle(Event::ManualStop(shutdown()), now);
     assert_eq!(f.state(), State::Idle);
     assert!(f.is_admin_down());
     assert_eq!(f.connect_retry_counter(), 0);
@@ -749,8 +947,47 @@ fn manual_stop_holds_the_peer_down_until_manual_start() {
     f.handle(Event::TcpConnectionFails, now);
     f.handle(Event::NotifMsgVerErr, now);
     assert!(f.timer(TimerKind::IdleHold).is_running());
-    f.handle(Event::ManualStop, now);
+    f.handle(Event::ManualStop(shutdown()), now);
     assert!(!f.timer(TimerKind::IdleHold).is_running());
+}
+
+#[test]
+fn manual_stop_sends_its_cease_and_counts_no_failure() {
+    // RFC 4486 §4: an operator reset is a ManualStop with Administrative
+    // Reset (here with an RFC 9003 communication), then a ManualStart. With
+    // no automatic restart allowed at all, neither step is a damped
+    // failure, so the restart limit has nothing to report.
+    let reset =
+        NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, "maintenance").unwrap();
+    for state in [
+        State::Connect,
+        State::Active,
+        State::OpenSent,
+        State::OpenConfirm,
+        State::Established,
+    ] {
+        let (mut f, now) = fsm_at(state, limited(Some(0)));
+        let a = f.handle(Event::ManualStop(reset.clone()), now);
+        assert!(
+            !a.iter()
+                .any(|x| matches!(x, Action::RestartLimitReached { .. })),
+            "{state}: {a:?}"
+        );
+        let sent = a.iter().find_map(|x| match x {
+            Action::SendNotification(n) => Some(n.clone()),
+            _ => None,
+        });
+        // RFC 4271 §8.2.2: the Cease goes out once an OPEN may have.
+        let expect = matches!(
+            state,
+            State::OpenSent | State::OpenConfirm | State::Established
+        );
+        assert_eq!(sent, expect.then(|| reset.clone()), "{state}");
+        assert_eq!(f.damped_failures(), 0, "{state}");
+        assert!(f.automatic_start_allowed(), "{state}");
+        f.handle(Event::ManualStart, now);
+        assert_eq!(f.state(), State::Connect, "{state}");
+    }
 }
 
 #[test]
@@ -825,4 +1062,307 @@ fn event_numbers_and_timer_events() {
 fn damping_default_values() {
     assert_eq!(Damping::default().initial, Duration::from_secs(10));
     assert_eq!(Damping::default().max, Duration::from_secs(120));
+    assert_eq!(Damping::default().restart_limit, Some(10));
+    assert_eq!(Damping::default().forget_after, Duration::from_secs(300));
+}
+
+/// A configuration whose damping allows `limit` automatic restarts.
+fn limited(limit: Option<u32>) -> Config {
+    let mut cfg = config();
+    cfg.damping = Some(Damping {
+        restart_limit: limit,
+        ..Damping::default()
+    });
+    cfg
+}
+
+/// One step of a scripted run: the event, the seconds since the start at
+/// which it happens, the state after it, the actions it returns, and the
+/// `IdleHoldTimer` it leaves (seconds after the event, or none).
+type Step = (Event, u64, State, &'static [&'static str], Option<u64>);
+
+fn run_steps(mut f: Fsm, start: Instant, steps: &[Step]) -> Fsm {
+    for (i, (event, at, state, expect, idle_hold)) in steps.iter().enumerate() {
+        let now = start + Duration::from_secs(*at);
+        let actions = f.handle(event.clone(), now);
+        assert_eq!(f.state(), *state, "step {i} ({event:?})");
+        assert_eq!(tags(&actions), *expect, "step {i} ({event:?})");
+        assert_eq!(
+            f.timer(TimerKind::IdleHold)
+                .deadline()
+                .map(|d| (d - now).as_secs()),
+            *idle_hold,
+            "step {i} ({event:?}): IdleHoldTimer"
+        );
+    }
+    f
+}
+
+#[test]
+fn restart_limit_leaves_the_peer_idle_until_a_manual_start() {
+    use Event::{
+        AutomaticStart, HoldTimerExpires, IdleHoldTimerExpires, ManualStart,
+        TcpConnectionConfirmed, TcpCrAcked,
+    };
+    use State::{Connect, Idle, OpenSent};
+    // RFC 4486 §4: two automatic restarts, then the third damped failure
+    // in a row leaves the peer Idle until a ManualStart.
+    let start = t0();
+    let f = run_steps(
+        Fsm::new(limited(Some(2))),
+        start,
+        &[
+            (ManualStart, 0, Connect, &["connect"], None),
+            (TcpCrAcked, 1, OpenSent, &["open"], None),
+            (HoldTimerExpires, 2, Idle, &["notif 4/0", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 12, Connect, &["connect"], None),
+            (TcpCrAcked, 13, OpenSent, &["open"], None),
+            (HoldTimerExpires, 14, Idle, &["notif 4/0", "drop"], Some(20)),
+            (IdleHoldTimerExpires, 34, Connect, &["connect"], None),
+            (TcpCrAcked, 35, OpenSent, &["open"], None),
+            (
+                HoldTimerExpires,
+                36,
+                Idle,
+                &["notif 4/0", "drop", "limit 3"],
+                None,
+            ),
+            // AllowAutomaticStart is FALSE: nothing starts the peer, and
+            // Idle keeps refusing connections.
+            (AutomaticStart, 1000, Idle, &[], None),
+            (IdleHoldTimerExpires, 1001, Idle, &[], None),
+            (TcpConnectionConfirmed, 1002, Idle, &[], None),
+        ],
+    );
+    assert!(!f.automatic_start_allowed());
+    assert!(!f.is_admin_down());
+    assert_eq!(f.damped_failures(), 3);
+    assert_eq!(f.next_deadline(), None);
+    // The administrative intervention: a ManualStart starts a new run.
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (ManualStart, 2000, Connect, &["connect"], None),
+            (TcpCrAcked, 2001, OpenSent, &["open"], None),
+            (
+                HoldTimerExpires,
+                2002,
+                Idle,
+                &["notif 4/0", "drop"],
+                Some(10),
+            ),
+        ],
+    );
+    assert!(f.automatic_start_allowed());
+    assert_eq!(f.damped_failures(), 1);
+}
+
+#[test]
+fn restart_limit_counts_short_sessions_and_forgets_stable_ones() {
+    use Event::{AutomaticStop, BgpOpen, IdleHoldTimerExpires, KeepAliveMsg, TcpCrAcked};
+    use State::{Connect, Established, Idle, OpenConfirm, OpenSent};
+    // A peer torn down by a prefix limit right after it sends its table
+    // reaches Established every time; that must not end the run, or the
+    // oscillation would never be damped or bounded (RFC 4486 §4).
+    let stop = || {
+        AutomaticStop(NotificationMessage::max_prefixes_reached(
+            AddressFamily::IPV4_UNICAST,
+            100,
+        ))
+    };
+    let (f, start) = fsm_at(State::Established, limited(Some(2)));
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (stop(), 1, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 11, Connect, &["connect"], None),
+            (TcpCrAcked, 11, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 11, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 11, Established, &["up"], None),
+            (stop(), 12, Idle, &["notif 6/1", "down", "drop"], Some(20)),
+            (IdleHoldTimerExpires, 32, Connect, &["connect"], None),
+            (TcpCrAcked, 32, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 32, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 32, Established, &["up"], None),
+            (
+                stop(),
+                33,
+                Idle,
+                &["notif 6/1", "down", "drop", "limit 3"],
+                None,
+            ),
+        ],
+    );
+    assert!(!f.automatic_start_allowed());
+    // A session that stayed up for `forget_after` ends the run first:
+    // whatever brings it down counts as the first failure of a new one.
+    let (f, start) = fsm_at(State::Established, limited(Some(2)));
+    let f = run_steps(
+        f,
+        start,
+        &[
+            (stop(), 1, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 11, Connect, &["connect"], None),
+            (TcpCrAcked, 11, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 11, OpenConfirm, &["keepalive"], None),
+            (KeepAliveMsg, 11, Established, &["up"], None),
+            (stop(), 311, Idle, &["notif 6/1", "down", "drop"], Some(10)),
+        ],
+    );
+    assert_eq!(f.damped_failures(), 1);
+    assert!(f.automatic_start_allowed());
+}
+
+#[test]
+fn restart_limit_zero_never_restarts_and_none_always_does() {
+    // `Some(0)`: no automatic restart after any damped failure.
+    let (mut f, now) = fsm_at(State::OpenSent, limited(Some(0)));
+    let a = f.handle(Event::HoldTimerExpires, now);
+    assert_eq!(tags(&a), ["notif 4/0", "drop", "limit 1"]);
+    assert!(!f.timer(TimerKind::IdleHold).is_running());
+    // A failure that does not damp is not bounded: a peer that refuses
+    // connections is retried for as long as it takes.
+    let (mut f, mut now) = fsm_at(State::Connect, limited(Some(0)));
+    for _ in 0..20 {
+        let a = f.handle(Event::TcpConnectionFails, now);
+        assert_eq!(tags(&a), ["drop"]);
+        now = f.timer(TimerKind::IdleHold).deadline().unwrap();
+        f.handle(Event::IdleHoldTimerExpires, now);
+        assert_eq!(f.state(), State::Connect);
+    }
+    assert_eq!(f.damped_failures(), 0);
+    // `None`: unbounded, the hold stays at the cap.
+    let (mut f, mut now) = fsm_at(State::OpenSent, limited(None));
+    for _ in 0..50 {
+        let a = f.handle(Event::HoldTimerExpires, now);
+        assert_eq!(tags(&a), ["notif 4/0", "drop"]);
+        now = f.timer(TimerKind::IdleHold).deadline().unwrap();
+        f.handle(Event::IdleHoldTimerExpires, now);
+        f.handle(Event::TcpCrAcked, now);
+    }
+    assert_eq!(f.damped_failures(), 50);
+    assert!(f.automatic_start_allowed());
+    // ManualStop wins over the bound: the peer stays down, no limit action.
+    let (mut f, now) = fsm_at(State::OpenSent, limited(Some(0)));
+    let a = f.handle(Event::ManualStop(shutdown()), now);
+    assert_eq!(tags(&a), ["notif 6/2", "drop"]);
+    assert_eq!(f.damped_failures(), 0);
+}
+
+#[test]
+fn a_collision_neither_counts_nor_ends_a_run_of_damped_failures() {
+    use Event::{
+        AutomaticStartPassive, BgpOpen, HoldTimerExpires, IdleHoldTimerExpires, ManualStart,
+        OpenCollisionDump, TcpConnectionConfirmed, TcpCrAcked,
+    };
+    use State::{Active, Connect, Idle, OpenConfirm, OpenSent};
+    // One automatic restart allowed. A damped failure starts the run; the
+    // restart collides with the peer's own connection, which wins (RFC
+    // 4271 §6.8), and the coordinator goes on with it through event 5.
+    let start = t0();
+    let f = run_steps(
+        Fsm::new(limited(Some(1))),
+        start,
+        &[
+            (ManualStart, 0, Connect, &["connect"], None),
+            (TcpCrAcked, 1, OpenSent, &["open"], None),
+            (HoldTimerExpires, 2, Idle, &["notif 4/0", "drop"], Some(10)),
+            (IdleHoldTimerExpires, 12, Connect, &["connect"], None),
+            (TcpCrAcked, 13, OpenSent, &["open"], None),
+            // The dump is no damped failure: no limit, the hold not
+            // doubled...
+            (
+                OpenCollisionDump,
+                14,
+                Idle,
+                &["notif 6/7", "drop"],
+                Some(20),
+            ),
+            // ... and the restart on the winner is no ManualStart.
+            (AutomaticStartPassive, 14, Active, &[], None),
+            (TcpConnectionConfirmed, 14, OpenSent, &["open"], None),
+            (BgpOpen(peer_open()), 14, OpenConfirm, &["keepalive"], None),
+        ],
+    );
+    assert_eq!(f.damped_failures(), 1);
+    assert!(f.automatic_start_allowed());
+    // So the next damped failure is the second of the run, over the limit.
+    let f = run_steps(
+        f,
+        start,
+        &[(
+            HoldTimerExpires,
+            15,
+            Idle,
+            &["notif 4/0", "drop", "limit 2"],
+            None,
+        )],
+    );
+    assert!(!f.automatic_start_allowed());
+    // Event 5 is automatic: it does not start a peer the limit stopped,
+    // nor one the operator stopped.
+    let mut f = f;
+    assert_eq!(f.handle(AutomaticStartPassive, start), vec![]);
+    assert_eq!(f.state(), Idle);
+    let (mut f, now) = fsm_at(Idle, config());
+    f.handle(Event::ManualStop(shutdown()), now);
+    assert_eq!(f.handle(AutomaticStartPassive, now), vec![]);
+    assert_eq!(f.state(), Idle);
+    // Once Established (CollisionDetectEstablishedState), the same: the
+    // session goes down without damping.
+    let mut cfg = limited(Some(0));
+    cfg.collision_detect_established = true;
+    let (mut f, now) = fsm_at(State::Established, cfg);
+    let a = f.handle(OpenCollisionDump, now);
+    assert_eq!(tags(&a), ["notif 6/7", "down", "drop"]);
+    assert_eq!(f.damped_failures(), 0);
+    assert_eq!(
+        tags(&f.handle(AutomaticStartPassive, now)),
+        Vec::<String>::new()
+    );
+    assert_eq!(f.state(), Active);
+}
+
+#[test]
+fn received_ceases_damp_as_rfc4486_recommends() {
+    // RFC 4486 §4: damp after Administrative Shutdown, Peer De-configured,
+    // Connection Rejected and Out of Resources; RFC 4271 §8.2.2 names no
+    // damping for any other NOTIFICATION received while Established.
+    for subcode in 0..=9u8 {
+        let (mut f, now) = fsm_at(State::Established, config());
+        let n = NotificationMessage {
+            code: bgpfc_wire::error::ErrorCode::Cease,
+            subcode,
+            data: Vec::new(),
+        };
+        let a = f.handle(Event::NotifMsg(n), now);
+        assert_eq!(tags(&a), ["down", "drop"]);
+        let damped = matches!(subcode, 2 | 3 | 5 | 8);
+        assert_eq!(f.damped_failures(), u32::from(damped), "subcode {subcode}");
+        // The first damped failure waits the initial hold; the next one
+        // waits twice as long.
+        assert_eq!(
+            f.timer(TimerKind::IdleHold).deadline(),
+            Some(now + Duration::from_secs(10))
+        );
+        let later = now + Duration::from_secs(10);
+        f.handle(Event::IdleHoldTimerExpires, later);
+        f.handle(Event::TcpCrAcked, later);
+        f.handle(Event::HoldTimerExpires, later);
+        let expected = if damped { 20 } else { 10 };
+        assert_eq!(
+            f.timer(TimerKind::IdleHold).deadline(),
+            Some(later + Duration::from_secs(expected)),
+            "subcode {subcode}"
+        );
+    }
+    // Any other NOTIFICATION while Established does not damp either.
+    let (mut f, now) = fsm_at(State::Established, config());
+    f.handle(
+        Event::NotifMsg(NotificationMessage::hold_timer_expired()),
+        now,
+    );
+    assert_eq!(f.damped_failures(), 0);
 }

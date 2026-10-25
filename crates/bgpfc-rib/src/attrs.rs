@@ -3,8 +3,8 @@
 //!
 //! Implements: RFC 4271 §4.3 (the well-known attributes), §5 (unknown
 //! optional transitive attributes are carried with the Partial bit);
-//! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 1997, 4360,
-//! 8092 (communities).
+//! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 8950 §3 (IPv4
+//! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
@@ -17,7 +17,7 @@ use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Afi};
-use bgpfc_wire::update::UpdateMessage;
+use bgpfc_wire::update::{DecodedUpdate, UpdateMessage};
 
 /// An optional transitive attribute this implementation does not know,
 /// kept for forwarding (RFC 4271 §5).
@@ -74,17 +74,39 @@ fn sort_unique<T: Ord + Copy>(list: &mut Box<[T]>) {
     *list = v.into_boxed_slice();
 }
 
+/// What an UPDATE announces, one entry per part of the message, each with
+/// the next hop that goes with it (RFC 4760 §3): `NEXT_HOP` for the
+/// RFC 4271 NLRI field, the attribute's own for `MP_REACH_NLRI`. IPv4
+/// unicast may come in both at once (RFC 7606 §5.1), and in the latter with
+/// an IPv6 next hop (RFC 8950 §3). Empty when treated as withdraw; the
+/// NLRI field is left out when `NEXT_HOP` is missing, which the decoder
+/// already turned into treat-as-withdraw.
+pub fn announced(
+    update: &DecodedUpdate,
+) -> impl Iterator<Item = (AddressFamily, NextHop, &[Prefix])> {
+    let m = &update.message;
+    let live = update.treated_as_withdraw.is_none();
+    let nlri = m
+        .next_hop()
+        .filter(|_| live && !m.nlri.is_empty())
+        .map(|n| (AddressFamily::IPV4_UNICAST, NextHop::Ipv4(n), &m.nlri[..]));
+    let mp = m
+        .mp_reach
+        .as_ref()
+        .filter(|r| live && !r.nlri.is_empty())
+        .map(|r| (r.family, r.next_hop, &r.nlri[..]));
+    nlri.into_iter().chain(mp)
+}
+
 impl PathAttrs {
-    /// The attributes an UPDATE carries for routes of `family`: the
-    /// `NEXT_HOP` attribute for IPv4 unicast, the `MP_REACH_NLRI` next hop
-    /// otherwise. `None` when the message has no next hop for the family,
-    /// which the decoder rules out for announcing messages.
+    /// The attributes an UPDATE gives the routes it announces with
+    /// `next_hop`, which [`announced`] picks per part of the message.
     #[must_use]
-    pub fn from_update(m: &UpdateMessage, family: AddressFamily) -> Option<PathAttrs> {
+    pub fn from_update(m: &UpdateMessage, next_hop: NextHop) -> PathAttrs {
         let mut attrs = PathAttrs {
             origin: Origin::Incomplete,
             as_path: AsPath::empty(),
-            next_hop: NextHop::Ipv4(std::net::Ipv4Addr::UNSPECIFIED),
+            next_hop,
             med: None,
             local_pref: None,
             atomic_aggregate: false,
@@ -94,13 +116,11 @@ impl PathAttrs {
             large_communities: Box::default(),
             unknown: Box::default(),
         };
-        let mut next_hop = None;
         let mut unknown = Vec::new();
         for a in &m.attributes {
             match a {
                 PathAttribute::Origin(o) => attrs.origin = *o,
                 PathAttribute::AsPath(p) => attrs.as_path = p.clone(),
-                PathAttribute::NextHop(n) => next_hop = Some(NextHop::Ipv4(*n)),
                 PathAttribute::MultiExitDisc(v) => attrs.med = Some(*v),
                 PathAttribute::LocalPref(v) => attrs.local_pref = Some(*v),
                 PathAttribute::AtomicAggregate => attrs.atomic_aggregate = true,
@@ -117,19 +137,17 @@ impl PathAttrs {
                         value: value.clone(),
                     });
                 }
-                // Never in `attributes`; the decoder lifts them out.
-                PathAttribute::MpReach(_) | PathAttribute::MpUnreach(_) => {}
+                // The caller chose the next hop for the part of the message
+                // the routes came in; the MP attributes are never in
+                // `attributes`, the decoder lifts them out.
+                PathAttribute::NextHop(_)
+                | PathAttribute::MpReach(_)
+                | PathAttribute::MpUnreach(_) => {}
             }
         }
-        if let Some(r) = &m.mp_reach
-            && r.family == family
-        {
-            next_hop = Some(r.next_hop);
-        }
-        attrs.next_hop = next_hop?;
         attrs.unknown = unknown.into_boxed_slice();
         attrs.normalise();
-        Some(attrs)
+        attrs
     }
 
     /// Sort and deduplicate the sets so equal attribute sets compare

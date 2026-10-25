@@ -18,7 +18,9 @@ use bgpfc_bench::pack::Packer;
 use bgpfc_bench::stats::summarize;
 use bgpfc_bench::synth::{SynthOpts, generate};
 use bgpfc_bench::table::Table;
+use bgpfc_rib::attrs::announced;
 use bgpfc_rib::decision::{Candidate, Neighbor, best};
+use bgpfc_rib::pacing::default_interval;
 use bgpfc_rib::{Interner, PathAttrs, PeerInfo, Rib};
 use bgpfc_wire::header::HEADER_LEN;
 use bgpfc_wire::prefix::Prefix;
@@ -74,6 +76,7 @@ const CTX: DecodeContext = DecodeContext {
     four_octet_as: true,
     peer: PeerKind::External,
     allow_as_set: false,
+    extended_next_hop: false,
 };
 
 fn peer() -> PeerInfo {
@@ -84,9 +87,20 @@ fn peer() -> PeerInfo {
         router_id: RouterId::from(Ipv4Addr::new(10, 0, 0, 1)),
         kind: PeerKind::External,
         families: vec![AddressFamily::IPV4_UNICAST],
+        receive_families: vec![AddressFamily::IPV4_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
+        // The daemon's default for an external peer (RFC 4271 §10).
+        advertisement_interval: default_interval(PeerKind::External),
+        prefix_limits: Vec::new(),
     }
+}
+
+/// The time the RIB is given: pacing reads none of its own.
+fn now() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
 }
 
 fn table(prefixes: usize, attr_sets: usize) -> Table {
@@ -108,9 +122,9 @@ fn decode_all(messages: &[Vec<u8>]) -> Vec<DecodedUpdate> {
 fn loaded(adds: &[DecodedUpdate]) -> Rib {
     let mut rib = Rib::new(Asn(65_000));
     let mut out = Vec::new();
-    rib.peer_up(peer(), &mut out);
+    rib.peer_up(peer(), now(), &mut out);
     for u in adds {
-        rib.update(peer().addr, u, &mut out);
+        rib.update(peer().addr, u, now(), &mut out);
         out.clear();
     }
     rib
@@ -191,10 +205,10 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
     bench(filter, "rib_insert_per_route_100k", || {
         let mut rib = Rib::new(Asn(65_000));
         let mut out = Vec::new();
-        rib.peer_up(peer(), &mut out);
+        rib.peer_up(peer(), now(), &mut out);
         let t = Instant::now();
         for u in &adds {
-            rib.update(from, u, &mut out);
+            rib.update(from, u, now(), &mut out);
             black_box(&out);
             out.clear();
         }
@@ -205,7 +219,7 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
         let mut out = Vec::new();
         let t = Instant::now();
         for u in &dels {
-            rib.update(from, u, &mut out);
+            rib.update(from, u, now(), &mut out);
             black_box(&out);
             out.clear();
         }
@@ -222,11 +236,11 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
     bench(filter, "rib_insert_two_peers_per_route_100k", || {
         let mut rib = Rib::new(Asn(65_000));
         let mut out = Vec::new();
-        rib.peer_up(peer(), &mut out);
-        rib.peer_up(second(), &mut out);
+        rib.peer_up(peer(), now(), &mut out);
+        rib.peer_up(second(), now(), &mut out);
         let t = Instant::now();
         for u in &adds {
-            rib.update(from, u, &mut out);
+            rib.update(from, u, now(), &mut out);
             black_box(&out);
             out.clear();
         }
@@ -238,7 +252,7 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
         let mut rib = loaded(&adds);
         let mut out = Vec::new();
         let t = Instant::now();
-        rib.peer_up(second(), &mut out);
+        rib.peer_up(second(), now(), &mut out);
         black_box(&out);
         (t.elapsed(), routes)
     });
@@ -246,7 +260,7 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
         let mut rib = loaded(&adds);
         let mut out = Vec::new();
         let t = Instant::now();
-        rib.peer_down(from, &mut out);
+        rib.peer_down(from, now(), &mut out);
         black_box(&out);
         (t.elapsed(), routes)
     });
@@ -257,10 +271,10 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
 /// tells apart (RFC 4271 §9.1.2.2 f), so every step runs; and interning
 /// an attribute set already held, as each UPDATE does once per family.
 fn decision(filter: Option<&str>, update: &DecodedUpdate) {
-    let attrs = Arc::new(
-        PathAttrs::from_update(&update.message, AddressFamily::IPV4_UNICAST)
-            .expect("the synthetic UPDATE has a next hop"),
-    );
+    let (_, next_hop, _) = announced(update)
+        .next()
+        .expect("the synthetic UPDATE announces");
+    let attrs = Arc::new(PathAttrs::from_update(&update.message, next_hop));
     for n in [1u8, 2, 4, 8, 16] {
         let neighbors: Vec<Neighbor> = (1..=n)
             .map(|i| Neighbor {

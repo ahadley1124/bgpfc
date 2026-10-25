@@ -3,7 +3,8 @@
 //!
 //! Implements: route installation with our protocol number in one table
 //! (README, "FIB dry-run"); RFC 8950 §3 next hops (an IPv6 gateway for an
-//! IPv4 route goes in `RTA_VIA`).
+//! IPv4 route goes in `RTA_VIA` as a `struct rtvia`, since `RTA_GATEWAY`
+//! holds an address of the route's own family).
 
 use std::net::IpAddr;
 
@@ -46,6 +47,12 @@ const RTA_VIA: u16 = 18;
 // <bits/socket.h>
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
+
+/// `offsetof(struct rtvia, rtvia_addr)`: `<linux/rtnetlink.h>` declares
+/// `struct rtvia { __kernel_sa_family_t rtvia_family; __u8 rtvia_addr[]; }`,
+/// and `__kernel_sa_family_t` is an `unsigned short` in host byte order
+/// (`<linux/socket.h>`).
+const RTVIA_ADDR_OFFSET: usize = 2;
 
 /// `sizeof(struct rtmsg)`.
 const RTMSG_LEN: usize = 12;
@@ -118,13 +125,11 @@ impl RouteMsg {
         netlink::push_attr(&mut p, RTA_DST, &addr_bytes(self.dst.addr()));
         if let Some(gw) = self.gateway {
             match (self.dst.afi(), gw) {
-                // RFC 8950 §3: an IPv6 next hop for IPv4 NLRI; the kernel
-                // takes it as `struct rtvia { family, addr }`.
-                (Afi::Ipv4, IpAddr::V6(v6)) => {
-                    let mut via = u16::from(AF_INET6).to_ne_bytes().to_vec();
-                    via.extend_from_slice(&v6.octets());
-                    netlink::push_attr(&mut p, RTA_VIA, &via);
-                }
+                // RFC 8950 §3: an IPv6 next hop for IPv4 NLRI. RTA_GATEWAY
+                // only holds an address of the route's family, so the kernel
+                // takes this one as RTA_VIA, as `ip route add ... via inet6`
+                // sends it.
+                (Afi::Ipv4, IpAddr::V6(_)) => netlink::push_attr(&mut p, RTA_VIA, &encode_via(gw)),
                 _ => netlink::push_attr(&mut p, RTA_GATEWAY, &addr_bytes(gw)),
             }
         }
@@ -227,19 +232,7 @@ impl RouteMsg {
             match ty {
                 RTA_DST => dst = parse_addr(afi, value),
                 RTA_GATEWAY => gateway = parse_addr(afi, value),
-                RTA_VIA => {
-                    gateway = match value {
-                        [f0, f1, rest @ ..] => {
-                            let fam = u16::from_ne_bytes([*f0, *f1]);
-                            if fam == u16::from(AF_INET6) {
-                                parse_addr(Afi::Ipv6, rest)
-                            } else {
-                                parse_addr(Afi::Ipv4, rest)
-                            }
-                        }
-                        _ => None,
-                    };
-                }
+                RTA_VIA => gateway = decode_via(value),
                 RTA_OIF => oif = parse_u32(value),
                 RTA_PRIORITY => priority = parse_u32(value),
                 RTA_TABLE => {
@@ -270,6 +263,34 @@ impl RouteMsg {
             kind,
             flags,
         }))
+    }
+}
+
+/// The value of an `RTA_VIA` attribute: a `struct rtvia` holding `gw`
+/// (`<linux/rtnetlink.h>`).
+fn encode_via(gw: IpAddr) -> Vec<u8> {
+    let family = match gw {
+        IpAddr::V4(_) => AF_INET,
+        IpAddr::V6(_) => AF_INET6,
+    };
+    let mut via = u16::from(family).to_ne_bytes().to_vec();
+    via.extend_from_slice(&addr_bytes(gw));
+    via
+}
+
+/// The gateway in an `RTA_VIA` value (`struct rtvia`, `<linux/rtnetlink.h>`),
+/// or `None` for a family other than IPv4 and IPv6 (the kernel also uses
+/// it for MPLS) or an address of the wrong length.
+fn decode_via(value: &[u8]) -> Option<IpAddr> {
+    let family = <[u8; RTVIA_ADDR_OFFSET]>::try_from(value.get(..RTVIA_ADDR_OFFSET)?).ok()?;
+    let family = u16::from_ne_bytes(family);
+    let addr = value.get(RTVIA_ADDR_OFFSET..)?;
+    if family == u16::from(AF_INET6) {
+        parse_addr(Afi::Ipv6, addr)
+    } else if family == u16::from(AF_INET) {
+        parse_addr(Afi::Ipv4, addr)
+    } else {
+        None
     }
 }
 
@@ -392,29 +413,97 @@ mod tests {
         assert_eq!(d[16], AF_INET6);
     }
 
+    /// `strace -e trace=sendmsg ip route add 198.51.100.0/24 via inet6
+    /// 2001:db8::1 proto 186 metric 20` (iproute2 6.1): `RTA_DST`, then
+    /// `RTA_VIA` holding `struct rtvia` (`rtvia_family` `AF_INET6` in host
+    /// order on x86-64, the 16 address octets, two octets of padding), then
+    /// `RTA_PRIORITY`.
+    const ADD_VIA6_PAYLOAD: [u8; 52] = [
+        0x02, 0x18, 0x00, 0x00, 0xfe, 0xba, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01,
+        0x00, 0xc6, 0x33, 0x64, 0x00, 0x16, 0x00, 0x12, 0x00, 0x0a, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x08,
+        0x00, 0x06, 0x00, 0x14, 0x00, 0x00, 0x00,
+    ];
+    /// `ip route del 198.51.100.0/24 via inet6 2001:db8::1 proto 186
+    /// metric 20`.
+    const DEL_VIA6_PAYLOAD: [u8; 52] = [
+        0x02, 0x18, 0x00, 0x00, 0xfe, 0xba, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x01,
+        0x00, 0xc6, 0x33, 0x64, 0x00, 0x16, 0x00, 0x12, 0x00, 0x0a, 0x00, 0x20, 0x01, 0x0d, 0xb8,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x08,
+        0x00, 0x06, 0x00, 0x14, 0x00, 0x00, 0x00,
+    ];
+    /// An `RTM_NEWROUTE` dump entry for that route, laid out as the
+    /// kernel's `fib_dump_info` and `fib_nexthop_info`
+    /// (`net/ipv4/fib_semantics.c`) emit it: `RTA_TABLE`, `RTA_DST`,
+    /// `RTA_PRIORITY`, then the next hop as `RTA_VIA` and `RTA_OIF` 2. Not
+    /// a capture: the build host boots with IPv6 disabled, so its kernel
+    /// refuses the route.
+    const DUMP_VIA6_PAYLOAD: [u8; 68] = [
+        0x02, 0x18, 0x00, 0x00, 0xfe, 0xba, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // rtmsg
+        0x08, 0x00, 0x0f, 0x00, 0xfe, 0x00, 0x00, 0x00, // RTA_TABLE 254
+        0x08, 0x00, 0x01, 0x00, 0xc6, 0x33, 0x64, 0x00, // RTA_DST
+        0x08, 0x00, 0x06, 0x00, 0x14, 0x00, 0x00, 0x00, // RTA_PRIORITY 20
+        0x16, 0x00, 0x12, 0x00, 0x0a, 0x00, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // RTA_VIA
+        0x08, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, // RTA_OIF 2
+    ];
+
     #[test]
-    fn ipv4_route_with_ipv6_gateway_uses_rta_via() {
+    fn ipv4_route_with_ipv6_gateway_matches_iproute2() {
+        // RFC 8950 §3 next hop in the FIB: RTA_VIA, never RTA_GATEWAY.
         let r = RouteMsg::unicast(
             p("198.51.100.0/24"),
             ip("2001:db8::1"),
             RT_TABLE_MAIN,
             RTPROT_BGP,
         );
-        let m = r.encode_set(1);
-        let attrs = netlink::parse_attrs(&m[netlink::HEADER_LEN + RTMSG_LEN..]).unwrap();
-        let via = attrs.iter().find(|a| a.ty == RTA_VIA).unwrap();
-        assert_eq!(via.value.len(), 18);
         assert_eq!(
-            u16::from_ne_bytes([via.value[0], via.value[1]]),
-            u16::from(AF_INET6)
+            normalise(r.encode_set(1)),
+            framed(RTM_NEWROUTE, &ADD_VIA6_PAYLOAD)
         );
-        assert!(attrs.iter().all(|a| a.ty != RTA_GATEWAY));
-        // And decodes back.
-        let back = RouteMsg::decode(&m[netlink::HEADER_LEN..])
-            .unwrap()
-            .unwrap();
-        assert_eq!(back.gateway, Some(ip("2001:db8::1")));
-        assert_eq!(back.dst, p("198.51.100.0/24"));
+        assert_eq!(
+            normalise(r.encode_delete(1)),
+            framed(RTM_DELROUTE, &DEL_VIA6_PAYLOAD)
+        );
+        // What we send decodes back to the same route.
+        let m = r.encode_set(1);
+        assert_eq!(
+            RouteMsg::decode(&m[netlink::HEADER_LEN..]).unwrap(),
+            Some(r.clone())
+        );
+        // A kernel dump entry decodes to the route plus its interface.
+        let back = RouteMsg::decode(&DUMP_VIA6_PAYLOAD).unwrap().unwrap();
+        assert_eq!(back, RouteMsg { oif: Some(2), ..r });
+    }
+
+    #[test]
+    fn rta_via_values() {
+        // struct rtvia: family in host order, then the address.
+        let v6 = encode_via(ip("2001:db8::1"));
+        assert_eq!(v6.len(), 18);
+        assert_eq!(&v6[..2], &u16::from(AF_INET6).to_ne_bytes());
+        assert_eq!(decode_via(&v6), Some(ip("2001:db8::1")));
+        let v4 = encode_via(ip("192.0.2.1"));
+        assert_eq!(v4.len(), 6);
+        assert_eq!(decode_via(&v4), Some(ip("192.0.2.1")));
+        // Too short for the family, an address of the wrong length, and
+        // another family (AF_MPLS, 28, which the kernel also puts in
+        // RTA_VIA): no gateway, and no panic.
+        assert_eq!(decode_via(&[]), None);
+        assert_eq!(decode_via(&[0x0a]), None);
+        assert_eq!(decode_via(&v6[..17]), None);
+        assert_eq!(decode_via(&v4[..5]), None);
+        let mut mpls = 28u16.to_ne_bytes().to_vec();
+        mpls.extend_from_slice(&[0, 0, 0x10, 0]);
+        assert_eq!(decode_via(&mpls), None);
+        // In a dump entry the route is still read, without a gateway.
+        // RTA_VIA starts at octet 36: length, type, then rtvia_family.
+        let mut bad = DUMP_VIA6_PAYLOAD;
+        assert_eq!(&bad[36..40], &[0x16, 0x00, 0x12, 0x00]);
+        bad[40..42].copy_from_slice(&28u16.to_ne_bytes());
+        let r = RouteMsg::decode(&bad).unwrap().unwrap();
+        assert_eq!(r.gateway, None);
+        assert_eq!(r.dst, p("198.51.100.0/24"));
     }
 
     #[test]

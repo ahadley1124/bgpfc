@@ -142,6 +142,15 @@ impl Json {
             None => self.null(),
         }
     }
+
+    /// `key: number | null` in one call.
+    pub fn field_opt_num(&mut self, name: &str, n: Option<impl Into<i128>>) -> &mut Self {
+        self.key(name);
+        match n {
+            Some(n) => self.number(n),
+            None => self.null(),
+        }
+    }
 }
 
 /// Write `s` as a JSON string with the escapes RFC 8259 §7 requires:
@@ -208,6 +217,9 @@ mod tests {
             .field_num("n", 42u32)
             .field_bool("ok", true)
             .field_opt("none", None::<u8>)
+            .field_opt("text", Some(7u8))
+            .field_opt_num("count", Some(7u32))
+            .field_opt_num("missing", None::<u32>)
             .key("list")
             .begin_array()
             .number(1u8)
@@ -222,7 +234,7 @@ mod tests {
             .end_object();
         assert_eq!(
             j.finish(),
-            r#"{"name":"a\"b\\c\n","n":42,"ok":true,"none":null,"list":[1,"x",{"ip":"127.0.0.1"}],"empty":{}}"#
+            r#"{"name":"a\"b\\c\n","n":42,"ok":true,"none":null,"text":"7","count":7,"missing":null,"list":[1,"x",{"ip":"127.0.0.1"}],"empty":{}}"#
         );
         let mut a = Json::new();
         a.begin_array().end_array();

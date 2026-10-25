@@ -23,6 +23,8 @@ commands:
   show routes [ipv4|ipv6] [PREFIX]
   show fib
   show status
+  show rpki
+  show rpki validate PREFIX ASN
   clear neighbor ADDR [soft] [MESSAGE]
   reload
   fib mode dry-run|install

@@ -45,9 +45,11 @@ fn bench(c: &mut Criterion) {
         four_octet_as: true,
         peer: PeerKind::External,
         allow_as_set: false,
+        extended_next_hop: false,
     };
     let ectx = EncodeContext {
         four_octet_as: true,
+        extended_next_hop: false,
     };
     let mut group = c.benchmark_group("update");
     for prefixes in [1u32, 50, 500] {

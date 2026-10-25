@@ -8,6 +8,7 @@ use std::mem;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use bgpfc_rpki::{AspaState, RovState};
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::AddressFamily;
 
@@ -15,7 +16,7 @@ use crate::attrs::PathAttrs;
 
 /// A peer's slot in the RIB's peer table. A route names its peer by slot;
 /// a slot is reused only after every route naming it has been removed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PeerId(pub(crate) u32);
 
 impl PeerId {
@@ -26,13 +27,28 @@ impl PeerId {
     }
 }
 
-/// One route in an Adj-RIB-In.
+/// One route in an Adj-RIB-In: as its peer sent it, and as import policy
+/// made it (RFC 4271 §3.2, §9.1.1), with its RFC 6811 validation state.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
-    /// Its attributes, shared with every route that has the same ones.
+    /// Its attributes as import policy gave them, shared with every route
+    /// that has the same ones; as received for a held route.
     pub(crate) attrs: Arc<PathAttrs>,
+    /// Its attributes as its peer sent them, when import policy changed
+    /// them: import policy runs on these again when the route's
+    /// validation state changes. `None` when they are `attrs`.
+    pub(crate) received: Option<Arc<PathAttrs>>,
     /// The peer it came from.
     pub(crate) peer: PeerId,
+    /// Its RFC 6811 §2 validation state, judged on the route as received.
+    /// Phase 2 does not use it; policy does.
+    pub(crate) rov: RovState,
+    /// Its ASPA verdict (a placeholder until ASPA lands).
+    pub(crate) aspa: AspaState,
+    /// Import policy rejected the route for its validation state alone:
+    /// the Adj-RIB-In holds it (RFC 6811 §2), but it is no candidate. A
+    /// destination keeps these after its candidates.
+    pub(crate) held: bool,
 }
 
 impl Route {
@@ -40,16 +56,30 @@ impl Route {
     pub(crate) fn same(&self, other: &Route) -> bool {
         self.peer == other.peer && Arc::ptr_eq(&self.attrs, &other.attrs)
     }
+
+    /// Whether `other` has the same validation verdicts, which export
+    /// policy may look at.
+    pub(crate) fn same_state(&self, other: &Route) -> bool {
+        self.rov == other.rov && self.aspa == other.aspa
+    }
+
+    /// The attributes as the peer sent them.
+    pub(crate) fn received(&self) -> &Arc<PathAttrs> {
+        self.received.as_ref().unwrap_or(&self.attrs)
+    }
 }
 
-/// Every route to one destination, the best first (Phase 2 moves it
-/// there). One route is held inline; more go in a `Vec` sized exactly.
+/// Every route to one destination: the candidates first, the best of them
+/// first of all (Phase 2 moves it there), then the routes held for their
+/// validation state alone. One route is held inline; more go in a boxed
+/// slice sized exactly, which keeps a destination at 24 octets beside a
+/// 24-octet route.
 #[derive(Debug)]
 pub(crate) enum Destination {
     /// One route, the common case.
     One(Route),
     /// Two or more, or none while the destination is being removed.
-    Many(Vec<Route>),
+    Many(Box<[Route]>),
 }
 
 impl Destination {
@@ -67,9 +97,15 @@ impl Destination {
         }
     }
 
-    /// The best route, if any.
+    /// The best route, if any: the first, unless that is held, which only
+    /// happens when every route is.
     pub(crate) fn best(&self) -> Option<&Route> {
-        self.routes().first()
+        self.routes().first().filter(|r| !r.held)
+    }
+
+    /// How many of the routes are candidates; they come first.
+    pub(crate) fn candidates(&self) -> usize {
+        self.routes().partition_point(|r| !r.held)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -81,49 +117,65 @@ impl Destination {
         self.routes().iter().position(|r| r.peer == peer)
     }
 
-    /// Add a route from a peer that has none here yet, at the end.
+    /// Add a route from a peer that has none here yet: a candidate after
+    /// the other candidates, a held route at the end.
     pub(crate) fn push(&mut self, route: Route) {
-        match self {
+        let at = if route.held {
+            self.routes().len()
+        } else {
+            self.candidates()
+        };
+        match mem::take(self) {
             Destination::Many(v) if v.is_empty() => *self = Destination::One(route),
             Destination::Many(v) => {
                 // Grow by one: a destination keeps one route per peer, and
                 // a Vec's doubling would leave room nothing fills.
+                let mut v = v.into_vec();
                 v.reserve_exact(1);
-                v.push(route);
+                v.insert(at, route);
+                *self = Destination::Many(v.into_boxed_slice());
             }
-            Destination::One(_) => {
-                let Destination::One(first) = mem::replace(self, Destination::Many(Vec::new()))
-                else {
-                    unreachable!()
-                };
-                *self = Destination::Many(vec![first, route]);
+            Destination::One(first) => {
+                *self = Destination::Many(if at == 0 {
+                    Box::new([route, first])
+                } else {
+                    Box::new([first, route])
+                });
             }
         }
     }
 
-    /// Remove the route at `i`; the order of the others is not kept.
+    /// Remove the route at `i`, keeping the order of the others.
     pub(crate) fn remove(&mut self, i: usize) -> Route {
-        match self {
-            Destination::One(_) => {
-                let Destination::One(r) = mem::replace(self, Destination::Many(Vec::new())) else {
-                    unreachable!()
-                };
-                r
-            }
+        match mem::take(self) {
+            Destination::One(r) => r,
             Destination::Many(v) => {
-                let r = v.swap_remove(i);
-                if v.len() == 1 {
+                let mut v = v.into_vec();
+                let r = v.remove(i);
+                *self = if v.len() == 1 {
                     // invariant: len is 1.
-                    *self = Destination::One(v.pop().unwrap());
-                } else if v.capacity() >= 2 * v.len() {
-                    v.shrink_to_fit();
-                }
+                    Destination::One(v.pop().unwrap())
+                } else {
+                    Destination::Many(v.into_boxed_slice())
+                };
                 r
             }
         }
     }
 
-    /// Put the route at `i` first, as the best.
+    /// Replace the route at `i` with `route` of the same peer, moving it
+    /// between the candidates and the held routes when it changes kind.
+    /// The route it replaces.
+    pub(crate) fn replace(&mut self, i: usize, route: Route) -> Route {
+        if self.routes()[i].held == route.held {
+            return mem::replace(&mut self.routes_mut()[i], route);
+        }
+        let old = self.remove(i);
+        self.push(route);
+        old
+    }
+
+    /// Put the candidate at `i` first, as the best.
     pub(crate) fn promote(&mut self, i: usize) {
         self.routes_mut().swap(0, i);
     }
@@ -133,14 +185,14 @@ impl Destination {
     pub(crate) fn heap_bytes(&self) -> usize {
         match self {
             Destination::One(_) => 0,
-            Destination::Many(v) => v.capacity() * size_of::<Route>(),
+            Destination::Many(v) => v.len() * size_of::<Route>(),
         }
     }
 }
 
 impl Default for Destination {
     fn default() -> Self {
-        Destination::Many(Vec::new())
+        Destination::Many(Box::default())
     }
 }
 
@@ -290,6 +342,10 @@ impl<T> FamilyMap<T> {
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.0.iter().map(|(_, v)| v)
     }
+
+    pub(crate) fn into_values(self) -> impl Iterator<Item = T> {
+        self.0.into_iter().map(|(_, v)| v)
+    }
 }
 
 impl<T: Default> FamilyMap<T> {
@@ -329,7 +385,18 @@ mod tests {
                 large_communities: Box::default(),
                 unknown: Box::default(),
             }),
+            received: None,
             peer: PeerId(peer),
+            rov: RovState::Disabled,
+            aspa: AspaState::Disabled,
+            held: false,
+        }
+    }
+
+    fn held(peer: u32) -> Route {
+        Route {
+            held: true,
+            ..route(peer)
         }
     }
 
@@ -339,13 +406,16 @@ mod tests {
 
     #[test]
     fn layout_stays_small() {
-        // A full table holds one of these per destination and per route.
-        assert_eq!(size_of::<Route>(), 16);
+        // A full table holds one of these per destination and per route:
+        // a route's validation state and the attributes it was received
+        // with fit beside the inline one, as the slice of several routes
+        // leaves room for the variant.
+        assert_eq!(size_of::<Route>(), 24);
         assert_eq!(size_of::<Destination>(), 24);
     }
 
     #[test]
-    fn one_route_inline_more_in_an_exact_vec() {
+    fn one_route_inline_more_in_an_exact_slice() {
         let mut d = Destination::default();
         assert!(d.is_empty());
         assert!(d.best().is_none());
@@ -355,7 +425,7 @@ mod tests {
         d.push(route(3));
         assert_eq!(peers(&d), vec![1, 2, 3]);
         match &d {
-            Destination::Many(v) => assert_eq!(v.capacity(), 3),
+            Destination::Many(v) => assert_eq!(v.len(), 3),
             Destination::One(_) => panic!("three routes inline"),
         }
         assert_eq!(d.position(PeerId(3)), Some(2));
@@ -378,11 +448,42 @@ mod tests {
         let b = Route {
             attrs: Arc::clone(&a.attrs),
             peer: PeerId(2),
+            ..a.clone()
         };
         assert!(a.same(&a.clone()));
         assert!(!a.same(&b));
         // Equal attributes in another allocation are a different set.
         assert!(!a.same(&route(1)));
+        let valid = Route {
+            rov: RovState::Valid,
+            ..a.clone()
+        };
+        assert!(a.same(&valid) && !a.same_state(&valid));
+        assert!(Arc::ptr_eq(a.received(), &a.attrs));
+    }
+
+    #[test]
+    fn held_routes_follow_the_candidates() {
+        let mut d = Destination::default();
+        d.push(held(1));
+        // Only a held route: no best.
+        assert!(d.best().is_none());
+        assert_eq!(d.candidates(), 0);
+        d.push(route(2));
+        d.push(held(3));
+        d.push(route(4));
+        assert_eq!(peers(&d), vec![2, 4, 1, 3]);
+        assert_eq!(d.candidates(), 2);
+        assert_eq!(d.best().unwrap().peer, PeerId(2));
+        // A candidate that becomes held moves behind the candidates, and
+        // back.
+        let old = d.replace(0, held(2));
+        assert!(!old.held);
+        assert_eq!(peers(&d), vec![4, 1, 3, 2]);
+        d.replace(3, route(2));
+        assert_eq!(peers(&d), vec![4, 2, 1, 3]);
+        assert_eq!(d.remove(1).peer, PeerId(2));
+        assert_eq!(peers(&d), vec![4, 1, 3]);
     }
 
     #[test]

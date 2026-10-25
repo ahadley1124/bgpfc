@@ -10,7 +10,8 @@
 //! RFC 4760 §3–§5, §7, §8; RFC 2918 §2, §3; RFC 8654 §3–§6; RFC 6793 §3,
 //! §4.2, §6; RFC 9072 §2, §3; RFC 7607 §2; RFC 6286 §2.1; RFC 4486 §3,
 //! §4; RFC 6608 §3, §4; RFC 9003 §2, §4; RFC 7606 §3–§5, §7; RFC 2545 §3;
-//! RFC 8950 §3; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774 §3.
+//! RFC 8950 §3, §4; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774
+//! §3.
 //!
 //! With the `profiling` feature, UPDATE and attribute decoding are timed
 //! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only
@@ -35,7 +36,7 @@ pub mod update;
 
 pub use as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 pub use attribute::{Aggregator, Origin, PathAttribute};
-pub use capability::Capability;
+pub use capability::{Capability, NextHopEncoding};
 pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use error::{
     CeaseSubcode, DecodeError, EncodeError, ErrorCode, FsmSubcode, HeaderSubcode, OpenSubcode,
@@ -50,6 +51,6 @@ pub use prefix::Prefix;
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
 pub use update::{
-    DecodeContext, DecodedUpdate, DiscardReason, DiscardedAttribute, EncodeContext, ErrorAction,
+    DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason, DiscardedAttribute, EncodeContext,
     PeerKind, UpdateError, UpdateMessage,
 };

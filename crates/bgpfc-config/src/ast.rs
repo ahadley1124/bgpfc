@@ -30,6 +30,8 @@ pub struct Config {
     pub fib: Fib,
     /// `control { ... }`.
     pub control: Control,
+    /// `rpki { ... }`; [`RpkiMode::Disabled`] when there is none.
+    pub rpki: Rpki,
     /// `prefix-list NAME { ... }` blocks, in file order.
     pub prefix_lists: Vec<PrefixList>,
     /// `policy NAME { ... }` blocks, in file order.
@@ -116,6 +118,194 @@ pub struct Http {
     pub writes: bool,
     /// `token-file`: when set, every request needs the bearer token.
     pub token_file: Option<PathBuf>,
+}
+
+/// How routes get their RFC 6811 origin validation state: the `rpki`
+/// block.
+///
+/// The durations are whole seconds. Every field has its default when the
+/// block leaves it out, and the defaults are those of the RTR client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rpki {
+    /// `mode`: required in the block.
+    pub mode: RpkiMode,
+    /// `cache` statements in file order: the router's cache list
+    /// (RFC 8210 §10). At least one in [`RpkiMode::External`].
+    pub caches: Vec<RpkiCache>,
+    /// `version`: the RTR protocol version offered first, 0 or 1
+    /// (RFC 8210 §7). Version 1 falls back to 0 for a cache that only
+    /// speaks 0; `version 0` is for a cache that mishandles version 1.
+    pub version: u8,
+    /// `connect-timeout`: the longest a connection attempt may take.
+    pub connect_timeout: Duration,
+    /// `response-timeout`: the longest the cache may take to start
+    /// answering a query, and between two PDUs of an answer.
+    pub response_timeout: Duration,
+    /// `reply-timeout`: the longest a whole answer may take, from the
+    /// query to its End of Data.
+    pub reply_timeout: Duration,
+    /// `max-expire`: the longest VRPs that cannot be refreshed are kept.
+    /// The cache's Expire Interval applies when it is shorter (RFC 8210
+    /// §6), so this can only shorten it; between [`Rpki::MIN_EXPIRE`] and
+    /// [`Rpki::MAX_EXPIRE`].
+    pub max_expire: Duration,
+    /// `max-vrps`: the most VRPs an answer may leave the router holding.
+    pub max_vrps: u32,
+    /// `backoff MIN MAX`: the delay before the first reconnect after a
+    /// failure, doubling with each failure in a row up to the second.
+    pub backoff_min: Duration,
+    /// The longest reconnect delay.
+    pub backoff_max: Duration,
+}
+
+impl Rpki {
+    /// The rpki-rtr port (RFC 8210 §9, RFC 6810 §7).
+    pub const DEFAULT_PORT: u16 = 323;
+    /// The default `connect-timeout`.
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The default `response-timeout`.
+    pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_mins(1);
+    /// The default `reply-timeout`.
+    pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_mins(30);
+    /// The shortest `max-expire`: RFC 8210 §6, Expire Interval, "Minimum
+    /// allowed value: 600 seconds".
+    pub const MIN_EXPIRE: Duration = Duration::from_mins(10);
+    /// The longest `max-expire`, and the default, which leaves the cache's
+    /// Expire Interval alone: RFC 8210 §6, "Maximum allowed value: 172800
+    /// seconds".
+    pub const MAX_EXPIRE: Duration = Duration::from_hours(48);
+    /// The default `max-vrps`.
+    pub const DEFAULT_MAX_VRPS: u32 = 4_000_000;
+    /// The default first reconnect delay.
+    pub const DEFAULT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+    /// The default longest reconnect delay: the default Retry Interval of
+    /// RFC 8210 §6.
+    pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_mins(10);
+    /// The longest reconnect delay that may be configured: the largest
+    /// Retry Interval RFC 8210 §6 allows a cache to ask for, "Maximum
+    /// allowed value: 7200 seconds".
+    pub const MAX_BACKOFF: Duration = Duration::from_hours(2);
+}
+
+impl Rpki {
+    /// Whether `other` asks for what `self` does: every setting the same,
+    /// and the same caches in the same order with the same preferences,
+    /// each host however it is spelled (see [`RpkiCache::is_at`]). A
+    /// reload leaves the RTR client alone unless this is false.
+    #[must_use]
+    pub fn same_as(&self, other: &Rpki) -> bool {
+        // Destructured, so that a new setting cannot be left out.
+        let Rpki {
+            mode,
+            caches,
+            version,
+            connect_timeout,
+            response_timeout,
+            reply_timeout,
+            max_expire,
+            max_vrps,
+            backoff_min,
+            backoff_max,
+        } = self;
+        *mode == other.mode
+            && caches.len() == other.caches.len()
+            && caches
+                .iter()
+                .zip(&other.caches)
+                .all(|(a, b)| a.preference == b.preference && a.is_at(&b.host, b.port))
+            && *version == other.version
+            && *connect_timeout == other.connect_timeout
+            && *response_timeout == other.response_timeout
+            && *reply_timeout == other.reply_timeout
+            && *max_expire == other.max_expire
+            && *max_vrps == other.max_vrps
+            && *backoff_min == other.backoff_min
+            && *backoff_max == other.backoff_max
+    }
+}
+
+impl Default for Rpki {
+    /// No `rpki` block: disabled.
+    fn default() -> Rpki {
+        Rpki {
+            mode: RpkiMode::Disabled,
+            caches: Vec::new(),
+            version: 1,
+            connect_timeout: Rpki::DEFAULT_CONNECT_TIMEOUT,
+            response_timeout: Rpki::DEFAULT_RESPONSE_TIMEOUT,
+            reply_timeout: Rpki::DEFAULT_REPLY_TIMEOUT,
+            max_expire: Rpki::MAX_EXPIRE,
+            max_vrps: Rpki::DEFAULT_MAX_VRPS,
+            backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
+            backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
+        }
+    }
+}
+
+/// Where VRPs come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpkiMode {
+    /// No origin validation: every route's state is `disabled`.
+    Disabled,
+    /// VRPs from the configured RTR caches (RFC 8210).
+    External,
+}
+
+impl std::fmt::Display for RpkiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RpkiMode::Disabled => "disabled",
+            RpkiMode::External => "external",
+        })
+    }
+}
+
+/// A `cache` statement: one entry of the router's cache list (RFC 8210
+/// §10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpkiCache {
+    /// "The IP address or fully qualified domain name of the cache", as
+    /// written.
+    pub host: String,
+    /// `port`: [`Rpki::DEFAULT_PORT`] unless given.
+    pub port: u16,
+    /// `preference`: "the lower the value, the more preferred"; 0 unless
+    /// given.
+    pub preference: u32,
+}
+
+impl RpkiCache {
+    /// Whether `host` on `port` names this cache: the same port, and the
+    /// same address however it is written (`2001:db8::1`,
+    /// `2001:0db8::1`), or the same name in any case, with or without its
+    /// final dot (RFC 4343 §3: a name lookup matches ASCII letters without
+    /// regard to case). Two `cache` statements for one cache are an
+    /// error, a reload that only respells a cache leaves the RTR client
+    /// alone, and the control plane finds the cache the client uses by it.
+    #[must_use]
+    pub fn is_at(&self, host: &str, port: u16) -> bool {
+        self.port == port && host_key(&self.host) == host_key(host)
+    }
+}
+
+/// What tells hosts apart: an address in its canonical text form, or a
+/// name in lower case without its final dot.
+fn host_key(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase(),
+    }
+}
+
+impl std::fmt::Display for RpkiCache {
+    /// `host:port`, with an IPv6 address in brackets.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// A prefix with optional length bounds, as in a prefix list or a
@@ -277,12 +467,38 @@ pub struct Neighbor {
     pub allow_as_set: bool,
     /// `collision-detect-established` (RFC 4271 §6.8, §8.1.1).
     pub collision_detect_established: bool,
+    /// `advertisement-interval`: the `MinRouteAdvertisementIntervalTimer`
+    /// (RFC 4271 §9.2.1.1), zero for none. `None` takes the RFC 4271 §10
+    /// default for the session type once it is known: 30 s external, 5 s
+    /// internal.
+    pub advertisement_interval: Option<Duration>,
+    /// `extended-next-hop`: the families listed in the Extended Next Hop
+    /// Encoding capability with an IPv6 next hop (RFC 8950 §4).
+    /// `extended-next-hop yes` gives IPv4 unicast, the one family RFC 8950
+    /// covers that bgpfc speaks; empty by default.
+    pub extended_next_hop: Vec<AddressFamily>,
+    /// `restart-limit`: how many automatic restarts in a row after damped
+    /// failures before the peer stays Idle until a manual start
+    /// (RFC 4486 §4); `None` for `off`, no bound.
+    /// [`DEFAULT_RESTART_LIMIT`] when not given.
+    pub restart_limit: Option<u32>,
+    /// `maximum-prefix FAMILY N`: the upper bound on the routes of the
+    /// family accepted from the neighbor (RFC 4271 §6.7), in file order;
+    /// exceeding it ends the session with Cease / Maximum Number of
+    /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
+    pub maximum_prefix: Vec<(AddressFamily, u32)>,
 }
+
+/// The `restart-limit` of a neighbor that sets none: the same figure as
+/// `bgpfc_fsm::DEFAULT_RESTART_LIMIT`, which this crate does not depend on.
+pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
-    /// the session reset, are the same. Description and policies are not
-    /// session parameters.
+    /// the session reset, are the same. Description, policies, the
+    /// advertisement interval and the prefix limits are not session
+    /// parameters: the interval paces what the RIB sends and the limits
+    /// bound what it keeps, and both change without a reset.
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr
@@ -296,5 +512,7 @@ impl Neighbor {
             && self.passive == other.passive
             && self.allow_as_set == other.allow_as_set
             && self.collision_detect_established == other.collision_detect_established
+            && self.extended_next_hop == other.extended_next_hop
+            && self.restart_limit == other.restart_limit
     }
 }

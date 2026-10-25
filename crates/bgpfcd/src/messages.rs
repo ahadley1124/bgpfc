@@ -1,11 +1,12 @@
 //! Messages between the daemon's threads (AGENTS.md §3).
 //!
 //! Each peer thread owns one channel of [`PeerInput`]; connection reader
-//! threads and the coordinator write to it, and the control plane will
-//! once it exists. Peer threads send [`RibMsg`] to the RIB thread over a
-//! bounded channel so that a flooding peer blocks instead of growing
-//! memory.
+//! threads, the coordinator and the control plane write to it. Peer
+//! threads send [`RibMsg`] to the RIB thread over a bounded channel so
+//! that a flooding peer blocks instead of growing memory, and so does the
+//! RTR client with its validation changes.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
@@ -79,9 +80,9 @@ pub(crate) enum PeerInput {
     /// UPDATEs from the RIB thread wait in the peer's outbox (a wake-up;
     /// see `peer::PeerHandle::send_updates`).
     Updates,
-    /// Shut the session down with this Cease subcode (`ManualStop` for
-    /// Administrative Shutdown, RFC 4271 §8.1.2 event 2; `AutomaticStop`
-    /// with the subcode otherwise, RFC 4486 §4) and end the thread.
+    /// Shut the session down with this Cease subcode (a `ManualStop`, RFC
+    /// 4271 §8.1.2 event 2, with the RFC 4486 §4 subcode for the reason)
+    /// and end the thread.
     Stop(CeaseSubcode),
     /// Reset the session: Cease / Administrative Reset, with a shutdown
     /// communication when given (RFC 9003), then start again.
@@ -94,6 +95,16 @@ pub(crate) enum PeerInput {
     RequestRoutes,
     /// Report the session's state on the sender.
     Report(SyncSender<PeerReport>),
+    /// The RIB found more routes of `family` than the neighbor's
+    /// `maximum-prefix` allows and dropped them (RFC 4271 §6.7): end the
+    /// session with Cease / Maximum Number of Prefixes Reached (RFC 4486
+    /// §4).
+    PrefixLimit {
+        /// The family over its limit.
+        family: AddressFamily,
+        /// The limit.
+        limit: u32,
+    },
 }
 
 /// What a peer thread reports about itself.
@@ -115,6 +126,8 @@ pub(crate) struct PeerReport {
     pub(crate) updates_out: u64,
     /// Administratively stopped (a `ManualStop` with no restart).
     pub(crate) admin_down: bool,
+    /// Left Idle by the restart limit (RFC 4486 §4) until cleared.
+    pub(crate) restart_limit_reached: bool,
 }
 
 /// What the RIB thread tells the FIB thread, and what the control plane
@@ -195,6 +208,9 @@ pub(crate) struct RouteReport {
     pub(crate) attrs: std::sync::Arc<bgpfc_rib::PathAttrs>,
     /// Whether it is the chosen route.
     pub(crate) best: bool,
+    /// Its RFC 6811 §2 origin validation state, judged on the route as
+    /// received; `Disabled` while there is no validation source.
+    pub(crate) rov: bgpfc_rib::RovState,
 }
 
 /// The RIB's answer.
@@ -206,6 +222,33 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
     FibRoutes(Vec<(Prefix, IpAddr)>),
+}
+
+/// What the coordinator reports about the `rpki` block.
+#[derive(Clone, Debug)]
+pub(crate) struct RpkiReport {
+    /// The running block.
+    pub(crate) config: bgpfc_config::ast::Rpki,
+    /// The RTR client's status, if one runs. Its VRPs are the data the
+    /// RIB validates with.
+    pub(crate) status: Option<bgpfc_rtr::client::Status>,
+}
+
+/// Each neighbor's configured `advertisement-interval` (RFC 4271
+/// §9.2.1.1); `None` takes the RFC 4271 §10 default for the session type.
+pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;
+
+/// Each neighbor's `maximum-prefix` limits per family (RFC 4271 §6.7).
+pub(crate) type PrefixLimits = HashMap<IpAddr, Vec<(AddressFamily, u32)>>;
+
+/// The per-neighbor settings the RIB thread applies to sessions as they
+/// come up, and to running ones after a reload.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RibSettings {
+    /// `advertisement-interval`s.
+    pub(crate) intervals: Intervals,
+    /// `maximum-prefix` limits.
+    pub(crate) prefix_limits: PrefixLimits,
 }
 
 /// What peer threads tell the RIB thread.
@@ -221,7 +264,8 @@ pub(crate) enum RibMsg {
         /// Negotiated parameters.
         session: Session,
     },
-    /// A decoded UPDATE (announcements, withdrawals, or treat-as-withdraw).
+    /// A decoded UPDATE (announcements, withdrawals, treat-as-withdraw, and
+    /// the families an incorrect MP attribute disabled, RFC 4760 §7).
     Update {
         /// Peer address.
         peer: IpAddr,
@@ -231,14 +275,6 @@ pub(crate) enum RibMsg {
         /// (`docs/PROFILING.md`); `None` with spans off.
         #[cfg(feature = "profiling")]
         started: Option<Instant>,
-    },
-    /// An UPDATE's multiprotocol attribute was unusable (RFC 4760 §7): drop
-    /// the family's routes from this peer and ignore it from now on.
-    FamilyDisabled {
-        /// Peer address.
-        peer: IpAddr,
-        /// The family.
-        family: AddressFamily,
     },
     /// The peer asked for its Adj-RIB-Out of a family again (RFC 2918 §4).
     RouteRefresh {
@@ -262,12 +298,24 @@ pub(crate) enum RibMsg {
         /// Peers to re-export to.
         reexport: Vec<IpAddr>,
     },
+    /// The advertisement intervals after a reload: sessions that are up
+    /// follow at once, without a reset; later sessions start with them.
+    SetIntervals(Intervals),
+    /// The prefix limits after a reload, applied like the intervals; a
+    /// session already over a new limit ends (RFC 4271 §6.7).
+    SetPrefixLimits(PrefixLimits),
     /// Re-send the Adj-RIB-Out of every family to `peer` in full (a soft
     /// reset, RFC 2918 §4).
     Resend {
         /// Peer address.
         peer: IpAddr,
     },
+    /// The validation source changed (issue #56): validate again the
+    /// routes the change affects (RFC 6811 §4). The RTR client sends it on
+    /// the same bounded channel as the peers, so it waits behind what is
+    /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
+    /// coordinator when a reload turns validation off.
+    Validation(bgpfc_rpki::ValidationChange),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.

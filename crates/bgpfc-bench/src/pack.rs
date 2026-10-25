@@ -66,7 +66,10 @@ impl Packer {
     #[must_use]
     pub fn new(four_octet_as: bool, extended: bool) -> Packer {
         Packer {
-            ctx: EncodeContext { four_octet_as },
+            ctx: EncodeContext {
+                four_octet_as,
+                extended_next_hop: false,
+            },
             max_len: if extended { 65_535 } else { 4_096 },
         }
     }
@@ -282,6 +285,7 @@ mod tests {
         four_octet_as: true,
         peer: PeerKind::External,
         allow_as_set: false,
+        extended_next_hop: false,
     };
 
     /// Decode one framed message with the daemon's decoder.
