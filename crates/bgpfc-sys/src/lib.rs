@@ -8,7 +8,8 @@
 //!
 //! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`; the
 //! self-pipe signal handler of AGENTS.md §3; the two privilege modes of
-//! the README.
+//! the README; with the `profiling` feature, the counting allocator of
+//! `docs/PROFILING.md`.
 //!
 //! Also implements, for the supervised RPKI sidecar, the child-process
 //! controls std lacks: a parent-death signal (`prctl(2)`) and sending a
@@ -18,6 +19,8 @@
 //! from the child.
 #![cfg(target_os = "linux")]
 
+#[cfg(feature = "profiling")]
+pub mod alloc;
 mod caps;
 mod ffi;
 mod inherit;

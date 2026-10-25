@@ -1,0 +1,33 @@
+[package]
+name = "bgpfc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Load generator, benchmark harness and micro-benchmarks for bgpfcd (docs/PROFILING.md)"
+
+# Development tooling, never linked by the daemon. Std-only all the same:
+# it lives under crates/ and check-deps.sh covers it.
+[dependencies]
+bgpfc-log.workspace = true
+bgpfc-prof.workspace = true
+bgpfc-rib.workspace = true
+bgpfc-wire.workspace = true
+
+[[bin]]
+name = "bgp_loadgen"
+path = "src/bin/bgp_loadgen.rs"
+
+[[bin]]
+name = "bgp_bench"
+path = "src/bin/bgp_bench.rs"
+
+# std-only micro-benchmarks; `harness = false` because #[bench] is unstable.
+[[bench]]
+name = "micro"
+harness = false
+
+[lints]
+workspace = true

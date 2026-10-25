@@ -178,18 +178,14 @@ mod tests {
         vec![
             AsPath::empty(),
             AsPath::sequence(&[Asn(64_496), Asn(64_497)]),
-            AsPath {
-                segments: vec![AsPathSegment {
-                    kind: SegmentType::Set,
-                    asns: vec![Asn(64_496)],
-                }],
-            },
-            AsPath {
-                segments: vec![AsPathSegment {
-                    kind: SegmentType::ConfedSequence,
-                    asns: vec![Asn(65_100)],
-                }],
-            },
+            AsPath::from_segments(&[AsPathSegment {
+                kind: SegmentType::Set,
+                asns: vec![Asn(64_496)],
+            }]),
+            AsPath::from_segments(&[AsPathSegment {
+                kind: SegmentType::ConfedSequence,
+                asns: vec![Asn(65_100)],
+            }]),
         ]
     }
 

@@ -10,11 +10,14 @@ use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
+#[cfg(feature = "profiling")]
+use std::time::Instant;
 
 use bgpfc_fsm::Session;
 use bgpfc_wire::error::{CeaseSubcode, DecodeError};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
+use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::DecodedUpdate;
@@ -74,9 +77,9 @@ pub(crate) enum PeerInput {
         /// Which connection.
         conn: ConnId,
     },
-    /// Framed UPDATE messages from the RIB thread, to write in order while
-    /// Established (RFC 4271 §9.2).
-    Send(Vec<Vec<u8>>),
+    /// UPDATEs from the RIB thread wait in the peer's outbox (a wake-up;
+    /// see `peer::PeerHandle::send_updates`).
+    Updates,
     /// Shut the session down with this Cease subcode (a `ManualStop`, RFC
     /// 4271 §8.1.2 event 2, with the RFC 4486 §4 subcode for the reason)
     /// and end the thread.
@@ -131,25 +134,44 @@ pub(crate) struct PeerReport {
 /// asks it.
 #[derive(Debug)]
 pub(crate) enum FibMsg {
-    /// A Loc-RIB change (RFC 4271 §9.3).
-    Change(bgpfc_rib::FibChange),
-    /// Switch between dry-run and install; the reply says what was done.
-    SetMode(bgpfc_fib::Mode, SyncSender<usize>),
-    /// Report the tables on the sender.
-    Query(SyncSender<FibReport>),
+    /// Loc-RIB changes, in order (RFC 4271 §9.3).
+    Changes(Vec<bgpfc_rib::FibChange>),
+    /// Switch between dry-run and install. Sent by the RIB thread only
+    /// (`RibMsg::FibMode`): going to install, its routes follow as
+    /// `Reconcile`; either way `ReconcileEnd` ends the switch.
+    SetMode(bgpfc_fib::Mode),
+    /// The RIB's routes, continuing in prefix order those sent since
+    /// `SetMode`.
+    Reconcile(Vec<(Prefix, IpAddr)>),
+    /// The end of a switch; the reply says how many operations it took.
+    ReconcileEnd(SyncSender<usize>),
+    /// Report the mode on the sender.
+    Mode(SyncSender<bgpfc_fib::Mode>),
+    /// Report the mode and a page of the installed routes: at most
+    /// [`PAGE`], after `after`, in prefix order.
+    Query {
+        /// The last route of the page before, if any.
+        after: Option<Prefix>,
+        /// Where the report goes.
+        reply: SyncSender<FibReport>,
+    },
     /// Remove every installed route and reply on the sender.
     Shutdown(SyncSender<()>),
 }
 
-/// A snapshot of the FIB manager.
+/// Routes in one page of a long listing (`show routes`, `show fib`): the
+/// control plane takes a full table a page at a time, so that answering
+/// costs a page of memory rather than copies of the table.
+pub(crate) const PAGE: usize = 4096;
+
+/// The FIB manager's mode and a page of its installed routes. What the
+/// RIB wants is the RIB's to say (`RibQuery::FibRoutes`).
 #[derive(Clone, Debug)]
 pub(crate) struct FibReport {
     /// The mode.
     pub(crate) mode: bgpfc_fib::Mode,
-    /// Desired routes.
-    pub(crate) desired: bgpfc_fib::Table,
-    /// Routes believed installed.
-    pub(crate) installed: bgpfc_fib::Table,
+    /// Routes believed installed: a page.
+    pub(crate) installed: Vec<(Prefix, IpAddr)>,
 }
 
 /// A question for the RIB thread.
@@ -157,13 +179,21 @@ pub(crate) struct FibReport {
 pub(crate) enum RibQuery {
     /// Per-peer route counts and session facts.
     Peers,
-    /// Loc-RIB routes of a family, optionally one prefix with all its
-    /// candidates.
+    /// Loc-RIB routes of a family, a page after `after`; or one prefix
+    /// with all its candidates.
     Routes {
         /// The family.
         family: AddressFamily,
         /// Only this destination.
-        prefix: Option<bgpfc_wire::prefix::Prefix>,
+        prefix: Option<Prefix>,
+        /// Without `prefix`: the last route of the page before, if any.
+        after: Option<Prefix>,
+    },
+    /// The next hop of the destinations after `after`, as the FIB is to
+    /// install them: a page.
+    FibRoutes {
+        /// The last route of the page before, if any.
+        after: Option<Prefix>,
     },
 }
 
@@ -190,6 +220,8 @@ pub(crate) enum RibReply {
     Peers(Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)>),
     /// Answer to [`RibQuery::Routes`].
     Routes(Vec<RouteReport>),
+    /// Answer to [`RibQuery::FibRoutes`].
+    FibRoutes(Vec<(Prefix, IpAddr)>),
 }
 
 /// What the coordinator reports about the `rpki` block.
@@ -239,6 +271,10 @@ pub(crate) enum RibMsg {
         peer: IpAddr,
         /// The decoded message.
         update: DecodedUpdate,
+        /// When the peer thread started decoding it, for `update_total`
+        /// (`docs/PROFILING.md`); `None` with spans off.
+        #[cfg(feature = "profiling")]
+        started: Option<Instant>,
     },
     /// The peer asked for its Adj-RIB-Out of a family again (RFC 2918 §4).
     RouteRefresh {
@@ -280,6 +316,10 @@ pub(crate) enum RibMsg {
     /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
     /// coordinator when a reload turns validation off.
     Validation(bgpfc_rpki::ValidationChange),
+    /// Switch the FIB between dry-run and install: the RIB thread passes
+    /// it on, with its routes for the reconcile going to install. The
+    /// FIB replies with the number of operations it took.
+    FibMode(bgpfc_fib::Mode, SyncSender<usize>),
 }
 
 /// A policy set on its way to the RIB thread (`dyn Policies` has no

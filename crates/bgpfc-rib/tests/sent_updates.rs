@@ -22,6 +22,13 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 use proptest::prelude::*;
 
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
+
 const LOCAL_AS: Asn = Asn(65_000);
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
@@ -181,15 +188,15 @@ proptest! {
         let now = Instant::now();
         let mut rib = Rib::new(LOCAL_AS);
         let mut sent = 0usize;
-        let mut outputs = Vec::new();
+        let mut all = Vec::new();
         for info in &infos {
-            outputs.extend(rib.peer_up(info.clone(), now));
+            all.extend(outputs(|o| rib.peer_up(info.clone(), now, o)));
         }
         for s in &steps {
             let info = &infos[s.peer];
-            outputs.extend(rib.update(info.addr, &update(s, info), now));
+            all.extend(outputs(|o| rib.update(info.addr, &update(s, info), now, o)));
         }
-        for out in outputs {
+        for out in all {
             let Output::Send { messages, .. } = out else {
                 continue;
             };

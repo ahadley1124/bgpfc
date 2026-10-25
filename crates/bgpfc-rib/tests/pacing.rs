@@ -22,6 +22,13 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 use proptest::prelude::*;
 
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
+
 const LOCAL_AS: Asn = Asn(65_000);
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 
@@ -152,7 +159,7 @@ fn note(log: &mut Log, out: &[Output], infos: &[PeerInfo], at: Instant) {
 
 fn adj_out(rib: &Rib, addr: IpAddr) -> BTreeMap<Prefix, PathAttrs> {
     rib.adj_rib_out(addr, V4)
-        .map(|(p, a)| (p, (**a).clone()))
+        .map(|(p, a)| (p, (*a).clone()))
         .collect()
 }
 
@@ -172,23 +179,23 @@ proptest! {
         let mut plain = Rib::new(LOCAL_AS);
         let mut log = Log::new();
         for (p, q) in paced_infos.iter().zip(&plain_infos) {
-            let out = paced.peer_up(p.clone(), t0);
+            let out = outputs(|o| paced.peer_up(p.clone(), t0, o));
             note(&mut log, &out, &paced_infos, t0);
-            plain.peer_up(q.clone(), t0);
+            outputs(|o| plain.peer_up(q.clone(), t0, o));
         }
         let mut t = t0;
         for s in &steps {
             t += Duration::from_secs(u64::from(s.after)) + Duration::from_millis(u64::from(s.millis));
             // The daemon's RIB thread flushes at every deadline.
             while let Some(d) = paced.next_deadline() && d <= t {
-                let out = paced.flush(d);
+                let out = outputs(|o| paced.flush(d, o));
                 note(&mut log, &out, &paced_infos, d);
             }
             let info = &paced_infos[usize::from(s.peer)];
-            let mut out = paced.update(info.addr, &update(s, info), t);
-            out.extend(paced.flush(t));
+            let mut out = outputs(|o| paced.update(info.addr, &update(s, info), t, o));
+            out.extend(outputs(|o| paced.flush(t, o)));
             note(&mut log, &out, &paced_infos, t);
-            plain.update(info.addr, &update(s, info), t);
+            outputs(|o| plain.update(info.addr, &update(s, info), t, o));
             // Withdrawals are never held: the paced peer has nothing the
             // unpaced one lacks.
             for i in &paced_infos {
@@ -214,7 +221,7 @@ proptest! {
         // Once every interval has run out, the latest state is what the
         // peers have.
         let end = t + Duration::from_secs(60);
-        paced.flush(end);
+        outputs(|o| paced.flush(end, o));
         prop_assert_eq!(paced.next_deadline().filter(|d| *d <= end), None);
         for i in &paced_infos {
             prop_assert_eq!(adj_out(&paced, i.addr), adj_out(&plain, i.addr));

@@ -12,8 +12,8 @@
 //! and run the BGP decision process if needed"), for the routes that
 //! [`AffectedPrefixes`] names.
 
-use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,10 +21,13 @@ use std::time::Instant;
 use bgpfc_rpki::{
     AffectedPrefixes, PrefixSet, RouteOrigin, RovState, ValidationChange, ValidationSource,
 };
-use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::{Destination, Interner, Judged, Output, PeerState, Policies, Rib, judge};
+use crate::store::{Destination, PeerId};
+use crate::{
+    Dirty, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
+};
 
 /// A table walks its affected destinations in one pass, rather than one
 /// range query per range, once it has fewer than this many destinations
@@ -148,57 +151,87 @@ impl Rib {
     /// pass over every table. Either way the cost of the routes whose
     /// state changes, through import policy and the decision process,
     /// soon outweighs that of finding them.
-    pub fn validation_changed(&mut self, change: ValidationChange, now: Instant) -> Vec<Output> {
+    pub fn validation_changed(
+        &mut self,
+        change: ValidationChange,
+        now: Instant,
+        out: &mut impl Sink,
+    ) {
         let ValidationChange { source, affected } = change;
-        self.validation = source;
+        self.s.cx.validation = source;
         let ranges = match &affected {
             AffectedPrefixes::All => None,
             AffectedPrefixes::CoveredBy(changed) => Some(covered_ranges(changed)),
         };
         let mut tally = Tally::default();
-        let mut dirty = Vec::new();
-        let mut families: Vec<AddressFamily> = self.tables.keys().copied().collect();
-        families.sort_unstable();
-        for family in families {
-            let Some(table) = self.tables.get_mut(&family) else {
-                continue;
-            };
+        let mut scratch = std::mem::take(&mut self.scratch);
+        // Empty destinations to remove once a table's walk is done.
+        let mut empty: Vec<Prefix> = Vec::new();
+        for (family, table) in self.tables.iter_mut() {
+            let cx = &mut self.s.cx;
             let mut pass = Pass {
                 family,
-                local_as: self.local_as,
-                source: &*self.validation,
-                peers: &mut self.peers,
-                policies: &*self.policies,
-                interner: &mut self.interner,
+                local_as: cx.local_as,
+                source: &*cx.validation,
+                peers: &mut self.s.peers,
+                policies: &*cx.policies,
+                interner: &mut cx.interner,
                 tally: &mut tally,
-                dirty: &mut dirty,
+                scratch: &mut scratch,
+                empty: &mut empty,
             };
-            let mut visit =
-                |prefix: &Prefix, dest: &mut Destination| pass.destination(*prefix, dest);
             match &ranges {
-                None => table.iter_mut().for_each(|(p, d)| visit(p, d)),
+                None => {
+                    for (k, d) in &mut table.v4 {
+                        pass.destination(k.prefix(), d);
+                    }
+                    for (p, d) in &mut table.v6 {
+                        pass.destination(*p, d);
+                    }
+                }
                 Some(ranges) => {
                     let ranges = of_family(ranges, family.afi);
-                    if ranges.len().saturating_mul(DENSE) >= table.len() {
-                        walk_alongside(table, ranges, visit);
+                    let dense =
+                        ranges.len().saturating_mul(DENSE) >= table.v4.len() + table.v6.len();
+                    let v4: Vec<RangeInclusive<Ipv4Key>> = ranges
+                        .iter()
+                        .filter_map(|r| Some(Ipv4Key::new(*r.start())?..=Ipv4Key::new(*r.end())?))
+                        .collect();
+                    let visit4 = |k: &Ipv4Key, d: &mut Destination| pass.destination(k.prefix(), d);
+                    if dense {
+                        walk_alongside(&mut table.v4, &v4, visit4);
                     } else {
-                        walk_ranges(table, ranges, visit);
+                        walk_ranges(&mut table.v4, &v4, visit4);
+                    }
+                    let visit6 = |p: &Prefix, d: &mut Destination| pass.destination(*p, d);
+                    if dense {
+                        walk_alongside(&mut table.v6, ranges, visit6);
+                    } else {
+                        walk_ranges(&mut table.v6, ranges, visit6);
                     }
                 }
             }
+            for prefix in empty.drain(..) {
+                match Ipv4Key::new(prefix) {
+                    Some(k) => table.v4.remove(&k),
+                    None => table.v6.remove(&prefix),
+                };
+            }
         }
-        let decided = self.reconsider(&dirty, now);
-        let best_changed = decided
+        let best_changed = scratch
+            .dirty
             .iter()
-            .filter(|o| matches!(o, Output::Fib(_)))
+            .filter(|d| match (&d.old, &d.new) {
+                (None, None) => false,
+                (Some(a), Some(b)) => !a.same(b),
+                _ => true,
+            })
             .count();
-        let mut out: Vec<Output> = tally
-            .finish(best_changed)
-            .map(Output::Revalidated)
-            .into_iter()
-            .collect();
-        out.extend(decided);
-        out
+        if let Some(report) = tally.finish(best_changed) {
+            out.put(Output::Revalidated(report));
+        }
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
     }
 }
 
@@ -208,30 +241,35 @@ struct Pass<'a> {
     family: AddressFamily,
     local_as: Asn,
     source: &'a dyn ValidationSource,
-    peers: &'a mut HashMap<IpAddr, PeerState>,
+    peers: &'a mut Vec<Option<PeerState>>,
     policies: &'a dyn Policies,
     interner: &'a mut Interner,
     tally: &'a mut Tally,
-    dirty: &'a mut Vec<(AddressFamily, Prefix)>,
+    scratch: &'a mut Scratch,
+    /// Destinations left with no route, for the caller to remove.
+    empty: &'a mut Vec<Prefix>,
 }
 
 impl Pass<'_> {
     /// Validate again the routes held for `prefix`, in place, and run
-    /// import policy again on those whose state changed; `dirty` gets the
-    /// destination if its candidates changed.
+    /// import policy again on those whose state changed; the scratch gets
+    /// the destination with its best route before and after if its
+    /// candidates changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
+        let old = dest.best().cloned();
         let mut changed = false;
         let mut restated = false;
         // Whether a route moved between the candidates and the held
         // routes, and which ones no state admits any more.
         let mut moved = false;
-        let mut dropped: Vec<IpAddr> = Vec::new();
-        for route in &mut dest.routes {
+        let mut dropped: Vec<PeerId> = Vec::new();
+        for route in dest.routes_mut() {
             self.tally.routes += 1;
             // RFC 6811 §2, on the route as received, as on its arrival.
-            let origin = RouteOrigin::from_as_path(&route.received.as_path, self.local_as);
+            let received = Arc::clone(route.received());
+            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
             let rov = self.source.rov(prefix, origin);
-            let aspa = self.source.aspa(&route.received.as_path);
+            let aspa = self.source.aspa(&received.as_path);
             if rov == route.rov && aspa == route.aspa {
                 continue;
             }
@@ -243,7 +281,7 @@ impl Pass<'_> {
             route.aspa = aspa;
             // Always found: the Adj-RIBs-In hold routes only of peers
             // that are up, as a peer's routes go with it.
-            let Some(peer) = self.peers.get_mut(&route.peer) else {
+            let Some(peer) = self.peers[route.peer.index()].as_mut() else {
                 continue;
             };
             let was_held = route.held;
@@ -252,40 +290,42 @@ impl Pass<'_> {
                 self.interner,
                 &peer.info,
                 (self.family, prefix),
-                &route.received,
+                &received,
                 rov,
             );
-            match judged {
-                Judged::Accepted(attrs) => {
-                    route.attrs = attrs;
-                    route.held = false;
-                }
-                Judged::Held => {
-                    route.attrs = Arc::clone(&route.received);
-                    route.held = true;
-                }
+            let (attrs, held) = match judged {
+                Judged::Accepted(attrs) => (attrs, false),
+                Judged::Held => (Arc::clone(&received), true),
                 // Policy accepted the route with some state when it was
                 // last judged, so only a change of policy since, before
                 // the ROUTE-REFRESH that follows one, can leave none.
                 Judged::Dropped => {
-                    let n = peer.adj_in_count.entry(self.family).or_insert(0);
+                    let n = peer.adj_in_count.or_default(self.family);
                     *n = n.saturating_sub(1);
                     dropped.push(route.peer);
-                    // No candidate any more, like a held route, until it
-                    // goes below.
-                    route.held = true;
+                    (Arc::clone(&received), true)
                 }
-            }
-            // A candidate with a new state, or one that came or went.
-            changed |= !(was_held && route.held);
-            moved |= was_held != route.held;
-        }
-        if !dropped.is_empty() {
-            dest.routes.retain(|r| !dropped.contains(&r.peer));
+            };
+            let replaced = std::mem::replace(&mut route.attrs, attrs);
+            let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
+            self.scratch.released.push(replaced);
+            route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
+            route.held = held;
+            // A candidate with a new state or new attributes, or one that
+            // came or went.
+            changed |= !(was_held && held && unchanged);
+            moved |= was_held != held;
         }
         if moved {
             // Candidates first; a stable sort keeps their order.
-            dest.routes.sort_by_key(|r| r.held);
+            dest.routes_mut().sort_by_key(|r| r.held);
+        }
+        for peer in dropped {
+            if let Some(i) = dest.position(peer) {
+                let r = dest.remove(i);
+                self.scratch.released.push(r.attrs);
+                self.scratch.released.extend(r.received);
+            }
         }
         if restated {
             self.tally.destinations += 1;
@@ -293,10 +333,18 @@ impl Pass<'_> {
                 self.tally.sample.push(prefix);
             }
         }
-        // One left with nothing goes in the decision process, which
-        // removes it.
-        if changed || dest.is_unused() {
-            self.dirty.push((self.family, prefix));
+        if changed {
+            decide(self.peers, dest);
+            self.scratch.dirty.push(Dirty {
+                family: self.family,
+                prefix,
+                old,
+                new: dest.best().cloned(),
+                merged: false,
+            });
+        }
+        if dest.is_empty() {
+            self.empty.push(prefix);
         }
     }
 }
@@ -359,10 +407,10 @@ fn of_family(ranges: &[RangeInclusive<Prefix>], afi: Afi) -> &[RangeInclusive<Pr
 
 /// Visit the destinations of `table` within `ranges` (sorted, disjoint)
 /// with a range query per range.
-fn walk_ranges<T>(
-    table: &mut BTreeMap<Prefix, T>,
-    ranges: &[RangeInclusive<Prefix>],
-    mut visit: impl FnMut(&Prefix, &mut T),
+fn walk_ranges<K: Ord + Clone, T>(
+    table: &mut BTreeMap<K, T>,
+    ranges: &[RangeInclusive<K>],
+    mut visit: impl FnMut(&K, &mut T),
 ) {
     for range in ranges {
         for (prefix, value) in table.range_mut(range.clone()) {
@@ -373,10 +421,10 @@ fn walk_ranges<T>(
 
 /// Visit the destinations of `table` within `ranges` (sorted, disjoint)
 /// in one pass over the table, moving through the ranges alongside.
-fn walk_alongside<T>(
-    table: &mut BTreeMap<Prefix, T>,
-    ranges: &[RangeInclusive<Prefix>],
-    mut visit: impl FnMut(&Prefix, &mut T),
+fn walk_alongside<K: Ord, T>(
+    table: &mut BTreeMap<K, T>,
+    ranges: &[RangeInclusive<K>],
+    mut visit: impl FnMut(&K, &mut T),
 ) {
     let mut ranges = ranges.iter().peekable();
     for (prefix, value) in table.iter_mut() {

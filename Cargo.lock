@@ -30,6 +30,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bgpfc-bench"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+ "bgpfc-prof",
+ "bgpfc-rib",
+ "bgpfc-wire",
+]
+
+[[package]]
 name = "bgpfc-config"
 version = "0.1.0"
 dependencies = [
@@ -72,9 +82,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bgpfc-prof"
+version = "0.1.0"
+
+[[package]]
 name = "bgpfc-rib"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-prof",
  "bgpfc-rpki",
  "bgpfc-wire",
  "criterion",
@@ -116,6 +131,7 @@ version = "0.1.0"
 name = "bgpfc-wire"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-prof",
  "criterion",
  "proptest",
 ]
@@ -131,12 +147,14 @@ dependencies = [
 name = "bgpfcd"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-bench",
  "bgpfc-config",
  "bgpfc-control",
  "bgpfc-fib",
  "bgpfc-fsm",
  "bgpfc-log",
  "bgpfc-policy",
+ "bgpfc-prof",
  "bgpfc-rib",
  "bgpfc-rpki",
  "bgpfc-rtr",

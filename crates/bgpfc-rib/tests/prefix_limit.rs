@@ -19,6 +19,13 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 use proptest::prelude::*;
 
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
+
 const LOCAL_AS: Asn = Asn(65_000);
 const PEER_AS: Asn = Asn(65_001);
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
@@ -144,7 +151,7 @@ proptest! {
         let peer = info(limit);
         let now = Instant::now();
         let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectSome));
-        rib.peer_up(peer.clone(), now);
+        outputs(|o| rib.peer_up(peer.clone(), now, o));
         let mut model: BTreeSet<u8> = BTreeSet::new();
         for op in &ops {
             // The model: routes held after the UPDATE, one prefix at a
@@ -174,7 +181,7 @@ proptest! {
                     }
                 }
             }
-            let out = rib.update(peer.addr, &update(op), now);
+            let out = outputs(|o| rib.update(peer.addr, &update(op), now, o));
             let hits = out
                 .iter()
                 .filter(|o| matches!(o, Output::PrefixLimitExceeded { .. }))

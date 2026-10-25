@@ -15,12 +15,14 @@ rust-version = "1.99"
 # Workspace crates are added here as they gain their first dependant, so
 # cargo can warn about unused entries.
 [workspace.dependencies]
+bgpfc-bench = { path = "crates/bgpfc-bench" }
 bgpfc-config = { path = "crates/bgpfc-config" }
 bgpfc-control = { path = "crates/bgpfc-control" }
 bgpfc-fib = { path = "crates/bgpfc-fib" }
 bgpfc-fsm = { path = "crates/bgpfc-fsm" }
 bgpfc-log = { path = "crates/bgpfc-log" }
 bgpfc-policy = { path = "crates/bgpfc-policy" }
+bgpfc-prof = { path = "crates/bgpfc-prof" }
 bgpfc-rib = { path = "crates/bgpfc-rib" }
 bgpfc-rpki = { path = "crates/bgpfc-rpki" }
 bgpfc-rtr = { path = "crates/bgpfc-rtr" }
@@ -46,3 +48,9 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
+
+# docs/PROFILING.md: optimised like release, with full debug info for perf
+# and heaptrack: `cargo build --profile profiling --features profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true

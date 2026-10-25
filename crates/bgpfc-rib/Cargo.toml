@@ -8,8 +8,14 @@ rust-version.workspace = true
 description = "Adj-RIB-In, Loc-RIB, Adj-RIB-Out and the RFC 4271 §9 decision process"
 
 [dependencies]
+bgpfc-prof = { workspace = true, optional = true }
 bgpfc-rpki.workspace = true
 bgpfc-wire.workspace = true
+
+[features]
+# docs/PROFILING.md: time inserts, withdrawals, the decision process and
+# update generation; RIB size and duplication reports.
+profiling = ["dep:bgpfc-prof", "bgpfc-wire/profiling"]
 
 [dev-dependencies]
 proptest = "1.11"

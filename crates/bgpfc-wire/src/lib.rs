@@ -12,6 +12,10 @@
 //! §4; RFC 6608 §3, §4; RFC 9003 §2, §4; RFC 7606 §3–§5, §7; RFC 2545 §3;
 //! RFC 8950 §3, §4; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774
 //! §3.
+//!
+//! With the `profiling` feature, UPDATE and attribute decoding are timed
+//! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only
+//! read for that and never affects a result.
 #![forbid(unsafe_code)]
 
 pub mod as_path;
@@ -30,7 +34,7 @@ pub mod route_refresh;
 pub mod types;
 pub mod update;
 
-pub use as_path::{AsPath, AsPathSegment, SegmentType};
+pub use as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 pub use attribute::{Aggregator, Origin, PathAttribute};
 pub use capability::{Capability, NextHopEncoding};
 pub use community::{Community, ExtendedCommunity, LargeCommunity};

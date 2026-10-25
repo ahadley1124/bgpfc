@@ -28,6 +28,7 @@ commands:
   clear neighbor ADDR [soft] [MESSAGE]
   reload
   fib mode dry-run|install
+  stats                     (bgpfcd built with --features profiling)
 ";
 
 fn main() {

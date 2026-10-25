@@ -1,13 +1,13 @@
 //! The RIB thread: the only owner of RIB state (AGENTS.md §3). It turns
-//! peer messages into `bgpfc_rib::Rib` calls and delivers what comes out:
-//! UPDATEs to peer threads, route changes to the FIB thread. Between
-//! messages it sleeps until the next RFC 4271 §9.2.1.1 deadline and then
-//! releases the advertisements that were held back; the pacing itself is
-//! `bgpfc_rib`'s. A peer over its RFC 4271 §6.7 prefix limit is told to
-//! end its session. Routes the RIB ignored for a semantically incorrect
-//! next hop are logged (RFC 4271 §6.3), and so is what a change of the
-//! validation source did to the routes' RFC 6811 states, in one line per
-//! change.
+//! peer messages into `bgpfc_rib::Rib` calls and delivers what comes out
+//! as the RIB produces it: UPDATEs to peer threads, route changes to the
+//! FIB thread in batches. Between messages it sleeps until the next RFC
+//! 4271 §9.2.1.1 deadline and then releases the advertisements that were
+//! held back; the pacing itself is `bgpfc_rib`'s. A peer over its RFC 4271
+//! §6.7 prefix limit is told to end its session. Routes the RIB ignored
+//! for a semantically incorrect next hop are logged (RFC 4271 §6.3), and
+//! so is what a change of the validation source did to the routes' RFC
+//! 6811 states, in one line per change.
 //!
 //! Changes of the validation source arrive on the same channel, as
 //! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
@@ -16,13 +16,12 @@
 //! route `disabled`) and keeps it until a change says otherwise.
 
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{Output, PeerInfo, Revalidation, Rib};
+use bgpfc_rib::{FibChange, Output, PeerInfo, Revalidation, Rib, Sink};
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -30,8 +29,9 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PeerInput, RibMsg, RibQuery, RibReply, RibSettings, RouteReport,
+    FibMsg, Intervals, PAGE, PeerInput, RibMsg, RibQuery, RibReply, RibSettings, RouteReport,
 };
+use crate::peer::SendError;
 
 /// Start the RIB thread on `rib`, with the configured per-neighbor
 /// settings.
@@ -55,29 +55,49 @@ fn run(
     peers: &PeerTable,
     fib: &SyncSender<FibMsg>,
 ) {
+    let mut out = Deliver {
+        peers,
+        fib,
+        changes: Vec::new(),
+    };
+    #[cfg(feature = "profiling")]
+    let mut loads = crate::profiling::Loads::from_env();
     loop {
+        #[cfg(not(feature = "profiling"))]
         let Ok(msg) = next(rx, rib.next_deadline()) else {
             return;
         };
-        let now = Instant::now();
-        let mut outputs = match msg {
-            Some(m) => handle(&mut rib, &mut settings, m, now),
-            None => Vec::new(),
+        #[cfg(feature = "profiling")]
+        let Ok(msg) = loads.recv(rx, &rib, rib.next_deadline()) else {
+            return;
         };
+        let now = Instant::now();
+        #[cfg(feature = "profiling")]
+        let seen = msg.as_ref().map(|m| loads.before(m));
+        if let Some(msg) = msg {
+            handle(&mut rib, &mut settings, msg, now, fib, &mut out);
+        }
         // RFC 4271 §9.2.1.1: release what is due. After a message too, so
         // that a busy channel cannot starve the deadlines.
-        outputs.extend(rib.flush(now));
-        deliver(outputs, peers, fib);
+        rib.flush(now, &mut out);
+        out.flush();
+        #[cfg(feature = "profiling")]
+        if let Some(seen) = seen {
+            loads.after(seen, &rib);
+        }
     }
 }
 
 /// Every sender to the RIB thread is gone.
 #[derive(Debug)]
-struct Closed;
+pub(crate) struct Closed;
 
 /// Wait for the next message (`Some`), or until `deadline`, when there is
 /// one, passes first (`None`).
-fn next(rx: &Receiver<RibMsg>, deadline: Option<Instant>) -> Result<Option<RibMsg>, Closed> {
+pub(crate) fn next(
+    rx: &Receiver<RibMsg>,
+    deadline: Option<Instant>,
+) -> Result<Option<RibMsg>, Closed> {
     let Some(deadline) = deadline else {
         return rx.recv().map(Some).map_err(|_| Closed);
     };
@@ -88,8 +108,15 @@ fn next(rx: &Receiver<RibMsg>, deadline: Option<Instant>) -> Result<Option<RibMs
     }
 }
 
-/// Apply one message to the RIB.
-fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) -> Vec<Output> {
+/// Apply one message to the RIB, its outputs going to `out`.
+fn handle(
+    rib: &mut Rib,
+    settings: &mut RibSettings,
+    msg: RibMsg,
+    now: Instant,
+    fib: &SyncSender<FibMsg>,
+    out: &mut impl Sink,
+) {
     match msg {
         RibMsg::PeerUp {
             peer,
@@ -119,15 +146,15 @@ fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) 
             );
             let mut info = peer_info(peer, local_addr, &session, interval);
             info.prefix_limits = limits;
-            rib.peer_up(info, now)
+            rib.peer_up(info, now, out);
         }
-        RibMsg::Update { peer, update } => {
+        RibMsg::Update { peer, update, .. } => {
             log_update(peer, &update);
-            rib.update(peer, &update, now)
+            rib.update(peer, &update, now, out);
         }
         RibMsg::RouteRefresh { peer, family } => {
             bgpfc_log::info!("rib: route refresh", peer = peer, family = family);
-            rib.refresh(peer, family, now)
+            rib.refresh(peer, family, now, out);
         }
         RibMsg::PeerDown { peer } => {
             let stats = rib.peer_stats(peer).unwrap_or_default();
@@ -136,54 +163,72 @@ fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) 
                 peer = peer,
                 routes_deleted = stats.received.iter().map(|(_, n)| n).sum::<usize>()
             );
-            rib.peer_down(peer, now)
+            rib.peer_down(peer, now, out);
         }
         RibMsg::Query(q, reply) => {
             let _ = reply.send(answer(rib, &q));
-            Vec::new()
         }
         RibMsg::SetPolicies { policies, reexport } => {
-            rib.set_policies(policies.0);
-            let mut out = Vec::new();
-            for peer in reexport {
-                let families: Vec<_> = rib
-                    .peer(peer)
-                    .map(|p| p.families.clone())
-                    .unwrap_or_default();
-                for family in families {
-                    bgpfc_log::info!("rib: re-export", peer = peer, family = family);
-                    out.extend(rib.reexport(peer, family, now));
-                }
+            for peer in &reexport {
+                bgpfc_log::info!("rib: re-export", peer = peer);
             }
-            out
+            rib.set_policies(policies.0, &reexport, now, out);
         }
         RibMsg::SetIntervals(new) => {
             settings.intervals = new;
-            follow_intervals(rib, settings, now)
+            follow_intervals(rib, settings, now, out);
         }
         RibMsg::SetPrefixLimits(new) => {
             settings.prefix_limits = new;
-            follow_prefix_limits(rib, settings, now)
+            follow_prefix_limits(rib, settings, now, out);
         }
         RibMsg::Resend { peer } => {
             let families: Vec<_> = rib
                 .peer(peer)
                 .map(|p| p.families.clone())
                 .unwrap_or_default();
-            let mut out = Vec::new();
             for family in families {
                 bgpfc_log::info!("rib: resend", peer = peer, family = family);
-                out.extend(rib.refresh(peer, family, now));
+                rib.refresh(peer, family, now, out);
             }
-            out
         }
         RibMsg::Validation(change) => {
             bgpfc_log::debug!(
                 "rib: validation change",
                 affected = describe_affected(&change.affected)
             );
-            rib.validation_changed(change, now)
+            rib.validation_changed(change, now, out);
         }
+        // The changes of earlier messages went to the FIB first: the loop
+        // hands them on after each.
+        RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
+    }
+}
+
+/// Routes in one `FibMsg::Reconcile`.
+const RECONCILE_BATCH: usize = 4096;
+
+/// Switch the FIB's mode. Going to install, the FIB reconciles what is
+/// installed against every route the RIB has (README, "FIB dry-run"),
+/// which go to it in batches through the bounded queue rather than as one
+/// table-sized list.
+fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: SyncSender<usize>) {
+    let send = |msg| fib.send(msg).is_ok();
+    let mut ok = send(FibMsg::SetMode(mode));
+    if mode == bgpfc_fib::Mode::Install {
+        let mut batch = Vec::with_capacity(RECONCILE_BATCH);
+        for route in rib.fib_routes() {
+            batch.push(route);
+            if batch.len() == RECONCILE_BATCH {
+                ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
+                batch.reserve(RECONCILE_BATCH);
+            }
+        }
+        ok &= send(FibMsg::Reconcile(batch));
+    }
+    ok &= send(FibMsg::ReconcileEnd(reply));
+    if !ok {
+        bgpfc_log::error!("fib thread gone");
     }
 }
 
@@ -198,12 +243,11 @@ fn describe_affected(affected: &AffectedPrefixes) -> String {
 
 /// After a reload: running sessions take their new advertisement
 /// interval (RFC 4271 §9.2.1.1) without a reset.
-fn follow_intervals(rib: &mut Rib, settings: &RibSettings, now: Instant) -> Vec<Output> {
+fn follow_intervals(rib: &mut Rib, settings: &RibSettings, now: Instant, out: &mut impl Sink) {
     let up: Vec<(IpAddr, PeerKind, Duration)> = rib
         .peers()
         .map(|p| (p.addr, p.kind, p.advertisement_interval))
         .collect();
-    let mut out = Vec::new();
     for (peer, kind, old) in up {
         let interval = advertisement_interval(configured(&settings.intervals, peer), kind);
         if interval != old {
@@ -212,21 +256,19 @@ fn follow_intervals(rib: &mut Rib, settings: &RibSettings, now: Instant) -> Vec<
                 peer = peer,
                 seconds = interval.as_secs()
             );
-            out.extend(rib.set_advertisement_interval(peer, interval, now));
+            rib.set_advertisement_interval(peer, interval, now, out);
         }
     }
-    out
 }
 
 /// After a reload: running sessions take their new prefix limits
 /// (RFC 4271 §6.7) without a reset; one already over a new limit ends as
 /// if it had just crossed it.
-fn follow_prefix_limits(rib: &mut Rib, settings: &RibSettings, now: Instant) -> Vec<Output> {
+fn follow_prefix_limits(rib: &mut Rib, settings: &RibSettings, now: Instant, out: &mut impl Sink) {
     let up: Vec<(IpAddr, Vec<_>)> = rib
         .peers()
         .map(|p| (p.addr, p.prefix_limits.clone()))
         .collect();
-    let mut out = Vec::new();
     for (peer, old) in up {
         let limits = prefix_limits(settings, peer);
         if limits != old {
@@ -235,10 +277,9 @@ fn follow_prefix_limits(rib: &mut Rib, settings: &RibSettings, now: Instant) -> 
                 peer = peer,
                 limits = describe_limits(&limits)
             );
-            out.extend(rib.set_prefix_limits(peer, limits, now));
+            rib.set_prefix_limits(peer, limits, now, out);
         }
     }
-    out
 }
 
 /// The `maximum-prefix` limits configured for `peer` (RFC 4271 §6.7).
@@ -292,31 +333,60 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
     }
 }
 
-fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
-    for o in outputs {
-        match o {
+/// FIB changes sent in one message at most: one per channel operation
+/// costs the RIB thread more than the change itself.
+pub(crate) const FIB_BATCH: usize = 256;
+
+/// Hands RIB outputs to the FIB and peer threads as the RIB produces them;
+/// FIB changes go in batches, sent when full and after each input.
+struct Deliver<'a> {
+    peers: &'a PeerTable,
+    fib: &'a SyncSender<FibMsg>,
+    changes: Vec<FibChange>,
+}
+
+impl Deliver<'_> {
+    fn flush(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+        // The next input likely changes about as many destinations.
+        let next = Vec::with_capacity(self.changes.len());
+        let changes = std::mem::replace(&mut self.changes, next);
+        // A bounded channel: a slow kernel slows the RIB rather than
+        // growing memory (AGENTS.md §3 backpressure).
+        if self.fib.send(FibMsg::Changes(changes)).is_err() {
+            bgpfc_log::error!("fib thread gone");
+        }
+    }
+
+    fn handle(&self, peer: IpAddr) -> Option<crate::peer::PeerHandle> {
+        self.peers.read().ok().and_then(|t| t.get(&peer).cloned())
+    }
+}
+
+impl Sink for Deliver<'_> {
+    fn put(&mut self, output: Output) {
+        match output {
             Output::Fib(c) => {
-                // A bounded channel: a slow kernel slows the RIB rather
-                // than growing memory (AGENTS.md §3 backpressure).
-                if fib.send(FibMsg::Change(c)).is_err() {
-                    bgpfc_log::error!("fib thread gone");
+                self.changes.push(c);
+                if self.changes.len() >= FIB_BATCH {
+                    self.flush();
                 }
             }
             Output::Send { peer, messages } => {
-                let handle = peers.read().ok().and_then(|t| t.get(&peer).cloned());
-                let Some(handle) = handle else {
-                    continue;
+                let Some(handle) = self.handle(peer) else {
+                    return;
                 };
                 bgpfc_log::debug!("rib: send", peer = peer, messages = messages.len());
-                match handle.tx.try_send(PeerInput::Send(messages)) {
+                match handle.send_updates(messages) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
+                    Err(SendError::Overrun) => {
                         // AGENTS.md §3: never drop updates silently; the
                         // peer thread resets the session.
-                        bgpfc_log::warn!("rib: peer queue full", peer = peer);
-                        handle.overrun.store(true, Ordering::Relaxed);
+                        bgpfc_log::warn!("rib: peer outbox full", peer = peer);
                     }
-                    Err(TrySendError::Disconnected(_)) => {
+                    Err(SendError::Gone) => {
                         bgpfc_log::warn!("rib: peer thread gone", peer = peer);
                     }
                 }
@@ -335,9 +405,8 @@ fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
                     family = family,
                     limit = limit
                 );
-                let handle = peers.read().ok().and_then(|t| t.get(&peer).cloned());
-                let Some(handle) = handle else {
-                    continue;
+                let Some(handle) = self.handle(peer) else {
+                    return;
                 };
                 // RFC 4271 §6.7: the session must end. A full queue means
                 // the peer thread is busy and checks the slot after its
@@ -432,6 +501,10 @@ fn listed(shown: &[Prefix], total: usize) -> String {
 }
 
 fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
+    // Counting the prefixes costs more than the test.
+    if !bgpfc_log::enabled(bgpfc_log::Level::Debug) {
+        return;
+    }
     let announced = update.announcements().count();
     let withdrawn = update.withdrawals().count();
     bgpfc_log::debug!(
@@ -467,7 +540,11 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
                 .collect(),
         ),
-        RibQuery::Routes { family, prefix } => match prefix {
+        RibQuery::Routes {
+            family,
+            prefix,
+            after,
+        } => match prefix {
             Some(prefix) => {
                 let best = rib
                     .loc_rib(*family)
@@ -479,7 +556,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         .map(|c| RouteReport {
                             prefix: *prefix,
                             peer: c.peer,
-                            attrs: std::sync::Arc::clone(&c.attrs),
+                            attrs: std::sync::Arc::clone(c.attrs),
                             best: best == Some(c.peer),
                             rov: c.rov,
                         })
@@ -487,17 +564,21 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 )
             }
             None => RibReply::Routes(
-                rib.loc_rib(*family)
+                rib.loc_rib_after(*family, *after)
+                    .take(PAGE)
                     .map(|(prefix, b)| RouteReport {
                         prefix,
                         peer: b.peer,
-                        attrs: std::sync::Arc::clone(&b.attrs),
+                        attrs: std::sync::Arc::clone(b.attrs),
                         best: true,
                         rov: b.rov,
                     })
                     .collect(),
             ),
         },
+        RibQuery::FibRoutes { after } => {
+            RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
+        }
     }
 }
 
@@ -512,6 +593,27 @@ mod tests {
     use bgpfc_wire::types::{Asn, HoldTime, RouterId};
 
     const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
+
+    /// [`super::handle`], with what it put out.
+    fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) -> Vec<Output> {
+        let (fib, _) = sync_channel(1);
+        let mut out = Vec::new();
+        super::handle(rib, settings, msg, now, &fib, &mut out);
+        out
+    }
+
+    /// `outputs` through a [`Deliver`], as the thread hands them on.
+    fn deliver(outputs: Vec<Output>, peers: &PeerTable, fib: &SyncSender<FibMsg>) {
+        let mut out = Deliver {
+            peers,
+            fib,
+            changes: Vec::new(),
+        };
+        for o in outputs {
+            out.put(o);
+        }
+        out.flush();
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -618,10 +720,10 @@ mod tests {
             peer: ip(peer),
             update: bgpfc_wire::update::DecodedUpdate {
                 message,
-                treated_as_withdraw: None,
-                discarded: Vec::new(),
-                disabled: Vec::new(),
+                ..Default::default()
             },
+            #[cfg(feature = "profiling")]
+            started: None,
         }
     }
 
@@ -731,13 +833,7 @@ mod tests {
     /// tells a peer.
     fn handle_on_queue(addr: IpAddr) -> (crate::peer::PeerHandle, Receiver<PeerInput>) {
         let (tx, rx) = sync_channel(1);
-        let handle = crate::peer::PeerHandle {
-            addr,
-            tx,
-            overrun: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            prefix_limit: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
-        (handle, rx)
+        (crate::peer::PeerHandle::on(addr, tx), rx)
     }
 
     #[test]
@@ -937,7 +1033,7 @@ mod tests {
         conn.write_all(&frame(MessageType::Update, &body).unwrap())
             .unwrap();
         match rib_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(RibMsg::Update { peer, update }) => {
+            Ok(RibMsg::Update { peer, update, .. }) => {
                 assert_eq!(peer, addr);
                 assert_eq!(update.disabled.len(), 1);
                 assert!(update.disables(AddressFamily::IPV6_UNICAST));
@@ -1021,13 +1117,14 @@ mod tests {
         let q = RibQuery::Routes {
             family: V4,
             prefix: None,
+            after: None,
         };
         match answer(rib, &q) {
             RibReply::Routes(routes) => routes
                 .iter()
                 .map(|r| (r.prefix.to_string(), r.rov))
                 .collect(),
-            RibReply::Peers(_) => panic!("asked for routes"),
+            other => panic!("asked for routes, got {other:?}"),
         }
     }
 
@@ -1143,6 +1240,7 @@ mod tests {
             let q = RibQuery::Routes {
                 family: V4,
                 prefix: None,
+                after: None,
             };
             tx.send(RibMsg::Query(q, reply)).unwrap();
             match answer.recv_timeout(Duration::from_secs(10)) {
@@ -1186,8 +1284,8 @@ mod tests {
         // on the state yet. Turning validation off changed no best route.
         let installed: Vec<_> = fib_rx
             .try_iter()
-            .map(|m| match m {
-                FibMsg::Change(c) => c.prefix.to_string(),
+            .flat_map(|m| match m {
+                FibMsg::Changes(c) => c.into_iter().map(|c| c.prefix.to_string()),
                 other => panic!("unexpected {other:?}"),
             })
             .collect();

@@ -350,7 +350,7 @@ pub struct NeighborOpts {
     /// default (30 s external, 5 s internal).
     pub advertisement_interval: Option<u16>,
     /// More statements for the `neighbor` block, such as
-    /// `extended-next-hop yes;`.
+    /// `extended-next-hop yes;` or `connect-retry-time 5;`.
     pub extra: String,
 }
 

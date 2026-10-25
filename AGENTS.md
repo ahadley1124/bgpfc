@@ -31,6 +31,9 @@ for what it does and [`RESOURCES.md`](RESOURCES.md) for the RFCs.
    - `unsafe` never escapes. The crate exports only safe wrappers, such as
      `NetlinkSocket::send(&self, &[u8])`, and no raw pointers or file
      descriptors.
+   - The counting global allocator of profiling builds lives here too
+     (`bgpfc_sys::alloc`, behind the `profiling` feature): its
+     `unsafe impl GlobalAlloc` forwards to `System`.
 4. **OS access goes through hand-written `extern "C"` declarations** in
    `bgpfc-sys`. std already links glibc or musl, so declaring `socket`,
    `bind`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `close`,
@@ -87,14 +90,21 @@ crates/
                         restarted through std::process::Command.
   bgpfcd/               daemon binary: wiring, threads, signals.
   bgpfcctl/             CLI binary.
+  bgpfc-prof/           profiling instruments: counters, log2 histograms, span
+                        timers, /proc memory, the report line. Linked only
+                        through the `profiling` features (docs/PROFILING.md).
+  bgpfc-bench/          dev tooling, never linked by the daemon: bgp_loadgen,
+                        bgp_bench, the MRT reader, std-only micro-benchmarks.
 fuzz/                   cargo-fuzz crate, NOT a workspace member. Nightly allowed.
 interop/                dev-only crate: drives BIRD / FRR / GoBGP in network
                         namespaces or containers, with RTR caches (StayRTR and
                         a stub of its own). Not a workspace default-member.
 benches/ (per crate)    criterion benches as dev-dependencies.
+bench/results.csv       bgp_bench history; machine-specific, git-ignored.
 scripts/                check.sh, check-deps.sh, miri.sh, ...
 contrib/                bgpfcd.service, example configs.
-docs/                   config.md (grammar), control.md (CLI + HTTP API), design notes.
+docs/                   config.md (grammar), control.md (CLI + HTTP API),
+                        PROFILING.md, design notes.
 COMPLIANCE.md           RFC requirement matrix (see §6).
 ```
 
@@ -104,6 +114,9 @@ Route origin validation adds `rpki → wire`, `rtr → {rpki, wire, log}`,
 `sidecar → {sys, log}`, and `rib → rpki`; `bgpfcd` may depend on all three.
 `wire`, `fsm`, `policy`, `config`, `rpki`, and `rtr` must not depend on
 `sys`. Keep protocol logic pure so it can be tested without sockets or time.
+`bgpfc-prof` is a leaf below `wire`; `wire`, `rib` and `bgpfcd` reach it only
+through their `profiling` feature, so a default build does not link it.
+`bgpfc-bench` sits on top and only `bgpfcd`'s tests depend on it.
 
 The crate names and boundaries above are the plan. Changing them, for example
 by merging two crates, is fine if it is justified in the PR description and
@@ -186,6 +199,15 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 - JSON output is produced by a small writer in `bgpfc-control` that handles
   escaping correctly. Test it against a reference parser in dev-dependencies
   if useful.
+
+**Profiling** (`docs/PROFILING.md`).
+- Every hook is a `#[cfg(feature = "profiling")]` statement that only
+  observes: it never changes a result, a protocol decision or the default
+  build. Counters and histograms are relaxed atomics in `bgpfc-prof`.
+- Profiling builds read the clock in `wire` and `rib` for histograms only;
+  the FSM is not instrumented and stays clock-free.
+- Report lines go to stderr as `msg="profile"` log lines whatever the log
+  level, and to `bgpfcctl stats`; never over HTTP or the network.
 
 **Logging.**
 - `bgpfc-log` writes one line per event to stderr, in this format:
@@ -280,7 +302,8 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-rtr` | Unit tests with PDU byte vectors laid out as in the figures of RFC 8210 §5 and RFC 6810 §5, and from a capture of a real version 0 session. `proptest` round-trips of the codec, and framer properties: the same PDUs, and the same error, however the stream is cut. Fuzz targets for the PDU decoder and framer and for the client session. Miri. Table-driven session tests with injected time: every PDU type and every transport and timer event in every state, then the RFC 8210 §8 sequences, the §7 version fallback, the §6 timers and stale data. A proptest of the session against a simulated cache that updates, restarts, goes away and runs out of data: every commit is a whole set the cache held, and the session ends in sync with it. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
 | `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`; a stub cache of the crate's own stands in where StayRTR cannot. Uses network namespaces and needs root, so it runs in CI and on demand. |
-| benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation. Do not regress them without saying so in the PR. |
+| benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation; std-only micro-benchmarks in `bgpfc-bench`. Do not regress them without saying so in the PR. |
+| `bgpfc-prof`, `bgpfc-bench`, profiling | Histogram bucket and percentile math; allocator arithmetic on a private instance, under Miri; UPDATE packing against the size limit and round-tripped through the daemon's decoder; MRT parsing from hand-built records; the ignored loadgen-to-daemon test (`cargo test -p bgpfcd --features profiling -- --ignored`). `bgp_bench` keeps the time and memory history (`docs/PROFILING.md`); quote it when a change claims to be faster or smaller. |
 
 Miri cannot run FFI. Put real syscalls behind
 `#[cfg(not(miri))]` and keep the encode/decode logic separate so Miri can cover
@@ -292,13 +315,15 @@ it. Besides the crates with `unsafe` or a byte decoder of their own,
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features profiling -- -D warnings
 cargo test --workspace
+cargo test --workspace --features profiling
 scripts/check-deps.sh                                   # std-only enforcement
 cargo +nightly miri test -p bgpfc-wire -p bgpfc-sys -p bgpfc-fib \
-  -p bgpfc-rpki -p bgpfc-rtr                            # via scripts/miri.sh
+  -p bgpfc-rpki -p bgpfc-rtr --features bgpfc-sys/profiling   # via scripts/miri.sh
 ```
 
-`scripts/check.sh` runs all five. If a gate fails, fix the cause. Never
+`scripts/check.sh` runs all seven. If a gate fails, fix the cause. Never
 `#[allow]` a lint, `#[ignore]` a test, or loosen a gate to get green without
 the maintainer's explicit agreement. If you must add an `#[allow]`, it needs a
 comment explaining why.

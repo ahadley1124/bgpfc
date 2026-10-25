@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{PeerInfo, Rib};
+use bgpfc_rib::{Output, PeerInfo, Rib};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -20,6 +20,29 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 use criterion::Criterion;
+
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
+
+/// Give the RIB `updates` from `from` at `now`, with one output buffer
+/// for them all, as the daemon does.
+fn feed<'a>(
+    rib: &mut Rib,
+    from: IpAddr,
+    updates: impl IntoIterator<Item = &'a DecodedUpdate>,
+    now: Instant,
+    out: &mut Vec<Output>,
+) {
+    for u in updates {
+        rib.update(from, u, now, out);
+        black_box(&*out);
+        out.clear();
+    }
+}
 
 /// An external peer with no advertisement interval.
 fn peer(i: u8) -> PeerInfo {
@@ -126,11 +149,10 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let now = Instant::now();
             let mut rib = Rib::new(Asn(65_000));
-            rib.peer_up(peer(1), now);
-            rib.peer_up(peer(2), now);
-            for u in v4.iter().chain(&v6) {
-                black_box(rib.update(peer(1).addr, u, now));
-            }
+            let mut out = Vec::new();
+            outputs(|o| rib.peer_up(peer(1), now, o));
+            outputs(|o| rib.peer_up(peer(2), now, o));
+            feed(&mut rib, peer(1).addr, v4.iter().chain(&v6), now, &mut out);
             rib
         });
     });
@@ -142,15 +164,18 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let now = Instant::now();
             let mut rib = Rib::new(Asn(65_000));
-            rib.peer_up(peer(1), now);
-            rib.peer_up(peer(2), now);
-            rib.peer_up(peer(3), now);
-            for u in v4.iter().chain(&v6) {
-                black_box(rib.update(peer(1).addr, u, now));
-            }
-            for u in v4_other.iter().chain(&v6_other) {
-                black_box(rib.update(peer(3).addr, u, now));
-            }
+            let mut out = Vec::new();
+            outputs(|o| rib.peer_up(peer(1), now, o));
+            outputs(|o| rib.peer_up(peer(2), now, o));
+            outputs(|o| rib.peer_up(peer(3), now, o));
+            feed(&mut rib, peer(1).addr, v4.iter().chain(&v6), now, &mut out);
+            feed(
+                &mut rib,
+                peer(3).addr,
+                v4_other.iter().chain(&v6_other),
+                now,
+                &mut out,
+            );
             rib
         });
     });
@@ -159,14 +184,13 @@ fn bench(c: &mut Criterion) {
             || {
                 let now = Instant::now();
                 let mut rib = Rib::new(Asn(65_000));
-                rib.peer_up(peer(1), now);
-                rib.peer_up(peer(2), now);
-                for u in v4.iter().chain(&v6) {
-                    rib.update(peer(1).addr, u, now);
-                }
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(peer(1), now, o));
+                outputs(|o| rib.peer_up(peer(2), now, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(&v6), now, &mut out);
                 rib
             },
-            |mut rib| black_box(rib.peer_down(peer(1).addr, Instant::now())),
+            |mut rib| black_box(outputs(|o| rib.peer_down(peer(1).addr, Instant::now(), o))),
             criterion::BatchSize::LargeInput,
         );
     });
@@ -186,20 +210,24 @@ fn bench(c: &mut Criterion) {
             || {
                 let t0 = Instant::now();
                 let mut rib = Rib::new(Asn(65_000));
-                rib.peer_up(peer(1), t0);
-                rib.peer_up(paced_peer(2), t0);
-                for u in v4.iter().chain(&v6) {
-                    rib.update(peer(1).addr, u, t0);
-                }
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(peer(1), t0, o));
+                outputs(|o| rib.peer_up(paced_peer(2), t0, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(&v6), t0, &mut out);
                 (rib, t0)
             },
             |(mut rib, t0)| {
+                let mut out = Vec::new();
                 for (s, round) in (1u64..).zip(&churn) {
-                    for u in round {
-                        black_box(rib.update(peer(1).addr, u, t0 + Duration::from_secs(s)));
-                    }
+                    feed(
+                        &mut rib,
+                        peer(1).addr,
+                        round,
+                        t0 + Duration::from_secs(s),
+                        &mut out,
+                    );
                 }
-                black_box(rib.flush(t0 + Duration::from_secs(30)))
+                black_box(outputs(|o| rib.flush(t0 + Duration::from_secs(30), o)))
             },
             criterion::BatchSize::LargeInput,
         );
@@ -231,16 +259,15 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
     let valid: Arc<dyn ValidationSource> = Arc::new(valid);
     let now = Instant::now();
     let mut rib = Rib::new(Asn(65_000));
-    rib.peer_up(peer(1), now);
-    rib.peer_up(peer(2), now);
-    for u in v4.iter().chain(v6) {
-        rib.update(peer(1).addr, u, now);
-    }
+    let mut out = Vec::new();
+    outputs(|o| rib.peer_up(peer(1), now, o));
+    outputs(|o| rib.peer_up(peer(2), now, o));
+    feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
     let on = || ValidationChange {
         source: Arc::clone(&valid),
         affected: AffectedPrefixes::All,
     };
-    rib.validation_changed(on(), now);
+    outputs(|o| rib.validation_changed(on(), now, o));
 
     let mut group = c.benchmark_group("rib");
     group.sample_size(10);
@@ -263,12 +290,12 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
                     source: Arc::clone(source),
                     affected: affected.clone(),
                 };
-                black_box(rib.validation_changed(change, now))
+                black_box(outputs(|o| rib.validation_changed(change, now, o)))
             });
         });
         // Leave every route Valid for the next case.
         if flip {
-            rib.validation_changed(on(), now);
+            outputs(|o| rib.validation_changed(on(), now, o));
         }
     }
     let mut flip = false;
@@ -280,7 +307,7 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
             } else {
                 on()
             };
-            black_box(rib.validation_changed(change, now))
+            black_box(outputs(|o| rib.validation_changed(change, now, o)))
         });
     });
     group.finish();

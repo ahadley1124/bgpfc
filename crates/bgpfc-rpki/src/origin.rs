@@ -37,7 +37,7 @@ impl RouteOrigin {
         //     empty, or
         //   * the distinguished value "NONE" if the final segment of the
         //     AS_PATH attribute is of any other type."
-        let Some(last) = path.segments.last() else {
+        let Some(last) = path.segments().last() else {
             return RouteOrigin::As(local_as);
         };
         match last.kind {
@@ -45,9 +45,9 @@ impl RouteOrigin {
             // cannot be decoded; were one built by hand, it has no
             // rightmost AS, so its origin cannot be determined.
             SegmentType::Sequence => last
-                .asns
-                .last()
-                .map_or(RouteOrigin::None, |&asn| RouteOrigin::As(asn)),
+                .asns()
+                .next_back()
+                .map_or(RouteOrigin::None, RouteOrigin::As),
             SegmentType::ConfedSequence | SegmentType::ConfedSet => RouteOrigin::As(local_as),
             // RFC 6483 §2: with an AS_SET "the route is an aggregate, then
             // the origin AS cannot be determined".
@@ -81,24 +81,24 @@ mod tests {
         }
     }
 
-    fn origin(segments: Vec<AsPathSegment>) -> RouteOrigin {
-        RouteOrigin::from_as_path(&AsPath { segments }, LOCAL)
+    fn origin(segments: &[AsPathSegment]) -> RouteOrigin {
+        RouteOrigin::from_as_path(&AsPath::from_segments(segments), LOCAL)
     }
 
     #[test]
     fn rightmost_as_of_a_final_sequence() {
         // RFC 6811 §2, first bullet.
         assert_eq!(
-            origin(vec![seg(SegmentType::Sequence, &[64_496, 64_497, 64_498])]),
+            origin(&[seg(SegmentType::Sequence, &[64_496, 64_497, 64_498])]),
             RouteOrigin::As(Asn(64_498))
         );
         assert_eq!(
-            origin(vec![seg(SegmentType::Sequence, &[64_496])]),
+            origin(&[seg(SegmentType::Sequence, &[64_496])]),
             RouteOrigin::As(Asn(64_496))
         );
         // Only the final segment counts.
         assert_eq!(
-            origin(vec![
+            origin(&[
                 seg(SegmentType::Sequence, &[64_496]),
                 seg(SegmentType::Set, &[64_497, 64_498]),
                 seg(SegmentType::Sequence, &[64_499, 64_510]),
@@ -107,7 +107,7 @@ mod tests {
         );
         // A path that crossed a confederation and then left it.
         assert_eq!(
-            origin(vec![
+            origin(&[
                 seg(SegmentType::ConfedSequence, &[65_100, 65_101]),
                 seg(SegmentType::Sequence, &[64_496, 64_497]),
             ]),
@@ -115,7 +115,7 @@ mod tests {
         );
         // Four-octet origins are origins like any other (RFC 6811 §3).
         assert_eq!(
-            origin(vec![seg(SegmentType::Sequence, &[64_496, 4_200_000_000])]),
+            origin(&[seg(SegmentType::Sequence, &[64_496, 4_200_000_000])]),
             RouteOrigin::As(Asn(4_200_000_000))
         );
     }
@@ -123,21 +123,21 @@ mod tests {
     #[test]
     fn local_as_for_an_empty_path_or_a_final_confed_segment() {
         // RFC 6811 §2, second bullet.
-        assert_eq!(origin(vec![]), RouteOrigin::As(LOCAL));
+        assert_eq!(origin(&[]), RouteOrigin::As(LOCAL));
         assert_eq!(
             RouteOrigin::from_as_path(&AsPath::empty(), Asn(4_200_000_000)),
             RouteOrigin::As(Asn(4_200_000_000))
         );
         assert_eq!(
-            origin(vec![seg(SegmentType::ConfedSequence, &[65_100, 65_101])]),
+            origin(&[seg(SegmentType::ConfedSequence, &[65_100, 65_101])]),
             RouteOrigin::As(LOCAL)
         );
         assert_eq!(
-            origin(vec![seg(SegmentType::ConfedSet, &[65_100, 65_101])]),
+            origin(&[seg(SegmentType::ConfedSet, &[65_100, 65_101])]),
             RouteOrigin::As(LOCAL)
         );
         assert_eq!(
-            origin(vec![
+            origin(&[
                 seg(SegmentType::Sequence, &[64_496]),
                 seg(SegmentType::ConfedSequence, &[65_100]),
             ]),
@@ -149,11 +149,11 @@ mod tests {
     fn none_for_any_other_final_segment() {
         // RFC 6811 §2, third bullet; RFC 6483 §2: an aggregate.
         assert_eq!(
-            origin(vec![seg(SegmentType::Set, &[64_496, 64_497])]),
+            origin(&[seg(SegmentType::Set, &[64_496, 64_497])]),
             RouteOrigin::None
         );
         assert_eq!(
-            origin(vec![
+            origin(&[
                 seg(SegmentType::Sequence, &[64_496, 64_497]),
                 seg(SegmentType::Set, &[64_498]),
             ]),
@@ -161,7 +161,7 @@ mod tests {
         );
         // A set earlier in the path does not hide a final sequence.
         assert_ne!(
-            origin(vec![
+            origin(&[
                 seg(SegmentType::Set, &[64_498]),
                 seg(SegmentType::Sequence, &[64_496]),
             ]),
@@ -169,7 +169,7 @@ mod tests {
         );
         // A hand-built empty sequence has no rightmost AS.
         assert_eq!(
-            origin(vec![seg(SegmentType::Sequence, &[])]),
+            origin(&[seg(SegmentType::Sequence, &[])]),
             RouteOrigin::None
         );
     }

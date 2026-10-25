@@ -469,24 +469,20 @@ mod tests {
         use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
         let local = Asn(64_500);
         let set = set(&[vrp("192.0.2.0/24", 24, 64_500)]);
-        let confed = AsPath {
-            segments: vec![AsPathSegment {
-                kind: SegmentType::ConfedSequence,
-                asns: vec![Asn(65_100)],
-            }],
-        };
+        let confed = AsPath::from_segments(&[AsPathSegment {
+            kind: SegmentType::ConfedSequence,
+            asns: vec![Asn(65_100)],
+        }]);
         for path in [AsPath::empty(), confed] {
             let origin = RouteOrigin::from_as_path(&path, local);
             assert_eq!(set.validate(p("192.0.2.0/24"), origin), Valid);
             let elsewhere = RouteOrigin::from_as_path(&path, Asn(64_501));
             assert_eq!(set.validate(p("192.0.2.0/24"), elsewhere), Invalid);
         }
-        let aggregate = AsPath {
-            segments: vec![AsPathSegment {
-                kind: SegmentType::Set,
-                asns: vec![Asn(64_500)],
-            }],
-        };
+        let aggregate = AsPath::from_segments(&[AsPathSegment {
+            kind: SegmentType::Set,
+            asns: vec![Asn(64_500)],
+        }]);
         let origin = RouteOrigin::from_as_path(&aggregate, local);
         assert_eq!(set.validate(p("192.0.2.0/24"), origin), Invalid);
     }

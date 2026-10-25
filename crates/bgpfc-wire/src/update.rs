@@ -218,6 +218,8 @@ impl UpdateMessage {
     /// disable, treat-as-withdraw and attribute discard are not errors:
     /// the rest of the message is still decoded; see [`DecodedUpdate`].
     pub fn decode(body: &[u8], ctx: &DecodeContext) -> Result<DecodedUpdate, UpdateError> {
+        #[cfg(feature = "profiling")]
+        let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::MSG_PARSE_UPDATE);
         let (withdrawn_bytes, attr_bytes, nlri_bytes) = split_fields(body)?;
         // RFC 7606 §3 i) and §5.3: both prefix fields are checked for syntax,
         // and RFC 7606 §3 j): if the NLRI cannot be parsed, treat-as-withdraw
@@ -374,6 +376,8 @@ fn decode_attributes(
     nlri_field: bool,
     st: &mut State,
 ) -> Result<(), UpdateError> {
+    #[cfg(feature = "profiling")]
+    let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::ATTR_PARSE);
     let mut r = Reader::new(bytes);
     while !r.is_empty() {
         let Ok(raw) = parse_raw(&mut r) else {
@@ -1389,12 +1393,10 @@ mod tests {
             UpdateSubcode::MalformedAsPath as u8
         );
         // RFC 9774 §3: AS_SET, unless allowed.
-        let set = AsPath {
-            segments: vec![crate::as_path::AsPathSegment {
-                kind: crate::as_path::SegmentType::Set,
-                asns: vec![Asn(65_001)],
-            }],
-        };
+        let set = AsPath::from_segments(&[crate::as_path::AsPathSegment {
+            kind: crate::as_path::SegmentType::Set,
+            asns: vec![Asn(65_001)],
+        }]);
         m.attributes[1] = PathAttribute::AsPath(set.clone());
         let wire = m.encode(&ENC4).unwrap();
         let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();

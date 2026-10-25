@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "bgpfc BGP-4 routing daemon"
 
 [dependencies]
+bgpfc-prof = { workspace = true, optional = true }
 bgpfc-config.workspace = true
 bgpfc-control.workspace = true
 bgpfc-fib.workspace = true
@@ -19,6 +20,20 @@ bgpfc-rpki.workspace = true
 bgpfc-rtr.workspace = true
 bgpfc-sys.workspace = true
 bgpfc-wire.workspace = true
+
+# docs/PROFILING.md: the load generator for tests/loadgen.rs.
+[dev-dependencies]
+bgpfc-bench.workspace = true
+
+[features]
+# docs/PROFILING.md: counters, histograms and the counting allocator. Off by
+# default; the default build contains none of it.
+profiling = [
+    "dep:bgpfc-prof",
+    "bgpfc-rib/profiling",
+    "bgpfc-sys/profiling",
+    "bgpfc-wire/profiling",
+]
 
 [lints]
 workspace = true

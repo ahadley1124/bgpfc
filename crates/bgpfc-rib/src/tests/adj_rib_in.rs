@@ -83,23 +83,17 @@ impl Policies for RejectUnvalidated {
 
 /// What the Adj-RIB-In holds for `prefix`: each peer's route as received.
 fn received(rib: &Rib, family: AddressFamily, prefix: Prefix) -> Vec<(IpAddr, Arc<PathAttrs>)> {
-    rib.tables
-        .get(&family)
-        .and_then(|t| t.get(&prefix))
-        .map(|d| {
-            d.routes
-                .iter()
-                .map(|r| (r.peer, Arc::clone(&r.received)))
-                .collect()
-        })
-        .unwrap_or_default()
+    routes(rib, family, prefix)
+        .into_iter()
+        .map(|(peer, r)| (peer, Arc::clone(r.received())))
+        .collect()
 }
 
 /// Destinations the RIB holds in `family`, whatever is in them.
 fn destinations(rib: &Rib, family: AddressFamily) -> Vec<Prefix> {
     rib.tables
-        .get(&family)
-        .map(|t| t.keys().copied().collect())
+        .get(family)
+        .map(|t| t.iter().map(|(p, _)| p).collect())
         .unwrap_or_default()
 }
 
@@ -109,14 +103,17 @@ fn accepted_routes_are_held_as_received_and_rejected_ones_are_dropped() {
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOneRaiseRest(rejected)));
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    rib.peer_up(e1.clone(), now());
-    rib.peer_up(e2.clone(), now());
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
     let a = attrs(&[65_001], "10.0.0.1");
-    let out = rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
-        now(),
-    );
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            now(),
+            o,
+        );
+    });
     // Only the accepted route is a candidate, with what policy set.
     let f = fib(&out);
     assert_eq!(f.len(), 1);
@@ -141,11 +138,14 @@ fn accepted_routes_are_held_as_received_and_rejected_ones_are_dropped() {
         vec![(V4, 1), (V6, 0)]
     );
     // A second peer's route to the rejected destination: the same.
-    rib.update(
-        e2.addr,
-        &announce(&["198.51.100.0/24"], &attrs(&[65_002], "10.0.0.2")),
-        now(),
-    );
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(&["198.51.100.0/24"], &attrs(&[65_002], "10.0.0.2")),
+            now(),
+            o,
+        );
+    });
     assert_eq!(destinations(&rib, V4), vec![p("192.0.2.0/24")]);
     assert_eq!(rib.loc_rib(V4).count(), 1);
 }
@@ -159,17 +159,17 @@ fn a_route_import_policy_rejected_is_used_once_policy_accepts_it_again() {
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOneRaiseRest(rejected)));
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    rib.peer_up(e1.clone(), now());
-    rib.peer_up(e2.clone(), now());
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
     let a = attrs(&[65_001], "10.0.0.1");
     let both = announce(&["192.0.2.0/24", "198.51.100.0/24"], &a);
-    rib.update(e1.addr, &both, now());
+    outputs(|o| rib.update(e1.addr, &both, now(), o));
     assert_eq!(rib.loc_rib(V4).count(), 1);
     // The same UPDATE again under the same policy: nothing to do.
-    assert_eq!(rib.update(e1.addr, &both, now()), vec![]);
+    assert_eq!(outputs(|o| rib.update(e1.addr, &both, now(), o)), vec![]);
 
-    rib.set_policies(Box::new(AcceptAll));
-    let out = rib.update(e1.addr, &both, now());
+    rib.set_policies(Box::new(AcceptAll), &[], now(), &mut Vec::new());
+    let out = outputs(|o| rib.update(e1.addr, &both, now(), o));
     // The newly accepted route goes into the FIB; the other changed its
     // attributes (no LOCAL_PREF set any more) and is installed again.
     let f = fib(&out);
@@ -190,8 +190,13 @@ fn a_route_import_policy_rejected_is_used_once_policy_accepts_it_again() {
     );
 
     // Rejected again: withdrawn, and no longer held or counted.
-    rib.set_policies(Box::new(RejectOneRaiseRest(rejected)));
-    let out = rib.update(e1.addr, &both, now());
+    rib.set_policies(
+        Box::new(RejectOneRaiseRest(rejected)),
+        &[],
+        now(),
+        &mut Vec::new(),
+    );
+    let out = outputs(|o| rib.update(e1.addr, &both, now(), o));
     let withdrawn: Vec<Prefix> = fib(&out)
         .iter()
         .filter(|c| c.next_hop.is_none())
@@ -217,13 +222,16 @@ fn a_route_rejected_for_its_validation_state_alone_is_held() {
     let asked = Arc::clone(&policy.1);
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
     let e1 = peer("10.0.0.1", 65_001, 1);
-    rib.peer_up(e1.clone(), now());
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
     let a = attrs(&[65_001], "10.0.0.1");
-    let out = rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
-        now(),
-    );
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            now(),
+            o,
+        );
+    });
     assert_eq!(fib(&out).len(), 1);
     assert!(rib.candidates(V4, held).is_empty());
     assert_eq!(received(&rib, V4, held), vec![(e1.addr, Arc::new(a))]);
@@ -252,21 +260,27 @@ fn withdrawals_peer_down_and_family_disable_drop_held_routes_too() {
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    rib.peer_up(e1.clone(), now());
-    rib.peer_up(e2.clone(), now());
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
     let a = attrs(&[65_001], "10.0.0.1");
     let v6 = attrs(&[65_001], "2001:db8::1");
     let send_all = |rib: &mut Rib| {
-        rib.update(
-            e1.addr,
-            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
-            now(),
-        );
-        rib.update(
-            e1.addr,
-            &announce(&["2001:db8:1::/48", "2001:db8:9::/48"], &v6),
-            now(),
-        );
+        outputs(|o| {
+            rib.update(
+                e1.addr,
+                &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+                now(),
+                o,
+            );
+        });
+        outputs(|o| {
+            rib.update(
+                e1.addr,
+                &announce(&["2001:db8:1::/48", "2001:db8:9::/48"], &v6),
+                now(),
+                o,
+            );
+        });
     };
     send_all(&mut rib);
     assert_eq!(destinations(&rib, V4).len(), 2);
@@ -274,7 +288,7 @@ fn withdrawals_peer_down_and_family_disable_drop_held_routes_too() {
 
     // A withdrawal of a held route: the destination goes with it, with
     // nothing to tell anyone.
-    let out = rib.update(e1.addr, &withdraw(&["198.51.100.0/24"]), now());
+    let out = outputs(|o| rib.update(e1.addr, &withdraw(&["198.51.100.0/24"]), now(), o));
     assert_eq!(out, vec![]);
     assert_eq!(destinations(&rib, V4), vec![p("192.0.2.0/24")]);
     assert_eq!(
@@ -282,36 +296,39 @@ fn withdrawals_peer_down_and_family_disable_drop_held_routes_too() {
         vec![(V4, 1), (V6, 2)]
     );
     // A replacement the loop checks drop takes a held route out too.
-    rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now());
+    outputs(|o| rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now(), o));
     let looped = attrs(&[65_001, LOCAL_AS.0], "10.0.0.1");
-    let out = rib.update(e1.addr, &announce(&["198.51.100.0/24"], &looped), now());
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["198.51.100.0/24"], &looped), now(), o));
     assert_eq!(out, vec![]);
     assert_eq!(destinations(&rib, V4), vec![p("192.0.2.0/24")]);
 
     // RFC 4760 §7: the family goes, held routes included.
-    rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now());
-    let out = rib.update(e1.addr, &disabling(V6, DecodedUpdate::default()), now());
+    outputs(|o| rib.update(e1.addr, &announce(&["198.51.100.0/24"], &a), now(), o));
+    let out = outputs(|o| rib.update(e1.addr, &disabling(V6, DecodedUpdate::default()), now(), o));
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(destinations(&rib, V6), Vec::<Prefix>::new());
     assert_eq!(received(&rib, V6, held6).len(), 0);
     assert_eq!(destinations(&rib, V4).len(), 2);
 
     // Peer down: nothing of the peer is left.
-    let out = rib.peer_down(e1.addr, now());
+    let out = outputs(|o| rib.peer_down(e1.addr, now(), o));
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(destinations(&rib, V4), Vec::<Prefix>::new());
     assert_eq!(destinations(&rib, V6), Vec::<Prefix>::new());
 
     // A destination another peer still has a route to stays, with that
     // route alone.
-    rib.peer_up(e1.clone(), now());
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
     send_all(&mut rib);
-    rib.update(
-        e2.addr,
-        &announce(&["198.51.100.0/24"], &attrs(&[65_002], "10.0.0.2")),
-        now(),
-    );
-    rib.peer_down(e1.addr, now());
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(&["198.51.100.0/24"], &attrs(&[65_002], "10.0.0.2")),
+            now(),
+            o,
+        );
+    });
+    outputs(|o| rib.peer_down(e1.addr, now(), o));
     assert_eq!(destinations(&rib, V4), vec![held]);
     let peers: Vec<IpAddr> = received(&rib, V4, held).iter().map(|r| r.0).collect();
     assert_eq!(peers, vec![e2.addr]);
@@ -327,26 +344,19 @@ fn each_route_is_held_once_with_what_policy_made_of_it() {
         .map(|i| peer(&format!("10.0.0.{i}"), 65_000 + u32::from(i), u32::from(i)))
         .collect();
     for info in &peers {
-        rib.peer_up(info.clone(), now());
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
     }
-    let dest = |rib: &Rib| -> (usize, usize) {
-        let d = &rib.tables[&V4][&p("192.0.2.0/24")];
-        (d.routes.len(), d.routes.capacity())
-    };
     for (n, info) in peers.iter().enumerate() {
         let a = attrs(&[info.remote_as.0], &info.addr.to_string());
-        rib.update(info.addr, &announce(&["192.0.2.0/24"], &a), now());
-        let (len, capacity) = dest(&rib);
-        assert_eq!(len, n + 1);
-        // Exact up to four, then doubling.
-        assert_eq!(capacity, if len <= 4 { len } else { 8 }, "{len}");
+        outputs(|o| rib.update(info.addr, &announce(&["192.0.2.0/24"], &a), now(), o));
+        // One route per peer, in a slice sized exactly.
+        assert_eq!(routes(&rib, V4, p("192.0.2.0/24")).len(), n + 1);
     }
-    let d = &rib.tables[&V4][&p("192.0.2.0/24")];
-    for r in &d.routes {
+    for (_, r) in routes(&rib, V4, p("192.0.2.0/24")) {
         assert!(!r.held);
-        assert_eq!(r.received.local_pref, None);
+        assert_eq!(r.received().local_pref, None);
         assert_eq!(r.attrs.local_pref, Some(200));
-        assert_eq!(r.attrs.as_path, r.received.as_path);
+        assert_eq!(r.attrs.as_path, r.received().as_path);
     }
     assert_eq!(rib.candidates(V4, p("192.0.2.0/24")).len(), 6);
 }
@@ -362,24 +372,28 @@ fn held_routes_follow_the_candidates() {
         .map(|i| peer(&format!("10.0.0.{i}"), 65_000 + u32::from(i), u32::from(i)))
         .collect();
     for info in &e {
-        rib.peer_up(info.clone(), now());
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
     }
     let send = |rib: &mut Rib, i: usize, prefix: &str| {
         let a = attrs(&[e[i].remote_as.0], &e[i].addr.to_string());
-        rib.update(e[i].addr, &announce(&[prefix], &a), now())
+        outputs(|o| rib.update(e[i].addr, &announce(&[prefix], &a), now(), o))
     };
     send(&mut rib, 0, "198.51.100.0/24");
     // Peer 2's route arrives while the policy takes everything, so it is
     // a candidate.
-    rib.set_policies(Box::new(AcceptAll));
+    rib.set_policies(Box::new(AcceptAll), &[], now(), &mut Vec::new());
     send(&mut rib, 1, "198.51.100.0/24");
-    rib.set_policies(Box::new(RejectUnvalidated::new(vec![prefix])));
+    rib.set_policies(
+        Box::new(RejectUnvalidated::new(vec![prefix])),
+        &[],
+        now(),
+        &mut Vec::new(),
+    );
     send(&mut rib, 2, "198.51.100.0/24");
     let order = |rib: &Rib| -> Vec<(IpAddr, bool)> {
-        rib.tables[&V4][&prefix]
-            .routes
-            .iter()
-            .map(|r| (r.peer, r.held))
+        routes(rib, V4, prefix)
+            .into_iter()
+            .map(|(peer, r)| (peer, r.held))
             .collect()
     };
     assert_eq!(
@@ -398,7 +412,8 @@ fn held_routes_follow_the_candidates() {
         vec![FibChange {
             family: V4,
             prefix,
-            next_hop: None
+            next_hop: None,
+            previous: Some(e[1].addr),
         }]
     );
     assert!(order(&rib).iter().all(|r| r.1));

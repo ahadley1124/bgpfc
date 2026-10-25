@@ -32,13 +32,14 @@ failure, 2 on a usage error.
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
 | `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
-| `show fib` | FIB mode and every desired route with `installed`, `pending` or `stale` |
+| `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
 | `fib mode dry-run\|install` | switch the FIB mode at runtime; switching to install performs a full reconcile |
+| `stats` | profiling builds only (`docs/PROFILING.md`): the report line of counters, histograms and memory. Not served over HTTP. |
 
 ### Wire format
 
@@ -51,9 +52,19 @@ A body line that starts with `.` is sent as `..`. One request per
 connection; the daemon closes after the response. Requests over 4096
 bytes are refused.
 
+`show routes` of a whole family and `show fib` can list millions of
+routes. The daemon takes them from the RIB and the FIB 4096 at a time and
+writes each part as it comes, so the listing is not one snapshot: a
+route that changes meanwhile may show either way. If the daemon cannot
+finish a listing, the response ends without its `.` line, which the client
+reports as an error.
+
 ## HTTP API
 
-Every response is JSON with `Connection: close`. Errors are
+Every response is JSON with `Connection: close`. `GET /v1/routes` without
+a prefix and `GET /v1/fib` are written as they are produced, as above,
+without `Content-Length`: the body ends when the connection closes (RFC
+9112 §6.3), and a body cut short is not valid JSON. Errors are
 `{"error": "..."}` with the status below. When a `token-file` is
 configured, every request must carry `Authorization: Bearer TOKEN` (the
 file's content, trimmed), else `401` with `WWW-Authenticate: Bearer`.

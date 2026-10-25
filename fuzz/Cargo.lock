@@ -49,6 +49,7 @@ dependencies = [
 name = "bgpfc-rib"
 version = "0.1.0"
 dependencies = [
+ "bgpfc-rpki",
  "bgpfc-wire",
 ]
 

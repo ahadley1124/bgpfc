@@ -11,7 +11,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
+use bgpfc_wire::as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
 use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
@@ -21,7 +21,7 @@ use bgpfc_wire::header::{Header, MessageType, frame};
 use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop, is_global_ipv6, is_host_ipv4};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::prefix::{Prefix, decode_prefixes};
+use bgpfc_wire::prefix::{Ipv4Key, Prefix, decode_prefixes};
 use bgpfc_wire::reader::Reader;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
@@ -72,7 +72,7 @@ fn as_path(confed: bool) -> impl Strategy<Value = AsPath> {
             .prop_map(|(kind, asns)| AsPathSegment { kind, asns }),
         0..=4,
     )
-    .prop_map(|segments| AsPath { segments })
+    .prop_map(|segments| AsPath::from_segments(&segments))
 }
 
 fn address_family() -> impl Strategy<Value = AddressFamily> {
@@ -356,6 +356,37 @@ const ENC2: EncodeContext = EncodeContext {
 
 // ---------------------------------------------------------------- round trips
 
+/// The order `Prefix` had when it was derived: variant, then the address
+/// octets, then the length.
+fn field_order(p: &Prefix) -> (u8, Vec<u8>, u8) {
+    match p.addr() {
+        std::net::IpAddr::V4(a) => (0, a.octets().to_vec(), p.prefix_len()),
+        std::net::IpAddr::V6(a) => (1, a.octets().to_vec(), p.prefix_len()),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn prefix_order_is_variant_then_address_then_length(
+        a in prop_oneof![prefix_v4(), prefix_v6()],
+        b in prop_oneof![prefix_v4(), prefix_v6()],
+    ) {
+        prop_assert_eq!(a.cmp(&b), field_order(&a).cmp(&field_order(&b)));
+        prop_assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+        prop_assert_eq!(a.cmp(&b) == std::cmp::Ordering::Equal, a == b);
+    }
+
+    #[test]
+    fn ipv4_key_orders_and_converts_like_its_prefix(a in prefix_v4(), b in prefix_v4()) {
+        let (ka, kb) = (Ipv4Key::new(a).unwrap(), Ipv4Key::new(b).unwrap());
+        prop_assert_eq!(ka.prefix(), a);
+        prop_assert_eq!(ka.cmp(&kb), a.cmp(&b));
+        prop_assert_eq!(ka == kb, a == b);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -387,7 +418,7 @@ proptest! {
             // RFC 6793 §4.2.2: non-mappable ASNs become AS_TRANS; the shape
             // and the mappable ASNs survive.
             prop_assert_eq!(back.hop_count(), p.hop_count());
-            prop_assert_eq!(back.segments.len(), p.segments.len());
+            prop_assert_eq!(back.segments().count(), p.segments().count());
             for (a, b) in back.asns().zip(p.asns()) {
                 prop_assert_eq!(a, if b.is_mappable() { b } else { Asn::TRANS });
             }
@@ -395,6 +426,34 @@ proptest! {
         let mut again = Vec::new();
         back.encode(four, &mut again).unwrap();
         prop_assert_eq!(again, wire);
+    }
+
+    #[test]
+    fn as_path_holds_its_segments_and_prepends_like_a_vector_of_them(
+        segments in vec(
+            (
+                segment_type(true),
+                // Short segments, and full ones to cross the 255 limit.
+                prop_oneof![vec(asn(), 1..=6), vec(asn(), 254..=255)],
+            )
+                .prop_map(|(kind, asns)| AsPathSegment { kind, asns }),
+            0..=3,
+        ),
+        asn in asn(),
+    ) {
+        let p = AsPath::from_segments(&segments);
+        let back: Vec<AsPathSegment> = p.segments().map(Segment::into_owned).collect();
+        prop_assert_eq!(&back, &segments);
+        prop_assert_eq!(p.heap_size(), 4 * segments.iter().map(|s| 1 + s.asns.len()).sum::<usize>());
+        // RFC 4271 §5.1.2 b, c, as the Vec-of-segments form did it.
+        let mut expected = segments.clone();
+        match expected.first_mut() {
+            Some(s) if s.kind == SegmentType::Sequence && s.asns.len() < 255 => s.asns.insert(0, asn),
+            _ => expected.insert(0, AsPathSegment { kind: SegmentType::Sequence, asns: vec![asn] }),
+        }
+        let prepended = p.prepend(asn);
+        prop_assert_eq!(&prepended, &AsPath::from_segments(&expected));
+        prop_assert_eq!(prepended.heap_size(), 4 * expected.iter().map(|s| 1 + s.asns.len()).sum::<usize>());
     }
 
     #[test]

@@ -13,11 +13,12 @@
 //! it), §5 (our own address is of the session's protocol; a next hop
 //! passed on keeps its encoding).
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
-use bgpfc_wire::community::Community;
+use bgpfc_wire::community::{Community, ExtendedCommunity};
 use bgpfc_wire::error::EncodeError;
 use bgpfc_wire::header::{HEADER_LEN, MessageType, frame};
 use bgpfc_wire::mp::{MpUnreach, NextHop};
@@ -67,26 +68,62 @@ pub fn export(
     attrs: &PathAttrs,
     to: &PeerInfo,
 ) -> Option<PathAttrs> {
-    if !eligible(family, source, to) {
+    if !eligible(family, source, to) || !permitted(family, attrs, to) {
         return None;
     }
-    // RFC 1997: NO_ADVERTISE goes nowhere; NO_EXPORT and
-    // NO_EXPORT_SUBCONFED stay inside the AS (no confederations here).
+    Some(rewrite(local_as, family, attrs, to))
+}
+
+/// Whether attributes allow a route of `family` to `to` at all: RFC 1997
+/// `NO_ADVERTISE` goes nowhere; `NO_EXPORT` and `NO_EXPORT_SUBCONFED` stay
+/// inside the AS (no confederations here). RFC 8950 §4: an IPv6 next hop
+/// for IPv4 NLRI goes only to a peer that advertised the capability for
+/// the family, and §5: a next hop passed on unchanged keeps its encoding,
+/// so a peer that cannot take it does not get the route at all.
+#[must_use]
+pub fn permitted(family: AddressFamily, attrs: &PathAttrs, to: &PeerInfo) -> bool {
     if attrs.has_community(Community::NO_ADVERTISE) {
-        return None;
+        return false;
     }
     if to.kind == PeerKind::External
         && (attrs.has_community(Community::NO_EXPORT)
             || attrs.has_community(Community::NO_EXPORT_SUBCONFED))
     {
-        return None;
+        return false;
     }
+    // Our own address, when the rewrite puts it there, is one the peer
+    // takes (see `rewrite`).
+    !keeps_next_hop(family, to) || to.takes_next_hop(family, &attrs.next_hop)
+}
+
+/// Whether the session rewrite leaves the `NEXT_HOP` as received: an
+/// external session overwrites it with our address when that is of the
+/// NLRI's family, or an IPv6 one for IPv4 NLRI under RFC 8950.
+fn keeps_next_hop(family: AddressFamily, to: &PeerInfo) -> bool {
+    !(to.kind == PeerKind::External
+        && match (family, to.local_addr) {
+            (AddressFamily::IPV4_UNICAST, IpAddr::V4(_))
+            | (AddressFamily::IPV6_UNICAST, IpAddr::V6(_)) => true,
+            (AddressFamily::IPV4_UNICAST, IpAddr::V6(_)) => to.extended_next_hop.contains(&family),
+            _ => false,
+        })
+}
+
+/// What `attrs` become on the session to `to` (RFC 4271 §5.1): the
+/// attributes an UPDATE to that peer carries. `local_as` is our AS.
+#[must_use]
+pub fn rewrite(
+    local_as: Asn,
+    family: AddressFamily,
+    attrs: &PathAttrs,
+    to: &PeerInfo,
+) -> PathAttrs {
     let mut out = attrs.clone();
     match to.kind {
         PeerKind::External => {
             // RFC 4271 §5.1.2 c): prepend our AS. RFC 9774 §5: as a
             // sequence; never a set.
-            out.as_path = prepend(&attrs.as_path, local_as);
+            out.as_path = attrs.as_path.prepend(local_as);
             // RFC 4271 §5.1.3: the next hop is our address on the session
             // when it is of the NLRI's family (RFC 2545 §3 for IPv6). RFC
             // 8950 §5: on a session over IPv6 our own address is an IPv6
@@ -118,7 +155,14 @@ pub fn export(
             out.local_pref = None;
             // RFC 4360 §6: non-transitive extended communities stay in
             // the AS.
-            out.ext_communities.retain(|c| c.is_transitive());
+            if out.ext_communities.iter().any(|c| !c.is_transitive()) {
+                out.ext_communities = out
+                    .ext_communities
+                    .iter()
+                    .copied()
+                    .filter(|c| c.is_transitive())
+                    .collect();
+            }
         }
         PeerKind::Internal => {
             // RFC 4271 §5.1.2 b), §5.1.3, §5.1.4: AS_PATH, NEXT_HOP and MED
@@ -139,14 +183,7 @@ pub fn export(
     // NOTE(interop): FRR likewise passes a received link-local address on
     // only when configured to (`nexthop-local unchanged`).
     out.next_hop = global_only(out.next_hop);
-    // RFC 8950 §4: an IPv6 next hop for IPv4 NLRI only to a peer that
-    // advertised the capability for the family. §5: a next hop passed on
-    // unchanged keeps its encoding, so a peer that cannot take it does not
-    // get the route at all.
-    if !to.takes_next_hop(family, &out.next_hop) {
-        return None;
-    }
-    Some(out)
+    out
 }
 
 /// `next_hop` without its link-local address, if any (RFC 2545 §3).
@@ -160,25 +197,36 @@ fn global_only(next_hop: NextHop) -> NextHop {
     }
 }
 
-/// `as_path` with `asn` prepended to its leading `AS_SEQUENCE`, or as a
-/// new one (RFC 4271 §5.1.2 c, RFC 4271 §4.3: at most 255 ASes per
-/// segment).
+/// Whether [`rewrite`] makes `a` and `b` the same for `to`, worked out
+/// without making either: what the session overwrites or drops is not
+/// compared. When true the rewrites are equal, so the peer needs no new
+/// UPDATE; it may be false for some equal rewrites, which only costs a
+/// redundant one.
 #[must_use]
-pub fn prepend(as_path: &AsPath, asn: Asn) -> AsPath {
-    let mut path = as_path.clone();
-    match path.segments.first_mut() {
-        Some(seg) if seg.kind == SegmentType::Sequence && seg.asns.len() < 255 => {
-            seg.asns.insert(0, asn);
+pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &PeerInfo) -> bool {
+    let kept = a.origin == b.origin
+        && a.as_path == b.as_path
+        && a.atomic_aggregate == b.atomic_aggregate
+        && a.aggregator == b.aggregator
+        && a.communities == b.communities
+        && a.large_communities == b.large_communities
+        && a.unknown == b.unknown
+        && (!keeps_next_hop(family, to) || global_only(a.next_hop) == global_only(b.next_hop));
+    kept && match to.kind {
+        PeerKind::External => {
+            let transitive = |x: &&ExtendedCommunity| x.is_transitive();
+            a.ext_communities
+                .iter()
+                .filter(transitive)
+                .eq(b.ext_communities.iter().filter(transitive))
         }
-        _ => path.segments.insert(
-            0,
-            AsPathSegment {
-                kind: SegmentType::Sequence,
-                asns: vec![asn],
-            },
-        ),
+        PeerKind::Internal => {
+            a.med == b.med
+                && a.ext_communities == b.ext_communities
+                && a.local_pref.unwrap_or(DEFAULT_LOCAL_PREF)
+                    == b.local_pref.unwrap_or(DEFAULT_LOCAL_PREF)
+        }
     }
-    path
 }
 
 /// Announcements and withdrawals for one peer and family, grouped so that
@@ -187,21 +235,40 @@ pub fn prepend(as_path: &AsPath, asn: Asn) -> AsPath {
 pub struct Batch {
     /// Prefixes to withdraw.
     pub withdraw: Vec<Prefix>,
-    /// Prefixes to announce, per attribute set.
-    pub announce: Vec<(Arc<PathAttrs>, Vec<Prefix>)>,
+    /// Prefixes to announce, per attribute set, in the order the sets
+    /// were first announced.
+    announce: Vec<(Arc<PathAttrs>, Vec<Prefix>)>,
+    /// The position of each set in `announce`, by its address. A full
+    /// table sent to a new peer has tens of thousands of sets, too many to
+    /// search for every prefix. The batch holds every set it indexes, so
+    /// no address is reused while it is in here.
+    index: HashMap<usize, usize>,
 }
 
 impl Batch {
     /// Record an announcement.
     pub fn announce(&mut self, attrs: &Arc<PathAttrs>, prefix: Prefix) {
-        match self
-            .announce
-            .iter_mut()
-            .find(|(a, _)| Arc::ptr_eq(a, attrs))
+        // The prefixes of an UPDATE share a set: try the last one first.
+        if let Some((last, prefixes)) = self.announce.last_mut()
+            && Arc::ptr_eq(last, attrs)
         {
-            Some((_, v)) => v.push(prefix),
-            None => self.announce.push((Arc::clone(attrs), vec![prefix])),
+            prefixes.push(prefix);
+            return;
         }
+        match self.index.entry(Arc::as_ptr(attrs).addr()) {
+            Entry::Occupied(e) => self.announce[*e.get()].1.push(prefix),
+            Entry::Vacant(e) => {
+                e.insert(self.announce.len());
+                self.announce.push((Arc::clone(attrs), vec![prefix]));
+            }
+        }
+    }
+
+    /// Empty the batch, giving back the sets it announced.
+    pub fn take_sets(&mut self) -> impl Iterator<Item = Arc<PathAttrs>> + '_ {
+        self.withdraw.clear();
+        self.index.clear();
+        self.announce.drain(..).map(|(a, _)| a)
     }
 
     /// Whether nothing is queued.
@@ -211,17 +278,23 @@ impl Batch {
     }
 
     /// Encode as framed UPDATE messages no longer than the peer allows.
+    /// The announced sets are as the export policy left them; each is
+    /// given the session rewrite (RFC 4271 §5.1, [`rewrite`]) here, once
+    /// for all its prefixes. `local_as` is our AS.
     ///
     /// # Errors
     /// [`EncodeError`] if an attribute set cannot be encoded at all.
     pub fn encode(
         &self,
+        local_as: Asn,
         family: AddressFamily,
         to: &PeerInfo,
     ) -> Result<Vec<Vec<u8>>, EncodeError> {
+        #[cfg(feature = "profiling")]
+        let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::ADJ_RIB_OUT_BUILD);
         let ctx = EncodeContext {
             four_octet_as: to.four_octet_as,
-            // RFC 8950 §4; `export` already keeps such routes from a peer
+            // RFC 8950 §4; export already keeps such routes from a peer
             // without it, and the encoder refuses them as well.
             extended_next_hop: to.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
         };
@@ -244,6 +317,7 @@ impl Batch {
             out.push(frame(MessageType::Update, &m.encode(&ctx)?)?);
         }
         for (attrs, prefixes) in &self.announce {
+            let attrs = rewrite(local_as, family, attrs, to);
             // Size the attributes once, then fill each message with as
             // many prefixes as fit.
             let empty = attrs.to_update(family, Vec::new()).encode(&ctx)?;

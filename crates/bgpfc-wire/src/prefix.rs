@@ -4,6 +4,7 @@
 //! RFC 4760 §5 (the same encoding for other address families), RFC 7606
 //! §5.3 (syntactic correctness of NLRI fields).
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -12,7 +13,9 @@ use crate::reader::{Reader, WriteBytes as _};
 use crate::types::Afi;
 
 /// An IP prefix in canonical form: host bits are zero.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Ordered IPv4 first, then by address, then by length.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prefix {
     /// An IPv4 prefix.
     V4 {
@@ -28,6 +31,32 @@ pub enum Prefix {
         /// Prefix length, 0..=128.
         len: u8,
     },
+}
+
+// The RIB and FIB tables are B-trees keyed by prefix, so every lookup
+// makes a score of these comparisons. Comparing the address as one integer
+// gives the order the derived impl gave (octets in order, most
+// significant first) at a fraction of the cost of comparing it octet by
+// octet.
+impl Ord for Prefix {
+    fn cmp(&self, other: &Prefix) -> Ordering {
+        match (self, other) {
+            (Prefix::V4 { addr: a, len: l }, Prefix::V4 { addr: b, len: m }) => {
+                u32::from(*a).cmp(&u32::from(*b)).then(l.cmp(m))
+            }
+            (Prefix::V6 { addr: a, len: l }, Prefix::V6 { addr: b, len: m }) => {
+                u128::from(*a).cmp(&u128::from(*b)).then(l.cmp(m))
+            }
+            (Prefix::V4 { .. }, Prefix::V6 { .. }) => Ordering::Less,
+            (Prefix::V6 { .. }, Prefix::V4 { .. }) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for Prefix {
+    fn partial_cmp(&self, other: &Prefix) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Prefix {
@@ -249,6 +278,60 @@ impl FromStr for Prefix {
     }
 }
 
+/// An IPv4 prefix in five octets, to key large tables with. A B-tree node
+/// holds eleven keys, so in a table of a million routes the key is a good
+/// part of what a route costs: this one is 5 octets against [`Prefix`]'s
+/// 18. Ordered like the `Prefix` it stands for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C, packed)]
+pub struct Ipv4Key {
+    addr: u32,
+    len: u8,
+}
+
+impl Ipv4Key {
+    /// The key of an IPv4 prefix; `None` for an IPv6 one.
+    #[must_use]
+    pub fn new(prefix: Prefix) -> Option<Ipv4Key> {
+        match prefix {
+            Prefix::V4 { addr, len } => Some(Ipv4Key {
+                addr: u32::from(addr),
+                len,
+            }),
+            Prefix::V6 { .. } => None,
+        }
+    }
+
+    /// The prefix this key stands for.
+    #[must_use]
+    pub fn prefix(self) -> Prefix {
+        Prefix::V4 {
+            addr: Ipv4Addr::from(self.addr),
+            len: self.len,
+        }
+    }
+}
+
+impl Ord for Ipv4Key {
+    fn cmp(&self, other: &Ipv4Key) -> Ordering {
+        // Copies: the fields of a packed struct are not borrowed.
+        let (a, l, b, m) = (self.addr, self.len, other.addr, other.len);
+        a.cmp(&b).then(l.cmp(&m))
+    }
+}
+
+impl PartialOrd for Ipv4Key {
+    fn partial_cmp(&self, other: &Ipv4Key) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for Ipv4Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.prefix(), f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +433,17 @@ mod tests {
             v,
             vec![p("9.0.0.0/8"), p("10.0.0.0/8"), p("10.0.0.0/9"), p("::/0")]
         );
+    }
+
+    #[test]
+    fn ipv4_key_is_five_octets_and_only_for_ipv4() {
+        assert_eq!(size_of::<Ipv4Key>(), 5);
+        let p: Prefix = "192.0.2.0/24".parse().unwrap();
+        let k = Ipv4Key::new(p).unwrap();
+        assert_eq!(k.prefix(), p);
+        assert_eq!(format!("{k:?}"), "192.0.2.0/24");
+        assert!(Ipv4Key::new("2001:db8::/32".parse().unwrap()).is_none());
+        let shorter = Ipv4Key::new("192.0.2.0/23".parse().unwrap()).unwrap();
+        assert!(shorter < k);
     }
 }

@@ -29,10 +29,10 @@ fn attrs(path: &[u32]) -> PathAttrs {
         local_pref: None,
         atomic_aggregate: false,
         aggregator: None,
-        communities: vec![Community::new(65_001, 1)],
-        ext_communities: Vec::new(),
-        large_communities: Vec::new(),
-        unknown: Vec::new(),
+        communities: vec![Community::new(65_001, 1)].into(),
+        ext_communities: Box::default(),
+        large_communities: Box::default(),
+        unknown: Box::default(),
     }
 }
 
@@ -127,15 +127,17 @@ fn every_match_clause_kind() {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     assert_eq!(
         s.evaluate("P", &route("203.0.113.0/24", &a)),
         Verdict::Accept
     );
-    a.large_communities.clear();
+    a.large_communities = Box::default();
     a.ext_communities = vec![bgpfc_wire::community::ExtendedCommunity::two_octet_as(
         2, true, 1, 1,
-    )];
+    )]
+    .into();
     assert_eq!(
         s.evaluate("P", &route("203.0.113.0/24", &a)),
         Verdict::Accept
@@ -162,8 +164,8 @@ fn set_actions_modify_a_copy() {
     assert_eq!(m.local_pref, Some(200));
     assert_eq!(m.med, Some(10));
     assert_eq!(
-        m.communities,
-        vec![Community::new(65_000, 5), Community::NO_EXPORT]
+        *m.communities,
+        [Community::new(65_000, 5), Community::NO_EXPORT]
     );
     assert_eq!(m.large_communities.len(), 1);
     assert_eq!(
@@ -337,4 +339,63 @@ fn engine_tells_next_hop_self_what_the_session_negotiated() {
             link_local: None
         }
     );
+}
+
+#[test]
+fn engine_keeps_each_neighbors_policies_apart() {
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy LOW { term t { set local-pref 50; action accept; } }
+         policy HIGH { term t { set local-pref 200; action accept; } }
+         policy NONE { term t { action reject; } }
+         neighbor 10.0.0.1 { remote-as 65001; import LOW; export NONE; }
+         neighbor 10.0.0.2 { remote-as 65002; import HIGH; export NONE; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let peer = |addr: &str| PeerInfo {
+        addr: ip(addr),
+        local_addr: ip("10.0.0.254"),
+        remote_as: Asn(65_001),
+        router_id: RouterId::new(1).unwrap(),
+        kind: PeerKind::External,
+        families: vec![V4],
+        receive_families: vec![V4],
+        four_octet_as: true,
+        extended_messages: false,
+        extended_next_hop: Vec::new(),
+        advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
+    };
+    let local_pref = |v: Verdict| match v {
+        Verdict::Modified(m) => m.local_pref,
+        other => panic!("{other:?}"),
+    };
+    let a = attrs(&[65_001]);
+    let p: Prefix = "203.0.113.0/24".parse().unwrap();
+    // Alternate, and go through an unknown peer in between: each
+    // neighbor's own policy every time.
+    for _ in 0..2 {
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
+            Some(50)
+        );
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
+            Some(50)
+        );
+        assert_eq!(
+            engine.import(&peer("10.0.0.9"), V4, p, &a, RovState::Disabled),
+            Verdict::Reject
+        );
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled)),
+            Some(200)
+        );
+        assert_eq!(
+            engine.export(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled),
+            Verdict::Reject
+        );
+    }
 }

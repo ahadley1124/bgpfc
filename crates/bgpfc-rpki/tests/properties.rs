@@ -81,7 +81,7 @@ fn as_path() -> impl Strategy<Value = AsPath> {
             kind: SegmentType::from_u8(kind).unwrap(),
             asns: asns.into_iter().map(|a| Asn(64_496 + a)).collect(),
         });
-    prop::collection::vec(segment, 0..4).prop_map(|segments| AsPath { segments })
+    prop::collection::vec(segment, 0..4).prop_map(|segments| AsPath::from_segments(&segments))
 }
 
 /// One step of a validation producer.

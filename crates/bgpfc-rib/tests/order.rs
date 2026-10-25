@@ -3,14 +3,16 @@
 //! final Adj-RIBs-Out are the same (AGENTS.md §5, `bgpfc-rib` row). With
 //! policy that acts on the validation state, it is a function of the
 //! Adj-RIBs-In, policy and the current validation source, whatever the
-//! interleaving of UPDATEs and validation changes (RFC 6811 §4).
+//! interleaving of UPDATEs and validation changes (RFC 6811 §4). The FIB
+//! changes on the way chain up to the same routes.
 #![cfg(not(miri))]
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
+use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -19,6 +21,13 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 use proptest::prelude::*;
+
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
 
 const LOCAL_AS: Asn = Asn(65_000);
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
@@ -135,17 +144,30 @@ fn step() -> impl Strategy<Value = Step> {
 }
 
 /// The final state: best route per prefix and each peer's Adj-RIB-Out.
+/// On the way, checks that the FIB changes chain: each names as previous
+/// the next hop the one before gave the prefix, and together they end at
+/// the routes a full reconcile gets.
 fn run(steps: &[Step]) -> (Vec<(Prefix, IpAddr)>, Vec<Vec<Prefix>>) {
     let infos = peers();
     let now = Instant::now();
     let mut rib = Rib::new(LOCAL_AS);
     for info in &infos {
-        rib.peer_up(info.clone(), now);
+        outputs(|o| rib.peer_up(info.clone(), now, o));
     }
+    let mut fib = BTreeMap::new();
     for s in steps {
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info), now);
+        for o in outputs(|o| rib.update(info.addr, &update(s, info), now, o)) {
+            if let Output::Fib(c) = o {
+                assert_eq!(c.previous, fib.get(&c.prefix).copied(), "{c:?}");
+                match c.next_hop {
+                    Some(n) => fib.insert(c.prefix, n),
+                    None => fib.remove(&c.prefix),
+                };
+            }
+        }
     }
+    assert_eq!(rib.fib_routes().collect::<BTreeMap<_, _>>(), fib);
     let best = rib.loc_rib(V4).map(|(p, b)| (p, b.peer)).collect();
     let outs = infos
         .iter()
@@ -205,7 +227,12 @@ impl Policies for ByState {
             return Verdict::Accept;
         }
         let mut a = a.clone();
-        a.communities.push(Community::new(65_000, 1));
+        a.communities = a
+            .communities
+            .iter()
+            .copied()
+            .chain([Community::new(65_000, 1)])
+            .collect();
         a.normalise();
         Verdict::Modified(a)
     }
@@ -248,7 +275,7 @@ fn outcome(rib: &Rib, infos: &[PeerInfo]) -> Outcome {
             let mut c: Vec<_> = rib
                 .candidates(V4, prefix(i))
                 .iter()
-                .map(|c| (c.peer, c.rov, (*c.attrs).clone()))
+                .map(|c| (c.peer, c.rov, (**c.attrs).clone()))
                 .collect();
             c.sort_by_key(|c| c.0);
             c
@@ -260,7 +287,7 @@ fn outcome(rib: &Rib, infos: &[PeerInfo]) -> Outcome {
         .map(|i| {
             let mut v: Vec<_> = rib
                 .adj_rib_out(i.addr, V4)
-                .map(|(p, a)| (p, (**a).clone()))
+                .map(|(p, a)| (p, (*a).clone()))
                 .collect();
             v.sort_by_key(|e| e.0);
             v
@@ -280,7 +307,7 @@ fn interleaved(steps: &[Step], sources: &[VrpSet], at: &[usize], merged: &[bool]
     let now = Instant::now();
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
     for info in &infos {
-        rib.peer_up(info.clone(), now);
+        outputs(|o| rib.peer_up(info.clone(), now, o));
     }
     let mut pending: Option<AffectedPrefixes> = None;
     let mut next = 0;
@@ -297,13 +324,16 @@ fn interleaved(steps: &[Step], sources: &[VrpSet], at: &[usize], merged: &[bool]
             pending = Some(affected);
             return;
         }
-        rib.validation_changed(
-            ValidationChange {
-                source: Arc::new(sources[k].clone()),
-                affected,
-            },
-            now,
-        );
+        outputs(|o| {
+            rib.validation_changed(
+                ValidationChange {
+                    source: Arc::new(sources[k].clone()),
+                    affected,
+                },
+                now,
+                o,
+            );
+        });
     };
     for (i, s) in steps.iter().enumerate() {
         while next < sources.len() && at[next] <= i {
@@ -311,7 +341,7 @@ fn interleaved(steps: &[Step], sources: &[VrpSet], at: &[usize], merged: &[bool]
             next += 1;
         }
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info), now);
+        outputs(|o| rib.update(info.addr, &update(s, info), now, o));
     }
     while next < sources.len() {
         give(&mut rib, next);
@@ -326,20 +356,23 @@ fn source_first(steps: &[Step], source: Option<&VrpSet>) -> Outcome {
     let now = Instant::now();
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
     if let Some(source) = source {
-        rib.validation_changed(
-            ValidationChange {
-                source: Arc::new(source.clone()),
-                affected: AffectedPrefixes::All,
-            },
-            now,
-        );
+        outputs(|o| {
+            rib.validation_changed(
+                ValidationChange {
+                    source: Arc::new(source.clone()),
+                    affected: AffectedPrefixes::All,
+                },
+                now,
+                o,
+            );
+        });
     }
     for info in &infos {
-        rib.peer_up(info.clone(), now);
+        outputs(|o| rib.peer_up(info.clone(), now, o));
     }
     for s in steps {
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info), now);
+        outputs(|o| rib.update(info.addr, &update(s, info), now, o));
     }
     outcome(&rib, &infos)
 }

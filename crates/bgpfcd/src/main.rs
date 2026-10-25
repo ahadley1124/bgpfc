@@ -15,6 +15,8 @@ mod fib;
 mod messages;
 mod peer;
 mod privileges;
+#[cfg(feature = "profiling")]
+mod profiling;
 mod reader;
 mod rib;
 mod rpki;
@@ -32,11 +34,21 @@ use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
 use crate::messages::{FibMsg, PeerInput, RibMsg};
 
+/// docs/PROFILING.md: a profiling build counts every allocation.
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static ALLOCATOR: bgpfc_sys::alloc::Counting = bgpfc_sys::alloc::Counting::new();
+
 /// Updates the RIB thread may have queued before peers block.
 const RIB_QUEUE: usize = 1024;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(feature = "profiling")]
+    if argv.iter().any(|a| a == "--print-sizes") {
+        profiling::print_sizes();
+        return;
+    }
     let opts = match args::parse(&argv) {
         Ok(a) => a,
         Err(msg) => {
@@ -44,6 +56,8 @@ fn main() {
                 eprintln!("bgpfcd: {msg}");
             }
             eprint!("{}", args::USAGE);
+            #[cfg(feature = "profiling")]
+            eprint!("{}", args::PROFILING_USAGE);
             std::process::exit(2);
         }
     };
@@ -58,6 +72,8 @@ fn main() {
         return;
     }
     bgpfc_log::init(config.log_level);
+    #[cfg(feature = "profiling")]
+    profiling::init();
     bgpfc_log::info!(
         "bgpfcd starting",
         version = env!("CARGO_PKG_VERSION"),
@@ -356,8 +372,8 @@ impl Coordinator<'_> {
                     if new.fib.mode != self.config.fib.mode {
                         let (tx, rx) = sync_channel(1);
                         if self
-                            .fib_tx
-                            .send(FibMsg::SetMode(fib::mode_of(new.fib.mode), tx))
+                            .rib_tx
+                            .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
                             .is_ok()
                         {
                             let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
@@ -458,6 +474,8 @@ impl Coordinator<'_> {
         // Last: neither the Ceases nor the FIB cleanup need it, and it may
         // first have to hand the RIB thread a change (see `rpki`).
         self.rpki.stop();
+        #[cfg(feature = "profiling")]
+        profiling::emit(&profiling::report("shutdown", |_| {}));
         bgpfc_log::info!("bgpfcd stopped");
     }
 }
