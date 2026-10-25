@@ -6,8 +6,8 @@
 //! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 1997, 4360,
 //! 8092 (communities).
 
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -341,24 +341,74 @@ impl<'a, H: Hasher> Chunks<'a, H> {
 }
 
 /// Shares one allocation between routes with equal attributes.
-#[derive(Debug, Default)]
-pub struct Interner {
-    set: HashSet<Arc<PathAttrs>>,
+///
+/// Sets are kept by their hash, worked out once per call: hashing a whole
+/// set is most of what interning costs, and a table of the sets
+/// themselves hashed each one again to insert it and again every time the
+/// table grew. The hash is keyed (`RandomState`), so a peer cannot choose
+/// sets that collide; two different sets that collide anyway are not
+/// shared, which costs memory, not correctness.
+#[derive(Debug)]
+pub struct Interner<S = RandomState> {
+    sets: HashMap<u64, Arc<PathAttrs>, BuildHasherDefault<Prehashed>>,
+    hasher: S,
     /// Size after the last sweep; a sweep runs when the set doubles.
     swept_at: usize,
 }
 
-impl Interner {
+/// The hasher of a table keyed by hashes already worked out: it passes
+/// them through.
+#[derive(Default)]
+struct Prehashed(u64);
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u64 keys are hashed here; this keeps any other input usable.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+impl Default for Interner {
+    fn default() -> Self {
+        Interner::with_hasher(RandomState::new())
+    }
+}
+
+impl<S: BuildHasher> Interner<S> {
+    /// An empty interner hashing with `hasher`.
+    pub fn with_hasher(hasher: S) -> Interner<S> {
+        Interner {
+            sets: HashMap::default(),
+            hasher,
+            swept_at: 0,
+        }
+    }
+
     /// The shared instance of `attrs`.
     pub fn intern(&mut self, attrs: PathAttrs) -> Arc<PathAttrs> {
-        if let Some(a) = self.set.get(&attrs) {
-            return Arc::clone(a);
+        let hash = self.hasher.hash_one(&attrs);
+        if let Some(a) = self.sets.get(&hash) {
+            if **a == attrs {
+                return Arc::clone(a);
+            }
+            // A collision: this one is not shared.
+            return Arc::new(attrs);
         }
-        if self.set.len() >= 2 * self.swept_at.max(1024) {
+        if self.sets.len() >= 2 * self.swept_at.max(1024) {
             self.sweep();
         }
         let a = Arc::new(attrs);
-        self.set.insert(Arc::clone(&a));
+        self.sets.insert(hash, Arc::clone(&a));
         a
     }
 
@@ -369,12 +419,16 @@ impl Interner {
     pub fn release(&mut self, attrs: Arc<PathAttrs>) {
         // Two holders: the interner and `attrs`. No other thread can take
         // a new one from nothing, so the count cannot rise meanwhile.
-        if Arc::strong_count(&attrs) == 2
-            && let Some(held) = self.set.take(&*attrs)
-            && !Arc::ptr_eq(&held, &attrs)
-        {
-            // Equal attributes in another allocation: not ours to drop.
-            self.set.insert(held);
+        if Arc::strong_count(&attrs) == 2 {
+            let hash = self.hasher.hash_one(&*attrs);
+            // Equal attributes in another allocation are not ours to drop.
+            if self
+                .sets
+                .get(&hash)
+                .is_some_and(|held| Arc::ptr_eq(held, &attrs))
+            {
+                self.sets.remove(&hash);
+            }
         }
         drop(attrs);
         self.shrink();
@@ -382,8 +436,8 @@ impl Interner {
 
     /// Drop entries no route uses any more.
     pub fn sweep(&mut self) {
-        self.set.retain(|a| Arc::strong_count(a) > 1);
-        self.swept_at = self.set.len();
+        self.sets.retain(|_, a| Arc::strong_count(a) > 1);
+        self.swept_at = self.sets.len();
         self.shrink();
     }
 
@@ -391,26 +445,26 @@ impl Interner {
     /// with a full table goes: a hash table keeps its capacity otherwise.
     /// Halving the length each time keeps this O(1) per removal.
     fn shrink(&mut self) {
-        if self.set.capacity() > 64 && self.set.len() < self.set.capacity() / 4 {
-            self.set.shrink_to(self.set.len() * 2);
+        if self.sets.capacity() > 64 && self.sets.len() < self.sets.capacity() / 4 {
+            self.sets.shrink_to(self.sets.len() * 2);
         }
     }
 
     /// Distinct attribute sets held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.set.len()
+        self.sets.len()
     }
 
     /// Entries the table has room for without growing.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.set.capacity()
+        self.sets.capacity()
     }
 
     /// Whether nothing is interned.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.sets.is_empty()
     }
 }

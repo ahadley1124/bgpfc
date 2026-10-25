@@ -1166,3 +1166,33 @@ fn routes_sharing_attributes_share_one_exported_set_per_peer() {
     assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
     assert_eq!(rib.s.cx.interner.len(), 0);
 }
+
+#[test]
+fn colliding_sets_are_not_shared_and_nothing_is_lost() {
+    use std::hash::{BuildHasherDefault, Hasher};
+    // Every set hashes alike: only the first is kept in the table.
+    #[derive(Default)]
+    struct Zero;
+    impl Hasher for Zero {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, _: &[u8]) {}
+    }
+    let mut i = crate::attrs::Interner::with_hasher(BuildHasherDefault::<Zero>::default());
+    let a1 = i.intern(attrs(&[1], "10.0.0.1"));
+    let b1 = i.intern(attrs(&[2], "10.0.0.1"));
+    let a2 = i.intern(attrs(&[1], "10.0.0.1"));
+    let b2 = i.intern(attrs(&[2], "10.0.0.1"));
+    assert!(Arc::ptr_eq(&a1, &a2));
+    assert!(!Arc::ptr_eq(&b1, &b2), "a colliding set is not shared");
+    assert_eq!(*b1, *b2);
+    assert_eq!(i.len(), 1);
+    // Releasing a set that is not the table's leaves the table's alone.
+    i.release(b1);
+    i.release(b2);
+    assert_eq!(i.len(), 1);
+    i.release(a1);
+    i.release(a2);
+    assert_eq!(i.len(), 0);
+}
