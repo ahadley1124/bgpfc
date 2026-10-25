@@ -109,7 +109,7 @@ neighbor-item
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
-             | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; default off *)
+             | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -246,7 +246,11 @@ neighbor Send, and send them when we advertised Send and the neighbor
 Receive; otherwise the family is exchanged as without ADD-PATH in that
 direction. Neither is on unless configured, and a session without it
 costs nothing for it. The family must be one of the neighbor's
-`families`; `no` and `off` say nothing and may be left out.
+`families`; `no` and `off` say nothing and may be left out. `N` is a
+number from 1 to 4294967295; `0` is refused, since sending no more than
+the one best path is what `off` is for: it advertises no Send for the
+family, where `1` still sends Path Identifiers to a neighbor that takes
+them.
 
 With `add-path receive`, each path the neighbor sends for a prefix is
 kept under the Path Identifier it came with, and every one of them takes
