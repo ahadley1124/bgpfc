@@ -12,7 +12,8 @@
 //! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
 //! with the VRPs that Cover and Match it; the routes the Adj-RIBs-In hold
 //! for their state, listed and counted), §3 (the state import policy set
-//! beside the one looked up).
+//! beside the one looked up), §5 (the `enforcement` that acts on the
+//! state); issue #59 (the latest routes whose state changed, with when).
 
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -29,7 +30,7 @@ use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
-use bgpfc_rib::Held;
+use bgpfc_rib::{Held, RouteStatus};
 use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
@@ -37,7 +38,7 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use crate::coordinator::PeerTable;
 use crate::messages::{
     FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
-    RpkiReport,
+    RpkiReport, TransitionsReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -92,6 +93,8 @@ pub(crate) enum Command {
     ShowFib,
     ShowStatus,
     ShowRpki,
+    /// The latest routes whose RFC 6811 state changed (issue #59).
+    ShowRpkiTransitions,
     ValidateRpki {
         prefix: Prefix,
         origin: Asn,
@@ -155,6 +158,7 @@ impl Command {
             ["show", "fib"] => Ok(Command::ShowFib),
             ["show", "status"] => Ok(Command::ShowStatus),
             ["show", "rpki"] => Ok(Command::ShowRpki),
+            ["show", "rpki", "transitions"] => Ok(Command::ShowRpkiTransitions),
             ["show", "rpki", "validate", p, a] => Ok(Command::ValidateRpki {
                 prefix: p.parse().map_err(|_| format!("`{p}` is not a prefix"))?,
                 origin: parse_asn(a)?,
@@ -225,6 +229,7 @@ impl Command {
             }
             ("GET", ["v1", "fib"]) => Ok(Command::ShowFib),
             ("GET", ["v1", "rpki"]) => Ok(Command::ShowRpki),
+            ("GET", ["v1", "rpki", "transitions"]) => Ok(Command::ShowRpkiTransitions),
             ("GET", ["v1", "rpki", "validate"]) => {
                 let (Some(p), Some(a)) = (r.param("prefix"), r.param("origin")) else {
                     return Err((400, "needs prefix and origin".to_owned()));
@@ -337,6 +342,9 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         Command::ShowFib => unreachable!("show fib is a listing"),
         Command::ShowStatus => status(ctx),
         Command::ShowRpki => Ok(render_rpki(&rpki_report(ctx)?, Instant::now())),
+        Command::ShowRpkiTransitions => {
+            Ok(render_transitions(&rib_transitions(ctx)?, Instant::now()))
+        }
         Command::ValidateRpki { prefix, origin } => {
             Ok(render_validation(&rpki_report(ctx)?, *prefix, *origin))
         }
@@ -471,8 +479,9 @@ fn seconds_between(earlier: Instant, later: Instant) -> u64 {
     later.saturating_duration_since(earlier).as_secs()
 }
 
-/// `show rpki`: the block's mode and cache list, and where the client
-/// stands with the cache it uses (RFC 8210 §10).
+/// `show rpki`: the block's mode, its enforcement (RFC 6811 §5), its
+/// cache list, and where the client stands with the cache it uses (RFC
+/// 8210 §10).
 fn render_rpki(r: &RpkiReport, now: Instant) -> Reply {
     let mut j = Json::new();
     write_rpki(&mut j, r, now);
@@ -506,7 +515,10 @@ fn current(
 
 fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let status = r.status.as_ref();
-    let mut lines = vec![format!("mode {}", r.config.mode)];
+    let mut lines = vec![
+        format!("mode {}", r.config.mode),
+        format!("enforcement {}", r.config.enforcement),
+    ];
     for c in &r.config.caches {
         lines.push(format!(
             "cache {c} preference {}{}{}",
@@ -596,6 +608,7 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
     let status = r.status.as_ref();
     j.begin_object()
         .field_display("mode", r.config.mode)
+        .field_display("enforcement", r.config.enforcement)
         .key("caches")
         .begin_array();
     for c in &r.config.caches {
@@ -669,6 +682,83 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
             s.last_error_at.map(|at| seconds_between(at, now)),
         )
         .end_object();
+}
+
+/// Ask the RIB thread for the routes whose state changed last.
+fn rib_transitions(ctx: &Ctx) -> Result<TransitionsReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(RibQuery::Transitions, tx))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::Transitions(r)) => Ok(r),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
+    }
+}
+
+/// `show rpki transitions` (issue #59: "An operator needs to see that a
+/// prefix went Valid → Invalid at a specific time"): the latest routes a
+/// change of the validation source moved among valid, invalid and
+/// not-found, oldest first, each at the time its log line has, and what
+/// became of it; then how many are kept and how many the RIB thread was
+/// never given. `now` is the moment of the report.
+fn render_transitions(r: &TransitionsReport, now: Instant) -> Reply {
+    let mut lines = Vec::with_capacity(r.entries.len() + 1);
+    let mut j = Json::new();
+    j.begin_object()
+        .field_num("capacity", num(r.capacity))
+        .field_num("unrecorded", r.unrecorded)
+        .key("transitions")
+        .begin_array();
+    for e in &r.entries {
+        let t = &e.transition;
+        let mut time = String::with_capacity(24);
+        bgpfc_log::push_timestamp(&mut time, e.at);
+        let held_by = match t.route {
+            RouteStatus::Held(by) => Some(by),
+            RouteStatus::Best | RouteStatus::Candidate => None,
+        };
+        lines.push(format!(
+            "{time} {} peer {} origin {} {}->{} {}{}",
+            t.prefix,
+            t.peer,
+            t.origin,
+            t.from,
+            t.to,
+            crate::rib::status_name(t.route),
+            held_by.map_or(String::new(), |by| format!(" by {by}"))
+        ));
+        j.begin_object()
+            .field_str("time", &time)
+            .field_num("seconds_ago", seconds_between(e.when, now))
+            .field_display("family", t.family)
+            .field_display("prefix", t.prefix)
+            .field_display("peer", t.peer)
+            .field_opt_num(
+                "origin",
+                match t.origin {
+                    RouteOrigin::As(asn) => Some(asn.0),
+                    RouteOrigin::None => None,
+                },
+            )
+            .field_str("from", t.from.as_str())
+            .field_str("to", t.to.as_str())
+            .field_str("route", crate::rib::status_name(t.route))
+            .field_opt("held_by", held_by.map(Held::as_str))
+            .end_object();
+    }
+    j.end_array().end_object();
+    lines.push(format!(
+        "{} kept (most recent {}); {} not recorded",
+        r.entries.len(),
+        r.capacity,
+        r.unrecorded
+    ));
+    Reply {
+        lines,
+        json: j.finish(),
+    }
 }
 
 /// Whether `vrp` Covers `route`: it is the route's prefix or less specific
@@ -2122,7 +2212,16 @@ mod tests {
             http::Request::read_from(&mut format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
                 .unwrap()
         };
+        assert_eq!(
+            Command::parse(&words("show rpki transitions")),
+            Ok(Command::ShowRpkiTransitions)
+        );
+        for bad in ["show rpki transitions all", "show rpki transition"] {
+            assert!(Command::parse(&words(bad)).is_err(), "{bad}");
+        }
+        assert!(!Command::ShowRpkiTransitions.is_write());
         for (path, expected) in [
+            ("/v1/rpki/transitions", Command::ShowRpkiTransitions),
             ("/v1/routes?held=1", routes(v4, None, true)),
             ("/v1/routes?family=ipv6&held=yes", routes(v6, None, true)),
             ("/v1/routes?family=ipv4&held=0", routes(v4, None, false)),
@@ -2337,6 +2436,7 @@ mod tests {
             r.lines,
             [
                 "mode external",
+                "enforcement drop-invalid",
                 "cache 127.0.0.1:3323 preference 0",
                 "cache rtr.example.net:323 preference 10, in use, current",
                 "state idle, connected, version 1",
@@ -2350,7 +2450,7 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"external","caches":["#,
+                r#"{"mode":"external","enforcement":"drop-invalid","caches":["#,
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
                 r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
@@ -2379,7 +2479,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[3..],
+            r.lines[4..],
             [
                 "state connecting, version 1",
                 "session-id - serial -",
@@ -2400,7 +2500,7 @@ mod tests {
             s.running = false;
         }
         assert_eq!(
-            render_rpki(&report, now).lines[3],
+            render_rpki(&report, now).lines[4],
             "state stopped, version 1"
         );
         // Disabled: the configured caches, nothing else, every member there.
@@ -2411,12 +2511,17 @@ mod tests {
         let r = render_rpki(&report, now);
         assert_eq!(
             r.lines,
-            ["mode disabled", "cache 192.0.2.10:323 preference 0"]
+            [
+                "mode disabled",
+                "enforcement drop-invalid",
+                "cache 192.0.2.10:323 preference 0"
+            ]
         );
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","caches":[{"host":"192.0.2.10","port":323,"#,
+                r#"{"mode":"disabled","enforcement":"drop-invalid","#,
+                r#""caches":[{"host":"192.0.2.10","port":323,"#,
                 r#""preference":0,"in_use":false,"current":false}],"#,
                 r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
@@ -2428,7 +2533,10 @@ mod tests {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
         };
-        assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+        assert_eq!(
+            render_rpki(&none, now).lines,
+            ["mode disabled", "enforcement drop-invalid"]
+        );
     }
 
     #[test]
@@ -2450,7 +2558,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[1..7],
+            r.lines[2..8],
             [
                 "cache 127.0.0.1:3323 preference 0, current",
                 "cache rtr.example.net:323 preference 10, in use",
@@ -2481,7 +2589,7 @@ mod tests {
             r.lines
         );
         assert_eq!(
-            r.lines[6],
+            r.lines[7],
             "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
         );
         assert!(
@@ -2497,7 +2605,7 @@ mod tests {
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(
-            render_rpki(&respelled, now).lines[2],
+            render_rpki(&respelled, now).lines[3],
             "cache RTR.Example.NET.:323 preference 10, in use, current"
         );
         // Held data that expired is no cache's: every route not-found.
@@ -2507,11 +2615,162 @@ mod tests {
             (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
         }
         let r = render_rpki(&report, now);
-        assert_eq!(r.lines[6], "vrps ipv4 0 ipv6 0");
+        assert_eq!(r.lines[7], "vrps ipv4 0 ipv6 0");
         assert!(
             r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
             "{}",
             r.json
+        );
+    }
+
+    #[test]
+    fn rpki_status_shows_the_enforcement() {
+        // RFC 6811 §5: what acts on the state, next to the mode that
+        // turns validation on (design §D1.3), whether written or the
+        // default, with a client or without.
+        let now = Instant::now();
+        for (statement, mode) in [
+            ("", "drop-invalid"),
+            ("enforcement drop-invalid;", "drop-invalid"),
+            ("enforcement prefer-valid;", "prefer-valid"),
+            ("enforcement off;", "off"),
+        ] {
+            for (block, status) in [
+                (
+                    "mode external; cache 192.0.2.10;",
+                    rpki_report(now, &[]).status,
+                ),
+                ("mode disabled;", None),
+            ] {
+                let report = RpkiReport {
+                    config: rpki_block(&format!("rpki {{ {block} {statement} }}")),
+                    status,
+                };
+                let r = render_rpki(&report, now);
+                assert_eq!(r.lines[1], format!("enforcement {mode}"), "{block}");
+                assert!(
+                    r.json
+                        .contains(&format!(r#""enforcement":"{mode}","caches":["#)),
+                    "{}",
+                    r.json
+                );
+            }
+        }
+    }
+
+    /// Three routes that changed state, 12 s and 3 s before `now`, and
+    /// five changes never recorded.
+    fn transitions(now: Instant) -> TransitionsReport {
+        use crate::messages::Recorded;
+        use bgpfc_rib::Transition;
+        // 2026-10-03T12:34:56.789Z, the example in AGENTS.md.
+        let base = std::time::UNIX_EPOCH + Duration::from_millis(1_791_030_896_789);
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        let entry = |ago: u64, t: Transition| Recorded {
+            at: base - Duration::from_secs(ago),
+            when: now.checked_sub(Duration::from_secs(ago)).unwrap(),
+            transition: t,
+        };
+        let moved = |prefix: &str, origin, from, to, route| Transition {
+            family: if prefix.contains(':') {
+                AddressFamily::IPV6_UNICAST
+            } else {
+                AddressFamily::IPV4_UNICAST
+            },
+            prefix: p(prefix),
+            peer: "198.51.100.1".parse().unwrap(),
+            origin,
+            from,
+            to,
+            route,
+        };
+        let as65001 = RouteOrigin::As(Asn(65_001));
+        TransitionsReport {
+            capacity: 1024,
+            unrecorded: 5,
+            entries: vec![
+                entry(
+                    12,
+                    moved(
+                        "192.0.2.0/24",
+                        as65001,
+                        RovState::Valid,
+                        RovState::Invalid,
+                        RouteStatus::Held(Held::Enforcement),
+                    ),
+                ),
+                entry(
+                    3,
+                    moved(
+                        "2001:db8::/32",
+                        RouteOrigin::None,
+                        RovState::Invalid,
+                        RovState::NotFound,
+                        RouteStatus::Best,
+                    ),
+                ),
+                entry(
+                    3,
+                    moved(
+                        "203.0.113.0/24",
+                        as65001,
+                        RovState::NotFound,
+                        RovState::Valid,
+                        RouteStatus::Candidate,
+                    ),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn transitions_render_as_lines_and_json() {
+        // Issue #59: each route that went from one RFC 6811 state to
+        // another, at the time its log line has, oldest first.
+        let now = Instant::now();
+        let report = transitions(now);
+        let r = render_transitions(&report, now);
+        assert_eq!(
+            r.lines,
+            [
+                "2026-10-03T12:34:44.789Z 192.0.2.0/24 peer 198.51.100.1 origin AS65001 \
+                 valid->invalid held by enforcement",
+                "2026-10-03T12:34:53.789Z 2001:db8::/32 peer 198.51.100.1 origin none \
+                 invalid->not-found best",
+                "2026-10-03T12:34:53.789Z 203.0.113.0/24 peer 198.51.100.1 origin AS65001 \
+                 not-found->valid candidate",
+                "3 kept (most recent 1024); 5 not recorded",
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"capacity":1024,"unrecorded":5,"transitions":["#,
+                r#"{"time":"2026-10-03T12:34:44.789Z","seconds_ago":12,"#,
+                r#""family":"ipv4-unicast","prefix":"192.0.2.0/24","peer":"198.51.100.1","#,
+                r#""origin":65001,"from":"valid","to":"invalid","route":"held","#,
+                r#""held_by":"enforcement"},"#,
+                r#"{"time":"2026-10-03T12:34:53.789Z","seconds_ago":3,"#,
+                r#""family":"ipv6-unicast","prefix":"2001:db8::/32","peer":"198.51.100.1","#,
+                r#""origin":null,"from":"invalid","to":"not-found","route":"best","#,
+                r#""held_by":null},"#,
+                r#"{"time":"2026-10-03T12:34:53.789Z","seconds_ago":3,"#,
+                r#""family":"ipv4-unicast","prefix":"203.0.113.0/24","peer":"198.51.100.1","#,
+                r#""origin":65001,"from":"not-found","to":"valid","route":"candidate","#,
+                r#""held_by":null}]}"#
+            )
+        );
+        // Nothing yet.
+        let empty = TransitionsReport {
+            capacity: 1024,
+            unrecorded: 0,
+            entries: Vec::new(),
+        };
+        let r = render_transitions(&empty, now);
+        assert_eq!(r.lines, ["0 kept (most recent 1024); 0 not recorded"]);
+        assert_eq!(
+            r.json,
+            r#"{"capacity":1024,"unrecorded":0,"transitions":[]}"#
         );
     }
 

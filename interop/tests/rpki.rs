@@ -707,7 +707,7 @@ fn with_mode_disabled_no_cache_is_asked() {
     s.wait_for_states(ESTABLISH, &DISABLED);
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
-        ok && out == "mode disabled\ncache 127.0.0.1:3323 preference 0\n",
+        ok && out == "mode disabled\nenforcement off\ncache 127.0.0.1:3323 preference 0\n",
         "{out}"
     );
     let body = s.http("/v1/rpki");

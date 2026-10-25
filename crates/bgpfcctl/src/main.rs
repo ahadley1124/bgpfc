@@ -24,6 +24,7 @@ commands:
   show fib
   show status
   show rpki
+  show rpki transitions
   show rpki validate PREFIX ASN
   clear neighbor ADDR [soft] [MESSAGE]
   reload

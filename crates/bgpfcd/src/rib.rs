@@ -14,8 +14,10 @@
 //! at a specific time." After the line of a change of the validation
 //! source come the routes it moved among valid, invalid and not-found, a
 //! line each: the first [`LOGGED`] at info, the rest the RIB lists at
-//! debug. Moves to and from `disabled`, validation being switched on or
-//! off, are only counted, as is what the RIB does not list.
+//! debug. The thread also keeps the latest [`KEPT`] of them, with their
+//! time, for `show rpki transitions` ([`RibQuery::Transitions`]). Moves
+//! to and from `disabled`, validation being switched on or off, are only
+//! counted, as is what the RIB does not list.
 //!
 //! Changes of the validation source arrive on the same channel, as
 //! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
@@ -23,10 +25,11 @@
 //! delivered like any other output. The RIB starts with no source (every
 //! route `disabled`) and keeps it until a change says otherwise.
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
 use bgpfc_log::Level;
@@ -40,7 +43,8 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, RibMsg, RibQuery, RibReply, RibSettings, RouteReport,
+    FibMsg, Intervals, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply, RibSettings,
+    RouteReport, TransitionsReport,
 };
 use crate::peer::SendError;
 
@@ -71,6 +75,7 @@ fn run(
         fib,
         changes: Vec::new(),
     };
+    let mut transitions = Transitions::default();
     #[cfg(feature = "profiling")]
     let mut loads = crate::profiling::Loads::from_env();
     loop {
@@ -86,7 +91,15 @@ fn run(
         #[cfg(feature = "profiling")]
         let seen = msg.as_ref().map(|m| loads.before(m));
         if let Some(msg) = msg {
-            handle(&mut rib, &mut settings, msg, now, fib, &mut out);
+            handle(
+                &mut rib,
+                &mut settings,
+                &mut transitions,
+                msg,
+                now,
+                fib,
+                &mut out,
+            );
         }
         // RFC 4271 §9.2.1.1: release what is due. After a message too, so
         // that a busy channel cannot starve the deadlines.
@@ -119,10 +132,12 @@ pub(crate) fn next(
     }
 }
 
-/// Apply one message to the RIB, its outputs going to `out`.
+/// Apply one message to the RIB, its outputs going to `out`; the routes
+/// a change of the validation source moved are kept in `transitions`.
 fn handle(
     rib: &mut Rib,
     settings: &mut RibSettings,
+    transitions: &mut Transitions,
     msg: RibMsg,
     now: Instant,
     fib: &SyncSender<FibMsg>,
@@ -177,7 +192,7 @@ fn handle(
             rib.peer_down(peer, now, out);
         }
         RibMsg::Query(q, reply) => {
-            let _ = reply.send(answer(rib, &q));
+            let _ = reply.send(answer(rib, transitions, &q));
         }
         RibMsg::SetPolicies { policies, reexport } => {
             for peer in &reexport {
@@ -208,7 +223,12 @@ fn handle(
                 "rib: validation change",
                 affected = describe_affected(&change.affected)
             );
-            rib.validation_changed(change, now, out);
+            let mut out = Recording {
+                transitions,
+                out,
+                when: now,
+            };
+            rib.validation_changed(change, now, &mut out);
         }
         RibMsg::SetEnforcement(mode) => {
             bgpfc_log::debug!("rib: rpki enforcement", mode = mode);
@@ -605,6 +625,69 @@ pub(crate) const fn status_name(s: RouteStatus) -> &'static str {
     }
 }
 
+/// Changes of state kept for `show rpki transitions`: the most recent of
+/// those the RIB lists, as many as one change of the validation source
+/// lists at most ([`Revalidation::LISTED`]), so that the last large one
+/// shows whole. About 64 KB. Not configurable, as [`LOGGED`] is not.
+pub(crate) const KEPT: usize = 1024;
+
+/// The RIB thread's memory of the routes changes of the validation source
+/// moved among valid, invalid and not-found: the latest [`KEPT`], each
+/// with when it happened, and a count of those it was never given.
+#[derive(Debug, Default)]
+pub(crate) struct Transitions {
+    kept: VecDeque<Recorded>,
+    unrecorded: u64,
+}
+
+impl Transitions {
+    /// Keep what `r` lists, which happened at `at` (`when` on the
+    /// monotonic clock), dropping the oldest beyond [`KEPT`], and count
+    /// what it does not list.
+    fn record(&mut self, r: &Revalidation, at: SystemTime, when: Instant) {
+        let listed = &r.transitions[r.transitions.len().saturating_sub(KEPT)..];
+        let room = KEPT - listed.len();
+        if self.kept.len() > room {
+            self.kept.drain(..self.kept.len() - room);
+        }
+        self.kept.extend(listed.iter().map(|t| Recorded {
+            at,
+            when,
+            transition: t.clone(),
+        }));
+        self.unrecorded = self
+            .unrecorded
+            .saturating_add(u64::try_from(r.unlisted).unwrap_or(u64::MAX));
+    }
+
+    /// What is kept, oldest first, for the control plane.
+    fn report(&self) -> TransitionsReport {
+        TransitionsReport {
+            capacity: KEPT,
+            unrecorded: self.unrecorded,
+            entries: self.kept.iter().cloned().collect(),
+        }
+    }
+}
+
+/// Passes outputs on to `out`, keeping in `transitions` first what the
+/// report of a change of the validation source lists.
+struct Recording<'a, S> {
+    transitions: &'a mut Transitions,
+    out: &'a mut S,
+    /// When the change was taken from the channel.
+    when: Instant,
+}
+
+impl<S: Sink> Sink for Recording<'_, S> {
+    fn put(&mut self, output: Output) {
+        if let Output::Revalidated(r) = &output {
+            self.transitions.record(r, SystemTime::now(), self.when);
+        }
+        self.out.put(output);
+    }
+}
+
 /// The message of the line logged when the `enforcement` changes.
 const ENFORCEMENT_CHANGED: &str = "rib: rpki enforcement changed";
 
@@ -689,8 +772,9 @@ fn route_report(prefix: Prefix, r: &bgpfc_rib::RouteRef<'_>, best: bool) -> Rout
     }
 }
 
-fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
+fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
     match q {
+        RibQuery::Transitions => RibReply::Transitions(transitions.report()),
         RibQuery::Peers => RibReply::Peers(
             rib.peers()
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
@@ -760,9 +844,20 @@ mod tests {
 
     /// [`super::handle`], with what it put out.
     fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) -> Vec<Output> {
+        handle_with(rib, settings, &mut Transitions::default(), msg, now)
+    }
+
+    /// [`handle`], keeping the transitions in `transitions`.
+    fn handle_with(
+        rib: &mut Rib,
+        settings: &mut RibSettings,
+        transitions: &mut Transitions,
+        msg: RibMsg,
+        now: Instant,
+    ) -> Vec<Output> {
         let (fib, _) = sync_channel(1);
         let mut out = Vec::new();
-        super::handle(rib, settings, msg, now, &fib, &mut out);
+        super::handle(rib, settings, transitions, msg, now, &fib, &mut out);
         out
     }
 
@@ -1284,7 +1379,7 @@ mod tests {
             after: None,
             held: false,
         };
-        match answer(rib, &q) {
+        match answer(rib, &Transitions::default(), &q) {
             RibReply::Routes(routes) => routes
                 .iter()
                 .map(|r| (r.prefix.to_string(), r.rov))
@@ -1669,6 +1764,7 @@ mod tests {
         let mut rib = Rib::new(Asn(65_000));
         rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
         let mut settings = RibSettings::default();
+        let mut kept = Transitions::default();
         handle(
             &mut rib,
             &mut settings,
@@ -1677,8 +1773,15 @@ mod tests {
         );
         let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
         handle(&mut rib, &mut settings, msg, now);
-        let mut apply =
-            |rib: &mut Rib, change| handle(rib, &mut settings, RibMsg::Validation(change), now);
+        let mut apply = |rib: &mut Rib, change| {
+            handle_with(
+                rib,
+                &mut settings,
+                &mut kept,
+                RibMsg::Validation(change),
+                now,
+            )
+        };
         // Validation switched on: disabled->X, counted and not listed.
         let theirs = vrp("203.0.113.0/24", 24, 64_496);
         let ours = vrp("198.51.100.0/24", 24, 65_001);
@@ -1720,18 +1823,38 @@ mod tests {
         );
         // Nothing more at debug: every listed move has its info line.
         assert_eq!(revalidation_lines(r, true), revalidation_lines(r, false));
-        // What became of each route is what the RIB now has.
-        let now_held: Vec<_> = rib.held(V4).map(|(p, r)| (p.to_string(), r.held)).collect();
+        // Both kept, with the moment the change was applied.
+        let report = kept.report();
+        assert_eq!((report.capacity, report.unrecorded), (KEPT, 0));
+        let moved: Vec<_> = report
+            .entries
+            .iter()
+            .map(|e| {
+                assert_eq!(e.when, now);
+                (
+                    e.transition.prefix.to_string(),
+                    e.transition.from,
+                    e.transition.to,
+                    e.transition.route,
+                )
+            })
+            .collect();
         assert_eq!(
-            now_held,
-            [(
-                "198.51.100.0/24".to_owned(),
-                Some(bgpfc_rib::Held::Enforcement)
-            )]
-        );
-        assert_eq!(
-            states(&rib),
-            [("203.0.113.0/24".to_owned(), RovState::Valid)]
+            moved,
+            [
+                (
+                    "198.51.100.0/24".to_owned(),
+                    RovState::Valid,
+                    RovState::Invalid,
+                    RouteStatus::Held(bgpfc_rib::Held::Enforcement)
+                ),
+                (
+                    "203.0.113.0/24".to_owned(),
+                    RovState::Invalid,
+                    RovState::Valid,
+                    RouteStatus::Best
+                ),
+            ]
         );
     }
 
@@ -1827,7 +1950,7 @@ mod tests {
 
     /// What `answer` says to a routes query.
     fn listed_routes(rib: &Rib, q: &RibQuery) -> Vec<Listed> {
-        match answer(rib, q) {
+        match answer(rib, &Transitions::default(), q) {
             RibReply::Routes(routes) => routes
                 .iter()
                 .map(|r| {
@@ -2030,5 +2153,47 @@ mod tests {
                 (prefixes[PAGE / 2 + 1].as_str(), "192.0.2.2")
             ]
         );
+    }
+
+    #[test]
+    fn the_transition_ring_keeps_the_latest_1024() {
+        let now = Instant::now();
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_791_030_896);
+        let mut kept = Transitions::default();
+        let report = |transitions, unlisted| Revalidation {
+            transitions,
+            unlisted,
+            ..Default::default()
+        };
+        kept.record(&report(moved(0, 600), 0), at, now);
+        assert_eq!(kept.report().entries.len(), 600);
+        // Past the capacity, the oldest go first.
+        kept.record(&report(moved(600, 600), 5), at, now);
+        let r = kept.report();
+        assert_eq!((r.capacity, r.unrecorded), (1024, 5));
+        assert_eq!(r.entries.len(), KEPT);
+        assert_eq!(r.entries[0].transition, moved(176, 1)[0]);
+        assert_eq!(r.entries[KEPT - 1].transition, moved(1199, 1)[0]);
+        // A change that lists the most the RIB lists replaces them all.
+        kept.record(&report(moved(2000, Revalidation::LISTED), 7), at, now);
+        let r = kept.report();
+        assert_eq!(r.unrecorded, 12);
+        assert_eq!(r.entries[0].transition, moved(2000, 1)[0]);
+        assert!(r.entries.iter().all(|e| e.at == at && e.when == now));
+        // The same through the channel's query.
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let (tx, rx) = sync_channel(1);
+        handle_with(
+            &mut rib,
+            &mut settings,
+            &mut kept,
+            RibMsg::Query(RibQuery::Transitions, tx),
+            now,
+        );
+        match rx.try_recv() {
+            Ok(RibReply::Transitions(answer)) => assert_eq!(answer, r),
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -9,9 +9,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
-#[cfg(feature = "profiling")]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
 use bgpfc_wire::error::{CeaseSubcode, DecodeError};
@@ -200,6 +198,8 @@ pub(crate) enum RibQuery {
         /// The last route of the page before, if any.
         after: Option<Prefix>,
     },
+    /// The most recent changes of a route's RFC 6811 state (issue #59).
+    Transitions,
 }
 
 /// One route in a reply: of the Loc-RIB, a candidate, or a route held
@@ -233,6 +233,36 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
     FibRoutes(Vec<(Prefix, IpAddr)>),
+    /// Answer to [`RibQuery::Transitions`].
+    Transitions(TransitionsReport),
+}
+
+/// A route's move from one RFC 6811 state to another, as the RIB thread
+/// keeps it (issue #59: "An operator needs to see that a prefix went
+/// Valid → Invalid at a specific time").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Recorded {
+    /// When the RIB thread applied the change (a log timestamp, AGENTS.md
+    /// §3): the time of its log lines, give or take the moment it took to
+    /// write them.
+    pub(crate) at: SystemTime,
+    /// The same moment on the monotonic clock, for how long ago it was.
+    pub(crate) when: Instant,
+    /// The route, its move, and what became of it.
+    pub(crate) transition: bgpfc_rib::Transition,
+}
+
+/// The changes of state the RIB thread keeps: the most recent of those
+/// the RIB listed (`bgpfc_rib::Revalidation::transitions`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransitionsReport {
+    /// The most it keeps.
+    pub(crate) capacity: usize,
+    /// Changes of state it was never given, since it started: those
+    /// beyond what the RIB lists for one change of the validation source.
+    pub(crate) unrecorded: u64,
+    /// The changes kept, oldest first.
+    pub(crate) entries: Vec<Recorded>,
 }
 
 /// What the coordinator reports about the `rpki` block.
