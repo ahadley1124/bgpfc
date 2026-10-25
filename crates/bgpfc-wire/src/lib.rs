@@ -14,7 +14,8 @@
 //! §3; RFC 7911 §2–§5 (the ADD-PATH capability, the Path Identifier and its
 //! place in the NLRI of every field and attribute that carries any); RFC
 //! 9234 §4, §5 (the Role capability and the OTC attribute); RFC 4724 §3
-//! and RFC 8538 §2 (the Graceful Restart capability).
+//! and RFC 8538 §2 (the Graceful Restart capability), RFC 4724 §2 (the
+//! End-of-RIB marker).
 //!
 //! With the `profiling` feature, UPDATE and attribute decoding are timed
 //! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only

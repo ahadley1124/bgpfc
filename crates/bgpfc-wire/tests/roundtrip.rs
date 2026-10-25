@@ -671,6 +671,38 @@ proptest! {
     }
 
     #[test]
+    fn end_of_rib_round_trip(
+        v6 in any::<bool>(),
+        add_path in any::<bool>(),
+        extended_next_hop in any::<bool>(),
+    ) {
+        // RFC 4724 §2: the marker of either family encodes and decodes to
+        // itself, whatever else was negotiated, and names its family; it
+        // is never taken for anything announced or withdrawn.
+        let family = if v6 { AddressFamily::IPV6_UNICAST } else { AddressFamily::IPV4_UNICAST };
+        let paths = if add_path { AddPathFamilies::of(&[family]) } else { AddPathFamilies::NONE };
+        let wire = UpdateMessage::end_of_rib(family)
+            .encode(&EncodeContext { four_octet_as: true, extended_next_hop, add_path: paths })
+            .unwrap();
+        let d = UpdateMessage::decode(&wire, &DecodeContext {
+            four_octet_as: true,
+            peer: PeerKind::External,
+            allow_as_set: false,
+            extended_next_hop,
+            add_path: paths,
+        })
+        .unwrap();
+        prop_assert_eq!(d.message.end_of_rib_family(), Some(family));
+        prop_assert_eq!(d.announcements().count() + d.withdrawals().count(), 0);
+        prop_assert!(d.disabled.is_empty() && d.discarded.is_empty());
+        prop_assert_eq!(d.message.encode(&EncodeContext {
+            four_octet_as: true,
+            extended_next_hop,
+            add_path: paths,
+        }).unwrap(), wire);
+    }
+
+    #[test]
     fn open_round_trip(m in open_message(), force_extended in any::<bool>()) {
         let wire = m.encode_with(force_extended).unwrap();
         let back = OpenMessage::decode(&wire).unwrap();
