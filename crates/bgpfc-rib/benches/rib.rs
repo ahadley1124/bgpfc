@@ -59,6 +59,7 @@ fn peer(i: u8) -> PeerInfo {
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
     }
 }
 
@@ -67,6 +68,7 @@ fn paced_peer(i: u8) -> PeerInfo {
     PeerInfo {
         advertisement_interval: Duration::from_secs(30),
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
         ..peer(i)
     }
 }

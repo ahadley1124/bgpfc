@@ -2,7 +2,8 @@
 //!
 //! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
-//! per-family prefix limit), §6.3 a) (our own address is no next hop).
+//! per-family prefix limit), §6.3 a) (our own address is no next hop);
+//! RFC 7911 §5 (the families taken with Path Identifiers).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -53,6 +54,10 @@ pub struct PeerInfo {
     /// session (see [`Output::PrefixLimitExceeded`](crate::Output)).
     /// Families not listed have none.
     pub prefix_limits: Vec<(AddressFamily, u32)>,
+    /// The families the peer sends us routes of with a Path Identifier
+    /// before each prefix, several paths for one (RFC 7911 §5). Within
+    /// `receive_families`.
+    pub add_path_receive: Vec<AddressFamily>,
 }
 
 impl PeerInfo {
@@ -78,6 +83,12 @@ impl PeerInfo {
     #[must_use]
     pub fn receives(&self, family: AddressFamily) -> bool {
         self.receive_families.contains(&family) || self.speaks(family)
+    }
+
+    /// Whether the peer sends routes of `family` with Path Identifiers.
+    #[must_use]
+    pub fn receives_paths(&self, family: AddressFamily) -> bool {
+        self.add_path_receive.contains(&family)
     }
 
     /// The prefix limit for `family`, if there is one (RFC 4271 §6.7).

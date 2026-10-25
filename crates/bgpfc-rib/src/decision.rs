@@ -45,6 +45,9 @@ pub struct Candidate<'a> {
     pub from: Neighbor,
     /// The route's attributes.
     pub attrs: &'a PathAttrs,
+    /// The Path Identifier the peer sent it with (RFC 7911 §3), zero if the
+    /// session has none. Only ever the last tie-break.
+    pub path_id: u32,
 }
 
 /// The `LOCAL_PREF` assumed for routes without one (external routes the
@@ -89,7 +92,9 @@ pub fn path_length(attrs: &PathAttrs) -> usize {
 /// shortest `AS_PATH`; lowest ORIGIN; lowest MED among routes from the
 /// same neighboring AS (a missing MED is the lowest value); external over
 /// internal; (interior cost: not applicable, no IGP); lowest BGP
-/// Identifier; lowest peer address.
+/// Identifier; lowest peer address; and then, for the several paths one
+/// peer may send with ADD-PATH (RFC 7911 §3), which every step before
+/// finds equal, the lowest Path Identifier.
 #[must_use]
 pub fn best<'a>(n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> Option<usize> {
     #[cfg(feature = "profiling")]
@@ -152,6 +157,13 @@ fn after_med(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
         .then_with(|| b.from.router_id.cmp(&a.from.router_id))
         // g) lowest peer address.
         .then_with(|| b.from.addr.cmp(&a.from.addr))
+        // RFC 4271 §9.1.2.2 ends here, and RFC 7911 adds no step: two paths
+        // of one peer are equal to every step above, so without one more
+        // the choice between them would depend on which arrived first.
+        // The lowest Path Identifier, a local rule, keeps the Loc-RIB
+        // independent of arrival order. For a session without ADD-PATH it
+        // is zero on both sides.
+        .then_with(|| b.path_id.cmp(&a.path_id))
 }
 
 /// 0 when the route has the lowest MED of its neighboring AS among the

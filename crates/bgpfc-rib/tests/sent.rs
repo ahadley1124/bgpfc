@@ -52,6 +52,7 @@ fn peers() -> Vec<PeerInfo> {
             // only delays; tests/pacing.rs is about when.
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
+            add_path_receive: Vec::new(),
         })
         .collect()
 }
@@ -182,7 +183,7 @@ fn deliver(out: Vec<Output>, infos: &[PeerInfo], views: &mut [BTreeMap<Prefix, P
             for (_, p) in d.withdrawals() {
                 views[i].remove(&p);
             }
-            for (_, next_hop, prefixes) in announced(&d) {
+            for (_, next_hop, prefixes, _) in announced(&d) {
                 for &p in prefixes {
                     views[i].insert(p, PathAttrs::from_update(&d.message, next_hop));
                 }

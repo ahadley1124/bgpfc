@@ -74,6 +74,7 @@ fn peers() -> Vec<PeerInfo> {
             // tests/pacing.rs covers the paced case.
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
+            add_path_receive: Vec::new(),
         })
         .collect()
 }

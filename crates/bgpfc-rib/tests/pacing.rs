@@ -65,6 +65,7 @@ fn peers(paced: bool) -> Vec<PeerInfo> {
                     Duration::ZERO
                 },
                 prefix_limits: Vec::new(),
+                add_path_receive: Vec::new(),
             }
         })
         .collect()
