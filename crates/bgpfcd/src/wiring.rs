@@ -1,9 +1,10 @@
 //! From the validated configuration to what the threads need.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bgpfc_config::ast::{self, Neighbor};
 use bgpfc_fsm::{Config, Damping, SendHoldTime};
+use bgpfc_rib::{Output, Policies, Rib};
 use bgpfc_wire::capability::{Capability, NextHopEncoding};
 use bgpfc_wire::types::{Afi, Asn, RouterId};
 
@@ -86,6 +87,30 @@ pub(crate) fn rib_settings(config: &bgpfc_config::Config) -> RibSettings {
         intervals: advertisement_intervals(config),
         prefix_limits: prefix_limits(config),
     }
+}
+
+/// The RIB the RIB thread starts with: `policies`, a jitter seed for the
+/// advertisement intervals (RFC 4271 §10: they are jittered too), and the
+/// `rpki` block's `enforcement`. RFC 6811 §2: a route leaves the decision
+/// process for its validation state only when "explicitly configured to
+/// do so", and §5 names "rejecting all "invalid" routes" among the
+/// policies; the mode is set before any route arrives, so that every
+/// route is judged under it from the first. `Rib` itself starts with
+/// `off` and acts on nothing until told.
+pub(crate) fn rib(config: &bgpfc_config::Config, policies: Box<dyn Policies>) -> Rib {
+    let mut rib = Rib::with_policies(config.local_as, policies);
+    rib.set_jitter_seed(jitter_seed(&"rib"));
+    // With no route held, nothing is judged again: the report that says
+    // so is dropped, as the start line already names the mode.
+    let mut report = Vec::new();
+    rib.set_enforcement(config.rpki.enforcement, Instant::now(), &mut report);
+    debug_assert!(
+        report
+            .iter()
+            .all(|o| matches!(o, Output::Enforcement(r) if r.routes == 0)),
+        "{report:?}"
+    );
+    rib
 }
 
 /// A jitter seed that differs per process and per `salt` (a peer's
@@ -207,6 +232,42 @@ mod tests {
         // Not configured: the RIB thread picks the RFC 4271 §10 default.
         assert_eq!(i.get(&"192.0.2.3".parse::<IpAddr>().unwrap()), Some(&None));
         assert_ne!(jitter_seed(&"rib"), 0);
+    }
+
+    #[test]
+    fn the_rib_starts_with_the_rpki_blocks_enforcement() {
+        use bgpfc_rib::{AcceptAll, Enforcement};
+        let with = |block: &str| {
+            bgpfc_config::parse_str(
+                "t",
+                &format!("router-id 192.0.2.1; local-as 65000; {block}"),
+            )
+            .unwrap()
+        };
+        // Written or not, with validation on or off: the configured mode,
+        // drop-invalid unless another is written (issue #61).
+        for (block, mode) in [
+            ("", Enforcement::DropInvalid),
+            ("rpki { mode disabled; }", Enforcement::DropInvalid),
+            (
+                "rpki { mode external; cache 192.0.2.10; }",
+                Enforcement::DropInvalid,
+            ),
+            (
+                "rpki { mode external; enforcement prefer-valid; cache 192.0.2.10; }",
+                Enforcement::PreferValid,
+            ),
+            (
+                "rpki { mode external; enforcement off; cache 192.0.2.10; }",
+                Enforcement::Off,
+            ),
+        ] {
+            let cfg = with(block);
+            let rib = rib(&cfg, Box::new(AcceptAll));
+            assert_eq!(rib.enforcement(), mode, "{block}");
+            assert_eq!(rib.local_as(), Asn(65_000));
+            assert_eq!(rib.peers().count(), 0);
+        }
     }
 
     #[test]

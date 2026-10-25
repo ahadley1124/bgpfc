@@ -81,7 +81,8 @@ fn main() {
         local_as = config.local_as,
         router_id = config.router_id,
         fib_mode = config.fib.mode,
-        rpki = config.rpki.mode
+        rpki = config.rpki.mode,
+        enforcement = config.rpki.enforcement
     );
     // Issue #60: a cache that cannot be found stops the start, before
     // anything is opened, rather than leaving every route unvalidated.
@@ -179,12 +180,10 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 
     // No validation source yet (issue #56): every route is `disabled`
-    // until the RTR client sends its first full set.
-    let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
-    // RFC 4271 §10: the advertisement intervals are jittered too.
-    rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
+    // until the RTR client sends its first full set. The `enforcement` is
+    // set before the thread starts, so that no route is judged without it.
     rib::spawn(
-        rib,
+        wiring::rib(&config, Box::new(engine)),
         wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
