@@ -136,6 +136,15 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         .collect()
 }
 
+/// The type code of the first path attribute of a framed UPDATE.
+fn first_attribute_type(message: &[u8]) -> Option<u8> {
+    let body = &message[HEADER_LEN..];
+    let withdrawn = usize::from(u16::from_be_bytes([body[0], body[1]]));
+    // Total Path Attribute Length, then the first attribute's flags and
+    // type (RFC 4271 §4.3).
+    body[2 + withdrawn..].get(3).copied()
+}
+
 fn sends(out: &[Output], to: IpAddr) -> Vec<&Vec<Vec<u8>>> {
     out.iter()
         .filter_map(|o| match o {
@@ -724,6 +733,57 @@ fn large_batches_are_packed_within_the_message_limit() {
     assert_eq!(total, 3000);
     // Nothing uses an attribute set any more, and none is kept.
     assert_eq!(rib.attribute_sets(), 0);
+}
+
+#[test]
+fn each_update_carries_one_kind_of_route_with_mp_attributes_first() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("2001:db8::1", 65_001, 1);
+    let e2 = peer("2001:db8::2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(e2.clone(), o));
+    let v4 = attrs(&[65_001], "10.0.0.1");
+    let v6 = attrs(&[65_001], "2001:db8::1");
+    outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &v4), o));
+    outputs(|o| rib.update(e1.addr, &announce(&["2001:db8:1::/48"], &v6), o));
+    // One UPDATE with all four, as RFC 7606 §5.1 says we must accept.
+    let mut message = v4.to_update(V4, vec![p("198.51.100.0/24")]);
+    message.withdrawn = vec![p("192.0.2.0/24")];
+    message.mp_reach = v6.to_update(V6, vec![p("2001:db8:2::/48")]).mp_reach;
+    message.mp_unreach = Some(bgpfc_wire::mp::MpUnreach {
+        family: V6,
+        withdrawn: vec![p("2001:db8:1::/48")],
+    });
+    let update = DecodedUpdate {
+        message,
+        treated_as_withdraw: None,
+        discarded: Vec::new(),
+    };
+    let out = outputs(|o| rib.update(e1.addr, &update, o));
+    // RFC 7606 §5.1: what we send carries at most one of withdrawn
+    // routes, NLRI, MP_REACH_NLRI and MP_UNREACH_NLRI, and an MP
+    // attribute comes first.
+    let mut kinds = Vec::new();
+    for messages in sends(&out, e2.addr) {
+        for (raw, m) in messages.iter().zip(decode_sent(messages, &e2)) {
+            let present = [
+                !m.withdrawn.is_empty(),
+                !m.nlri.is_empty(),
+                m.mp_reach.is_some(),
+                m.mp_unreach.is_some(),
+            ];
+            assert_eq!(present.iter().filter(|k| **k).count(), 1, "{m:?}");
+            let kind = present.iter().position(|k| *k).unwrap();
+            // MP_REACH_NLRI is type 14, MP_UNREACH_NLRI 15 (RFC 4760 §3, §4).
+            let mp_type = [None, None, Some(14), Some(15)][kind];
+            if mp_type.is_some() {
+                assert_eq!(first_attribute_type(raw), mp_type);
+            }
+            kinds.push(kind);
+        }
+    }
+    kinds.sort_unstable();
+    assert_eq!(kinds, vec![0, 1, 2, 3]);
 }
 
 #[test]
