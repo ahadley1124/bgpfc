@@ -391,29 +391,37 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
 
 From this branch, in a 4-CPU cloud container (figures move with the host;
 see above). Synthetic table: 1 000 000 prefixes, 50 000 attribute sets,
-seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs. The second
-column is the same measurement where the profiling tools were added
-(24ae7d9), on the same host.
+seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs. The first
+two columns were measured interleaved, one run of each at a time, on the
+same host; 52f8429 is the end of the first round of memory work. The third
+is where the profiling tools were added (24ae7d9), measured earlier on a
+host that ran about 9 % faster (52f8429 loaded in 1.64 s there).
 
-| | now | 24ae7d9 |
-|---|---|---|
-| table load | 1.64 s (1.58–1.74), 30 500 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
-| of which on the RIB thread (`rib_update`) | 1.27 s; inserts and the decision process 0.70 s | 2.9 s |
-| decode on the peer thread (`msg_parse_update`) | 0.15 s, in parallel | 0.22 s |
-| bytes per prefix | 121 | 341 |
-| peak live / peak RSS | 121.7 MB / 130.3 MB | 341.7 MB / 360.4 MB |
-| allocations during the load | 1.02 M | 7.7 M |
-| spans off | 1.51 s | 3.02 s |
-| `withdraw-all`: peak live, residual | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
-| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.42–0.49 s, 0.98 MB, 133 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
+| | now | 52f8429 | 24ae7d9 |
+|---|---|---|---|
+| table load | 1.77 s (1.64–1.90), 28 300 UPDATEs/s | 1.79 s (1.75–1.88), 27 900 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
+| of which on the RIB thread (`rib_update`) | 1.37 s; inserts and the decision process 0.73 s | 1.43 s; 0.83 s | 2.9 s |
+| decode on the peer thread (`msg_parse_update`) | 0.17 s, in parallel | 0.17 s | 0.22 s |
+| bytes per prefix | 58 | 121 | 341 |
+| peak live / peak RSS | 59.2 MB / 67.7 MB | 121.7 MB / 130.4 MB | 341.7 MB / 360.4 MB |
+| allocations during the load | 0.88 M | 1.02 M | 7.7 M |
+| spans off | 1.64 s | 1.63 s | 3.02 s |
+| `withdraw-all`: peak live, residual | 91.1 MB, 0.20 MB | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
+| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.47–0.61 s, 0.42 MB, 70–73 MB | 0.45–0.56 s, 0.98 MB, 133–138 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
+
+With one peer the load time is the same; the time saved is in sending
+routes to other peers, which a single peer does not exercise (see "Two
+peers" below and the micro-benchmarks).
 
 A real table, RouteViews `route-views.sg` 2026-10-01 00:00, peer 39
 (AS23673): 1 114 715 routes over 159 391 attribute sets and 137 311
-`AS_PATH`s; load 2.44 s, 161 octets per prefix, 180 MB peak live, 195 MB
-RSS (at 24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
+`AS_PATH`s, interleaved as above: load 2.48 s (2.19–2.59), RIB thread
+2.01 s, 90 octets per prefix, 101.0 MB peak live, 115.8 MB RSS; at
+52f8429 2.71 s (2.31–3.03), 2.22 s, 161 octets, 180.5 MB, 195.4 MB (at
+24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
 
 A profiling build is slower than the default build. Measured from outside
-on the same host, interleaved, from starting the load generator until the
+at 52f8429, interleaved, from starting the load generator until the
 daemon reports every route received (session setup included, so not
 comparable with `load_us`): 1.87 s in the default build, 1.99 s in the
 profiling build with spans off and 2.06 s with spans on. Compare
@@ -423,13 +431,24 @@ against 3.38 s and 360 MB.
 
 Install mode, 1M routes into the kernel of a network namespace of their
 own (a veth pair, one end 192.0.2.10/24, so the load generator's next
-hops resolve), default build, three runs each, timed until the FIB
-thread goes idle with every route in the kernel: 5.2–5.6 s and 131 MB
-RSS, against 9.4–9.6 s and 416 MB at 24ae7d9, which held the desired and
-the installed routes as two tables. The FIB thread bounds it: 4.7 s of
-CPU (8.7 s at 24ae7d9), two thirds of it in the kernel, for one netlink
-request and acknowledgement per route. Listing the kernel table while it
-fills (`ip route | wc -l`) slows the inserts; count it once, at the end.
+hops resolve), default build, three runs each, interleaved, timed until
+every route is in the kernel: 4.4–4.6 s and 86.5 MB RSS, against
+6.1–6.6 s and 130.6 MB at 52f8429 on the same host (9.4–9.6 s and 416 MB
+at 24ae7d9, which held the desired and the installed routes as two
+tables, on the faster host). The FIB thread bounds it: 3.1–3.3 s of CPU
+(4.6–5.1 s at 52f8429), two thirds of it in the kernel, now that
+requests go 256 to a netlink message with one acknowledgement. Listing
+the kernel table while it fills (`ip route | wc -l`) slows the inserts;
+count it once, at the end.
+
+Two peers, one relaying its full table to the other, in a network
+namespace, release build: the synthetic million peaks at 69 MB RSS and the
+RouteViews table at 117 MB, about what one peer needs, since a peer's
+Adj-RIB-Out is no longer stored. Before this branch the peer loading the
+table was reset (Cease, Out of Resources) about 39 000 UPDATEs in, every
+time: the RIB's UPDATEs to it went through its input queue, full of its
+own. With that fixed and the Adj-RIB-Out still a hash map per peer, the
+synthetic million peaked at 201 MB.
 
 ## Caveats
 
