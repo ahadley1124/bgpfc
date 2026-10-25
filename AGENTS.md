@@ -168,12 +168,16 @@ tests can drive time deterministically.
   in the main table.
 - At startup, the FIB thread dumps the routes that carry our protocol number,
   diffs them against the (empty) desired set, and removes the stale ones.
-  Never touch routes with another protocol number.
+  Never touch routes with another protocol number. When a neighbor has
+  graceful restart on (step 16), the removal waits until every such peer
+  has sent End-of-RIB for the family or its restart time has passed
+  (RFC 4724 §4.1), and then removes only the routes not learned again.
 - `mode dry-run | install` comes from config, can be overridden with a CLI
   flag, and can be toggled at runtime through the control channel. **The
   default is dry-run.** Switching from dry-run to install performs a full
   reconcile.
-- Single best path only. Do not use nexthop groups.
+- Single best path only, ADD-PATH included: the FIB gets the one best
+  path. Do not use nexthop groups.
 
 **Privileges.** Support both modes described in the README:
 
@@ -419,8 +423,9 @@ Steps 0–9 are complete: they built v1. Their text stays as a record of what
 v1 covers. Steps 10 to 12 are complete as well, and their text stays as a
 record of what they added; step 11 also did the part of step 13 that
 re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4), and step
-12 the part that adds the `rpki` config, external caches or disabled. Work
-continues at step 13.
+12 the part that adds the `rpki` config, external caches or disabled. The
+maintainer chose this order for the steps still open: 15, 16, 17, 18, 13,
+14, 19. Each lands in the one combined PR on branch `capabilities`.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.
@@ -492,12 +497,56 @@ continues at step 13.
       from a thread that lives as long as the daemon.
     - Localhost RTR auto-wiring.
     - A unified config surface for external caches and the sidecar.
+15. **ADD-PATH (RFC 7911).**
+    - Capability 69, a Send/Receive value per `<AFI, SAFI>`, negotiated per
+      family (§4, §5).
+    - The Path Identifier in NLRI, in the NLRI field and the MP attributes
+      of both families, only where negotiated (§3). The Adj-RIB-In keys
+      routes by prefix and path identifier.
+    - Receive: `add-path receive yes` per neighbor and family. Every path
+      received takes part in the decision process; the FIB still gets the
+      one best path (§3 FIB).
+    - Send: `add-path send N | all` per neighbor and family: the N best
+      paths by the decision process, or every path export policy accepts.
+      A path keeps its identifier while it lives.
+    - Interop scenarios against BIRD and FRR.
+16. **Graceful Restart (RFC 4724, RFC 8538), receiving and restarting
+    speaker.**
+    - Capability 64: Restart State, Restart Time (120 s by default, as in
+      BIRD and FRR), and an F bit per family (§3). End-of-RIB sent after
+      the initial table and recognised on receipt (§2).
+    - Receiving speaker: when a GR peer's session goes, keep its routes as
+      stale; delete them when its restart timer runs out, and those it did
+      not send again at its End-of-RIB (§4.2). RFC 8538: the N bit, Hard
+      Reset, and graceful handling of the other NOTIFICATIONs.
+    - Restarting speaker: `graceful-restart yes` per neighbor, off by
+      default. The startup flush waits as §3 FIB says; the F bit is set
+      only for families whose routes were kept.
+    - Interop scenarios against BIRD and FRR, both directions.
+17. **Enhanced Route Refresh (RFC 7313).**
+    - Capability 70; ROUTE-REFRESH subtypes BoRR and EoRR (§3).
+    - Routes not refreshed between BoRR and EoRR, or by the stale timer,
+      are purged (§4).
+    - Interop scenario against BIRD.
+18. **BGP Roles and OTC (RFC 9234).**
+    - Capability 9; role pairs checked on OPEN, Role Mismatch NOTIFICATION
+      (§4.2), and a strict mode, off by default.
+    - The Only to Customer attribute set and checked on ingress and egress
+      (§5).
+    - Interop scenario against BIRD.
+19. **Open RFC items (`docs/bgp-rfcs.md`).**
+    - RFC 6286 §2.2 and §2.3.
+    - RFC 8212 rows in COMPLIANCE.md: met by design, every neighbor names
+      an import and an export policy.
+    - RFC 8326: tag our own announcements with `GRACEFUL_SHUTDOWN` before
+      a shutdown.
+    - GTSM (RFC 5082), through `bgpfc-sys`.
+    - RFC 8642 §6 and the RFC 5396 "asplain" citation in `docs/config.md`.
 
 **Out of scope until the maintainer says otherwise:** ASPA (planned for
 v1.1.0), BGPsec (RFC 8205), the protected RTR transports (RFC 8210 §9; see
-§4), BGP roles (9234), RFC 8212, graceful restart, ADD-PATH, route
-reflection, confederations, ECMP, VPN families, TCP-MD5/AO, and non-Linux
-platforms. Do not add hooks or abstractions "for later"; the `AspaState`
+§4), route reflection, confederations, ECMP, VPN families, TCP-MD5/AO,
+and non-Linux platforms. Do not add hooks or abstractions "for later"; the `AspaState`
 placeholder in step 11 is the one exception the maintainer asked for. Build
 cleanly, and refactor when a feature actually lands.
 
