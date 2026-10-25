@@ -10,11 +10,15 @@
 //! The RIB sees none of that. It asks a [`ValidationSource`] for verdicts
 //! and receives a [`ValidationChange`] (new source, affected routes) when
 //! they change; a producer sends those through a [`ValidationSink`].
-//! [`NullSource`] is the source when validation is off.
+//! [`NullSource`] is the source when validation is off. What the router
+//! then does with a route's state, beyond what policy does, is the
+//! operator's [`Enforcement`].
 //!
 //! Implements: RFC 6811 §2 (VRPs, the Route Origin ASN, Covered, Matched,
-//! the three validation states), §4 (re-validate the affected prefixes
-//! when VRPs change); RFC 6483 §2 (validation outcome),
+//! the three validation states), §3 (how policy reads a state, see
+//! [`RovState::satisfies`]), §4 (re-validate the affected prefixes when
+//! VRPs change), §5 (drop Invalid routes or prefer Valid ones, see
+//! [`Enforcement`]); RFC 6483 §2 (validation outcome),
 //! §4 (an AS 0 ROA disavows origination); RFC 7607 §2 (AS 0 is never a
 //! valid origin); RFC 9319 §3 (a VRP authorises nothing longer than its
 //! maxLength); RFC 8210 §5.1, §5.6, §5.7 (bounds of Max Length; one VRP
@@ -22,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod affected;
+pub mod enforcement;
 mod index;
 pub mod origin;
 pub mod set;
@@ -34,6 +39,7 @@ use std::fmt;
 use bgpfc_wire::prefix::Prefix;
 
 pub use affected::{AffectedPrefixes, PrefixSet};
+pub use enforcement::Enforcement;
 pub use origin::RouteOrigin;
 pub use set::VrpSet;
 pub use source::{NullSource, ValidationChange, ValidationSink, ValidationSource};
@@ -62,6 +68,8 @@ pub enum RpkiError {
     },
     /// Text that names no validation state.
     UnknownState(String),
+    /// Text that names no enforcement mode.
+    UnknownEnforcement(String),
     /// The consumer of validation changes has gone away.
     SinkClosed,
 }
@@ -82,6 +90,7 @@ impl fmt::Display for RpkiError {
                 )
             }
             RpkiError::UnknownState(s) => write!(f, "unknown validation state {s:?}"),
+            RpkiError::UnknownEnforcement(s) => write!(f, "unknown enforcement mode {s:?}"),
             RpkiError::SinkClosed => {
                 f.write_str("the consumer of validation changes has gone away")
             }
