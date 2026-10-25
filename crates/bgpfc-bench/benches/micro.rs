@@ -271,7 +271,9 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
 /// tells apart (RFC 4271 §9.1.2.2 f), so every step runs; and interning
 /// an attribute set already held, as each UPDATE does once per family.
 fn decision(filter: Option<&str>, update: &DecodedUpdate) {
-    let (_, next_hop, _) = announced(update)[0];
+    let (_, next_hop, _) = announced(update)
+        .next()
+        .expect("the synthetic UPDATE announces");
     let attrs = Arc::new(PathAttrs::from_update(&update.message, next_hop));
     for n in [1u8, 2, 4, 8, 16] {
         let neighbors: Vec<Neighbor> = (1..=n)

@@ -678,7 +678,7 @@ fn an_update_with_both_ipv4_fields_keeps_each_next_hop() {
         next_hop: v6_next_hop("2001:db8::1", "fe80::1"),
         nlri: vec![p("203.0.113.0/24")],
     });
-    let parts = announced(&d);
+    let parts: Vec<_> = announced(&d).collect();
     assert_eq!(parts.len(), 2);
     outputs(|o| rib.update(a.addr, &d, now(), o));
     let nh = |prefix| rib.candidates(V4, p(prefix))[0].attrs.next_hop;
@@ -692,7 +692,7 @@ fn an_update_with_both_ipv4_fields_keeps_each_next_hop() {
         bgpfc_wire::error::UpdateSubcode::InvalidOrigin,
         vec![],
     ));
-    assert_eq!(announced(&d).len(), 0);
+    assert_eq!(announced(&d).count(), 0);
 }
 
 // --- The RIB end to end --------------------------------------------------
@@ -1319,7 +1319,7 @@ fn attributes_round_trip_through_an_update() {
     .into();
     a.normalise();
     let d = announce(&["192.0.2.0/24"], &a);
-    let parts = announced(&d);
+    let parts: Vec<_> = announced(&d).collect();
     assert_eq!(parts.len(), 1);
     let (family, next_hop, prefixes) = parts[0];
     assert_eq!((family, prefixes), (V4, &[p("192.0.2.0/24")][..]));
@@ -1333,7 +1333,7 @@ fn attributes_round_trip_through_an_update() {
     let mut expect = a.clone();
     expect.unknown[0].flags = 0xe0;
     assert_eq!(back, expect);
-    assert_eq!(announced(&withdraw(&["192.0.2.0/24"])).len(), 0);
+    assert_eq!(announced(&withdraw(&["192.0.2.0/24"])).count(), 0);
     assert!(a.has_community(Community::new(65_001, 2)));
     assert_eq!(a.next_hop_afi(), bgpfc_wire::types::Afi::Ipv4);
 }

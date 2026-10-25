@@ -81,24 +81,21 @@ fn sort_unique<T: Ord + Copy>(list: &mut Box<[T]>) {
 /// an IPv6 next hop (RFC 8950 §3). Empty when treated as withdraw; the
 /// NLRI field is left out when `NEXT_HOP` is missing, which the decoder
 /// already turned into treat-as-withdraw.
-#[must_use]
-pub fn announced(update: &DecodedUpdate) -> Vec<(AddressFamily, NextHop, &[Prefix])> {
+pub fn announced(
+    update: &DecodedUpdate,
+) -> impl Iterator<Item = (AddressFamily, NextHop, &[Prefix])> {
     let m = &update.message;
-    if update.treated_as_withdraw.is_some() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    if let Some(n) = m.next_hop()
-        && !m.nlri.is_empty()
-    {
-        out.push((AddressFamily::IPV4_UNICAST, NextHop::Ipv4(n), &m.nlri[..]));
-    }
-    if let Some(r) = &m.mp_reach
-        && !r.nlri.is_empty()
-    {
-        out.push((r.family, r.next_hop, &r.nlri[..]));
-    }
-    out
+    let live = update.treated_as_withdraw.is_none();
+    let nlri = m
+        .next_hop()
+        .filter(|_| live && !m.nlri.is_empty())
+        .map(|n| (AddressFamily::IPV4_UNICAST, NextHop::Ipv4(n), &m.nlri[..]));
+    let mp = m
+        .mp_reach
+        .as_ref()
+        .filter(|r| live && !r.nlri.is_empty())
+        .map(|r| (r.family, r.next_hop, &r.nlri[..]));
+    nlri.into_iter().chain(mp)
 }
 
 impl PathAttrs {
