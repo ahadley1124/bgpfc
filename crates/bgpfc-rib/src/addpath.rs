@@ -29,7 +29,7 @@ use bgpfc_wire::types::{AddressFamily, PathId};
 use crate::attrs::{Interner, PathAttrs};
 use crate::decision::{self, Candidate};
 use crate::export::{self, Batch};
-use crate::pacing::{Offer, Pace};
+use crate::pacing::{Offer, Pace, Pacing, Tick};
 use crate::peer::{PathLimit, PeerInfo};
 use crate::store::{Destination, PeerId, PrefixMap};
 use crate::{Batches, Deadline, Exported, PeerState, Sessions, count};
@@ -66,16 +66,37 @@ pub(crate) enum Sync {
     Full,
 }
 
-/// A path the peer is to have: the route it is made of, and what export
+/// A path the peer may have: the route it is made of, and what export
 /// makes of that.
 struct Chosen {
+    /// The route's place among the destination's candidates.
+    route: usize,
     src: PeerId,
     rx: u32,
     exported: Exported,
 }
 
+/// The paths of a destination that export lets through to a peer. The
+/// first `sent` are the ones it is to have, the best first; the rest are
+/// routes it could have had that the `n` best leave out.
+struct Open {
+    paths: Vec<Chosen>,
+    sent: usize,
+}
+
+impl Open {
+    fn chosen(&self) -> &[Chosen] {
+        &self.paths[..self.sent]
+    }
+
+    fn displaced(&self) -> &[Chosen] {
+        &self.paths[self.sent..]
+    }
+}
+
 /// One path to announce: which of the chosen, and the identifier it goes
-/// with; `new` unless the peer has it already, with other attributes.
+/// with; `new` unless the peer has it already, with other attributes. A
+/// plan lists them in the order of the chosen.
 #[derive(Debug, PartialEq, Eq)]
 struct Announce {
     chosen: usize,
@@ -115,51 +136,48 @@ struct Plan {
 /// still be on its way.
 fn plan(
     old: &[SentPath],
-    (chosen, displaced): (&[Chosen], &[(PeerId, u32)]),
+    (chosen, displaced): (&[Chosen], &[Chosen]),
     how: Sync,
     family: AddressFamily,
     info: &PeerInfo,
 ) -> Plan {
     let mut plan = Plan::default();
-    let mut kept = vec![false; old.len()];
-    let mut used: Vec<u32> = old.iter().map(|s| s.tx).collect();
+    // The new paths take identifiers in increasing order, so every one
+    // below `next` is taken, by `old` or by an earlier new path.
+    let mut next = 1u32;
     for (c, path) in chosen.iter().enumerate() {
-        let found = old
-            .iter()
-            .position(|s| s.src == path.src && s.rx == path.rx);
-        let Some(k) = found else {
-            let tx = (1..=u32::MAX)
-                .find(|t| !used.contains(t))
-                .unwrap_or(u32::MAX);
-            used.push(tx);
+        let Some(sent) = old.iter().find(|s| s.src == path.src && s.rx == path.rx) else {
+            // invariant: `next` stays within one of the number of paths
+            // held and announced, far below 2^32.
+            while old.iter().any(|s| s.tx == next) {
+                next += 1;
+            }
             plan.announce.push(Announce {
                 chosen: c,
-                tx,
+                tx: next,
                 new: true,
             });
+            next += 1;
             continue;
         };
-        kept[k] = true;
-        let stored = &old[k].attrs;
         let same = match &path.exported {
-            Exported::Own(a) if Arc::ptr_eq(a, stored) => true,
-            e => export::same_rewrite(family, stored, e.attrs(), info),
+            Exported::Own(a) if Arc::ptr_eq(a, &sent.attrs) => true,
+            e => export::same_rewrite(family, &sent.attrs, e.attrs(), info),
         };
         if how == Sync::Full || !same {
             plan.announce.push(Announce {
                 chosen: c,
-                tx: old[k].tx,
+                tx: sent.tx,
                 new: false,
             });
         }
     }
     plan.withdraw = old
         .iter()
-        .zip(&kept)
-        .filter(|(_, kept)| !**kept)
-        .map(|(s, _)| Withdraw {
+        .filter(|s| !chosen.iter().any(|c| c.src == s.src && c.rx == s.rx))
+        .map(|s| Withdraw {
             tx: s.tx,
-            displaced: displaced.contains(&(s.src, s.rx)),
+            displaced: displaced.iter().any(|c| c.src == s.src && c.rx == s.rx),
         })
         .collect();
     plan
@@ -176,13 +194,13 @@ impl Sessions {
         }
     }
 
-    /// The paths of `dest` that peer `to` is to have: those of its
-    /// candidates that export lets through to `to`, and when `limit` is
-    /// `n`, the `n` best of them by the decision process (RFC 4271 §9.1.2),
-    /// the best first, then the best of the rest, and so on, so that the
-    /// best path that can be sent is always among them (RFC 7911 §5).
-    /// With them, the paths that export lets through that the `n` best
-    /// leave out, by source and identifier.
+    /// The paths of `dest` that peer `to` may have: those of its
+    /// candidates that export lets through to `to`. When `limit` is `n`,
+    /// the first `n` of them are the `n` best by the decision process
+    /// (RFC 4271 §9.1.2), the best first, then the best of the rest, and
+    /// so on, so that the best path that can be sent is always among them
+    /// (RFC 7911 §5); the routes export lets through that they leave out
+    /// come after.
     fn choose_paths(
         &self,
         to: PeerId,
@@ -190,42 +208,43 @@ impl Sessions {
         prefix: Prefix,
         dest: Option<&Destination>,
         limit: PathLimit,
-    ) -> (Vec<Chosen>, Vec<(PeerId, u32)>) {
+    ) -> Open {
         let Some(dest) = dest else {
-            return (Vec::new(), Vec::new());
+            return Open {
+                paths: Vec::new(),
+                sent: 0,
+            };
         };
-        let mut open: Vec<(usize, Exported)> = Vec::new();
-        for i in 0..dest.candidates() {
-            if let Some(e) = self.exported(None, family, prefix, Some(dest.route(i)), to) {
-                open.push((i, e));
+        let mut paths = Vec::with_capacity(dest.candidates());
+        for route in 0..dest.candidates() {
+            if let Some(exported) = self.exported(None, family, prefix, Some(dest.route(route)), to)
+            {
+                paths.push(Chosen {
+                    route,
+                    src: dest.route(route).peer,
+                    rx: dest.id(route),
+                    exported,
+                });
             }
         }
-        let mut displaced = Vec::new();
-        if let PathLimit::Best(n) = limit {
-            let n = usize::try_from(n).unwrap_or(usize::MAX);
-            if open.len() > n {
-                let mut best = Vec::with_capacity(n);
-                while best.len() < n && !open.is_empty() {
-                    let k = decision::best(open.len(), |j| self.candidate(dest, open[j].0))
-                        .unwrap_or(0);
-                    best.push(open.swap_remove(k));
-                }
-                displaced = open
-                    .iter()
-                    .map(|(i, _)| (dest.route(*i).peer, dest.id(*i)))
-                    .collect();
-                open = best;
+        let mut sent = paths.len();
+        if let PathLimit::Best(n) = limit
+            && let Ok(n) = usize::try_from(n)
+            && n < sent
+        {
+            sent = n;
+            // A selection sort, as far as `sent`: a destination has a
+            // route per peer, a handful. When none is left out, the
+            // candidates' order is kept: the best first, as Phase 2 left
+            // it.
+            for at in 0..sent {
+                let rest = &paths[at..];
+                let k = decision::best(rest.len(), |j| self.candidate(dest, rest[j].route))
+                    .unwrap_or(0);
+                paths.swap(at, at + k);
             }
         }
-        let chosen = open
-            .into_iter()
-            .map(|(i, exported)| Chosen {
-                src: dest.route(i).peer,
-                rx: dest.id(i),
-                exported,
-            })
-            .collect();
-        (chosen, displaced)
+        Open { paths, sent }
     }
 
     /// Phase 3 for the peers sent several paths: bring each one's paths of
@@ -269,12 +288,10 @@ impl Sessions {
         how: Sync,
         batch: &mut Batch,
     ) {
-        let info = &self.peer(id).info;
-        let Some(limit) = info.path_limit(family) else {
+        let Some(limit) = self.peer(id).info.path_limit(family) else {
             return;
         };
-        let interval = info.advertisement_interval;
-        let (chosen, displaced) = self.choose_paths(id, family, prefix, dest, limit);
+        let open = self.choose_paths(id, family, prefix, dest, limit);
         let old: &[SentPath] = self
             .peer(id)
             .sent
@@ -282,11 +299,30 @@ impl Sessions {
             .and_then(|m| m.get(prefix))
             .map_or(&[], |s| &s[..]);
         let had = !old.is_empty();
-        let plan = plan(old, (&chosen, &displaced), how, family, &self.peer(id).info);
+        let plan = plan(
+            old,
+            (open.chosen(), open.displaced()),
+            how,
+            family,
+            &self.peer(id).info,
+        );
         if plan.withdraw.is_empty() && plan.announce.is_empty() {
             return;
         }
+        self.apply(id, (family, prefix), (how, had), (open, plan), batch);
+    }
 
+    /// Carry out `plan` for peer `id`: the withdrawals now, the
+    /// announcements as the interval allows.
+    fn apply(
+        &mut self,
+        id: PeerId,
+        (family, prefix): (AddressFamily, Prefix),
+        (how, had): (Sync, bool),
+        (mut open, plan): (Open, Plan),
+        batch: &mut Batch,
+    ) {
+        let interval = self.peer(id).info.advertisement_interval;
         let mut pace = Pace {
             interval,
             now: self.at,
@@ -302,20 +338,22 @@ impl Sessions {
             .get(family)
             .and_then(|p| p.holds_paths(prefix))
             .is_some();
-        let mut go = !plan.announce.is_empty();
-        let mut due = None;
-        if go && how == Sync::Change {
-            if waiting {
-                go = false;
-            } else if let Offer::Hold(at) = state
+        let release = if plan.announce.is_empty() {
+            Release::Nothing
+        } else if how != Sync::Change {
+            Release::Now
+        } else if waiting {
+            Release::Wait
+        } else {
+            match state
                 .pacing
                 .or_default(family)
                 .offer(prefix, had, &mut pace)
             {
-                go = false;
-                due = Some(at);
+                Offer::Now => Release::Now,
+                Offer::Hold(at) => Release::Hold(at),
             }
-        }
+        };
 
         let mut paths: Vec<SentPath> = state
             .sent
@@ -325,8 +363,9 @@ impl Sessions {
             .unwrap_or_default();
         // Withdrawals go at once, but for the paths the announcements that
         // wait would displace: they stay until those go out.
+        let held_back = matches!(release, Release::Wait | Release::Hold(_));
         for w in &plan.withdraw {
-            if w.displaced && !plan.announce.is_empty() && !go {
+            if w.displaced && held_back {
                 continue;
             }
             if let Some(k) = paths.iter().position(|p| p.tx == w.tx) {
@@ -336,42 +375,45 @@ impl Sessions {
                 self.cx.interner.release(p.attrs);
             }
         }
-        if go {
-            announce_sent(
-                (state, family, prefix),
-                &mut paths,
-                (&plan.announce, chosen),
-                batch,
-                &mut self.cx.interner,
-            );
-            // A whole Adj-RIB-Out sent at once is remembered as that.
-            if how != Sync::Full {
-                state.pacing.or_default(family).advertised(prefix, &pace);
+        match release {
+            Release::Now => {
+                open.paths.truncate(open.sent);
+                announce_sent(
+                    (state, family, prefix),
+                    &mut paths,
+                    (&plan.announce, open.paths),
+                    batch,
+                    &mut self.cx.interner,
+                );
+                // A whole Adj-RIB-Out sent at once is remembered as that.
+                if how != Sync::Full {
+                    state.pacing.or_default(family).advertised(prefix, &pace);
+                }
             }
-        } else if let Some(at) = due {
-            let pacing = state.pacing.or_default(family);
-            pacing.hold_paths(prefix, at, !paths.is_empty());
-            if pacing.queue(prefix, at) {
-                self.deadlines.push(Reverse(Deadline {
-                    at,
-                    peer: id,
-                    family,
-                    prefix,
-                }));
+            Release::Hold(at) => {
+                let pacing = state.pacing.or_default(family);
+                pacing.hold_paths(prefix, at, !paths.is_empty());
+                if pacing.queue(prefix, at) {
+                    self.deadlines.push(Reverse(Deadline {
+                        at,
+                        peer: id,
+                        family,
+                        prefix,
+                    }));
+                }
             }
+            Release::Wait | Release::Nothing => {}
         }
-        // The peer has lost its paths of the prefix: that is remembered for
-        // the interval, so that a route that comes back is paced (RFC 4271
-        // §9.2.1.1). Not while announcements wait: the hold stays, with
-        // what the peer has meanwhile.
-        let pacing = state.pacing.or_default(family);
-        if waiting && !plan.announce.is_empty() {
-            pacing.set_held_paths(prefix, !paths.is_empty());
-        } else if waiting && paths.is_empty() && had {
-            pacing.withdrew_held_paths(prefix, &pace);
-        } else if !waiting && plan.announce.is_empty() && paths.is_empty() && had {
-            pacing.withdrew(prefix, &pace);
-        }
+        settle(
+            state.pacing.or_default(family),
+            (prefix, &pace),
+            &release,
+            Meanwhile {
+                waiting,
+                had,
+                has: !paths.is_empty(),
+            },
+        );
         if !paths.is_empty() {
             state
                 .sent
@@ -381,9 +423,55 @@ impl Sessions {
     }
 }
 
+/// What the interval makes of the announcements of a change.
+enum Release {
+    /// There are none.
+    Nothing,
+    /// They go out now.
+    Now,
+    /// Announcements are held back already: they join those.
+    Wait,
+    /// They are held back until then.
+    Hold(Tick),
+}
+
+/// What the peer had of a destination before a change, and has after it.
+#[derive(Clone, Copy)]
+struct Meanwhile {
+    /// Announcements were held back already.
+    waiting: bool,
+    /// The peer had paths of the destination.
+    had: bool,
+    /// And has some now.
+    has: bool,
+}
+
+/// The peer has lost its paths of the prefix: that is remembered for the
+/// interval, so that a route that comes back is paced (RFC 4271
+/// §9.2.1.1). Not while announcements wait: the hold stays, with what the
+/// peer has meanwhile.
+fn settle(
+    pacing: &mut Pacing,
+    (prefix, pace): (Prefix, &Pace<'_>),
+    release: &Release,
+    m: Meanwhile,
+) {
+    let announcing = !matches!(release, Release::Nothing);
+    if m.waiting && announcing {
+        pacing.set_held_paths(prefix, m.has);
+    } else if !announcing && !m.has && m.had {
+        if m.waiting {
+            pacing.withdrew_held_paths(prefix, pace);
+        } else {
+            pacing.withdrew(prefix, pace);
+        }
+    }
+}
+
 /// Announce the paths of `announce` into `batch` and note them in `paths`,
 /// what the peer has of the prefix: a new one is added, one the peer has
 /// is given its new attributes under the identifier it has (RFC 7911 §5).
+/// `announce` is in the order of `chosen`, as a plan makes it.
 fn announce_sent(
     (state, family, prefix): (&mut PeerState, AddressFamily, Prefix),
     paths: &mut Vec<SentPath>,
@@ -391,10 +479,11 @@ fn announce_sent(
     batch: &mut Batch,
     interner: &mut Interner,
 ) {
-    let mut chosen: Vec<Option<Chosen>> = chosen.into_iter().map(Some).collect();
-    for a in announce {
-        // invariant: each chosen path is announced at most once.
-        let c = chosen[a.chosen].take().unwrap();
+    let mut announce = announce.iter().peekable();
+    for (n, c) in chosen.into_iter().enumerate() {
+        let Some(a) = announce.next_if(|a| a.chosen == n) else {
+            continue;
+        };
         let attrs = c.exported.intern(interner);
         batch.announce_path(&attrs, prefix, PathId(a.tx));
         if a.new {
@@ -473,6 +562,7 @@ mod tests {
 
     fn chosen(src: u32, rx: u32, a: &Arc<PathAttrs>) -> Chosen {
         Chosen {
+            route: 0,
             src: PeerId(src),
             rx,
             exported: Exported::Own(Arc::clone(a)),
@@ -512,6 +602,23 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn several_new_paths_fill_the_gaps_in_order_and_then_go_on() {
+        // The peer has 1, 3 and 4; three more take 2, 5 and 6.
+        let a = attrs(65_001);
+        let old = [sent(1, 0, 1, &a), sent(2, 0, 3, &a), sent(3, 0, 4, &a)];
+        let new: Vec<Chosen> = (1..=6).map(|src| chosen(src, 0, &a)).collect();
+        let p = plan(&old, (&new, &[]), Sync::Change, V4, &info());
+        assert_eq!(p.withdraw, vec![]);
+        assert_eq!(
+            p.announce
+                .iter()
+                .map(|a| (a.chosen, a.tx))
+                .collect::<Vec<_>>(),
+            vec![(3, 2), (4, 5), (5, 6)]
         );
     }
 
@@ -573,7 +680,7 @@ mod tests {
         // (2, 0) is still a route export lets through, (1, 0) is not.
         let p = plan(
             &old,
-            (&[chosen(3, 0, &a)], &[(PeerId(2), 0)]),
+            (&[chosen(3, 0, &a)], &[chosen(2, 0, &a)]),
             Sync::Change,
             V4,
             &info(),
