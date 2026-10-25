@@ -182,6 +182,7 @@ Config {
             maximum_prefix: [],
             add_path_receive: [],
             add_path_send: [],
+            graceful_restart: None,
             role: None,
         },
     ],

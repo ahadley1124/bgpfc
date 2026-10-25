@@ -22,12 +22,12 @@ use std::time::Duration;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::role::{LocalRole, Role};
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 
 use crate::ast::{
-    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http,
-    Match, Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime,
-    SetAction, Term,
+    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, DEFAULT_RESTART_TIME,
+    DEFAULT_STALE_TIME, Fib, FibMode, GracefulRestart, Http, Match, Neighbor, Policy, PrefixEntry,
+    PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -1168,6 +1168,12 @@ struct NeighborBuilder {
     /// Where `role-strict yes` stands, for the error when there is no
     /// `role` to be strict about.
     role_strict_at: Option<Pos>,
+    graceful_restart: Once<bool>,
+    restart_time: Once<RestartTime>,
+    stale_time: Once<Duration>,
+    /// Where `restart-time` and `stale-time` stand, for the error when
+    /// Graceful Restart is not on for them to tune.
+    restart_options_at: Option<Pos>,
 }
 
 impl NeighborBuilder {
@@ -1195,6 +1201,10 @@ impl NeighborBuilder {
             role: Once::new("role"),
             role_strict: Once::new("role-strict"),
             role_strict_at: None,
+            graceful_restart: Once::new("graceful-restart"),
+            restart_time: Once::new("restart-time"),
+            stale_time: Once::new("stale-time"),
+            restart_options_at: None,
         }
     }
 
@@ -1294,6 +1304,7 @@ impl NeighborBuilder {
             }
             "maximum-prefix" => self.maximum_prefix(l, t),
             "add-path" => self.add_path(l, t),
+            "graceful-restart" | "restart-time" | "stale-time" => self.graceful_restart(l, t),
             "role" => self.role(l, t),
             "role-strict" => {
                 let v = l.yes_no(t);
@@ -1380,6 +1391,54 @@ impl NeighborBuilder {
         }
     }
 
+    /// `graceful-restart yes|no`, and the `restart-time` and `stale-time`
+    /// that tune it (RFC 4724, RFC 8538).
+    fn graceful_restart(&mut self, l: &mut Lowerer, t: &Statement) {
+        match t.keyword.as_str() {
+            "restart-time" => self.restart_time(l, t),
+            "stale-time" => self.stale_time(l, t),
+            _ => {
+                let v = l.yes_no(t);
+                self.graceful_restart.set(l, t.pos, v);
+            }
+        }
+    }
+
+    /// `restart-time N`: the Restart Time to advertise, "in seconds (12
+    /// bits)" (RFC 4724 §3).
+    fn restart_time(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            let secs: u16 = l.parse(a, "a number of seconds (0-4095)")?;
+            let time = RestartTime::new(secs);
+            if time.is_none() {
+                l.err(
+                    a.pos,
+                    "restart-time is at most 4095, what twelve bits hold (RFC 4724 §3)",
+                );
+            }
+            time
+        });
+        self.restart_options_at.get_or_insert(t.pos);
+        self.restart_time.set(l, t.pos, v);
+    }
+
+    /// `stale-time N`: how long a restarted neighbor's stale routes are
+    /// kept once its session is back. RFC 8538 §4.1 makes the timer
+    /// mandatory and keeping the routes for ever not the default; zero would
+    /// delete the routes of a neighbor the moment its session is back.
+    fn stale_time(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            let secs: u16 = l.parse(a, "a number of seconds (1-65535)")?;
+            if secs == 0 {
+                l.err(a.pos, "stale-time must be at least 1 (RFC 8538 §4.1)");
+                return None;
+            }
+            Some(Duration::from_secs(u64::from(secs)))
+        });
+        self.restart_options_at.get_or_insert(t.pos);
+        self.stale_time.set(l, t.pos, v);
+    }
+
     /// `role NAME`: one of the five Roles of RFC 9234 §4.1, Table 1, by the
     /// names the RFC uses. It is ours, not the neighbor's.
     fn role(&mut self, l: &mut Lowerer, t: &Statement) {
@@ -1447,6 +1506,21 @@ impl NeighborBuilder {
                 format!("neighbor {addr}: `role-strict yes` needs a `role` (RFC 9234 §4.2)"),
             );
         }
+        // `restart-time` and `stale-time` tune what `graceful-restart yes`
+        // turns on: alone they would silently do nothing.
+        // A `graceful-restart` that was given but is bad has been reported.
+        let graceful_restart = self.graceful_restart.value.unwrap_or(false);
+        if let Some(at) = self.restart_options_at
+            && !graceful_restart
+            && (self.graceful_restart.value.is_some() || !self.graceful_restart.seen)
+        {
+            l.err(
+                at,
+                format!(
+                    "neighbor {addr}: `restart-time` and `stale-time` need `graceful-restart yes`"
+                ),
+            );
+        }
         Some(Neighbor {
             pos,
             addr,
@@ -1496,6 +1570,16 @@ impl NeighborBuilder {
                 .into_iter()
                 .filter_map(|(family, send)| send.map(|send| (family, send)))
                 .collect(),
+            graceful_restart: graceful_restart.then(|| GracefulRestart {
+                restart_time: self.restart_time.value.unwrap_or(
+                    // invariant: the default is below the 12-bit maximum.
+                    RestartTime::new(DEFAULT_RESTART_TIME).unwrap_or(RestartTime::MAX),
+                ),
+                stale_time: self
+                    .stale_time
+                    .value
+                    .unwrap_or(Duration::from_secs(u64::from(DEFAULT_STALE_TIME))),
+            }),
             role: self.role.value.map(|role| LocalRole {
                 role,
                 strict: self.role_strict.value.unwrap_or(false),

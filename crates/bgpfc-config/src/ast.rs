@@ -12,7 +12,7 @@ use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::role::LocalRole;
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 
 use crate::error::Pos;
 
@@ -445,6 +445,34 @@ pub enum AddPathSend {
     All,
 }
 
+/// `graceful-restart yes` and what goes with it (RFC 4724, RFC 8538).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GracefulRestart {
+    /// `restart-time`: the Restart Time we advertise (RFC 4724 §3), the
+    /// time the neighbor allows our session to come back in after a
+    /// restart, and, after our own restart, the time we wait for the
+    /// neighbors' End-of-RIB before the routes not learned again are
+    /// removed (RFC 4724 §4.1). [`DEFAULT_RESTART_TIME`] when not given.
+    pub restart_time: RestartTime,
+    /// `stale-time`: the longest the stale routes of a neighbor that
+    /// restarted are kept once its session is back, waiting for its
+    /// End-of-RIB (RFC 4724 §4.2, RFC 8538 §4.1).
+    /// [`DEFAULT_STALE_TIME`] seconds when not given.
+    pub stale_time: Duration,
+}
+
+/// The `restart-time` of a neighbor that sets none, in seconds: 120, as
+/// BIRD (`graceful restart time`) and FRR (`bgp graceful-restart
+/// restart-time`) default to. RFC 4724 §4 only suggests "a value less
+/// than or equal to the HOLDTIME carried in the OPEN".
+pub const DEFAULT_RESTART_TIME: u16 = 120;
+
+/// The `stale-time` of a neighbor that sets none, in seconds: 360, as FRR
+/// (`bgp graceful-restart stalepath-time`) defaults to. RFC 8538 §4.1
+/// suggests 180 and requires a timer; BIRD's closest knob, `graceful
+/// restart wait`, defaults to 240.
+pub const DEFAULT_STALE_TIME: u16 = 360;
+
 /// A `neighbor` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Neighbor {
@@ -505,6 +533,12 @@ pub struct Neighbor {
     /// per prefix for, and how many (RFC 7911 §5), in file order. Empty by
     /// default: one path per prefix.
     pub add_path_send: Vec<(AddressFamily, AddPathSend)>,
+    /// `graceful-restart yes`, with `restart-time` and `stale-time`: the
+    /// Graceful Restart capability is advertised, End-of-RIB follows the
+    /// initial update, and the neighbor's routes are kept as stale when its
+    /// session ends the way RFC 4724 §4.2 and RFC 8538 §4 describe. `None`,
+    /// the default, advertises nothing and keeps RFC 4271's rules.
+    pub graceful_restart: Option<GracefulRestart>,
     /// `role` and `role-strict`: our BGP Role on the session (RFC 9234
     /// §4), with strict mode (§4.2) if asked for. `None` by default: no
     /// Role is advertised and the Only to Customer procedures (§5) do not
@@ -541,6 +575,9 @@ impl Neighbor {
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
             && self.add_path_receive == other.add_path_receive
+            // RFC 4724 §3: the capability is in the OPEN with the Restart
+            // Time, and the stale time is read when a session comes up.
+            && self.graceful_restart == other.graceful_restart
             && self
                 .add_path_send
                 .iter()

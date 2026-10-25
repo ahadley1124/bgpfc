@@ -359,6 +359,39 @@ mod tests {
     }
 
     #[test]
+    fn graceful_restart_is_a_session_parameter() {
+        let a = cfg(BASE);
+        let with = |extra: &str| {
+            cfg(&BASE.replace("remote-as 65002;", &format!("remote-as 65002; {extra}")))
+        };
+        // RFC 4724 §3: the capability and its Restart Time are in the OPEN,
+        // and the stale time is read when a session comes up, so turning
+        // it on, or changing either time, resets the session.
+        let on = with("graceful-restart yes;");
+        let d = ConfigDiff::between(&a, &on);
+        assert_eq!(d.reset, vec![addr("192.0.2.3")]);
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+        for other in [
+            "graceful-restart yes; restart-time 60;",
+            "graceful-restart yes; stale-time 90;",
+        ] {
+            let d = ConfigDiff::between(&on, &with(other));
+            assert_eq!(d.reset, vec![addr("192.0.2.3")], "{other}");
+        }
+        // Back off, a reset again; `no` is the same as nothing, and the
+        // defaults written out are the defaults.
+        assert_eq!(ConfigDiff::between(&on, &a).reset, vec![addr("192.0.2.3")]);
+        assert!(ConfigDiff::between(&a, &with("graceful-restart no;")).is_empty());
+        assert!(
+            ConfigDiff::between(
+                &on,
+                &with("graceful-restart yes; restart-time 120; stale-time 360;")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn add_path_resets_for_a_family_but_not_for_how_many_paths() {
         let a = cfg(BASE);
         let with = |extra: &str| {

@@ -110,6 +110,9 @@ neighbor-item
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
              | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
+             | "graceful-restart" yes-no ";"         (* default no *)
+             | "restart-time" u16 ";"                (* 0-4095; default 120; needs graceful-restart yes *)
+             | "stale-time" u16 ";"                  (* 1-65535; default 360; needs graceful-restart yes *)
              | "role" role ";"                       (* default none; external sessions only *)
              | "role-strict" yes-no ";"              (* default no; needs a role *)
              | "passive" yes-no ";"                  (* default no *)
@@ -311,6 +314,22 @@ loses a collision (RFC 4271 §6.8), after which the session goes on with the
 other one; neither counts toward the limit or ends a run. `0` never
 restarts after a damped failure; `off` always does.
 
+**Graceful Restart.** `graceful-restart yes;` makes the neighbor take part
+in Graceful Restart (RFC 4724) with the Graceful Notification of RFC 8538:
+bgpfcd advertises the capability with the N bit, a Restart Time and a
+tuple for each of the neighbor's `families`, and follows the Receiving
+Speaker procedures for a neighbor that advertised it too. It is off by
+default, and a neighbor without it is treated as RFC 4271 has it: no
+capability, no End-of-RIB, and the routes of a session that ended are
+deleted. `restart-time` is the Restart Time advertised, the time in
+seconds the neighbor should allow our session to come back in after we
+restart (RFC 4724 §3): 0 to 4095, the most its twelve bits hold, 120 by
+default as BIRD and FRR have it. `stale-time` is how long the stale
+routes of a neighbor that restarted are kept once its session is back,
+waiting for its End-of-RIB (RFC 8538 §4.1): 1 to 65535 seconds, 360 by
+default as FRR has it (`bgp graceful-restart stalepath-time`). Both need
+`graceful-restart yes`; stating `graceful-restart no` is the default.
+
 **BGP Roles.** `role customer;` says that our Role on the session is
 Customer: the neighbor is our transit provider (RFC 9234 §4). The names
 are those of RFC 9234 §4.1, and the Role is ours, the one the OPEN
@@ -443,8 +462,9 @@ has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
 family in `families`; a `role` only on an external session, and
-`role-strict yes` only with a `role`; an `rpki` block has a `mode`, at least one `cache` with `mode
-external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`role-strict yes` only with a `role`; `restart-time` and `stale-time` only
+with `graceful-restart yes`; an `rpki` block has a `mode`, at least one
+`cache` with `mode external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN.
 
@@ -454,9 +474,10 @@ Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`, and the number of paths
-`add-path send` sends; `restart-limit`, `role` and `role-strict` included,
-and so are the families `add-path` is on for, since the capability is in
-the OPEN) reset with Cease / Other Configuration Change and start again, and
+`add-path send` sends; `restart-limit`, `role`, `role-strict`,
+`graceful-restart`, `restart-time` and `stale-time` included, and so are
+the families `add-path` is on for, since the capability is in the OPEN)
+reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
 supports it. A changed `advertisement-interval` applies to the running

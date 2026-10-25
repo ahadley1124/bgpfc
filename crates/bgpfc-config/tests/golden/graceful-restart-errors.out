@@ -1,0 +1,63 @@
+graceful-restart-errors.conf:8:22: `maybe` is not `yes` or `no`
+      graceful-restart maybe;
+                       ^
+graceful-restart-errors.conf:9:5: `graceful-restart` is given more than once
+      graceful-restart yes;
+      ^
+graceful-restart-errors.conf:10:5: `graceful-restart` is given more than once
+      graceful-restart no;
+      ^
+graceful-restart-errors.conf:11:18: restart-time is at most 4095, what twelve bits hold (RFC 4724 §3)
+      restart-time 4096;
+                   ^
+graceful-restart-errors.conf:12:5: `restart-time` is given more than once
+      restart-time soon;
+      ^
+graceful-restart-errors.conf:12:18: `soon` is not a number of seconds (0-4095)
+      restart-time soon;
+                   ^
+graceful-restart-errors.conf:13:5: `restart-time` is given more than once
+      restart-time 120;
+      ^
+graceful-restart-errors.conf:14:5: `restart-time` is given more than once
+      restart-time 121;
+      ^
+graceful-restart-errors.conf:15:16: stale-time must be at least 1 (RFC 8538 §4.1)
+      stale-time 0;
+                 ^
+graceful-restart-errors.conf:16:5: `stale-time` is given more than once
+      stale-time 65536;
+      ^
+graceful-restart-errors.conf:16:16: `65536` is not a number of seconds (1-65535)
+      stale-time 65536;
+                 ^
+graceful-restart-errors.conf:17:5: `stale-time` is given more than once
+      stale-time long;
+      ^
+graceful-restart-errors.conf:17:16: `long` is not a number of seconds (1-65535)
+      stale-time long;
+                 ^
+graceful-restart-errors.conf:18:5: `stale-time` is given more than once
+      stale-time 360;
+      ^
+graceful-restart-errors.conf:19:5: `stale-time` is given more than once
+      stale-time 361;
+      ^
+graceful-restart-errors.conf:20:5: `restart-time` takes one argument, found 0
+      restart-time;
+      ^
+graceful-restart-errors.conf:20:5: `restart-time` is given more than once
+      restart-time;
+      ^
+graceful-restart-errors.conf:21:5: `stale-time` takes one argument, found 2
+      stale-time 1 2;
+      ^
+graceful-restart-errors.conf:21:5: `stale-time` is given more than once
+      stale-time 1 2;
+      ^
+graceful-restart-errors.conf:23:59: neighbor 192.0.2.3: `restart-time` and `stale-time` need `graceful-restart yes`
+  neighbor 192.0.2.3 { remote-as 65001; import A; export A; restart-time 120; }
+                                                            ^
+graceful-restart-errors.conf:24:59: neighbor 192.0.2.4: `restart-time` and `stale-time` need `graceful-restart yes`
+  neighbor 192.0.2.4 { remote-as 65001; import A; export A; stale-time 360; graceful-restart no; }
+                                                            ^
