@@ -322,6 +322,65 @@ impl Policies for FavourInvalid {
     }
 }
 
+/// Import policy that rejects the Invalid and leaves the rest alone: what
+/// `InvalidAction::Drop` does without any policy.
+struct RejectInvalid;
+
+impl Policies for RejectInvalid {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        if rov == RovState::Invalid {
+            Verdict::Reject
+        } else {
+            Verdict::Accept
+        }
+    }
+
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        ByState.export(peer, family, prefix, a, rov)
+    }
+}
+
+/// The policy of `RejectInvalid` without its import clause.
+struct ExportByState;
+
+impl Policies for ExportByState {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
+    }
+
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        ByState.export(peer, family, prefix, a, rov)
+    }
+}
+
 /// How a test builds its RIB: its policies, and what it does with
 /// Invalid routes by itself.
 type Setup = (fn() -> Box<dyn Policies>, InvalidAction);
@@ -390,12 +449,15 @@ fn outcome(rib: &Rib, infos: &[PeerInfo]) -> Outcome {
 /// later one only the prefixes its VRPs differ in from the last, and a
 /// change marked in `merged` is held back and given together with the
 /// next, as a consumer that fell behind would (`ValidationChange`).
+/// `switches` change the RIB's action for Invalid routes (a reload does):
+/// `(i, action)` before step `i`, in order.
 fn interleaved(
     steps: &[Step],
     sources: &[VrpSet],
     at: &[usize],
     merged: &[bool],
     (policies, action): Setup,
+    switches: &[(usize, InvalidAction)],
 ) -> Outcome {
     let infos = peers();
     let now = Instant::now();
@@ -430,10 +492,14 @@ fn interleaved(
             );
         });
     };
+    let mut switching = switches.iter().peekable();
     for (i, s) in steps.iter().enumerate() {
         while next < sources.len() && at[next] <= i {
             give(&mut rib, next);
             next += 1;
+        }
+        while let Some((_, action)) = switching.next_if(|(at, _)| *at <= i) {
+            rib.set_invalid_action(*action, now, &mut Vec::new());
         }
         let info = &infos[usize::from(s.peer)];
         outputs(|o| rib.update(info.addr, &update(s, info), now, o));
@@ -441,6 +507,9 @@ fn interleaved(
     while next < sources.len() {
         give(&mut rib, next);
         next += 1;
+    }
+    for (_, action) in switching {
+        rib.set_invalid_action(*action, now, &mut Vec::new());
     }
     outcome(&rib, &infos)
 }
@@ -501,7 +570,14 @@ fn follows_the_source(
         .collect();
     let mut at = at[..sources.len()].to_vec();
     at.sort_unstable();
-    let got = interleaved(steps, &sources, &at, merged, setup);
+    let got = interleaved(steps, &sources, &at, merged, setup, &[]);
+    if setup.1.drops() {
+        // RFC 6811 §5: no Invalid route is a candidate, let alone best.
+        for candidates in &got.0 {
+            prop_assert!(candidates.iter().all(|c| c.1 != RovState::Invalid));
+        }
+        prop_assert!(got.1.iter().all(|b| b.2 != RovState::Invalid));
+    }
     if setup.1.demotes() {
         // RFC 6811 §5: an Invalid route is chosen only when no other is.
         for (i, candidates) in got.0.iter().enumerate() {
@@ -591,6 +667,117 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The same, with Invalid routes refused by the RIB: whether a route
+    /// is a candidate follows its state, and so the source, never the
+    /// order things happened. Policy gives the Invalid a degree of
+    /// preference far above the others, which only the refusal keeps from
+    /// winning.
+    #[test]
+    fn loc_rib_follows_the_validation_source_when_invalid_routes_are_dropped(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+        seed in any::<u64>(),
+    ) {
+        follows_the_source(
+            &steps, sources, &at, &merged, seed,
+            (|| Box::new(FavourInvalid), InvalidAction::Drop),
+        )?;
+    }
+
+    /// And with policy that sets states: the action acts on the state a
+    /// route holds after policy (RFC 6811 §3), so a route policy takes as
+    /// Valid is used and one it takes as Invalid is refused.
+    #[test]
+    fn loc_rib_follows_the_validation_source_when_policy_sets_states_and_invalid_routes_are_dropped(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+        seed in any::<u64>(),
+    ) {
+        follows_the_source(
+            &steps, sources, &at, &merged, seed,
+            (|| Box::new(Setter), InvalidAction::Drop),
+        )?;
+    }
+
+    /// Refusing the Invalid by itself is what a policy that rejects them
+    /// does: the same candidates, best routes and Adj-RIBs-Out, however
+    /// the routes and the VRPs arrive.
+    #[test]
+    fn dropping_the_invalid_is_rejecting_them_in_policy(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+    ) {
+        let sources: Vec<VrpSet> = sources
+            .into_iter()
+            .map(|v| v.into_iter().collect())
+            .collect();
+        let mut at = at[..sources.len()].to_vec();
+        at.sort_unstable();
+        let by_action = interleaved(
+            &steps, &sources, &at, &merged,
+            (|| Box::new(ExportByState), InvalidAction::Drop),
+            &[],
+        );
+        let by_policy = interleaved(
+            &steps, &sources, &at, &merged,
+            (|| Box::new(RejectInvalid), InvalidAction::Policy),
+            &[],
+        );
+        prop_assert_eq!(by_action, by_policy);
+    }
+
+    /// The action can change while the RIB runs, as a reload changes it:
+    /// whatever the changes were, the RIB ends where it would have been
+    /// had it run with the last action all along. A route held for the
+    /// action comes back when the action allows it, with no ROUTE-REFRESH
+    /// (RFC 6811 §2, §4).
+    #[test]
+    fn the_action_in_force_at_the_end_decides_whatever_came_before(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+        switches in proptest::collection::vec((0usize..13, 0usize..3), 0..5),
+        seed in any::<u64>(),
+    ) {
+        let sources: Vec<VrpSet> = sources
+            .into_iter()
+            .map(|v| v.into_iter().collect())
+            .collect();
+        let mut at = at[..sources.len()].to_vec();
+        at.sort_unstable();
+        let mut switches: Vec<(usize, InvalidAction)> = switches
+            .into_iter()
+            .map(|(i, a)| (i, InvalidAction::ALL[a]))
+            .collect();
+        switches.sort_by_key(|s| s.0);
+        let last = switches.last().map_or(InvalidAction::Policy, |s| s.1);
+        let favour: fn() -> Box<dyn Policies> = || Box::new(FavourInvalid);
+        let got = interleaved(&steps, &sources, &at, &merged, (favour, InvalidAction::Policy), &switches);
+        let mut decisive = last_words(&steps);
+        shuffle(&mut decisive, seed);
+        let expected = source_first(&decisive, sources.last(), (favour, last));
+        prop_assert_eq!(got, expected);
+    }
 
     #[test]
     fn loc_rib_is_independent_of_arrival_order(

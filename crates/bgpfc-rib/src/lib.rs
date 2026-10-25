@@ -1092,6 +1092,7 @@ impl Rib {
             let origin = RouteOrigin::from_as_path(&attrs.as_path, cx.local_as);
             let aspa = cx.validation.aspa(&attrs.as_path);
             let limit = info.prefix_limit(family);
+            let drop_invalid = cx.invalid.drops();
             for (k, &prefix) in prefixes.iter().enumerate() {
                 #[cfg(feature = "profiling")]
                 let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_INSERT);
@@ -1105,7 +1106,7 @@ impl Rib {
                     info,
                     (family, prefix),
                     &attrs,
-                    lookup,
+                    (lookup, drop_invalid),
                 );
                 match judged.into_route(&attrs, id, lookup, aspa) {
                     Some(route) => {
@@ -2285,9 +2286,13 @@ enum Judged {
     /// state, which is the lookup's unless policy set another (RFC 6811
     /// §3).
     Accepted(Arc<PathAttrs>, RovState),
-    /// Rejected with the route's validation state, accepted with another:
-    /// held in the Adj-RIB-In, and no candidate.
-    Held,
+    /// Not a candidate, but one the Adj-RIB-In holds (RFC 6811 §2): import
+    /// policy rejects the route with its validation state and accepts it
+    /// with another, or accepts it and the RIB itself refuses it for being
+    /// Invalid ([`InvalidAction::Drop`]). The state is the one the route
+    /// holds meanwhile: the lookup's, or the one policy set that the RIB
+    /// refused.
+    Held(RovState),
     /// Rejected whatever the route's validation state: not kept.
     Dropped,
 }
@@ -2306,7 +2311,7 @@ impl Judged {
     ) -> Option<Route> {
         let (attrs, rov, held) = match self {
             Judged::Accepted(a, rov) => (a, rov, false),
-            Judged::Held => (Arc::clone(received), lookup, true),
+            Judged::Held(rov) => (Arc::clone(received), rov, true),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -2326,7 +2331,9 @@ impl Judged {
 /// sent for `prefix` of `family`, with `attrs` as received and the
 /// validation state `rov` the lookup gave it, is a candidate for Phase 2,
 /// and with which attributes and validation state (RFC 6811 §3: policy
-/// may set the state).
+/// may set the state). With `drop_invalid` ([`InvalidAction::Drop`]) a
+/// route that policy accepts with the state Invalid is not a candidate
+/// either (RFC 6811 §5: "rejecting all 'invalid' routes").
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -2339,6 +2346,12 @@ impl Judged {
 /// can bring it back, and holding it would let a filtered peer fill
 /// memory, past any `maximum-prefix`, with routes nothing uses.
 ///
+/// What the RIB refuses by itself is held the same way, since a change of
+/// state or of the action admits it, and it is what makes `drop_invalid`
+/// leave what is kept alone: whether a route is in the Adj-RIB-In depends
+/// on policy and never on the action, so the action can change, and a
+/// reload that changes it needs no ROUTE-REFRESH to bring routes back.
+///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
 fn judge(
@@ -2347,9 +2360,15 @@ fn judge(
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
     attrs: &Arc<PathAttrs>,
-    rov: RovState,
+    (rov, drop_invalid): (RovState, bool),
 ) -> Judged {
-    match policies.import(info, family, prefix, attrs, rov) {
+    let verdict = policies.import(info, family, prefix, attrs, rov);
+    // The state the route would hold, if accepted.
+    let state = verdict.rov().unwrap_or(rov);
+    if drop_invalid && state == RovState::Invalid && !matches!(verdict, Verdict::Reject) {
+        return Judged::Held(state);
+    }
+    match verdict {
         Verdict::Accept => Judged::Accepted(Arc::clone(attrs), rov),
         Verdict::Restated(state) => Judged::Accepted(Arc::clone(attrs), state),
         Verdict::Modified(a) => Judged::Accepted(modified(interner, attrs, a), rov),
@@ -2364,7 +2383,7 @@ fn judge(
                 )
             });
             if admitted {
-                Judged::Held
+                Judged::Held(rov)
             } else {
                 Judged::Dropped
             }

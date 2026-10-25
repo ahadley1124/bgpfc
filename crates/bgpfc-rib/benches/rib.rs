@@ -414,33 +414,34 @@ fn enforcement(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Decod
     };
     let mut group = c.benchmark_group("rib");
     group.sample_size(10);
-    for action in [InvalidAction::Policy, InvalidAction::PreferValid] {
+    for action in InvalidAction::ALL {
         group.bench_function(
             format!("insert_{routes}_from_two_peers_validated_{action}"),
             |b| b.iter(|| load(action)),
         );
     }
-    let (mut rib, now) = load(InvalidAction::Policy);
-    let mut flip = false;
-    group.bench_function(
-        format!(
-            "switch_the_action_with_{}_invalid_of_{routes}",
-            prefixes.len() / 20
-        ),
-        |b| {
-            b.iter(|| {
-                flip = !flip;
-                let action = if flip {
-                    InvalidAction::PreferValid
-                } else {
-                    InvalidAction::Policy
-                };
-                black_box(outputs(|o| {
-                    black_box(rib.set_invalid_action(action, now, o));
-                }))
-            });
-        },
-    );
+    // Preferring the Valid decides each destination with an Invalid route
+    // again; dropping also moves those routes between the candidates and
+    // the held routes.
+    for to in [InvalidAction::PreferValid, InvalidAction::Drop] {
+        let (mut rib, now) = load(InvalidAction::Policy);
+        let mut flip = false;
+        group.bench_function(
+            format!(
+                "switch_the_action_to_{to}_and_back_with_{}_invalid_of_{routes}",
+                prefixes.len() / 20
+            ),
+            |b| {
+                b.iter(|| {
+                    flip = !flip;
+                    let action = if flip { to } else { InvalidAction::Policy };
+                    black_box(outputs(|o| {
+                        black_box(rib.set_invalid_action(action, now, o));
+                    }))
+                });
+            },
+        );
+    }
     group.finish();
 }
 

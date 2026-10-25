@@ -23,6 +23,7 @@ use crate::{FibChange, Output, Rib};
 
 mod add_path;
 mod adj_rib_in;
+mod invalid_drop;
 mod roles;
 mod roles_add_path;
 mod validation;

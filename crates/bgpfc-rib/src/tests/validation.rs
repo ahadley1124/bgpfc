@@ -127,16 +127,16 @@ fn policy_is_told_the_validation_state() {
     );
 }
 
-fn vrp(prefix: &str, max_len: u8, asn: u32) -> Vrp {
+pub(super) fn vrp(prefix: &str, max_len: u8, asn: u32) -> Vrp {
     Vrp::new(p(prefix), max_len, Asn(asn)).unwrap()
 }
 
-fn vrps(list: &[(&str, u8, u32)]) -> VrpSet {
+pub(super) fn vrps(list: &[(&str, u8, u32)]) -> VrpSet {
     list.iter().map(|&(p, m, a)| vrp(p, m, a)).collect()
 }
 
 /// Switch to `set`, every route affected.
-fn all(set: VrpSet) -> ValidationChange {
+pub(super) fn all(set: VrpSet) -> ValidationChange {
     ValidationChange {
         source: Arc::new(set),
         affected: AffectedPrefixes::All,
@@ -144,7 +144,7 @@ fn all(set: VrpSet) -> ValidationChange {
 }
 
 /// Go from `old` to `new`, the routes their difference covers affected.
-fn delta(old: &VrpSet, new: VrpSet) -> ValidationChange {
+pub(super) fn delta(old: &VrpSet, new: VrpSet) -> ValidationChange {
     ValidationChange {
         affected: AffectedPrefixes::between(old, &new),
         source: Arc::new(new),
@@ -152,7 +152,7 @@ fn delta(old: &VrpSet, new: VrpSet) -> ValidationChange {
 }
 
 /// Each peer's route for `prefix` in the Adj-RIB-In, with its state.
-fn held(rib: &Rib, family: AddressFamily, prefix: &str) -> Vec<(IpAddr, RovState)> {
+pub(super) fn held(rib: &Rib, family: AddressFamily, prefix: &str) -> Vec<(IpAddr, RovState)> {
     routes(rib, family, p(prefix))
         .into_iter()
         .map(|(peer, r)| (peer, r.rov))
@@ -161,7 +161,7 @@ fn held(rib: &Rib, family: AddressFamily, prefix: &str) -> Vec<(IpAddr, RovState
 
 /// The report of the validation states that changed, if `out` has one;
 /// it never has two.
-fn report(out: &[Output]) -> Option<&Revalidation> {
+pub(super) fn report(out: &[Output]) -> Option<&Revalidation> {
     let mut reports = out.iter().filter_map(|o| match o {
         Output::Revalidated(r) => Some(r),
         _ => None,
@@ -1372,7 +1372,7 @@ fn restated_attributes_are_interned_like_any_modified_ones() {
 /// Import policy that gives Invalid routes a degree of preference of 500,
 /// far above the default, so that nothing but the RIB's own treatment of
 /// the Invalid can put one below another route.
-struct FavourInvalid;
+pub(super) struct FavourInvalid;
 
 impl Policies for FavourInvalid {
     fn import(
@@ -1403,7 +1403,7 @@ impl Policies for FavourInvalid {
 }
 
 /// The peer the best route to `prefix` came from.
-fn best_peer(rib: &Rib, prefix: &str) -> Option<IpAddr> {
+pub(super) fn best_peer(rib: &Rib, prefix: &str) -> Option<IpAddr> {
     rib.loc_rib(V4)
         .find(|(q, _)| *q == p(prefix))
         .map(|(_, b)| b.peer)
@@ -1600,6 +1600,8 @@ fn changing_the_action_decides_the_destinations_with_an_invalid_route_again() {
         Enforcement {
             invalid: 2,
             destinations: 2,
+            held: 0,
+            taken: 0,
             best_changed: 2,
         }
     );
