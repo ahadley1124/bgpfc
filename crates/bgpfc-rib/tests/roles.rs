@@ -59,6 +59,7 @@ fn peers(roles: &[Option<Role>]) -> Vec<PeerInfo> {
             add_path_send: Vec::new(),
             // RFC 9234 §4: Roles are for external sessions.
             role: if i < 5 { roles[usize::from(i)] } else { None },
+            restart: None,
         })
         .collect()
 }

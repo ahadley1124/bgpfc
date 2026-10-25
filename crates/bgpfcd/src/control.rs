@@ -1797,6 +1797,7 @@ mod tests {
                 (v6, bgpfc_rib::PathLimit::Best(2)),
             ],
             role: None,
+            restart: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 2), (v6, 0)],
@@ -1858,6 +1859,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: None,
+            restart: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],

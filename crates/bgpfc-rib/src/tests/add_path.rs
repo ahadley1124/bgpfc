@@ -9,7 +9,7 @@ use super::*;
 use crate::{AcceptAll, Policies, Verdict};
 
 /// A peer that sends us paths with identifiers for both families.
-fn add_path_peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
+pub(super) fn add_path_peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     PeerInfo {
         add_path_receive: vec![V4, V6],
         ..peer(addr, remote_as, router_id)
@@ -19,7 +19,7 @@ fn add_path_peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
 /// `a` announced for each of `paths` (prefix, Path Identifier), in the NLRI
 /// field of IPv4 or in `MP_REACH_NLRI` for any other family, as the encoder
 /// puts them.
-fn announce_paths(paths: &[(&str, u32)], a: &PathAttrs) -> DecodedUpdate {
+pub(super) fn announce_paths(paths: &[(&str, u32)], a: &PathAttrs) -> DecodedUpdate {
     let family = if paths[0].0.contains(':') { V6 } else { V4 };
     let prefixes = paths.iter().map(|(s, _)| p(s)).collect();
     let mut message = a.to_update(family, prefixes);
@@ -40,7 +40,7 @@ fn announce_paths(paths: &[(&str, u32)], a: &PathAttrs) -> DecodedUpdate {
 }
 
 /// A withdrawal of each of `paths`.
-fn withdraw_paths(paths: &[(&str, u32)]) -> DecodedUpdate {
+pub(super) fn withdraw_paths(paths: &[(&str, u32)]) -> DecodedUpdate {
     let mut message = UpdateMessage::default();
     let ids = paths.iter().map(|(_, id)| PathId(*id)).collect();
     let prefixes = paths.iter().map(|(s, _)| p(s)).collect();

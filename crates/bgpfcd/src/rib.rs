@@ -429,6 +429,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         add_path_receive: s.add_path_receive.clone(),
         add_path_send: Vec::new(),
         role: s.role,
+        restart: None,
     }
 }
 
@@ -461,6 +462,31 @@ impl Deliver<'_> {
 
     fn handle(&self, peer: IpAddr) -> Option<crate::peer::PeerHandle> {
         self.peers.read().ok().and_then(|t| t.get(&peer).cloned())
+    }
+
+    /// A peer is over its prefix limit (RFC 4271 §6.7): log it and tell the
+    /// peer thread to end the session.
+    fn prefix_limit_exceeded(&self, peer: IpAddr, family: AddressFamily, limit: u32) {
+        bgpfc_log::error!(
+            "rib: prefix limit exceeded, routes dropped",
+            peer = peer,
+            family = family,
+            limit = limit
+        );
+        let Some(handle) = self.handle(peer) else {
+            return;
+        };
+        // RFC 4271 §6.7: the session must end. A full queue means the peer
+        // thread is busy and checks the slot after its current input; the
+        // RIB never blocks on a peer (AGENTS.md §3).
+        match handle.tx.try_send(PeerInput::PrefixLimit { family, limit }) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                if let Ok(mut slot) = handle.prefix_limit.lock() {
+                    *slot = Some((family, limit));
+                }
+            }
+        }
     }
 }
 
@@ -497,29 +523,7 @@ impl Sink for Deliver<'_> {
                 peer,
                 family,
                 limit,
-            } => {
-                bgpfc_log::error!(
-                    "rib: prefix limit exceeded, routes dropped",
-                    peer = peer,
-                    family = family,
-                    limit = limit
-                );
-                let Some(handle) = self.handle(peer) else {
-                    return;
-                };
-                // RFC 4271 §6.7: the session must end. A full queue means
-                // the peer thread is busy and checks the slot after its
-                // current input; the RIB never blocks on a peer
-                // (AGENTS.md §3).
-                match handle.tx.try_send(PeerInput::PrefixLimit { family, limit }) {
-                    Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                    Err(TrySendError::Full(_)) => {
-                        if let Ok(mut slot) = handle.prefix_limit.lock() {
-                            *slot = Some((family, limit));
-                        }
-                    }
-                }
-            }
+            } => self.prefix_limit_exceeded(peer, family, limit),
             Output::InvalidNextHop {
                 peer,
                 family,
@@ -556,6 +560,24 @@ impl Sink for Deliver<'_> {
                     first = first
                 );
             }
+            Output::StaleRemoved {
+                peer,
+                family,
+                routes,
+                why,
+            } => {
+                // RFC 4724 §4.2: the routes of a restarted neighbor that
+                // were kept and are now deleted. The FIB changes and the
+                // UPDATEs for other peers have come out with it.
+                bgpfc_log::info!(
+                    "rib: stale routes removed",
+                    peer = peer,
+                    family = family.map_or_else(|| "all".to_owned(), |f| f.to_string()),
+                    routes = routes,
+                    why = why
+                );
+            }
+            Output::SelectionDone { .. } => {}
             Output::Revalidated(r) => {
                 // RFC 6811 §4: the routes a change of the validation source
                 // moved, counted. One line per change, however many routes

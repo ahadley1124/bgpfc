@@ -49,6 +49,11 @@ pub(crate) struct Route {
     /// the Adj-RIB-In holds it (RFC 6811 §2), but it is no candidate. A
     /// destination keeps these after its candidates.
     pub(crate) held: bool,
+    /// The session it came over ended and the route is kept until its peer
+    /// sends it again (RFC 4724 §4.2): "stale routing information", which
+    /// the decision process and forwarding treat like any other. Sits in
+    /// the padding beside `held`, so costs a route nothing.
+    pub(crate) stale: bool,
 }
 
 impl Route {
@@ -255,6 +260,21 @@ impl Destination {
     /// The index of a route `peer` sent, whichever its identifier.
     pub(crate) fn position_of_peer(&self, peer: PeerId) -> Option<usize> {
         slots!(self, s => s.iter().position(|r| r.route().peer == peer))
+    }
+
+    /// The index of a stale route `peer` sent (RFC 4724 §4.2), whichever
+    /// its identifier.
+    pub(crate) fn position_stale(&self, peer: PeerId) -> Option<usize> {
+        slots!(self, s => s.iter().position(|r| {
+            let r = r.route();
+            r.stale && r.peer == peer
+        }))
+    }
+
+    /// Mark every route `peer` sent as stale, or no longer stale. How many
+    /// there were.
+    pub(crate) fn set_stale(&mut self, peer: PeerId, stale: bool) -> usize {
+        slots_mut!(self, s => s.iter_mut().filter(|r| r.route().peer == peer).map(|r| r.route_mut().stale = stale).count())
     }
 
     /// The routes as slots with identifiers, whatever form they are in.
@@ -487,6 +507,12 @@ impl<V> PrefixMap<V> {
         }
     }
 
+    /// Every entry, mutably, in prefix order.
+    pub(crate) fn for_each_mut(&mut self, mut each: impl FnMut(&mut V)) {
+        self.v4.values_mut().for_each(&mut each);
+        self.v6.values_mut().for_each(&mut each);
+    }
+
     /// Keep the entries `keep` says to, in prefix order.
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prefix, &mut V) -> bool) {
         self.v4.retain(|k, v| keep(k.prefix(), v));
@@ -524,22 +550,23 @@ impl<T> FamilyMap<T> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn remove(&mut self, family: AddressFamily) -> Option<T> {
         let i = self.0.iter().position(|(f, _)| *f == family)?;
         Some(self.0.swap_remove(i).1)
     }
 
-    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (AddressFamily, &T)> {
         self.0.iter().map(|(f, v)| (*f, v))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (AddressFamily, &mut T)> {
         self.0.iter_mut().map(|(f, v)| (*f, v))
     }
 
-    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.0.iter().map(|(_, v)| v)
     }
@@ -592,6 +619,7 @@ mod tests {
             rov: RovState::Disabled,
             aspa: AspaState::Disabled,
             held: false,
+            stale: false,
         }
     }
 

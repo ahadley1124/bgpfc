@@ -15,7 +15,7 @@
 //! each prefix sent to a peer that takes several paths); RFC 9234 §5 (a
 //! route with the Only to Customer attribute is not sent to a provider, a
 //! peer or a route server, and one without it gets ours when sent to a
-//! customer, a peer or an RS-Client).
+//! customer, a peer or an RS-Client); RFC 4724 §2 (the End-of-RIB marker).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -78,6 +78,25 @@ pub fn export(
         return None;
     }
     Some(rewrite(local_as, family, attrs, to))
+}
+
+/// The End-of-RIB marker for `family` as sent to `to`, framed (RFC 4724
+/// §2): the empty UPDATE for IPv4 unicast, an UPDATE with an empty
+/// `MP_UNREACH_NLRI` for any other family. It has no prefixes, so what was
+/// negotiated about them changes nothing about it.
+///
+/// # Errors
+/// [`EncodeError`] if it cannot be encoded, which a marker never cannot.
+pub fn end_of_rib(family: AddressFamily, to: &PeerInfo) -> Result<Vec<u8>, EncodeError> {
+    let ctx = EncodeContext {
+        four_octet_as: to.four_octet_as,
+        extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
+    };
+    frame(
+        MessageType::Update,
+        &UpdateMessage::end_of_rib(family).encode(&ctx)?,
+    )
 }
 
 /// Whether attributes allow a route of `family` to `to` at all: RFC 1997

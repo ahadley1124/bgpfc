@@ -156,6 +156,7 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
         // session, internal ones included: `same_rewrite` is asked of what
         // the session says, not of whether the combination is sensible.
         role: role.map(Role::from_u8),
+        restart: None,
     })
 }
 

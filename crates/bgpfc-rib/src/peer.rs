@@ -4,7 +4,8 @@
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
 //! per-family prefix limit), §6.3 a) (our own address is no next hop);
 //! RFC 7911 §5 (the families sent and taken with Path Identifiers, and how
-//! many paths are sent); RFC 9234 §4 (our BGP Role on the session).
+//! many paths are sent); RFC 9234 §4 (our BGP Role on the session);
+//! RFC 4724 §4, §4.2 (Graceful Restart on the session).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
+
+use crate::restart::Restart;
 
 /// How many paths of a prefix to send a peer with ADD-PATH (RFC 7911 §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +82,12 @@ pub struct PeerInfo {
     /// Customer procedures of §5 (see [`otc`](crate::otc)). `None` for a
     /// session with no Role, which leaves the attribute alone.
     pub role: Option<Role>,
+    /// Graceful Restart (RFC 4724), when we advertised the capability to
+    /// this peer: the End-of-RIB marker ends the initial update of each
+    /// family (§4), and if the peer advertised it too its routes are kept
+    /// as stale when the session ends (§4.2). `None` leaves the session as
+    /// RFC 4271 has it.
+    pub restart: Option<Restart>,
 }
 
 impl PeerInfo {
