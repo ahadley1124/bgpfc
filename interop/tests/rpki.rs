@@ -1,8 +1,11 @@
 //! Route origin validation in `bgpfcd` (RFC 6811) with VRPs over RTR
 //! (RFC 8210) from `StayRTR`, an independent RTR cache, for routes from
-//! BIRD 2 (AGENTS.md §5, `interop/` row). Nothing acts on the states yet
-//! (AGENTS.md §9, step 13), so every route is accepted and relayed
-//! whatever its state.
+//! BIRD 2 (AGENTS.md §5, `interop/` row). These scenarios test the RTR
+//! transport and the states it gives the routes, so their `rpki` blocks
+//! say `enforcement off;` (RFC 8481 §5, "Set State, Don't Act"): every
+//! route is accepted and relayed whatever its state, and the state moves
+//! nothing but itself. Without it the default, `drop-invalid`, would hold
+//! the Invalid routes back.
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
@@ -429,7 +432,8 @@ impl Setup {
 }
 
 /// The `rpki` block for the caches at `binds`, in that order of
-/// preference, after the one at `unanswered` if there is one.
+/// preference, after the one at `unanswered` if there is one, with
+/// `enforcement off`: the states are shown and acted on by nothing.
 fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
     let mut entries = String::new();
     if let Some(addr) = unanswered {
@@ -448,7 +452,7 @@ fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> Strin
     }
     // The shortest back-off, so that a cache that comes back is found
     // within a second or two.
-    format!("rpki {{ mode {mode};{entries} backoff 1 1; }}")
+    format!("rpki {{ mode {mode}; enforcement off;{entries} backoff 1 1; }}")
 }
 
 /// The `session-id ... serial ...` line of `show rpki`.
