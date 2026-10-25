@@ -3,7 +3,8 @@
 //!
 //! Implements: RFC 4271 §4.2 (Hold Time, BGP Identifier), RFC 6793 §3
 //! (four-octet AS numbers, `AS_TRANS`), RFC 4760 §3 (AFI/SAFI values),
-//! RFC 6286 §2.1 (BGP Identifier is any non-zero 4-octet value).
+//! RFC 6286 §2.1 (BGP Identifier is any non-zero 4-octet value), RFC 7911
+//! §3 (Path Identifier).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -44,6 +45,20 @@ impl From<u16> for Asn {
 impl fmt::Display for Asn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AS{}", self.0)
+    }
+}
+
+/// Path Identifier (RFC 7911 §3): four octets that tell apart the paths one
+/// speaker advertises for a prefix. Assigning one is "purely a local
+/// matter" and the receiver "should not assume that the identifier
+/// carries any particular semantics" (§2), so it is only ever compared for
+/// equality and printed. Zero is a valid identifier like any other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathId(pub u32);
+
+impl fmt::Display for PathId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -239,6 +254,14 @@ mod tests {
         assert_eq!(Asn(4_200_000_000).to_two_octet(), 23_456);
         assert_eq!(Asn::from(7u16), Asn(7));
         assert_eq!(Asn(65_000).to_string(), "AS65000");
+    }
+
+    #[test]
+    fn path_id_is_a_plain_number() {
+        // RFC 7911 §2: no semantics; zero is as good as any other.
+        assert_eq!(PathId::default(), PathId(0));
+        assert!(PathId(1) < PathId(2));
+        assert_eq!(PathId(4_294_967_295).to_string(), "4294967295");
     }
 
     #[test]

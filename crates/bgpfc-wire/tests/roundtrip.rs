@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bgpfc_wire::as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
-use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::error::UpdateSubcode;
@@ -101,6 +101,14 @@ fn next_hop_encoding() -> impl Strategy<Value = NextHopEncoding> {
     ]
 }
 
+/// RFC 7911 §4 tuples: any family, a Send/Receive value of 1 to 3.
+fn add_path_tuple() -> impl Strategy<Value = AddPathTuple> {
+    (address_family(), 1u8..=3).prop_map(|(family, mode)| AddPathTuple {
+        family,
+        mode: AddPathMode::from_u8(mode).unwrap(),
+    })
+}
+
 fn capability() -> impl Strategy<Value = Capability> {
     prop_oneof![
         address_family().prop_map(Capability::Multiprotocol),
@@ -109,8 +117,10 @@ fn capability() -> impl Strategy<Value = Capability> {
         any::<u32>().prop_map(|a| Capability::FourOctetAs(Asn(a))),
         // RFC 8950 §4: at most 42 six-octet triples fit the length octet.
         vec(next_hop_encoding(), 0..=42).prop_map(Capability::ExtendedNextHop),
+        // RFC 7911 §4: at most 63 four-octet tuples fit the length octet.
+        vec(add_path_tuple(), 0..=63).prop_map(Capability::AddPath),
         (
-            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65)),
+            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65 | 69)),
             vec(any::<u8>(), 0..=255)
         )
             .prop_map(|(code, value)| Capability::Unknown { code, value }),
@@ -485,6 +495,27 @@ proptest! {
         if value.len() % 6 == 0 {
             let c = decoded.unwrap();
             prop_assert!(matches!(&c, Capability::ExtendedNextHop(t) if t.len() == value.len() / 6));
+            let mut again = Vec::new();
+            c.encode(&mut again).unwrap();
+            prop_assert_eq!(again, wire);
+        } else {
+            prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
+        }
+    }
+
+    #[test]
+    fn add_path_accepts_exactly_whole_tuples(value in vec(any::<u8>(), 0..=255)) {
+        // RFC 7911 §4: whole four-octet tuples decode and re-encode to the
+        // same octets, as an ADD-PATH capability when every Send/Receive
+        // value is 1 to 3 and as an unknown one otherwise; anything else is
+        // malformed.
+        let mut wire = vec![69, u8::try_from(value.len()).unwrap()];
+        wire.extend_from_slice(&value);
+        let decoded = Capability::decode(&mut Reader::new(&wire));
+        if value.len() % 4 == 0 {
+            let c = decoded.unwrap();
+            let understood = value.chunks(4).all(|t| (1..=3).contains(&t[3]));
+            prop_assert_eq!(matches!(c, Capability::AddPath(_)), understood);
             let mut again = Vec::new();
             c.encode(&mut again).unwrap();
             prop_assert_eq!(again, wire);

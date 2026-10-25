@@ -4,7 +4,7 @@
 //! ignored, never an error); RFC 4760 §8 (Multiprotocol Extensions, code 1);
 //! RFC 2918 §2 (Route Refresh, code 2); RFC 8950 §4 (Extended Next Hop
 //! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 6793 §3
-//! (Four-octet AS, code 65).
+//! (Four-octet AS, code 65); RFC 7911 §4 (ADD-PATH, code 69).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
@@ -24,6 +24,10 @@ pub enum Capability {
     ExtendedMessage,
     /// Four-octet AS number support, carrying the speaker's ASN (RFC 6793 §3).
     FourOctetAs(Asn),
+    /// ADD-PATH: per `<AFI, SAFI>`, whether the speaker can receive and/or
+    /// send multiple paths (RFC 7911 §4). A speaker lists all its families
+    /// in one instance; the tuples of several instances add up.
+    AddPath(Vec<AddPathTuple>),
     /// A capability this implementation does not understand. Kept so that
     /// the OPEN round-trips; the FSM ignores it (RFC 5492 §5).
     Unknown {
@@ -44,6 +48,7 @@ impl Capability {
             Capability::ExtendedNextHop(_) => 5,
             Capability::ExtendedMessage => 6,
             Capability::FourOctetAs(_) => 65,
+            Capability::AddPath(_) => 69,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -85,6 +90,22 @@ impl Capability {
             Capability::FourOctetAs(asn) => {
                 out.put_u8(4);
                 out.put_u32(asn.0);
+            }
+            Capability::AddPath(tuples) => {
+                // RFC 7911 §4: four octets per tuple, AFI (2), SAFI (1),
+                // Send/Receive (1).
+                let len = tuples.len() * AddPathTuple::WIRE_LEN;
+                let len = u8::try_from(len).map_err(|_| EncodeError::TooLong {
+                    what: "add-path capability",
+                    len,
+                    max: usize::from(u8::MAX),
+                })?;
+                out.put_u8(len);
+                for t in tuples {
+                    out.put_u16(t.family.afi.to_u16());
+                    out.put_u8(t.family.safi.to_u8());
+                    out.put_u8(t.mode.to_u8());
+                }
             }
             Capability::Unknown { value, .. } => {
                 let len = u8::try_from(value.len()).map_err(|_| EncodeError::TooLong {
@@ -138,7 +159,39 @@ impl Capability {
             6 if len == 0 => Capability::ExtendedMessage,
             // RFC 6793 §3: length 4, the speaker's ASN.
             65 if len == 4 => Capability::FourOctetAs(Asn(v.u32().map_err(|_| malformed())?)),
-            1 | 2 | 5 | 6 | 65 => return Err(malformed()),
+            // RFC 7911 §4: whole four-octet tuples.
+            // NOTE(interop): an empty value (no tuples) is accepted and means
+            // nothing, as with RFC 8950 above; RFC 7911 §4 draws one or more
+            // tuples but names no error for none.
+            69 if usize::from(len) % AddPathTuple::WIRE_LEN == 0 => {
+                let raw = v.rest_peek();
+                let mut tuples = Vec::with_capacity(usize::from(len) / AddPathTuple::WIRE_LEN);
+                let mut understood = true;
+                while !v.is_empty() {
+                    let afi = Afi::from_u16(v.u16().map_err(|_| malformed())?);
+                    let safi = Safi::from_u8(v.u8().map_err(|_| malformed())?);
+                    match AddPathMode::from_u8(v.u8().map_err(|_| malformed())?) {
+                        Some(mode) => tuples.push(AddPathTuple {
+                            family: AddressFamily { afi, safi },
+                            mode,
+                        }),
+                        None => understood = false,
+                    }
+                }
+                if understood {
+                    Capability::AddPath(tuples)
+                } else {
+                    // RFC 7911 §4: "If any other value is received, then the
+                    // capability SHOULD be treated as not understood and
+                    // ignored": the whole capability, kept as unknown so
+                    // that the OPEN round-trips.
+                    Capability::Unknown {
+                        code,
+                        value: raw.to_vec(),
+                    }
+                }
+            }
+            1 | 2 | 5 | 6 | 65 | 69 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -187,6 +240,100 @@ impl NextHopEncoding {
             safi: Safi::from_u8(safi),
         })
     }
+}
+
+/// The Send/Receive field of an ADD-PATH tuple (RFC 7911 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AddPathMode {
+    /// 1: the sender is able to receive multiple paths from its peer.
+    Receive,
+    /// 2: the sender is able to send multiple paths to its peer.
+    Send,
+    /// 3: both.
+    Both,
+}
+
+impl AddPathMode {
+    /// From the wire value; `None` for anything but 1, 2 and 3, which
+    /// RFC 7911 §4 has the receiver treat as not understood.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<AddPathMode> {
+        match v {
+            1 => Some(AddPathMode::Receive),
+            2 => Some(AddPathMode::Send),
+            3 => Some(AddPathMode::Both),
+            _ => None,
+        }
+    }
+
+    /// Wire value.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            AddPathMode::Receive => 1,
+            AddPathMode::Send => 2,
+            AddPathMode::Both => 3,
+        }
+    }
+
+    /// Whether the speaker can receive multiple paths (value 1 or 3).
+    #[must_use]
+    pub const fn receives(self) -> bool {
+        matches!(self, AddPathMode::Receive | AddPathMode::Both)
+    }
+
+    /// Whether the speaker can send multiple paths (value 2 or 3).
+    #[must_use]
+    pub const fn sends(self) -> bool {
+        matches!(self, AddPathMode::Send | AddPathMode::Both)
+    }
+
+    /// The mode that can do what `receive` and `send` say; `None` if
+    /// neither.
+    #[must_use]
+    pub const fn of(receive: bool, send: bool) -> Option<AddPathMode> {
+        match (receive, send) {
+            (true, true) => Some(AddPathMode::Both),
+            (true, false) => Some(AddPathMode::Receive),
+            (false, true) => Some(AddPathMode::Send),
+            (false, false) => None,
+        }
+    }
+}
+
+/// One `<AFI, SAFI, Send/Receive>` tuple of the ADD-PATH capability
+/// (RFC 7911 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AddPathTuple {
+    /// The `<AFI, SAFI>` the tuple is about (as in RFC 4760).
+    pub family: AddressFamily,
+    /// What the speaker can do for it.
+    pub mode: AddPathMode,
+}
+
+impl AddPathTuple {
+    /// Octets per tuple on the wire (RFC 7911 §4).
+    const WIRE_LEN: usize = 4;
+}
+
+/// What the ADD-PATH capabilities in `caps` say about `family`: the
+/// speaker can receive and/or send multiple paths for it, as
+/// `(receive, send)`. RFC 5492 §4 lets a capability be sent more than
+/// once and RFC 7911 §4 asks a speaker to use a single instance, so the
+/// tuples of all instances count, and a family listed twice has both
+/// abilities either entry gives.
+#[must_use]
+pub fn add_path_abilities(caps: &[Capability], family: AddressFamily) -> (bool, bool) {
+    caps.iter()
+        .filter_map(|c| match c {
+            Capability::AddPath(t) => Some(t),
+            _ => None,
+        })
+        .flatten()
+        .filter(|t| t.family == family)
+        .fold((false, false), |(r, s), t| {
+            (r || t.mode.receives(), s || t.mode.sends())
+        })
 }
 
 /// Every triple of every Extended Next Hop Encoding capability in `caps`:
@@ -318,6 +465,138 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(next_hop_encodings(&caps[..1]).count(), 0);
+    }
+
+    #[test]
+    fn add_path_round_trips() {
+        // RFC 7911 §4: AFI (2), SAFI (1), Send/Receive (1), per tuple.
+        let tuple = |family, mode| AddPathTuple { family, mode };
+        round_trip(
+            &Capability::AddPath(vec![tuple(
+                AddressFamily::IPV4_UNICAST,
+                AddPathMode::Receive,
+            )]),
+            &[69, 4, 0, 1, 1, 1],
+        );
+        // One instance for several families (RFC 7911 §4 MUST).
+        round_trip(
+            &Capability::AddPath(vec![
+                tuple(AddressFamily::IPV4_UNICAST, AddPathMode::Send),
+                tuple(AddressFamily::IPV6_UNICAST, AddPathMode::Both),
+            ]),
+            &[69, 8, 0, 1, 1, 2, 0, 2, 1, 3],
+        );
+        // A family this implementation does not speak is still a tuple.
+        round_trip(
+            &Capability::AddPath(vec![tuple(
+                AddressFamily {
+                    afi: Afi::Unknown(25),
+                    safi: Safi::Unknown(65),
+                },
+                AddPathMode::Both,
+            )]),
+            &[69, 4, 0, 25, 65, 3],
+        );
+        // An empty value is accepted (NOTE(interop) in `decode`).
+        round_trip(&Capability::AddPath(vec![]), &[69, 0]);
+        assert_eq!(Capability::AddPath(vec![]).code(), 69);
+    }
+
+    #[test]
+    fn add_path_with_a_value_other_than_1_to_3_is_not_understood() {
+        // RFC 7911 §4: the capability is treated as not understood and
+        // ignored; it is kept so that the OPEN round-trips.
+        for mode in [0u8, 4, 255] {
+            let wire = [69, 8, 0, 1, 1, 3, 0, 2, 1, mode];
+            round_trip(
+                &Capability::Unknown {
+                    code: 69,
+                    value: wire[2..].to_vec(),
+                },
+                &wire,
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_length_must_be_whole_tuples() {
+        for wire in [
+            &[69, 3, 0, 1, 1][..],
+            &[69, 5, 0, 1, 1, 1, 0][..],
+            &[69, 4, 0, 1, 1][..], // truncated value
+            &[69][..],
+        ] {
+            let e = Capability::decode(&mut Reader::new(wire)).unwrap_err();
+            assert_eq!(
+                e,
+                DecodeError::open(OpenSubcode::Unspecific, vec![]),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_limits_and_abilities() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // 63 tuples fill 252 of the 255 octets a capability may hold.
+        let tuple = AddPathTuple {
+            family: v4,
+            mode: AddPathMode::Both,
+        };
+        let mut out = Vec::new();
+        Capability::AddPath(vec![tuple; 63])
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 2 + 252);
+        assert_eq!(
+            Capability::AddPath(vec![tuple; 64]).encode(&mut Vec::new()),
+            Err(EncodeError::TooLong {
+                what: "add-path capability",
+                len: 256,
+                max: 255,
+            })
+        );
+        // Modes name what the sender can do.
+        assert!(AddPathMode::Receive.receives() && !AddPathMode::Receive.sends());
+        assert!(!AddPathMode::Send.receives() && AddPathMode::Send.sends());
+        assert!(AddPathMode::Both.receives() && AddPathMode::Both.sends());
+        assert_eq!(AddPathMode::of(true, true), Some(AddPathMode::Both));
+        assert_eq!(AddPathMode::of(true, false), Some(AddPathMode::Receive));
+        assert_eq!(AddPathMode::of(false, true), Some(AddPathMode::Send));
+        assert_eq!(AddPathMode::of(false, false), None);
+        for v in 0..=u8::MAX {
+            assert_eq!(
+                AddPathMode::from_u8(v).map(AddPathMode::to_u8),
+                (1..=3).contains(&v).then_some(v)
+            );
+        }
+        // RFC 5492 §4: several instances add up, and a family listed twice
+        // has what either entry gives.
+        let caps = [
+            Capability::RouteRefresh,
+            Capability::AddPath(vec![
+                AddPathTuple {
+                    family: v4,
+                    mode: AddPathMode::Receive,
+                },
+                AddPathTuple {
+                    family: v4,
+                    mode: AddPathMode::Send,
+                },
+            ]),
+            Capability::AddPath(vec![AddPathTuple {
+                family: v6,
+                mode: AddPathMode::Receive,
+            }]),
+        ];
+        assert_eq!(add_path_abilities(&caps, v4), (true, true));
+        assert_eq!(add_path_abilities(&caps, v6), (true, false));
+        assert_eq!(
+            add_path_abilities(&caps[..1], v4),
+            (false, false),
+            "no capability"
+        );
     }
 
     #[test]
