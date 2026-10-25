@@ -496,6 +496,50 @@ fn engine_import_matches_the_looked_up_state_and_returns_the_set_one() {
 }
 
 #[test]
+fn engine_reads_rov_only_with_a_match_rpki_clause() {
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy PLAIN { term t { match prefix 192.0.2.0/24; action reject; } term r { action accept; } }
+         policy SETS { term t { match prefix 192.0.2.0/24; set rpki valid; action accept; } }
+         policy READS { term t { action next; } term u { match rpki invalid; action reject; } }
+         policy OUT { term t { match rpki invalid; action reject; } }
+         neighbor 10.0.0.1 { remote-as 65001; import PLAIN; export OUT; }
+         neighbor 10.0.0.2 { remote-as 65001; import SETS; export OUT; }
+         neighbor 10.0.0.3 { remote-as 65001; import READS; export PLAIN; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let set = engine.policies();
+    assert!(!set.reads_rov("PLAIN"));
+    // Setting the state is no reading of it.
+    assert!(!set.reads_rov("SETS"));
+    assert!(set.reads_rov("READS"));
+    assert!(set.reads_rov("OUT"));
+    assert!(!set.reads_rov("NOPE"));
+    // Per neighbor, its import policy's; an unknown peer is rejected
+    // whatever the state.
+    let reads = |addr: &str| engine.import_reads_rov(&peer_at(addr));
+    assert!(!reads("10.0.0.1"));
+    assert!(!reads("10.0.0.2"));
+    assert!(reads("10.0.0.3"));
+    assert!(!reads("10.0.0.9"));
+    // And it holds: where the flag is false, every state gets the same
+    // answer.
+    let a = attrs(&[65_001]);
+    for addr in ["10.0.0.1", "10.0.0.2", "10.0.0.9"] {
+        for prefix in ["192.0.2.0/24", "203.0.113.0/24"] {
+            let prefix: Prefix = prefix.parse().unwrap();
+            let answers: Vec<Imported> = RovState::ALL
+                .into_iter()
+                .map(|rov| engine.import(&peer_at(addr), V4, prefix, &a, rov))
+                .collect();
+            assert!(answers.iter().all(|i| *i == answers[0]), "{addr} {prefix}");
+        }
+    }
+}
+
+#[test]
 fn export_sees_the_state_it_is_given() {
     // The RIB passes the state the route is used with; export policy
     // matches it and returns a verdict alone.

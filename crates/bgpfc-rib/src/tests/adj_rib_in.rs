@@ -81,6 +81,46 @@ impl Policies for RejectUnvalidated {
     }
 }
 
+/// Import policy that rejects some prefixes whatever their state and takes
+/// every other route, saying whether it reads the state; what it is asked
+/// is recorded.
+struct RejectSome {
+    rejected: Vec<Prefix>,
+    reads_rov: bool,
+    asked: Arc<Mutex<Vec<(Prefix, RovState)>>>,
+}
+
+impl Policies for RejectSome {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        rov: RovState,
+    ) -> Imported {
+        self.asked.lock().unwrap().push((p, rov));
+        if self.rejected.contains(&p) {
+            Verdict::Reject.into()
+        } else {
+            Verdict::Accept.into()
+        }
+    }
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
+    }
+    fn import_reads_rov(&self, _: &PeerInfo) -> bool {
+        self.reads_rov
+    }
+}
+
 /// What the Adj-RIB-In holds for `prefix`: each peer's route as received.
 fn received(rib: &Rib, family: AddressFamily, prefix: Prefix) -> Vec<(IpAddr, Arc<PathAttrs>)> {
     routes(rib, family, prefix)
@@ -250,6 +290,49 @@ fn a_route_rejected_for_its_validation_state_alone_is_held() {
             (held, Valid)
         ]
     );
+}
+
+#[test]
+fn import_policy_that_reads_no_state_is_asked_once() {
+    // A policy whose answer cannot depend on the state rejects with every
+    // state what it rejects with one: asking again would only cost time.
+    use RovState::{Disabled, Invalid, NotFound, Valid};
+    let rejected = p("198.51.100.0/24");
+    for reads_rov in [false, true] {
+        let asked = Arc::default();
+        let policy = RejectSome {
+            rejected: vec![rejected],
+            reads_rov,
+            asked: Arc::clone(&asked),
+        };
+        let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
+        let e1 = peer("10.0.0.1", 65_001, 1);
+        outputs(|o| rib.peer_up(e1.clone(), now(), o));
+        let a = attrs(&[65_001], "10.0.0.1");
+        let out = outputs(|o| {
+            rib.update(
+                e1.addr,
+                &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+                now(),
+                o,
+            );
+        });
+        // The same outcome either way: the accepted route is used, the
+        // rejected one is neither held nor counted.
+        assert_eq!(fib(&out).len(), 1, "{reads_rov}");
+        assert!(routes(&rib, V4, rejected).is_empty(), "{reads_rov}");
+        assert_eq!(destinations(&rib, V4), vec![p("192.0.2.0/24")]);
+        assert_eq!(
+            rib.peer_stats(e1.addr).unwrap().received,
+            vec![(V4, 1), (V6, 0)]
+        );
+        let mut expected = vec![(p("192.0.2.0/24"), Disabled), (rejected, Disabled)];
+        if reads_rov {
+            // m11's questions: every other state, none of which admits it.
+            expected.extend([(rejected, Valid), (rejected, Invalid), (rejected, NotFound)]);
+        }
+        assert_eq!(*asked.lock().unwrap(), expected, "{reads_rov}");
+    }
 }
 
 #[test]

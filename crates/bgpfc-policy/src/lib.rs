@@ -76,6 +76,9 @@ struct Term {
 #[derive(Clone, Debug)]
 struct Policy {
     terms: Vec<Term>,
+    /// Whether a term matches the validation state: without one, the
+    /// verdict and the state set are the same whatever the route's state.
+    reads_rov: bool,
 }
 
 /// Every policy and prefix list of a configuration, compiled.
@@ -192,8 +195,11 @@ impl PolicySet {
                     action: t.action,
                 });
             }
+            let reads_rov = terms
+                .iter()
+                .any(|t| t.clauses.iter().any(|c| matches!(c, Clause::Rpki(_))));
             names.insert(p.name.clone(), policies.len());
-            policies.push(Policy { terms });
+            policies.push(Policy { terms, reads_rov });
         }
         if errors.is_empty() {
             Ok(PolicySet {
@@ -210,6 +216,21 @@ impl PolicySet {
     #[must_use]
     pub fn has(&self, name: &str) -> bool {
         self.names.contains_key(name)
+    }
+
+    /// Whether what policy `name` makes of a route can depend on the
+    /// route's validation state: whether one of its terms has a `match
+    /// rpki` clause. A `set rpki` alone sets the same state whatever the
+    /// route's. An unknown policy rejects everything, so it does not.
+    #[must_use]
+    pub fn reads_rov(&self, name: &str) -> bool {
+        self.reads_rov_at(self.names.get(name).copied())
+    }
+
+    fn reads_rov_at(&self, index: Option<usize>) -> bool {
+        index
+            .and_then(|i| self.policies.get(i))
+            .is_some_and(|p| p.reads_rov)
     }
 
     /// Run policy `name` on `route`: whether and with which attributes the
@@ -388,13 +409,9 @@ impl Engine {
         &self.set
     }
 
-    fn run(
-        &self,
-        which: fn(NeighborPolicies) -> Option<usize>,
-        peer: &PeerInfo,
-        route: &Route<'_>,
-    ) -> Imported {
-        let policies = match self.last.get() {
+    /// The policies of `peer`, `None` for a peer with none configured.
+    fn policies_of(&self, peer: &PeerInfo) -> Option<NeighborPolicies> {
+        match self.last.get() {
             Some((addr, p)) if addr == peer.addr => Some(p),
             _ => {
                 let p = self.neighbors.get(&peer.addr).copied();
@@ -403,8 +420,16 @@ impl Engine {
                 }
                 p
             }
-        };
-        match policies {
+        }
+    }
+
+    fn run(
+        &self,
+        which: fn(NeighborPolicies) -> Option<usize>,
+        peer: &PeerInfo,
+        route: &Route<'_>,
+    ) -> Imported {
+        match self.policies_of(peer) {
             Some(p) => self.set.run_at(which(p), route),
             // A peer without configured policies gets nothing and gives
             // nothing (docs/config.md: every neighbor names both).
@@ -417,7 +442,10 @@ impl Engine {
 /// lookup gave the route, on export the one it is used with. Import
 /// returns the state a `set rpki` set, which the RIB then uses the route
 /// with (RFC 6811 §3). Validation keeps `set rpki` out of every policy a
-/// neighbor exports with, so export sets none.
+/// neighbor exports with, so export sets none. An import policy without
+/// `match rpki` tells the RIB that it does not read the state, which
+/// spares the RIB asking it about a rejected route again with every other
+/// state.
 impl Policies for Engine {
     fn import(
         &self,
@@ -457,6 +485,14 @@ impl Policies for Engine {
             rov,
         };
         self.run(|n| n.1, peer, &route).verdict
+    }
+
+    /// Whether the neighbor's import policy has a `match rpki` clause. A
+    /// peer with no policy configured is rejected whatever its routes'
+    /// state.
+    fn import_reads_rov(&self, peer: &PeerInfo) -> bool {
+        self.policies_of(peer)
+            .is_some_and(|p| self.set.reads_rov_at(p.0))
     }
 }
 

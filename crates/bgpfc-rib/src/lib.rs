@@ -172,6 +172,16 @@ pub trait Policies: Send {
         attrs: &PathAttrs,
         rov: RovState,
     ) -> Verdict;
+
+    /// Whether what [`Policies::import`] makes of a route from `peer` can
+    /// depend on its `rov` argument. When it cannot, policy gives the same
+    /// verdict and sets the same state whatever the route's state, so a
+    /// route it rejects is rejected with every state and the RIB does not
+    /// ask again with each of the others. `true`, the default, is always
+    /// correct; `false` only saves those questions.
+    fn import_reads_rov(&self, _peer: &PeerInfo) -> bool {
+        true
+    }
 }
 
 /// The policy that accepts every route unchanged.
@@ -2163,7 +2173,10 @@ impl Judged {
 /// without a ROUTE-REFRESH. A route policy rejects whatever its state is
 /// dropped, as rejected routes were before validation existed: no change
 /// of state can bring it back, and holding it would let a filtered peer
-/// fill memory, past any `maximum-prefix`, with routes nothing uses.
+/// fill memory, past any `maximum-prefix`, with routes nothing uses. A
+/// policy that does not read the state ([`Policies::import_reads_rov`])
+/// rejects with every state what it rejects with one, so it is not asked
+/// again: a filtered table costs one question per route, not four.
 ///
 /// A route policy accepts but whose state `enforcement` rules out (RFC
 /// 6811 §5, "rejecting all "invalid" routes", configured) is held
@@ -2192,12 +2205,13 @@ fn judge(
         Verdict::Accept => Arc::clone(attrs),
         Verdict::Modified(a) => interner.intern(a),
         Verdict::Reject => {
-            let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
-                !matches!(
-                    policies.import(info, family, prefix, attrs, s).verdict,
-                    Verdict::Reject
-                )
-            });
+            let admitted = policies.import_reads_rov(info)
+                && RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
+                    !matches!(
+                        policies.import(info, family, prefix, attrs, s).verdict,
+                        Verdict::Reject
+                    )
+                });
             return if admitted {
                 Judged::Held {
                     by: Held::Policy,
