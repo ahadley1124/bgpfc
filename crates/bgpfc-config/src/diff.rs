@@ -31,6 +31,11 @@ pub struct ConfigDiff {
     /// §6.7), which ends at once if it already holds more routes than a
     /// new limit allows. A neighbor may be in the lists above too.
     pub prefix_limit_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, that `add-path send` sends a different
+    /// number of paths to for some family (RFC 7911 §5): the RIB applies it
+    /// to the running session and sends what the change adds or takes
+    /// away. A neighbor may be in the lists above too.
+    pub add_path_send_changed: Vec<IpAddr>,
     /// Neighbors in both with only a description change, or none.
     pub unchanged: Vec<IpAddr>,
     /// Which global settings changed.
@@ -93,6 +98,12 @@ impl ConfigDiff {
             let policy = policy_differs(old, o, new, n);
             let interval = o.advertisement_interval != n.advertisement_interval;
             let limit = o.maximum_prefix != n.maximum_prefix;
+            // `same_session` holds the families `add-path send` is on for
+            // the same: only how many paths each sends can differ.
+            let paths = o.add_path_send != n.add_path_send;
+            if paths {
+                d.add_path_send_changed.push(n.addr);
+            }
             if policy {
                 d.policy_changed.push(n.addr);
             }
@@ -102,7 +113,7 @@ impl ConfigDiff {
             if limit {
                 d.prefix_limit_changed.push(n.addr);
             }
-            if !policy && !interval && !limit {
+            if !policy && !interval && !limit && !paths {
                 d.unchanged.push(n.addr);
             }
         }
@@ -118,6 +129,7 @@ impl ConfigDiff {
             && self.policy_changed.is_empty()
             && self.interval_changed.is_empty()
             && self.prefix_limit_changed.is_empty()
+            && self.add_path_send_changed.is_empty()
             && self.global.is_empty()
     }
 }
@@ -303,6 +315,65 @@ mod tests {
             vec![addr("192.0.2.3")]
         );
         assert!(ConfigDiff::between(&c, &c).is_empty());
+    }
+
+    #[test]
+    fn add_path_resets_for_a_family_but_not_for_how_many_paths() {
+        let a = cfg(BASE);
+        let with = |extra: &str| {
+            cfg(&BASE.replace("remote-as 65002;", &format!("remote-as 65002; {extra}")))
+        };
+        // RFC 7911 §4: the capability is in the OPEN, so turning ADD-PATH
+        // on or off for a family changes the session.
+        for extra in [
+            "add-path receive ipv4-unicast yes;",
+            "add-path send ipv4-unicast 2;",
+            "add-path send ipv4-unicast all;",
+        ] {
+            let d = ConfigDiff::between(&a, &with(extra));
+            assert_eq!(d.reset, vec![addr("192.0.2.3")], "{extra}");
+            assert_eq!(d.add_path_send_changed, Vec::<IpAddr>::new(), "{extra}");
+            assert!(!d.is_empty());
+        }
+        // `no`, `off` and nothing are the same.
+        for same in [
+            "add-path receive ipv4-unicast no;",
+            "add-path send ipv4-unicast off;",
+        ] {
+            assert!(ConfigDiff::between(&a, &with(same)).is_empty(), "{same}");
+        }
+        // Another family is another session.
+        assert_eq!(
+            ConfigDiff::between(
+                &with("add-path send ipv4-unicast 2;"),
+                &with("add-path send ipv6-unicast 2;")
+            )
+            .reset,
+            vec![addr("192.0.2.3")]
+        );
+        // How many paths is the RIB's: no reset, a re-evaluation.
+        let two = with("add-path send ipv4-unicast 2;");
+        for (other, listed) in [
+            ("add-path send ipv4-unicast 3;", true),
+            ("add-path send ipv4-unicast all;", true),
+            ("add-path send ipv4-unicast 2;", false),
+        ] {
+            let d = ConfigDiff::between(&two, &with(other));
+            assert_eq!(d.reset, Vec::<IpAddr>::new(), "{other}");
+            assert_eq!(
+                d.add_path_send_changed,
+                if listed {
+                    vec![addr("192.0.2.3")]
+                } else {
+                    vec![]
+                },
+                "{other}"
+            );
+            assert_eq!(d.is_empty(), !listed, "{other}");
+            if listed {
+                assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+            }
+        }
     }
 
     #[test]

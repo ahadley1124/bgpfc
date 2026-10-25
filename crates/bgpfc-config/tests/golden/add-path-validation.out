@@ -1,0 +1,6 @@
+add-path-validation.conf:5:1: neighbor 2001:db8::4: add-path receive for ipv4-unicast, which is not in its families
+  neighbor 2001:db8::4 {
+  ^
+add-path-validation.conf:5:1: neighbor 2001:db8::4: add-path send for ipv4-unicast, which is not in its families
+  neighbor 2001:db8::4 {
+  ^

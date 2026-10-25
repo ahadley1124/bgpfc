@@ -253,10 +253,27 @@ Config {
                     1000,
                 ),
             ],
+            add_path_receive: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+            ],
+            add_path_send: [
+                (
+                    AddressFamily {
+                        afi: Ipv4,
+                        safi: Unicast,
+                    },
+                    Best(
+                        3,
+                    ),
+                ),
+            ],
         },
         Neighbor {
             pos: Pos {
-                line: 56,
+                line: 58,
                 col: 1,
             },
             addr: 2001:db8::2,
@@ -310,6 +327,21 @@ Config {
                         safi: Unicast,
                     },
                     1200000,
+                ),
+            ],
+            add_path_receive: [
+                AddressFamily {
+                    afi: Ipv6,
+                    safi: Unicast,
+                },
+            ],
+            add_path_send: [
+                (
+                    AddressFamily {
+                        afi: Ipv6,
+                        safi: Unicast,
+                    },
+                    All,
                 ),
             ],
         },
