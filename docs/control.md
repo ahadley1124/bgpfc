@@ -248,6 +248,9 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again. `router-id` and `local-as` changes are refused, and `listen`,
+again; a changed `invalid` statement of that block is applied to the
+running RIB alone, which judges its Invalid routes again (logged as one
+`rib: action for invalid routes` line with the counts) and leaves the
+client and the sessions alone. `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.

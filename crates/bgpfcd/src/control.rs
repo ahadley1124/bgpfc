@@ -2407,7 +2407,7 @@ mod tests {
         let set: VrpSet = vrps.iter().copied().collect();
         RpkiReport {
             config: rpki_block(
-                "rpki { mode external; cache 127.0.0.1 port 3323;
+                "rpki { mode external; invalid policy; cache 127.0.0.1 port 3323;
                  cache rtr.example.net preference 10; }",
             ),
             status: Some(Status {
@@ -2604,7 +2604,7 @@ mod tests {
         // The list names the cache in use another way: still that cache.
         let mut respelled = rpki_report(now, &[]);
         respelled.config = rpki_block(
-            "rpki { mode external; cache 127.0.0.1 port 3323;
+            "rpki { mode external; invalid policy; cache 127.0.0.1 port 3323;
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(

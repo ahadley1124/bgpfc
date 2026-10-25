@@ -130,6 +130,9 @@ struct Opts {
     unanswered: bool,
     /// The `mode` of the `rpki` block.
     mode: &'static str,
+    /// The `invalid` statement of the block: what bgpfcd does with the
+    /// routes that turn out Invalid.
+    invalid: &'static str,
     /// Whether a second BIRD, in C, takes the routes from bgpfcd.
     relay: bool,
 }
@@ -142,6 +145,9 @@ impl Opts {
             backup: None,
             unanswered: false,
             mode: "external",
+            // Nothing of its own: the scenarios that are about the
+            // states, not about acting on them, see every route.
+            invalid: "policy",
             relay: false,
         }
     }
@@ -246,7 +252,7 @@ impl Setup {
         bgpfcd_opts.extra = format!(
             "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}",
             socket.display(),
-            rpki_block(opts.mode, binds, unanswered)
+            rpki_block((opts.mode, opts.invalid), binds, unanswered)
         );
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &bgpfcd_opts);
         Setup {
@@ -430,7 +436,11 @@ impl Setup {
 
 /// The `rpki` block for the caches at `binds`, in that order of
 /// preference, after the one at `unanswered` if there is one.
-fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
+fn rpki_block(
+    (mode, invalid): (&str, &str),
+    binds: &[&str],
+    unanswered: Option<Ipv4Addr>,
+) -> String {
     let mut entries = String::new();
     if let Some(addr) = unanswered {
         let _ = write!(
@@ -448,7 +458,7 @@ fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> Strin
     }
     // The shortest back-off, so that a cache that comes back is found
     // within a second or two.
-    format!("rpki {{ mode {mode};{entries} backoff 1 1; }}")
+    format!("rpki {{ mode {mode}; invalid {invalid};{entries} backoff 1 1; }}")
 }
 
 /// The `session-id ... serial ...` line of `show rpki`.

@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bgpfc_rpki::RovState;
+use bgpfc_rpki::{InvalidAction, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -158,6 +158,13 @@ pub struct Rpki {
     pub backoff_min: Duration,
     /// The longest reconnect delay.
     pub backoff_max: Duration,
+    /// `invalid`: what the RIB does with a route whose state is Invalid,
+    /// before the policies an operator wrote (RFC 6811 §5). Required in
+    /// [`RpkiMode::External`]: RFC 8481 §5, "Absent specific operator
+    /// configuration, policy MUST NOT be applied", so no action is taken
+    /// that the operator did not name. [`InvalidAction::Policy`], which
+    /// does nothing of its own, where the block leaves it out.
+    pub invalid: InvalidAction,
 }
 
 impl Rpki {
@@ -190,10 +197,13 @@ impl Rpki {
 }
 
 impl Rpki {
-    /// Whether `other` asks for what `self` does: every setting the same,
-    /// and the same caches in the same order with the same preferences,
-    /// each host however it is spelled (see [`RpkiCache::is_at`]). A
-    /// reload leaves the RTR client alone unless this is false.
+    /// Whether `other` asks the RTR client for what `self` does: every
+    /// setting the same, and the same caches in the same order with the
+    /// same preferences, each host however it is spelled (see
+    /// [`RpkiCache::is_at`]). A reload leaves the RTR client alone unless
+    /// this is false. What the RIB does with Invalid routes
+    /// ([`Rpki::invalid`]) is no concern of the client: it changes with
+    /// the client running, and has its own change in a reload.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
@@ -208,6 +218,7 @@ impl Rpki {
             max_vrps,
             backoff_min,
             backoff_max,
+            invalid: _,
         } = self;
         *mode == other.mode
             && caches.len() == other.caches.len()
@@ -240,6 +251,7 @@ impl Default for Rpki {
             max_vrps: Rpki::DEFAULT_MAX_VRPS,
             backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
             backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
+            invalid: InvalidAction::Policy,
         }
     }
 }

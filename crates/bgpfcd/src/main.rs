@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
@@ -81,7 +82,8 @@ fn main() {
         local_as = config.local_as,
         router_id = config.router_id,
         fib_mode = config.fib.mode,
-        rpki = config.rpki.mode
+        rpki = config.rpki.mode,
+        invalid = config.rpki.invalid
     );
     // Issue #60: a cache that cannot be found stops the start, before
     // anything is opened, rather than leaving every route unvalidated.
@@ -183,6 +185,10 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
     // RFC 4271 §10: the advertisement intervals are jittered too.
     rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
+    // RFC 6811 §5, RFC 8481 §5: what is done with Invalid routes is what
+    // the file says, from the first route on. No route is held yet, so
+    // there is nothing to judge again.
+    rib.set_invalid_action(config.rpki.invalid, Instant::now(), &mut Vec::new());
     rib::spawn(
         rib,
         wiring::rib_settings(&config),
@@ -359,27 +365,12 @@ impl Coordinator<'_> {
                     let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
                     notes.push(done.map_or_else(|e| e, str::to_owned));
                 }
+                GlobalChange::RpkiInvalid => notes.push(format!(
+                    "invalid routes: {} (was {})",
+                    new.rpki.invalid, self.config.rpki.invalid
+                )),
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
-                GlobalChange::Fib => {
-                    if new.fib.table != self.config.fib.table
-                        || new.fib.protocol != self.config.fib.protocol
-                    {
-                        notes.push(
-                            "fib table or protocol changed: takes effect at the next restart"
-                                .to_owned(),
-                        );
-                    }
-                    if new.fib.mode != self.config.fib.mode {
-                        let (tx, rx) = sync_channel(1);
-                        if self
-                            .rib_tx
-                            .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
-                            .is_ok()
-                        {
-                            let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
-                        }
-                    }
-                }
+                GlobalChange::Fib => self.reload_fib(&new, &mut notes),
             }
         }
         // RFC 4486 §4: de-configured peers and peers whose session
@@ -396,6 +387,11 @@ impl Coordinator<'_> {
             policies: messages::NewPolicies(Box::new(engine)),
             reexport: diff.policy_changed.clone(),
         });
+        // RFC 6811 §5: so does what is done with Invalid routes. After the
+        // new policies, which the routes are judged by again.
+        if diff.global.contains(&GlobalChange::RpkiInvalid) {
+            let _ = self.rib_tx.send(RibMsg::SetInvalidAction(new.rpki.invalid));
+        }
         // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
         // file without a reset. Sent before new peers start, so their
         // sessions come up with the new values.
@@ -446,6 +442,25 @@ impl Coordinator<'_> {
         );
         self.config = new;
         Ok(summary)
+    }
+
+    /// Apply a changed `fib` block: the mode at once, the table and the
+    /// protocol number at the next restart.
+    fn reload_fib(&self, new: &bgpfc_config::Config, notes: &mut Vec<String>) {
+        if new.fib.table != self.config.fib.table || new.fib.protocol != self.config.fib.protocol {
+            notes
+                .push("fib table or protocol changed: takes effect at the next restart".to_owned());
+        }
+        if new.fib.mode != self.config.fib.mode {
+            let (tx, rx) = sync_channel(1);
+            if self
+                .rib_tx
+                .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
+                .is_ok()
+            {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
     }
 
     /// The running `rpki` block and its client's status.

@@ -328,6 +328,10 @@ pub(crate) enum RibMsg {
     /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
     /// coordinator when a reload turns validation off.
     Validation(bgpfc_rpki::ValidationChange),
+    /// What the RIB does with Invalid routes by itself changed, with a
+    /// reload (RFC 6811 §5): the RIB judges the routes it holds that are
+    /// Invalid again, with no session reset and no ROUTE-REFRESH.
+    SetInvalidAction(bgpfc_rpki::InvalidAction),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.

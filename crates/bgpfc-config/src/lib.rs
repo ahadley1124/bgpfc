@@ -11,7 +11,8 @@
 //! §9 and §10 (the `rpki` block: the Expire Interval cap and the
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
 //! the cache list with preferences); RFC 9234 §4, §4.2 (`role`,
-//! `role-strict`); RFC 6811 §3 (`match rpki` and `set rpki`).
+//! `role-strict`); RFC 6811 §3 (`match rpki` and `set rpki`), §5
+//! (`invalid`); RFC 8481 §5 (`invalid` is required with `mode external`).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

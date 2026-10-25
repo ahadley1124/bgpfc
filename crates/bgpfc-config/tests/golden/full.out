@@ -56,6 +56,7 @@ Config {
         max_vrps: 1000000,
         backoff_min: 2s,
         backoff_max: 300s,
+        invalid: PreferValid,
     },
     prefix_lists: [
         PrefixList {

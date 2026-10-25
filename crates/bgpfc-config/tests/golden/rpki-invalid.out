@@ -1,0 +1,37 @@
+Config {
+    router_id: RouterId(
+        3221225985,
+    ),
+    local_as: Asn(
+        65000,
+    ),
+    log_level: Info,
+    listen: [
+        [::]:179,
+    ],
+    fib: Fib {
+        mode: DryRun,
+        table: 254,
+        protocol: 186,
+    },
+    control: Control {
+        socket: None,
+        http: None,
+    },
+    rpki: Rpki {
+        mode: Disabled,
+        caches: [],
+        version: 1,
+        connect_timeout: 10s,
+        response_timeout: 60s,
+        reply_timeout: 1800s,
+        max_expire: 172800s,
+        max_vrps: 4000000,
+        backoff_min: 1s,
+        backoff_max: 600s,
+        invalid: PreferValid,
+    },
+    prefix_lists: [],
+    policies: [],
+    neighbors: [],
+}
