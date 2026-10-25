@@ -99,10 +99,13 @@ fn bench(c: &mut Criterion) {
     group.bench_function(format!("insert_{routes}_from_one_peer_to_one_peer"), |b| {
         b.iter(|| {
             let mut rib = Rib::new(Asn(65_000));
-            rib.peer_up(peer(1));
-            rib.peer_up(peer(2));
+            let mut out = Vec::new();
+            rib.peer_up(peer(1), &mut out);
+            rib.peer_up(peer(2), &mut out);
             for u in v4.iter().chain(&v6) {
-                black_box(rib.update(peer(1).addr, u));
+                rib.update(peer(1).addr, u, &mut out);
+                black_box(&out);
+                out.clear();
             }
             rib
         });
@@ -111,14 +114,20 @@ fn bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut rib = Rib::new(Asn(65_000));
-                rib.peer_up(peer(1));
-                rib.peer_up(peer(2));
+                let mut out = Vec::new();
+                rib.peer_up(peer(1), &mut out);
+                rib.peer_up(peer(2), &mut out);
                 for u in v4.iter().chain(&v6) {
-                    rib.update(peer(1).addr, u);
+                    rib.update(peer(1).addr, u, &mut out);
+                    out.clear();
                 }
                 rib
             },
-            |mut rib| black_box(rib.peer_down(peer(1).addr)),
+            |mut rib| {
+                let mut out = Vec::new();
+                rib.peer_down(peer(1).addr, &mut out);
+                black_box(out)
+            },
             criterion::BatchSize::LargeInput,
         );
     });

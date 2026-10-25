@@ -4,6 +4,7 @@
 //! RFC 4760 §5 (the same encoding for other address families), RFC 7606
 //! §5.3 (syntactic correctness of NLRI fields).
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -12,7 +13,9 @@ use crate::reader::{Reader, WriteBytes as _};
 use crate::types::Afi;
 
 /// An IP prefix in canonical form: host bits are zero.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Ordered IPv4 first, then by address, then by length.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prefix {
     /// An IPv4 prefix.
     V4 {
@@ -28,6 +31,32 @@ pub enum Prefix {
         /// Prefix length, 0..=128.
         len: u8,
     },
+}
+
+// The RIB and FIB tables are B-trees keyed by prefix, so every lookup
+// makes a score of these comparisons. Comparing the address as one integer
+// gives the order the derived impl gave (octets in order, most
+// significant first) at a fraction of the cost of comparing it octet by
+// octet.
+impl Ord for Prefix {
+    fn cmp(&self, other: &Prefix) -> Ordering {
+        match (self, other) {
+            (Prefix::V4 { addr: a, len: l }, Prefix::V4 { addr: b, len: m }) => {
+                u32::from(*a).cmp(&u32::from(*b)).then(l.cmp(m))
+            }
+            (Prefix::V6 { addr: a, len: l }, Prefix::V6 { addr: b, len: m }) => {
+                u128::from(*a).cmp(&u128::from(*b)).then(l.cmp(m))
+            }
+            (Prefix::V4 { .. }, Prefix::V6 { .. }) => Ordering::Less,
+            (Prefix::V6 { .. }, Prefix::V4 { .. }) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for Prefix {
+    fn partial_cmp(&self, other: &Prefix) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Prefix {

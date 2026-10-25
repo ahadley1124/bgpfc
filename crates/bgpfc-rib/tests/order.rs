@@ -125,11 +125,11 @@ fn run(steps: &[Step]) -> (Vec<(Prefix, IpAddr)>, Vec<Vec<Prefix>>) {
     let infos = peers();
     let mut rib = Rib::new(LOCAL_AS);
     for info in &infos {
-        rib.peer_up(info.clone());
+        rib.peer_up(info.clone(), &mut Vec::new());
     }
     for s in steps {
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info));
+        rib.update(info.addr, &update(s, info), &mut Vec::new());
     }
     let best = rib.loc_rib(V4).map(|(p, b)| (p, b.peer)).collect();
     let outs = infos

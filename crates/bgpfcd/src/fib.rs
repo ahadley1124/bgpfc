@@ -9,8 +9,9 @@ use bgpfc_fib::{Applied, Fib, Mode, Op};
 
 use crate::messages::{FibMsg, FibReport};
 
-/// Changes the RIB thread may queue before it blocks.
-const QUEUE: usize = 4096;
+/// Batches of changes the RIB thread may queue before it blocks. A batch
+/// is one RIB input's changes, or [`crate::rib::FIB_BATCH`] of a long one.
+const QUEUE: usize = 64;
 
 /// Open the socket, flush stale routes (AGENTS.md §3: only those with
 /// our protocol number), and start the thread.
@@ -32,7 +33,13 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
 fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
-            FibMsg::Change(c) => report(&fib.set(c.prefix, c.next_hop)),
+            FibMsg::Changes(changes) => {
+                for c in changes {
+                    if let Some(applied) = fib.set(c.prefix, c.next_hop) {
+                        report(std::slice::from_ref(&applied));
+                    }
+                }
+            }
             FibMsg::SetMode(mode, reply) => {
                 bgpfc_log::info!("fib: mode", mode = mode);
                 let applied = fib.set_mode(mode);
@@ -42,8 +49,8 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
             FibMsg::Query(reply) => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    desired: fib.desired().clone(),
-                    installed: fib.installed().clone(),
+                    desired: fib.desired(),
+                    installed: fib.installed(),
                 });
             }
             FibMsg::Shutdown(done) => {

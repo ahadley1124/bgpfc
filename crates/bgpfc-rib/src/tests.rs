@@ -14,10 +14,17 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
 use crate::attrs::PathAttrs;
-use crate::decision::{Candidate, best};
+use crate::decision::{Candidate, Neighbor, best};
 use crate::export::{Source, export, prepend};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
+
+/// Run one RIB input and collect what it produced.
+fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
+    let mut out = Vec::new();
+    input(&mut out);
+    out
+}
 
 const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
 const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
@@ -76,14 +83,12 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     }
 }
 
-fn candidate(info: &PeerInfo, a: PathAttrs) -> Candidate {
-    Candidate {
-        peer: info.addr,
-        kind: info.kind,
-        router_id: info.router_id.to_u32(),
-        remote_as: info.remote_as,
-        attrs: Arc::new(a),
-    }
+/// Phase 2 over routes given as (peer, attributes).
+fn best_of(routes: &[(&PeerInfo, PathAttrs)]) -> Option<usize> {
+    best(routes.len(), |i| Candidate {
+        from: Neighbor::of(routes[i].0),
+        attrs: &routes[i].1,
+    })
 }
 
 fn announce(prefixes: &[&str], a: &PathAttrs) -> DecodedUpdate {
@@ -159,8 +164,8 @@ fn degree_of_preference_wins_first() {
     a.local_pref = Some(200);
     let b = attrs(&[1], "10.0.0.2");
     // Longer path, but a higher LOCAL_PREF.
-    let c = [candidate(&i1, a), candidate(&i2, b)];
-    assert_eq!(best(&c), Some(0));
+    let c = [(&i1, a), (&i2, b)];
+    assert_eq!(best_of(&c), Some(0));
 }
 
 #[test]
@@ -168,10 +173,10 @@ fn shorter_as_path_wins() {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     let c = [
-        candidate(&e1, attrs(&[65_001, 7, 8], "10.0.0.1")),
-        candidate(&e2, attrs(&[65_002, 7], "10.0.0.2")),
+        (&e1, attrs(&[65_001, 7, 8], "10.0.0.1")),
+        (&e2, attrs(&[65_002, 7], "10.0.0.2")),
     ];
-    assert_eq!(best(&c), Some(1));
+    assert_eq!(best_of(&c), Some(1));
 }
 
 #[test]
@@ -186,8 +191,8 @@ fn as_set_counts_as_one_hop() {
     });
     let b = attrs(&[65_002, 9, 9], "10.0.0.2");
     // a: 1 + 1 (the set) = 2 hops; b: 3 hops.
-    let c = [candidate(&e1, a), candidate(&e2, b)];
-    assert_eq!(best(&c), Some(0));
+    let c = [(&e1, a), (&e2, b)];
+    assert_eq!(best_of(&c), Some(0));
 }
 
 #[test]
@@ -198,8 +203,8 @@ fn lower_origin_wins() {
     a.origin = Origin::Incomplete;
     let mut b = attrs(&[65_002], "10.0.0.2");
     b.origin = Origin::Egp;
-    let c = [candidate(&e1, a), candidate(&e2, b)];
-    assert_eq!(best(&c), Some(1));
+    let c = [(&e1, a), (&e2, b)];
+    assert_eq!(best_of(&c), Some(1));
 }
 
 #[test]
@@ -215,27 +220,52 @@ fn med_compares_within_the_neighboring_as_only() {
     third.med = Some(5);
     // Same AS: b beats a on MED. Across ASes MED does not count, so b
     // and c3 go on to the router-id step, where b (id 2) wins.
-    let c = [
-        candidate(&e1, first),
-        candidate(&e2, second),
-        candidate(&e3, third),
-    ];
-    assert_eq!(best(&c), Some(1));
+    let c = [(&e1, first), (&e2, second), (&e3, third)];
+    assert_eq!(best_of(&c), Some(1));
     // A missing MED is the lowest value.
     let mut no_med = attrs(&[65_001], "10.0.0.1");
     no_med.med = None;
     let mut zero_med = attrs(&[65_001], "10.0.0.2");
     zero_med.med = Some(0);
-    let c = [candidate(&e1, no_med), candidate(&e2, zero_med)];
+    let c = [(&e1, no_med), (&e2, zero_med)];
     // Equal MED (0): router id decides, e1 has the lower one.
-    assert_eq!(best(&c), Some(0));
+    assert_eq!(best_of(&c), Some(0));
     let mut one_med = attrs(&[65_001], "10.0.0.2");
     one_med.med = Some(1);
-    let c = [
-        candidate(&e2, one_med),
-        candidate(&e1, attrs(&[65_001], "10.0.0.1")),
-    ];
-    assert_eq!(best(&c), Some(1));
+    let c = [(&e2, one_med), (&e1, attrs(&[65_001], "10.0.0.1"))];
+    assert_eq!(best_of(&c), Some(1));
+}
+
+#[test]
+fn med_outcome_does_not_depend_on_candidate_order() {
+    // Pairwise MED comparison is not transitive here: a beats b on MED
+    // (same AS), b beats c on router id (different AS, MED not
+    // compared), c beats a on router id. Ranking each route against all
+    // routes of its AS first makes the winner the same in every order.
+    let e1 = peer("10.0.0.1", 65_001, 3);
+    let e2 = peer("10.0.0.2", 65_001, 1);
+    let e3 = peer("10.0.0.3", 65_003, 2);
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.med = Some(5);
+    let mut b = attrs(&[65_001], "10.0.0.2");
+    b.med = Some(10);
+    let c = attrs(&[65_003], "10.0.0.3");
+    let routes = [(&e1, a), (&e2, b), (&e3, c)];
+    let winner = |order: [usize; 3]| {
+        let r: Vec<_> = order.iter().map(|i| routes[*i].clone()).collect();
+        order[best_of(&r).unwrap()]
+    };
+    // b is out on MED; of a and c, c has the lower router id.
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        assert_eq!(winner(order), 2, "{order:?}");
+    }
 }
 
 #[test]
@@ -247,8 +277,8 @@ fn med_uses_the_leftmost_as_for_internal_routes() {
     a.med = Some(20);
     let mut b = attrs(&[65_001, 6], "10.0.0.2");
     b.med = Some(10);
-    let c = [candidate(&i1, a), candidate(&i2, b)];
-    assert_eq!(best(&c), Some(1));
+    let c = [(&i1, a), (&i2, b)];
+    assert_eq!(best_of(&c), Some(1));
 }
 
 #[test]
@@ -256,10 +286,10 @@ fn external_beats_internal() {
     let i = peer("10.0.0.1", 65_000, 1);
     let e = peer("10.0.0.2", 65_002, 2);
     let c = [
-        candidate(&i, attrs(&[65_002], "10.0.0.1")),
-        candidate(&e, attrs(&[65_002], "10.0.0.2")),
+        (&i, attrs(&[65_002], "10.0.0.1")),
+        (&e, attrs(&[65_002], "10.0.0.2")),
     ];
-    assert_eq!(best(&c), Some(1));
+    assert_eq!(best_of(&c), Some(1));
 }
 
 #[test]
@@ -267,17 +297,17 @@ fn lower_router_id_then_lower_peer_address() {
     let e1 = peer("10.0.0.9", 65_001, 5);
     let e2 = peer("10.0.0.2", 65_002, 7);
     let c = [
-        candidate(&e1, attrs(&[65_001], "10.0.0.9")),
-        candidate(&e2, attrs(&[65_002], "10.0.0.2")),
+        (&e1, attrs(&[65_001], "10.0.0.9")),
+        (&e2, attrs(&[65_002], "10.0.0.2")),
     ];
-    assert_eq!(best(&c), Some(0));
+    assert_eq!(best_of(&c), Some(0));
     let e3 = peer("10.0.0.2", 65_002, 5);
     let c = [
-        candidate(&e1, attrs(&[65_001], "10.0.0.9")),
-        candidate(&e3, attrs(&[65_002], "10.0.0.2")),
+        (&e1, attrs(&[65_001], "10.0.0.9")),
+        (&e3, attrs(&[65_002], "10.0.0.2")),
     ];
-    assert_eq!(best(&c), Some(1));
-    assert_eq!(best(&[]), None);
+    assert_eq!(best_of(&c), Some(1));
+    assert_eq!(best_of(&[]), None);
 }
 
 // --- RFC 4271 §5.1, §9.2 export rules ----------------------------------
@@ -426,10 +456,16 @@ fn announce_withdraw_and_fib_changes() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    assert_eq!(rib.peer_up(e1.clone()).len(), 0);
-    assert_eq!(rib.peer_up(e2.clone()).len(), 0);
+    assert_eq!(outputs(|o| rib.peer_up(e1.clone(), o)).len(), 0);
+    assert_eq!(outputs(|o| rib.peer_up(e2.clone(), o)).len(), 0);
     let a = attrs(&[65_001, 7], "10.0.0.1");
-    let out = rib.update(e1.addr, &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a));
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            o,
+        );
+    });
     assert_eq!(
         fib(&out),
         vec![
@@ -465,13 +501,13 @@ fn announce_withdraw_and_fib_changes() {
     );
 
     // Re-announcing the same thing changes nothing.
-    let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a));
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
     assert!(out.is_empty(), "{out:?}");
 
     // A better route from e2 (shorter path) replaces it: e1 is told,
     // e2 is not.
     let b = attrs(&[65_002], "10.0.0.2");
-    let out = rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b));
+    let out = outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.2")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
@@ -480,10 +516,10 @@ fn announce_withdraw_and_fib_changes() {
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     assert_eq!(m[0].nlri.len(), 0);
     assert_eq!(rib.loc_rib(V4).count(), 2);
-    assert_eq!(rib.candidates(V4, p("192.0.2.0/24")).len(), 2);
+    assert_eq!(rib.candidates(V4, p("192.0.2.0/24")).count(), 2);
 
     // Withdraw from e2: back to e1's route; e2 gets it, e1 gets a withdraw.
-    let out = rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]));
+    let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
@@ -491,7 +527,7 @@ fn announce_withdraw_and_fib_changes() {
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
 
     // Peer down: everything from e1 goes.
-    let out = rib.peer_down(e1.addr);
+    let out = outputs(|o| rib.peer_down(e1.addr, o));
     let f = fib(&out);
     assert_eq!(f.len(), 2);
     assert!(f.iter().all(|c| c.next_hop.is_none()));
@@ -507,26 +543,32 @@ fn leftmost_as_must_be_the_external_peer() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
     let i1 = peer("10.0.0.3", 65_000, 3);
-    rib.peer_up(e1.clone());
-    rib.peer_up(i1.clone());
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(i1.clone(), o));
     // RFC 7606 §7.2: an external route not starting with the peer's AS is
     // treated as withdrawn.
-    let out = rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24"], &attrs(&[65_009], "10.0.0.1")),
-    );
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_009], "10.0.0.1")),
+            o,
+        );
+    });
     assert_eq!(fib(&out).len(), 0);
     assert_eq!(rib.loc_rib(V4).count(), 0);
     // An empty path from an external peer likewise.
-    let out = rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24"], &attrs(&[], "10.0.0.1")),
-    );
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[], "10.0.0.1")),
+            o,
+        );
+    });
     assert_eq!(fib(&out).len(), 0);
     // Internal peers may relay any path, including an empty one.
     let mut a = attrs(&[65_009], "10.0.0.3");
     a.local_pref = Some(100);
-    let out = rib.update(i1.addr, &announce(&["192.0.2.0/24"], &a));
+    let out = outputs(|o| rib.update(i1.addr, &announce(&["192.0.2.0/24"], &a), o));
     assert_eq!(fib(&out).len(), 1);
 }
 
@@ -536,10 +578,10 @@ fn prefix_in_both_withdrawn_and_nlri_is_announced() {
     // as not withdrawn.
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
-    rib.peer_up(e1.clone());
+    outputs(|o| rib.peer_up(e1.clone(), o));
     let mut u = announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1"));
     u.message.withdrawn = vec![p("192.0.2.0/24")];
-    let out = rib.update(e1.addr, &u);
+    let out = outputs(|o| rib.update(e1.addr, &u, o));
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
     assert_eq!(rib.loc_rib(V4).count(), 1);
@@ -549,16 +591,16 @@ fn prefix_in_both_withdrawn_and_nlri_is_announced() {
 fn as_loop_routes_are_excluded() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
-    rib.peer_up(e1.clone());
+    outputs(|o| rib.peer_up(e1.clone(), o));
     let a = attrs(&[65_001, LOCAL_AS.0, 7], "10.0.0.1");
-    let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a));
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
     assert_eq!(out.len(), 0);
     assert_eq!(rib.loc_rib(V4).count(), 0);
     // A replacement with a loop withdraws the earlier good route.
     let good = attrs(&[65_001], "10.0.0.1");
-    rib.update(e1.addr, &announce(&["192.0.2.0/24"], &good));
+    outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &good), o));
     assert_eq!(rib.loc_rib(V4).count(), 1);
-    let out = rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a));
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
     assert_eq!(fib(&out)[0].next_hop, None);
 }
 
@@ -566,17 +608,23 @@ fn as_loop_routes_are_excluded() {
 fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
-    rib.peer_up(e1.clone());
-    rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
-    );
-    rib.update(
-        e1.addr,
-        &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
-    );
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
+            o,
+        );
+    });
     let i = peer("10.0.0.3", 65_000, 3);
-    let out = rib.peer_up(i.clone());
+    let out = outputs(|o| rib.peer_up(i.clone(), o));
     let s = sends(&out, i.addr);
     assert_eq!(s.len(), 2, "one batch per family");
     let v4 = decode_sent(s[0], &i);
@@ -587,7 +635,7 @@ fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     assert_eq!(r.family, V6);
     assert_eq!(r.nlri, vec![p("2001:db8:1::/48")]);
     // Refresh: the same again, no FIB change.
-    let out = rib.refresh(i.addr, V6);
+    let out = outputs(|o| rib.refresh(i.addr, V6, o));
     assert_eq!(fib(&out).len(), 0);
     let v6 = decode_sent(sends(&out, i.addr)[0], &i);
     assert_eq!(
@@ -597,40 +645,52 @@ fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     // A family the peer does not speak: nothing.
     let mut v4_only = peer("10.0.0.4", 65_004, 4);
     v4_only.families = vec![V4];
-    let out = rib.peer_up(v4_only.clone());
+    let out = outputs(|o| rib.peer_up(v4_only.clone(), o));
     assert_eq!(sends(&out, v4_only.addr).len(), 1);
-    assert_eq!(rib.refresh(v4_only.addr, V6).len(), 0);
-    assert_eq!(rib.refresh(ip("10.9.9.9"), V4).len(), 0);
+    assert_eq!(outputs(|o| rib.refresh(v4_only.addr, V6, o)).len(), 0);
+    assert_eq!(outputs(|o| rib.refresh(ip("10.9.9.9"), V4, o)).len(), 0);
 }
 
 #[test]
 fn family_disable_drops_that_family_only() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
-    rib.peer_up(e1.clone());
-    rib.update(
-        e1.addr,
-        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
-    );
-    rib.update(
-        e1.addr,
-        &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
-    );
-    let out = rib.family_disabled(e1.addr, V6);
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
+            o,
+        );
+    });
+    let out = outputs(|o| rib.family_disabled(e1.addr, V6, o));
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(rib.loc_rib(V6).count(), 0);
     assert_eq!(rib.loc_rib(V4).count(), 1);
     // Later IPv6 announcements are ignored.
-    let out = rib.update(
-        e1.addr,
-        &announce(&["2001:db8:2::/48"], &attrs(&[65_001], "2001:db8::1")),
-    );
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["2001:db8:2::/48"], &attrs(&[65_001], "2001:db8::1")),
+            o,
+        );
+    });
     assert_eq!(out.len(), 0);
     // Unknown peers are ignored everywhere.
-    let out = rib.update(ip("10.9.9.9"), &withdraw(&["192.0.2.0/24"]));
+    let out = outputs(|o| rib.update(ip("10.9.9.9"), &withdraw(&["192.0.2.0/24"]), o));
     assert_eq!(out.len(), 0);
-    assert_eq!(rib.peer_down(ip("10.9.9.9")).len(), 0);
-    assert_eq!(rib.family_disabled(ip("10.9.9.9"), V4).len(), 0);
+    assert_eq!(outputs(|o| rib.peer_down(ip("10.9.9.9"), o)).len(), 0);
+    assert_eq!(
+        outputs(|o| rib.family_disabled(ip("10.9.9.9"), V4, o)).len(),
+        0
+    );
 }
 
 #[test]
@@ -639,15 +699,15 @@ fn large_batches_are_packed_within_the_message_limit() {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let mut e2 = peer("10.0.0.2", 65_002, 2);
     e2.four_octet_as = false;
-    rib.peer_up(e1.clone());
-    rib.peer_up(e2.clone());
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(e2.clone(), o));
     // 3000 /24s: more than fit in one 4096-octet UPDATE.
     let prefixes: Vec<String> = (0..3000u32)
         .map(|i| format!("10.{}.{}.0/24", (i >> 8) + 1, i & 0xff))
         .collect();
     let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
     let a = attrs(&[65_001, 4_200_000_000], "10.0.0.1");
-    let out = rib.update(e1.addr, &announce(&refs, &a));
+    let out = outputs(|o| rib.update(e1.addr, &announce(&refs, &a), o));
     let s = sends(&out, e2.addr);
     assert_eq!(s.len(), 1);
     let msgs = decode_sent(s[0], &e2);
@@ -660,12 +720,13 @@ fn large_batches_are_packed_within_the_message_limit() {
         vec![LOCAL_AS, Asn(65_001), Asn(4_200_000_000)]
     );
     // Withdrawing them all packs likewise.
-    let out = rib.peer_down(e1.addr);
+    let out = outputs(|o| rib.peer_down(e1.addr, o));
     let msgs = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert!(msgs.len() > 1);
     let total: usize = msgs.iter().map(|m| m.withdrawn.len()).sum();
     assert_eq!(total, 3000);
-    assert!(rib.attribute_sets() >= 1);
+    // Nothing uses an attribute set any more, and none is kept.
+    assert_eq!(rib.attribute_sets(), 0);
 }
 
 #[test]
@@ -738,20 +799,23 @@ fn reexport_sends_only_the_difference() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
-    rib.peer_up(e1.clone());
-    rib.peer_up(e2.clone());
-    rib.update(
-        e1.addr,
-        &announce(
-            &["192.0.2.0/24", "198.51.100.0/24"],
-            &attrs(&[65_001], "10.0.0.1"),
-        ),
-    );
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(e2.clone(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(
+                &["192.0.2.0/24", "198.51.100.0/24"],
+                &attrs(&[65_001], "10.0.0.1"),
+            ),
+            o,
+        );
+    });
     assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 2);
     // Nothing changed: nothing sent.
-    assert_eq!(rib.reexport(e2.addr, V4).len(), 0);
+    assert_eq!(outputs(|o| rib.reexport(e2.addr, V4, o)).len(), 0);
     rib.set_policies(Box::new(DropOdd));
-    let out = rib.reexport(e2.addr, V4);
+    let out = outputs(|o| rib.reexport(e2.addr, V4, o));
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m.len(), 1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
@@ -759,5 +823,268 @@ fn reexport_sends_only_the_difference() {
     assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 1);
     assert!(rib.peer(e2.addr).is_some());
     assert!(rib.peer(ip("10.9.9.9")).is_none());
-    assert_eq!(rib.reexport(ip("10.9.9.9"), V4).len(), 0);
+    assert_eq!(outputs(|o| rib.reexport(ip("10.9.9.9"), V4, o)).len(), 0);
+}
+
+#[test]
+fn peer_down_leaves_no_route_for_the_next_peer_in_its_slot() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let mut e1 = peer("10.0.0.1", 65_001, 1);
+    e1.families = vec![V4];
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+            o,
+        );
+    });
+    // A family the session did not negotiate: still stored (the decoder
+    // does not filter by family), so peer down must look there too.
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
+            o,
+        );
+    });
+    assert_eq!(rib.loc_rib(V6).count(), 1);
+    let out = outputs(|o| rib.peer_down(e1.addr, o));
+    assert_eq!(fib(&out).len(), 2);
+    assert_eq!(rib.loc_rib(V4).count(), 0);
+    assert_eq!(rib.loc_rib(V6).count(), 0);
+    // The next peer takes the free slot and inherits nothing.
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e2.clone(), o));
+    assert_eq!(rib.candidates(V6, p("2001:db8:1::/48")).count(), 0);
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_002], "10.0.0.2")),
+            o,
+        );
+    });
+    let routes: Vec<IpAddr> = rib
+        .candidates(V4, p("192.0.2.0/24"))
+        .map(|r| r.peer)
+        .collect();
+    assert_eq!(routes, vec![e2.addr]);
+    assert_eq!(
+        rib.peer_stats(e2.addr).unwrap().received,
+        vec![(V4, 1), (V6, 0)]
+    );
+}
+
+#[test]
+fn best_route_is_listed_first() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let e3 = peer("10.0.0.3", 65_003, 3);
+    for e in [&e1, &e2, &e3] {
+        outputs(|o| rib.peer_up(e.clone(), o));
+    }
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001, 7, 8], "10.0.0.1")),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_002], "10.0.0.2")),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e3.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_003, 7], "10.0.0.3")),
+            o,
+        );
+    });
+    let order = |rib: &Rib| -> Vec<IpAddr> {
+        rib.candidates(V4, p("192.0.2.0/24"))
+            .map(|r| r.peer)
+            .collect()
+    };
+    assert_eq!(order(&rib)[0], e2.addr);
+    assert_eq!(order(&rib).len(), 3);
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e2.addr);
+    // The best goes: the next best (shorter path) takes its place.
+    let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
+    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.3")));
+    assert_eq!(order(&rib), vec![e3.addr, e1.addr]);
+    // A non-best route going changes nothing.
+    let out = outputs(|o| rib.update(e1.addr, &withdraw(&["192.0.2.0/24"]), o));
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(order(&rib), vec![e3.addr]);
+}
+
+#[test]
+fn interner_releases_a_set_with_its_last_holder() {
+    let mut i = crate::attrs::Interner::default();
+    let a = i.intern(attrs(&[1], "10.0.0.1"));
+    let b = i.intern(attrs(&[1], "10.0.0.1"));
+    // Another holder remains: the set stays.
+    i.release(a);
+    assert_eq!(i.len(), 1);
+    i.release(b);
+    assert_eq!(i.len(), 0);
+    // Equal attributes in an allocation the interner does not hold leave
+    // its entry alone.
+    let held = i.intern(attrs(&[2], "10.0.0.1"));
+    let stranger = Arc::new(attrs(&[2], "10.0.0.1"));
+    i.release(Arc::clone(&stranger));
+    assert_eq!(i.len(), 1);
+    drop(stranger);
+    i.release(held);
+    assert_eq!(i.len(), 0);
+}
+
+#[test]
+fn attribute_sets_go_with_their_last_route() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i3 = peer("10.0.0.3", 65_000, 3);
+    for p in [&e1, &e2, &i3] {
+        outputs(|o| rib.peer_up(p.clone(), o));
+    }
+    let a = attrs(&[65_001, 7], "10.0.0.1");
+    let b = attrs(&[65_002], "10.0.0.2");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            o,
+        );
+    });
+    outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
+    // Received sets a and b, and what each is exported as to the others.
+    assert!(rib.attribute_sets() >= 4, "{}", rib.attribute_sets());
+    // Replacing a route lets its old set go once nothing uses it.
+    let a2 = attrs(&[65_001, 8], "10.0.0.1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a2),
+            o,
+        );
+    });
+    let held = rib.attribute_sets();
+    outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
+    assert!(rib.attribute_sets() < held);
+    outputs(|o| {
+        rib.update(e1.addr, &withdraw(&["192.0.2.0/24", "198.51.100.0/24"]), o);
+    });
+    assert_eq!(rib.attribute_sets(), 0);
+
+    // The same through peer down, including what the peer was sent.
+    outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
+    outputs(|o| rib.update(e2.addr, &announce(&["198.51.100.0/24"], &b), o));
+    assert!(rib.attribute_sets() > 0);
+    outputs(|o| rib.peer_down(e1.addr, o));
+    outputs(|o| rib.peer_down(e2.addr, o));
+    assert_eq!(rib.attribute_sets(), 0);
+}
+
+#[test]
+fn a_prefix_listed_twice_in_an_update_changes_once() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), o));
+    outputs(|o| rib.peer_up(e2.clone(), o));
+    let a = attrs(&[65_001], "10.0.0.1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            o,
+        );
+    });
+    // Withdrawn and announced again unchanged, in one UPDATE: the best
+    // route before and after is the same, so nothing follows.
+    let mut again = announce(&["192.0.2.0/24"], &a);
+    again.message.withdrawn = vec![p("192.0.2.0/24")];
+    let out = outputs(|o| rib.update(e1.addr, &again, o));
+    assert!(out.is_empty(), "{out:?}");
+    // The same with new attributes, the prefix twice in the NLRI too:
+    // one FIB change, one announcement to e2.
+    let longer = attrs(&[65_001, 9], "10.0.0.9");
+    let mut twice = announce(
+        &["192.0.2.0/24", "198.51.100.0/24", "192.0.2.0/24"],
+        &longer,
+    );
+    twice.message.withdrawn = vec![p("192.0.2.0/24")];
+    let out = outputs(|o| rib.update(e1.addr, &twice, o));
+    let changes = fib(&out);
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert_eq!(changes[0].prefix, p("192.0.2.0/24"));
+    assert_eq!(changes[0].next_hop, Some(ip("10.0.0.9")));
+    let sent = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].withdrawn.len(), 0);
+    assert_eq!(sent[0].nlri, vec![p("192.0.2.0/24"), p("198.51.100.0/24")]);
+    assert_eq!(rib.loc_rib(V4).count(), 2);
+}
+
+#[test]
+fn attribute_hash_follows_every_field() {
+    use bgpfc_wire::community::{ExtendedCommunity, LargeCommunity};
+    use std::hash::BuildHasher;
+    let hasher = std::collections::hash_map::RandomState::new();
+    let mut base = attrs(&[65_001, 7], "10.0.0.1");
+    base.med = Some(5);
+    base.local_pref = Some(100);
+    base.aggregator = Some(bgpfc_wire::attribute::Aggregator {
+        asn: Asn(65_001),
+        address: Ipv4Addr::new(1, 1, 1, 1),
+    });
+    base.communities = vec![Community::new(65_001, 1)];
+    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)];
+    base.large_communities = vec![LargeCommunity {
+        global: 1,
+        local1: 2,
+        local2: 3,
+    }];
+    base.unknown = vec![crate::attrs::UnknownAttribute {
+        flags: 0xc0,
+        code: 200,
+        value: vec![1, 2],
+    }];
+    assert_eq!(hasher.hash_one(&base), hasher.hash_one(base.clone()));
+    let changes: Vec<fn(&mut PathAttrs)> = vec![
+        |a| a.origin = Origin::Egp,
+        |a| a.as_path = AsPath::sequence(&[Asn(65_001), Asn(8)]),
+        |a| a.as_path = AsPath::sequence(&[Asn(65_001)]),
+        |a| a.next_hop = NextHop::Ipv4(Ipv4Addr::new(10, 0, 0, 2)),
+        |a| a.med = None,
+        |a| a.local_pref = Some(5),
+        |a| a.atomic_aggregate = true,
+        |a| a.aggregator = None,
+        |a| a.communities.push(Community::new(65_001, 2)),
+        |a| a.ext_communities.clear(),
+        |a| a.large_communities[0].local2 = 4,
+        |a| a.unknown[0].value.push(3),
+        |a| {
+            a.next_hop = NextHop::Ipv6 {
+                global: "2001:db8::1".parse().unwrap(),
+                link_local: Some("fe80::1".parse().unwrap()),
+            };
+        },
+    ];
+    for (i, change) in changes.iter().enumerate() {
+        let mut other = base.clone();
+        change(&mut other);
+        assert_ne!(other, base, "change {i}");
+        assert_ne!(
+            hasher.hash_one(&other),
+            hasher.hash_one(&base),
+            "change {i}"
+        );
+    }
 }

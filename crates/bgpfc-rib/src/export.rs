@@ -9,6 +9,8 @@
 //! (non-transitive extended communities stay in the AS); RFC 2545 §3
 //! (IPv6 next hops); RFC 8654 §4 (65535-octet UPDATEs).
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -142,20 +144,32 @@ pub fn prepend(as_path: &AsPath, asn: Asn) -> AsPath {
 pub struct Batch {
     /// Prefixes to withdraw.
     pub withdraw: Vec<Prefix>,
-    /// Prefixes to announce, per attribute set.
-    pub announce: Vec<(Arc<PathAttrs>, Vec<Prefix>)>,
+    /// Prefixes to announce, per attribute set, in the order the sets
+    /// were first announced.
+    announce: Vec<(Arc<PathAttrs>, Vec<Prefix>)>,
+    /// The position of each set in `announce`, by its address. A full
+    /// table sent to a new peer has tens of thousands of sets, too many to
+    /// search for every prefix. The batch holds every set it indexes, so
+    /// no address is reused while it is in here.
+    index: HashMap<usize, usize>,
 }
 
 impl Batch {
     /// Record an announcement.
     pub fn announce(&mut self, attrs: &Arc<PathAttrs>, prefix: Prefix) {
-        match self
-            .announce
-            .iter_mut()
-            .find(|(a, _)| Arc::ptr_eq(a, attrs))
+        // The prefixes of an UPDATE share a set: try the last one first.
+        if let Some((last, prefixes)) = self.announce.last_mut()
+            && Arc::ptr_eq(last, attrs)
         {
-            Some((_, v)) => v.push(prefix),
-            None => self.announce.push((Arc::clone(attrs), vec![prefix])),
+            prefixes.push(prefix);
+            return;
+        }
+        match self.index.entry(Arc::as_ptr(attrs).addr()) {
+            Entry::Occupied(e) => self.announce[*e.get()].1.push(prefix),
+            Entry::Vacant(e) => {
+                e.insert(self.announce.len());
+                self.announce.push((Arc::clone(attrs), vec![prefix]));
+            }
         }
     }
 

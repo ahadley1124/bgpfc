@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
-pub use reconcile::{Op, Table};
+pub use reconcile::{Op, Routes, Table};
 pub use route::RouteMsg;
 
 /// Whether operations are sent to the kernel.
@@ -100,11 +100,15 @@ pub struct Fib {
     mode: Mode,
     table: u32,
     protocol: u8,
-    desired: Table,
-    installed: Table,
+    /// The desired and the installed routes.
+    routes: Routes,
     seq: u32,
     #[cfg(not(miri))]
     socket: Option<bgpfc_sys::NetlinkSocket>,
+    /// The buffer acknowledgements are read into, kept between
+    /// operations: install mode sends one per route.
+    #[cfg(not(miri))]
+    ack: Vec<u8>,
 }
 
 impl Fib {
@@ -115,11 +119,12 @@ impl Fib {
             mode,
             table,
             protocol,
-            desired: Table::new(),
-            installed: Table::new(),
+            routes: Routes::new(),
             seq: 1,
             #[cfg(not(miri))]
             socket: None,
+            #[cfg(not(miri))]
+            ack: Vec::new(),
         }
     }
 
@@ -129,16 +134,17 @@ impl Fib {
         self.mode
     }
 
-    /// Routes the RIB wants.
+    /// Routes the RIB wants, as a table built for the caller.
     #[must_use]
-    pub fn desired(&self) -> &Table {
-        &self.desired
+    pub fn desired(&self) -> Table {
+        self.routes.desired_table()
     }
 
-    /// Routes believed to be in the kernel with our protocol number.
+    /// Routes believed to be in the kernel with our protocol number, as a
+    /// table built for the caller.
     #[must_use]
-    pub fn installed(&self) -> &Table {
-        &self.installed
+    pub fn installed(&self) -> Table {
+        self.routes.installed_table()
     }
 
     /// Open the netlink socket. Needs no privilege; install mode needs
@@ -173,43 +179,29 @@ impl Fib {
                 }
             }
         }
-        self.installed = installed;
+        self.routes.set_installed(&installed);
         Ok(self.reconcile())
     }
 
     /// Change the desired route for `prefix` (`None` deletes) and apply
-    /// what follows.
-    pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Vec<Applied> {
-        let previous = self.desired.get(&prefix).copied();
-        match gateway {
-            Some(gw) => {
-                self.desired.insert(prefix, gw);
-            }
-            None => {
-                self.desired.remove(&prefix);
-            }
-        }
+    /// what follows: at most one operation.
+    pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Option<Applied> {
+        let previous = self.routes.set_desired(prefix, gateway);
         // Dry-run installs nothing, so what it reports is the change to
         // the desired table itself: what install mode would have done.
         let reference = if self.mode == Mode::DryRun {
             previous
         } else {
-            self.installed.get(&prefix).copied()
+            self.routes.installed(&prefix)
         };
         // Only this prefix can differ now; a full plan is cheap enough
         // but a single-prefix plan keeps the common case O(log n).
-        let ops = match (self.desired.get(&prefix), reference.as_ref()) {
-            (Some(d), i) if i != Some(d) => vec![Op::Set {
-                prefix,
-                gateway: *d,
-            }],
-            (None, Some(i)) => vec![Op::Delete {
-                prefix,
-                gateway: *i,
-            }],
-            _ => Vec::new(),
+        let op = match (gateway, reference) {
+            (Some(d), i) if i != Some(d) => Op::Set { prefix, gateway: d },
+            (None, Some(i)) => Op::Delete { prefix, gateway: i },
+            _ => return None,
         };
-        self.run(ops)
+        Some(self.run_one(op))
     }
 
     /// Switch modes. Going to install performs a full reconcile (README,
@@ -225,38 +217,37 @@ impl Fib {
 
     /// Forget every desired route and remove what is installed (shutdown).
     pub fn clear(&mut self) -> Vec<Applied> {
-        self.desired.clear();
+        self.routes.clear_desired();
         self.reconcile()
     }
 
     /// Apply the full plan.
     pub fn reconcile(&mut self) -> Vec<Applied> {
-        let ops = reconcile::plan(&self.desired, &self.installed);
+        let ops = self.routes.plan();
         self.run(ops)
     }
 
     fn run(&mut self, ops: Vec<Op>) -> Vec<Applied> {
-        let mut out = Vec::with_capacity(ops.len());
-        for op in ops {
-            if self.mode == Mode::DryRun {
-                out.push(Applied {
-                    op,
-                    result: Ok(()),
-                    dry_run: true,
-                });
-                continue;
-            }
-            let result = self.send_op(&op);
-            if result.is_ok() {
-                reconcile::apply(&mut self.installed, &op);
-            }
-            out.push(Applied {
+        ops.into_iter().map(|op| self.run_one(op)).collect()
+    }
+
+    fn run_one(&mut self, op: Op) -> Applied {
+        if self.mode == Mode::DryRun {
+            return Applied {
                 op,
-                result,
-                dry_run: false,
-            });
+                result: Ok(()),
+                dry_run: true,
+            };
         }
-        out
+        let result = self.send_op(&op);
+        if result.is_ok() {
+            self.routes.apply(&op);
+        }
+        Applied {
+            op,
+            result,
+            dry_run: false,
+        }
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -287,10 +278,12 @@ impl Fib {
             ))
         })?;
         socket.send(&bytes)?;
-        let mut buf = vec![0u8; 8192];
+        if self.ack.is_empty() {
+            self.ack = vec![0u8; 8192];
+        }
         loop {
-            let n = socket.recv(&mut buf)?;
-            for m in netlink::parse(&buf[..n])? {
+            let n = socket.recv(&mut self.ack)?;
+            for m in netlink::parse(&self.ack[..n])? {
                 if m.header.seq != seq {
                     continue;
                 }
@@ -365,12 +358,11 @@ mod tests {
     #[test]
     fn dry_run_reports_without_touching_installed() {
         let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1")));
-        assert_eq!(out.len(), 1);
-        assert!(out[0].dry_run);
-        assert!(out[0].result.is_ok());
+        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).unwrap();
+        assert!(out.dry_run);
+        assert!(out.result.is_ok());
         assert_eq!(
-            out[0].op,
+            out.op,
             Op::Set {
                 prefix: p("192.0.2.0/24"),
                 gateway: ip("10.0.0.1")
@@ -379,14 +371,12 @@ mod tests {
         assert_eq!(fib.desired().len(), 1);
         assert_eq!(fib.installed().len(), 0);
         // Same again: no change to report.
-        assert_eq!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).len(), 0);
+        assert!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).is_none());
         // A new gateway, then the delete, are each reported once.
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.2")));
-        assert_eq!(out.len(), 1);
-        let out = fib.set(p("192.0.2.0/24"), None);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].op, Op::Delete { .. }));
-        assert_eq!(fib.set(p("192.0.2.0/24"), None).len(), 0);
+        assert!(fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.2"))).is_some());
+        let out = fib.set(p("192.0.2.0/24"), None).unwrap();
+        assert!(matches!(out.op, Op::Delete { .. }));
+        assert!(fib.set(p("192.0.2.0/24"), None).is_none());
         assert_eq!(fib.desired().len(), 0);
         assert_eq!(fib.mode(), Mode::DryRun);
         assert_eq!(Mode::Install.to_string(), "install");
@@ -397,9 +387,9 @@ mod tests {
     #[test]
     fn install_without_a_socket_fails_cleanly() {
         let mut fib = Fib::new(Mode::Install, route::RT_TABLE_MAIN, route::RTPROT_BGP);
-        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1")));
-        assert!(matches!(out[0].result, Err(FibError::Io(_))));
-        assert!(!out[0].dry_run);
+        let out = fib.set(p("192.0.2.0/24"), Some(ip("10.0.0.1"))).unwrap();
+        assert!(matches!(out.result, Err(FibError::Io(_))));
+        assert!(!out.dry_run);
         assert_eq!(fib.installed().len(), 0);
         let e = FibError::Kernel(101).to_string();
         assert!(e.contains("kernel refused"), "{e}");

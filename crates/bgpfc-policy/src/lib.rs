@@ -10,6 +10,7 @@
 pub mod prefix_list;
 pub mod regex;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -73,7 +74,9 @@ struct Policy {
 #[derive(Clone, Debug, Default)]
 pub struct PolicySet {
     prefix_lists: Vec<PrefixList>,
-    policies: HashMap<String, Policy>,
+    policies: Vec<Policy>,
+    /// Each policy's index in `policies`.
+    names: HashMap<String, usize>,
 }
 
 /// The route a policy looks at.
@@ -111,7 +114,8 @@ impl PolicySet {
             .iter()
             .map(|l| PrefixList::new(&l.entries))
             .collect();
-        let mut policies = HashMap::new();
+        let mut policies = Vec::new();
+        let mut names = HashMap::new();
         for p in &cfg.policies {
             let mut terms = Vec::new();
             for t in &p.terms {
@@ -156,12 +160,14 @@ impl PolicySet {
                     action: t.action,
                 });
             }
-            policies.insert(p.name.clone(), Policy { terms });
+            names.insert(p.name.clone(), policies.len());
+            policies.push(Policy { terms });
         }
         if errors.is_empty() {
             Ok(PolicySet {
                 prefix_lists,
                 policies,
+                names,
             })
         } else {
             Err(errors)
@@ -171,14 +177,20 @@ impl PolicySet {
     /// Whether a policy called `name` exists.
     #[must_use]
     pub fn has(&self, name: &str) -> bool {
-        self.policies.contains_key(name)
+        self.names.contains_key(name)
     }
 
     /// Run policy `name` on `route`. An unknown policy rejects, as does a
     /// policy no term of which decides (`docs/config.md`, "Policies").
     #[must_use]
     pub fn evaluate(&self, name: &str, route: &Route<'_>) -> Verdict {
-        let Some(policy) = self.policies.get(name) else {
+        self.evaluate_at(self.names.get(name).copied(), route)
+    }
+
+    /// Run the policy at `index` (from `names`); `None` rejects, as an
+    /// unknown policy does.
+    fn evaluate_at(&self, index: Option<usize>, route: &Route<'_>) -> Verdict {
+        let Some(policy) = index.and_then(|i| self.policies.get(i)) else {
             return Verdict::Reject;
         };
         let mut modified: Option<PathAttrs> = None;
@@ -266,9 +278,17 @@ fn edit<T: Copy + Ord>(set: &mut Vec<T>, op: CommunityOp, vals: &[T]) {
 #[derive(Clone, Debug, Default)]
 pub struct Engine {
     set: PolicySet,
-    /// Import and export policy names per neighbor.
-    neighbors: HashMap<IpAddr, (String, String)>,
+    /// Import and export policy per neighbor, as indices into the set
+    /// (`None`: no such policy, which rejects).
+    neighbors: HashMap<IpAddr, NeighborPolicies>,
+    /// The neighbor looked up last. The RIB asks about the routes of one
+    /// UPDATE, one peer, in a row; this spares hashing its address for
+    /// each.
+    last: Cell<Option<(IpAddr, NeighborPolicies)>>,
 }
+
+/// A neighbor's import and export policies, by index.
+type NeighborPolicies = (Option<usize>, Option<usize>);
 
 impl Engine {
     /// Compile `cfg` and remember which policies each neighbor uses.
@@ -280,9 +300,16 @@ impl Engine {
         let neighbors = cfg
             .neighbors
             .iter()
-            .map(|n| (n.addr, (n.import.clone(), n.export.clone())))
+            .map(|n| {
+                let index = |name: &str| set.names.get(name).copied();
+                (n.addr, (index(&n.import), index(&n.export)))
+            })
             .collect();
-        Ok(Engine { set, neighbors })
+        Ok(Engine {
+            set,
+            neighbors,
+            last: Cell::new(None),
+        })
     }
 
     /// The compiled policies.
@@ -293,12 +320,22 @@ impl Engine {
 
     fn run(
         &self,
-        which: fn(&(String, String)) -> &str,
+        which: fn(NeighborPolicies) -> Option<usize>,
         peer: &PeerInfo,
         route: &Route<'_>,
     ) -> Verdict {
-        match self.neighbors.get(&peer.addr) {
-            Some(names) => self.set.evaluate(which(names), route),
+        let policies = match self.last.get() {
+            Some((addr, p)) if addr == peer.addr => Some(p),
+            _ => {
+                let p = self.neighbors.get(&peer.addr).copied();
+                if let Some(p) = p {
+                    self.last.set(Some((peer.addr, p)));
+                }
+                p
+            }
+        };
+        match policies {
+            Some(p) => self.set.evaluate_at(which(p), route),
             // A peer without configured policies gets nothing and gives
             // nothing (docs/config.md: every neighbor names both).
             None => Verdict::Reject,
@@ -321,7 +358,7 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
         };
-        self.run(|n| &n.0, peer, &route)
+        self.run(|n| n.0, peer, &route)
     }
 
     fn export(
@@ -338,7 +375,7 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
         };
-        self.run(|n| &n.1, peer, &route)
+        self.run(|n| n.1, peer, &route)
     }
 }
 

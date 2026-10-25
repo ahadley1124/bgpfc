@@ -65,6 +65,19 @@ In a second terminal, one of the scenarios:
 ./target/profiling/bgp_loadgen --listen 127.0.0.2:11180
 ```
 
+To measure install mode without touching the host's routes, run both
+programs in a network namespace of their own, with `lo` up and an address
+in 192.0.2.0/24 so the load generator's next hops (192.0.2.1–4) resolve,
+and `fib { mode install; }` in the configuration:
+
+```sh
+sed 's/mode dry-run/mode install/' contrib/bgpfc-bench.conf > install.conf
+sudo unshare -n sh -c '
+  ip link set lo up && ip addr add 192.0.2.10/24 dev lo
+  ./target/profiling/bgpfcd -c install.conf &
+  sleep 1; ./target/profiling/bgp_loadgen --connect 127.0.0.1:11179'
+```
+
 `bgp_loadgen --help` lists every option: table size (`--prefixes`,
 `--attr-sets`, `--seed`), session (`--asn`, `--router-id`, `--hold-time`,
 `--extended` for 65535-octet UPDATEs), and `--hold SECS` to end the session
@@ -177,14 +190,16 @@ cargo bench -p bgpfc-bench --bench micro            # or a name filter: ... micr
 ```
 
 UPDATE decoding (one prefix, so mostly the attribute section; and a full
-4096-octet message per prefix), RIB insert, withdraw and peer down per
-route over 100 000 routes, the decision process over 1–16 candidates,
+4096-octet message per prefix), RIB insert, withdraw, peer down and
+sending the table to a second peer per route over 100 000 routes, the
+decision process over 1–16 candidates,
 interning an attribute set already held, and `Instant::now` itself. Each
 warms up for 300 ms and reports the median of 15 samples, setup excluded,
 using only `std::time::Instant` and `std::hint::black_box`.
 
-The criterion benches that existed before (`cargo bench -p bgpfc-wire`,
-`-p bgpfc-rib`, `-p bgpfc-policy`) are unchanged.
+The criterion benches (`cargo bench -p bgpfc-wire`, `-p bgpfc-rib`,
+`-p bgpfc-policy`) measure what they did before; the RIB's now passes a
+`Vec` as the output sink.
 
 ### Tests
 
@@ -250,7 +265,7 @@ end the measurement.
 | `updates_rx`, `updates_tx` | UPDATE messages received (before decoding) and sent |
 | `prefixes_announced`, `prefixes_withdrawn` | routes in the UPDATEs received; treat-as-withdraw counts as withdrawn |
 | `bytes_rx`, `bytes_tx` | BGP octets read and written, headers included |
-| `best_path_runs` | decision process runs, one per destination |
+| `best_path_runs` | decision process runs: one per destination whose routes changed, none for a new destination (its one route is the best) |
 | `sessions_established`, `sessions_dropped` | sessions reaching and leaving Established |
 
 Then, for each histogram, `<name>.count`, `.sum_ns`, `.max_ns`, `.p50_ns`,
@@ -264,9 +279,9 @@ The histograms count from daemon start, not per event.
 | `fsm_open_to_established` | the first OPEN sent or received on a connection to Established |
 | `msg_parse_update` | one `UpdateMessage::decode` (peer thread) |
 | `attr_parse` | the path attribute section of one UPDATE |
-| `rib_insert` | one announced route into the Adj-RIB-In, import policy included, before the decision process |
+| `rib_insert` | one announced route into the Adj-RIB-In, import policy and the decision process for its destination included |
 | `rib_remove` | one withdrawn route out of the Adj-RIB-In |
-| `best_path` | one decision process run for one destination |
+| `best_path` | one decision process run for one destination (see `best_path_runs`) |
 | `adj_rib_out_build` | packing one peer's batch of changes into UPDATEs |
 | `rib_peer_down` | removing every route of a peer that went down |
 | `rib_update` | the RIB thread on one UPDATE: Adj-RIB-In, decision process, Adj-RIB-Out, outputs handed to the FIB and peer threads |
@@ -284,10 +299,10 @@ of microseconds.
 | `destinations`, `routes` | destinations, and routes (candidates) over all of them |
 | `attr_sets` | distinct attribute sets the routes use, by allocation |
 | `attr_values` | distinct attribute sets by value; equal to `attr_sets` while interning works |
-| `interned` | sets the interner holds, unused ones included (they go at its next sweep) |
+| `interned` | sets the interner holds. A set goes with its last route; one still held elsewhere at that moment (a control-plane reply, say) goes at the next sweep |
 | `as_paths` | distinct `AS_PATH`s among the sets |
 | `as_path_bytes`, `as_path_bytes_if_interned` | `AS_PATH` heap octets as stored (one copy per set) and if each distinct path were stored once: their difference is what interning paths separately would save |
-| `candidate_bytes` | heap octets of the per-destination candidate vectors |
+| `candidate_bytes` | heap octets of the per-destination route vectors: only destinations with routes from two or more peers have one (a single route is held inline) |
 | `adj_rib_out`, `adj_rib_out_bytes` | Adj-RIB-Out entries and an estimate of their octets: a copy of the exported table per peer |
 | `walk_ms` | how long the walk took (the RIB thread is busy meanwhile) |
 
@@ -298,8 +313,9 @@ of microseconds.
 ```
 
 prints `size_of` for the structures a route is made of (`Prefix` 18,
-Loc-RIB entry 80, `Candidate` 40, `PathAttrs` 184 octets on x86-64), and
-for the messages and the per-peer state.
+`Destination` 24 with its first route inline, `Route` 16 for each further
+one, `PathAttrs` 184, a FIB route 26 octets on x86-64), and for the
+messages and the per-peer state.
 
 ## External profilers
 
@@ -333,16 +349,15 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
 
 ## What to look for
 
-- **Per-prefix allocations.** A synthetic load makes about 7.7 allocations
-  per prefix (`allocs` on the `table_load` line), 1.9 of them still live
-  at the end; the RIB alone makes 5.1 per inserted route and keeps 1.55.
-  The transient ones come per changed destination: `Rib::reconsider`
-  clones every peer's `PeerInfo` (a `Vec` and its `families`),
-  `decision::best` builds a `HashMap` for the MED step on every run, and
-  the FIB returns a `Vec` per change. The lasting one is the candidate
-  `Vec` of each destination: `candidate_bytes` is 160 octets per
-  destination for one 40-octet candidate, because a `Vec`'s first push
-  reserves room for four.
+- **Per-prefix allocations.** A synthetic load makes about one allocation
+  per prefix (`allocs` on the `table_load` line), two thirds of them
+  still live at the end (`allocs` minus `deallocs`): B-tree nodes of the
+  RIB and FIB tables, and the attribute sets with their paths and
+  communities. A new destination holds its route inline; only a
+  second peer's route to it allocates (`candidate_bytes`), sized exactly.
+  An UPDATE's own work reuses buffers kept in the RIB. Much more than one
+  allocation a prefix means something per route started allocating
+  again.
 - **Duplicated attributes.** `attr_sets` against `routes` says how well
   attribute sets are shared; `attr_values` equal to `attr_sets` says the
   interner leaves no duplicates. `as_path_bytes` against
@@ -352,54 +367,75 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   Adj-RIB-Out map of the exported table (`adj_rib_out`,
   `adj_rib_out_bytes`). With one load generator nothing is exported; add a
   second session to see it grow.
-- **Live bytes after `withdraw-all` or `flap`** (`residual_bytes`): the
-  interner keeps attribute sets no route uses until its set doubles and
-  it sweeps, so `interned` stays at the table's set count after every
-  route is gone. It is the same after every flap cycle: retention, not a
-  leak.
-- **`hwm_kb` against `peak`.** A session going down allocates
-  table-sized temporaries in `Rib::peer_down` while it frees the routes,
-  which raises RSS far more than the live peak.
+- **Live bytes after `withdraw-all` or `flap`** (`residual_bytes`): an
+  attribute set goes with its last route, so `interned` drops to zero
+  with the routes and what stays is the maps' own capacity, under a
+  megabyte. The same figure after every flap cycle means nothing leaks.
+- **`hwm_kb` against `peak`.** They stay close. RIB outputs go to the FIB
+  thread in bounded batches as they are produced, so a peer with a full
+  table going down builds no table-sized list (it raised RSS by 150 MB
+  before).
+- **Which thread is the bottleneck.** During a load the RIB thread is:
+  `rib_update` is most of `load_us`, and the queue wait
+  (`update_total` minus `rib_update`) is long. Its time per route grows
+  with the table, because each B-tree lookup misses the cache more. In
+  install mode the FIB thread is: one netlink request and acknowledgement
+  per route, most of it in the kernel.
 
 ## Baseline
 
 From this branch, in a 4-CPU cloud container (figures move with the host;
 see above). Synthetic table: 1 000 000 prefixes, 50 000 attribute sets,
-seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs.
+seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs. The second
+column is the same measurement where the profiling tools were added
+(24ae7d9), on the same host.
 
-| | |
-|---|---|
-| table load | 3.21 s (3.00–3.25), 15 600 UPDATEs/s, 312 000 prefixes/s |
-| of which on the RIB thread (`rib_update`) | 2.61 s: inserts 1.41 s, decision process 0.11 s |
-| decode on the peer thread (`msg_parse_update`) | 0.25 s, in parallel; attributes 0.09 s |
-| bytes per prefix | 341 |
-| peak live / peak RSS | 341.7 MB / 360.4 MB |
-| distinct attribute sets / routes | 50 000 / 1 000 000; `AS_PATH`s 50 000 |
-| candidate vectors | 160 MB of the 341 MB live (40 MB of candidates) |
-| spans off | 2.88 s (spans cost about 10 %) |
-| `withdraw-all` residual | 13.7 MB (live 14.25 MB against 0.53 MB before), 50 000 sets still interned |
-| `flap`, 3 cycles | live after every reset exactly 14 207 487 octets; reloads 2.6–2.7 s; `hwm_kb` 598 MB |
+| | now | 24ae7d9 |
+|---|---|---|
+| table load | 1.64 s (1.58–1.74), 30 500 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
+| of which on the RIB thread (`rib_update`) | 1.27 s; inserts and the decision process 0.70 s | 2.9 s |
+| decode on the peer thread (`msg_parse_update`) | 0.15 s, in parallel | 0.22 s |
+| bytes per prefix | 121 | 341 |
+| peak live / peak RSS | 121.7 MB / 130.3 MB | 341.7 MB / 360.4 MB |
+| allocations during the load | 1.02 M | 7.7 M |
+| spans off | 1.51 s | 3.02 s |
+| `withdraw-all`: peak live, residual | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
+| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.42–0.49 s, 0.98 MB, 133 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
 
 A real table, RouteViews `route-views.sg` 2026-10-01 00:00, peer 39
 (AS23673): 1 114 715 routes over 159 391 attribute sets and 137 311
-`AS_PATH`s; load 4.72 s, 386 octets per prefix, 431 MB peak live, 457 MB
-RSS. Interning `AS_PATH`s separately would save 1.15 MB.
+`AS_PATH`s; load 2.44 s, 161 octets per prefix, 180 MB peak live, 195 MB
+RSS (at 24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
 
-A profiling build is slower than the default build: measured from outside
-on the same host, interleaved, a 1M-prefix load took 3.42 s in the default
-build, 4.08 s in the profiling build with spans off and 4.25 s with spans
-on. Compare profiling builds with profiling builds.
+A profiling build is slower than the default build. Measured from outside
+on the same host, interleaved, from starting the load generator until the
+daemon reports every route received (session setup included, so not
+comparable with `load_us`): 1.87 s in the default build, 1.99 s in the
+profiling build with spans off and 2.06 s with spans on. Compare
+profiling builds with profiling builds. In another run the same way,
+interleaved with 24ae7d9's default build: 1.95 s and 130 MB of RSS
+against 3.38 s and 360 MB.
+
+Install mode, 1M routes into the kernel of a network namespace of their
+own (a veth pair, one end 192.0.2.10/24, so the load generator's next
+hops resolve), default build, three runs each, timed until the FIB
+thread goes idle with every route in the kernel: 5.2–5.6 s and 131 MB
+RSS, against 9.4–9.6 s and 416 MB at 24ae7d9, which held the desired and
+the installed routes as two tables. The FIB thread bounds it: 4.7 s of
+CPU (8.7 s at 24ae7d9), two thirds of it in the kernel, for one netlink
+request and acknowledgement per route. Listing the kernel table while it
+fills (`ip route | wc -l`) slows the inserts; count it once, at the end.
 
 ## Caveats
 
 - `bytes_per_prefix` counts everything allocated during the load in every
   thread, and the snapshot is taken at the End-of-RIB: UPDATEs the peer
   thread has already decoded for the next phase are counted too. After
-  `withdraw-all` the queued withdrawals show up as 370 octets per prefix
-  against 341 for `load`. Use `load` for the per-prefix figure.
+  `withdraw-all` the queued withdrawals show up as 143 octets per prefix
+  against 121 for `load`. Use `load` for the per-prefix figure.
 - The FIB thread may still be a few thousand changes behind at the
-  End-of-RIB (its queue holds 4096), so the FIB table is slightly
-  undercounted.
+  End-of-RIB (its queue holds 64 batches of up to 256), so the FIB table
+  is slightly undercounted.
 - `flap` cycles take about ten seconds each: after a reset the daemon holds
   the peer in Idle (RFC 4271 §8.1.1 damping, 10 s jittered) and the load
   generator retries until it is let in.

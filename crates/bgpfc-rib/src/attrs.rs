@@ -7,6 +7,7 @@
 //! 8092 (communities).
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ pub struct UnknownAttribute {
 }
 
 /// The path attributes of one route, in canonical form.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathAttrs {
     /// ORIGIN.
     pub origin: Origin,
@@ -220,6 +221,125 @@ impl PathAttrs {
     }
 }
 
+// The interner hashes the attributes of every UPDATE. A derived Hash makes
+// a hasher call per field and per AS number and community, and SipHash
+// costs about as much per call as per eight octets hashed; this one
+// writes the same fields as a few long runs of octets. Lists carry their
+// length, so different attributes rarely meet; equal ones always hash
+// alike, which is all `Eq` needs.
+impl Hash for PathAttrs {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut w = Chunks::new(state);
+        w.put(&[self.origin as u8]);
+        w.len(self.as_path.segments.len());
+        for seg in &self.as_path.segments {
+            w.put(&[seg.kind as u8]);
+            w.len(seg.asns.len());
+            for asn in &seg.asns {
+                w.put(&asn.0.to_be_bytes());
+            }
+        }
+        match &self.next_hop {
+            NextHop::Ipv4(a) => {
+                w.put(&[4]);
+                w.put(&a.octets());
+            }
+            NextHop::Ipv6 { global, link_local } => {
+                w.put(&[6]);
+                w.put(&global.octets());
+                match link_local {
+                    Some(l) => {
+                        w.put(&[1]);
+                        w.put(&l.octets());
+                    }
+                    None => w.put(&[0]),
+                }
+            }
+        }
+        for v in [self.med, self.local_pref] {
+            match v {
+                Some(v) => {
+                    w.put(&[1]);
+                    w.put(&v.to_be_bytes());
+                }
+                None => w.put(&[0]),
+            }
+        }
+        w.put(&[u8::from(self.atomic_aggregate)]);
+        match self.aggregator {
+            Some(a) => {
+                w.put(&[1]);
+                w.put(&a.asn.0.to_be_bytes());
+                w.put(&a.address.octets());
+            }
+            None => w.put(&[0]),
+        }
+        w.len(self.communities.len());
+        for c in &self.communities {
+            w.put(&c.0.to_be_bytes());
+        }
+        w.len(self.ext_communities.len());
+        for c in &self.ext_communities {
+            w.put(&c.0);
+        }
+        w.len(self.large_communities.len());
+        for c in &self.large_communities {
+            w.put(&c.global.to_be_bytes());
+            w.put(&c.local1.to_be_bytes());
+            w.put(&c.local2.to_be_bytes());
+        }
+        w.len(self.unknown.len());
+        for u in &self.unknown {
+            w.put(&[u.flags, u.code]);
+            w.len(u.value.len());
+            w.put(&u.value);
+        }
+        w.flush();
+    }
+}
+
+/// Octets on their way to a hasher, passed on in long runs.
+struct Chunks<'a, H: Hasher> {
+    state: &'a mut H,
+    buf: [u8; 128],
+    used: usize,
+}
+
+impl<'a, H: Hasher> Chunks<'a, H> {
+    fn new(state: &'a mut H) -> Self {
+        Chunks {
+            state,
+            buf: [0; 128],
+            used: 0,
+        }
+    }
+
+    fn put(&mut self, octets: &[u8]) {
+        if self.used + octets.len() > self.buf.len() {
+            self.flush();
+            if octets.len() > self.buf.len() {
+                self.state.write(octets);
+                return;
+            }
+        }
+        self.buf[self.used..self.used + octets.len()].copy_from_slice(octets);
+        self.used += octets.len();
+    }
+
+    fn len(&mut self, n: usize) {
+        // invariant: no attribute list is anywhere near 2^32 long; the
+        // value only has to be the same for equal lists.
+        self.put(&u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes());
+    }
+
+    fn flush(&mut self) {
+        if self.used > 0 {
+            self.state.write(&self.buf[..self.used]);
+            self.used = 0;
+        }
+    }
+}
+
 /// Shares one allocation between routes with equal attributes.
 #[derive(Debug, Default)]
 pub struct Interner {
@@ -240,6 +360,23 @@ impl Interner {
         let a = Arc::new(attrs);
         self.set.insert(Arc::clone(&a));
         a
+    }
+
+    /// Give back one holder's share of `attrs`, and drop the entry as well
+    /// when that was the last one outside the interner. Removing a route
+    /// through here frees its attribute set with the route, rather than at
+    /// the next sweep; the sweep remains for sets released otherwise.
+    pub fn release(&mut self, attrs: Arc<PathAttrs>) {
+        // Two holders: the interner and `attrs`. No other thread can take
+        // a new one from nothing, so the count cannot rise meanwhile.
+        if Arc::strong_count(&attrs) == 2
+            && let Some(held) = self.set.take(&*attrs)
+            && !Arc::ptr_eq(&held, &attrs)
+        {
+            // Equal attributes in another allocation: not ours to drop.
+            self.set.insert(held);
+        }
+        drop(attrs);
     }
 
     /// Drop entries no route uses any more.

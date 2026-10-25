@@ -18,7 +18,7 @@ use bgpfc_bench::pack::Packer;
 use bgpfc_bench::stats::summarize;
 use bgpfc_bench::synth::{SynthOpts, generate};
 use bgpfc_bench::table::Table;
-use bgpfc_rib::decision::{Candidate, best};
+use bgpfc_rib::decision::{Candidate, Neighbor, best};
 use bgpfc_rib::{Interner, PathAttrs, PeerInfo, Rib};
 use bgpfc_wire::header::HEADER_LEN;
 use bgpfc_wire::prefix::Prefix;
@@ -107,9 +107,11 @@ fn decode_all(messages: &[Vec<u8>]) -> Vec<DecodedUpdate> {
 /// A RIB holding `adds` from [`peer`].
 fn loaded(adds: &[DecodedUpdate]) -> Rib {
     let mut rib = Rib::new(Asn(65_000));
-    rib.peer_up(peer());
+    let mut out = Vec::new();
+    rib.peer_up(peer(), &mut out);
     for u in adds {
-        rib.update(peer().addr, u);
+        rib.update(peer().addr, u, &mut out);
+        out.clear();
     }
     rib
 }
@@ -188,25 +190,49 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
     let from = peer().addr;
     bench(filter, "rib_insert_per_route_100k", || {
         let mut rib = Rib::new(Asn(65_000));
-        rib.peer_up(peer());
+        let mut out = Vec::new();
+        rib.peer_up(peer(), &mut out);
         let t = Instant::now();
         for u in &adds {
-            black_box(rib.update(from, u));
+            rib.update(from, u, &mut out);
+            black_box(&out);
+            out.clear();
         }
         (t.elapsed(), routes)
     });
     bench(filter, "rib_withdraw_per_route_100k", || {
         let mut rib = loaded(&adds);
+        let mut out = Vec::new();
         let t = Instant::now();
         for u in &dels {
-            black_box(rib.update(from, u));
+            rib.update(from, u, &mut out);
+            black_box(&out);
+            out.clear();
         }
+        (t.elapsed(), routes)
+    });
+    // A second peer coming up is sent the whole Loc-RIB (RFC 4271 §9.2):
+    // export and UPDATE packing for every route.
+    bench(filter, "rib_peer_up_send_per_route_100k", || {
+        let mut rib = loaded(&adds);
+        let mut out = Vec::new();
+        let second = PeerInfo {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            remote_as: Asn(65_002),
+            router_id: RouterId::from(Ipv4Addr::new(10, 0, 0, 2)),
+            ..peer()
+        };
+        let t = Instant::now();
+        rib.peer_up(second, &mut out);
+        black_box(&out);
         (t.elapsed(), routes)
     });
     bench(filter, "rib_peer_down_per_route_100k", || {
         let mut rib = loaded(&adds);
+        let mut out = Vec::new();
         let t = Instant::now();
-        black_box(rib.peer_down(from));
+        rib.peer_down(from, &mut out);
+        black_box(&out);
         (t.elapsed(), routes)
     });
     adds
@@ -221,13 +247,12 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
             .expect("the synthetic UPDATE has a next hop"),
     );
     for n in [1u8, 2, 4, 8, 16] {
-        let candidates: Vec<Candidate> = (1..=n)
-            .map(|i| Candidate {
-                peer: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
+        let neighbors: Vec<Neighbor> = (1..=n)
+            .map(|i| Neighbor {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)),
                 kind: PeerKind::External,
                 router_id: u32::from(i),
                 remote_as: Asn(65_001),
-                attrs: Arc::clone(&attrs),
             })
             .collect();
         bench(
@@ -235,7 +260,11 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
             &format!("best_path_{n}_candidates"),
             timed(|| {
                 for _ in 0..10_000 {
-                    black_box(best(black_box(&candidates)));
+                    let neighbors = black_box(&neighbors);
+                    black_box(best(neighbors.len(), |i| Candidate {
+                        from: neighbors[i],
+                        attrs: &attrs,
+                    }));
                 }
                 10_000
             }),
