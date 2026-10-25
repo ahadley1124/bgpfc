@@ -261,9 +261,9 @@ check and the import policy, which is what `show neighbor` reports as
 received, and the routes it holds for their validation state (see
 **RPKI** below), so that a change of state never moves the count. Routes
 the import policy rejects whatever their state are not kept and not
-counted, as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
-be at least 1 and its family one of the neighbor's `families`. The
-neighbor then restarts like after any other damped failure, so a peer
+counted, as with FRR's `maximum-prefix` and BIRD's `import limit`. The
+limit must be at least 1 and its family one of the neighbor's `families`.
+The neighbor then restarts like after any other damped failure, so a peer
 that keeps sending too many routes is retried `restart-limit` times and
 then left Idle; `restart-limit 0` leaves it Idle at once.
 
@@ -328,10 +328,10 @@ the state (`match rpki`, `set rpki`). Without an `rpki` block, or with
 `mode disabled`, no route is validated, and `disabled` is never held.
 `enforcement` is accepted with `mode disabled` too, and then applies only
 to a state an import policy sets: `set rpki invalid` holds the route under
-`drop-invalid`. RFC 8481 §5 is stricter: "Absent specific
-operator configuration, policy MUST NOT be applied." bgpfcd's default
-departs from it, as the project chose (issue #61); `enforcement off;` gives
-the RFC 8481 §5 behaviour.
+`drop-invalid`. RFC 8481 §5 is stricter: "Absent specific operator
+configuration, policy MUST NOT be applied." bgpfcd's default departs from
+it, as the project chose (issue #61); `enforcement off;` gives the RFC 8481
+§5 behaviour.
 
 Each route goes through these steps in order:
 
@@ -411,6 +411,26 @@ cache has sent a full set, which replaces them, or until they expire (RFC
 8210 §10, §6). A cache listed twice, by the same address or the same name
 in any case, and the same port, is an error.
 
+**When caches disagree.** bgpfcd validates with the VRPs of exactly one
+cache at a time: the most preferred cache it is in sync with (RFC 8210 §4:
+the router "MUST choose the most preferred, by configuration, cache or set
+of caches"). It never merges data from several caches and never weighs one
+cache's data against another's: RFC 8210 §10 says a preference "merely
+denotes proximity, not trust, preferred belief, et cetera". So two caches
+that disagree about a ROA never make bgpfcd mix their answers. While the
+preferred cache answers, its data decides. When it goes away, its last
+VRPs stay in use until a less preferred cache has sent a full set (§10:
+"it SHOULD retain the data from the previous cache until it has a full set
+of data from one or more other caches") or until they expire (§6). Then
+the other cache's set replaces them as a whole, and only the routes the two
+sets judge differently are validated again. Those moves are VRP changes
+like any other: they go through `enforcement` and route selection as
+described above. When a more preferred cache comes back, bgpfcd moves to it
+the same way once it has sent its full set. To have the caches agree, point
+them at the same RPKI repositories with the same relying-party settings; a
+difference between them then shows up only as routes that change state at
+each move from one cache to the other.
+
 A cache that restarts usually starts a new session, with a new Session ID
 (RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
 (§8.1), which such a cache should answer with an Error Report or a Cache
@@ -454,9 +474,9 @@ the cache's data. A route that arrives before then is therefore used, as
 `disabled` is never held, and withdrawn once the VRPs make it Invalid. A
 cache on the router or near it answers well before a BGP session comes up,
 so this window is normally empty; BIRD and FRR behave the same way. The
-client logs with the rest of the daemon, at the `log`
-level: losing a cache is a warning, its return an info line, and VRPs that
-expire before a cache could refresh them an error.
+client logs with the rest of the daemon, at the `log` level: losing a cache
+is a warning, its return an info line, and VRPs that expire before a cache
+could refresh them an error.
 
 `backoff MIN MAX` paces reconnects. After a connection attempt fails, a
 connection ends before the cache has brought bgpfcd in sync, or a cache
@@ -471,17 +491,71 @@ so that a validator that restarts is picked up within seconds (issue #57),
 and reaches 600 seconds by the eleventh failure in a row. `backoff 600
 600` keeps to the RFC's default.
 
+**Route selection.** Of the routes to a destination that the import
+policy accepted and that are not held, bgpfcd uses one, chosen by removing
+routes from consideration in this order until one is left (RFC 4271
+§9.1.2.2: "The criteria MUST be applied in the order specified"; issue
+#47):
+
+1. Under `enforcement prefer-valid` only, the validation state the route is
+   used with: Valid, then `not-found` and `disabled`, then Invalid (RFC
+   6811 §5).
+2. The highest degree of preference: LOCAL_PREF, 100 for a route without
+   one (RFC 4271 §9.1.1).
+3. §9.1.2.2 a): the shortest AS_PATH, an AS_SET counting as one AS.
+4. b): the lowest ORIGIN, IGP before EGP before INCOMPLETE.
+5. c): among the routes from the same neighboring AS, the lowest
+   MULTI_EXIT_DISC, a route without one counting as 0. Only the routes
+   still under consideration count: a route an earlier step removed takes
+   no other out, however low its MULTI_EXIT_DISC.
+6. d): routes from external neighbors over routes from internal ones.
+7. e): the lowest interior cost to the next hop. bgpfcd runs no IGP, so
+   every route ties, as with BIRD and FRR when they know no IGP metric.
+8. f): the lowest BGP Identifier of the neighbor.
+9. g): the lowest neighbor address.
+
+Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
+first, as the most significant part of the degree of preference that RFC
+4271 §9.1.1 lets local policy compute: below LOCAL_PREF, a forged origin
+heard from a customer, whose routes usually have the highest LOCAL_PREF,
+would still beat the Valid route from a transit provider, which is the
+case the mode exists for. Cisco IOS XE and XR and Nokia SR OS place their
+comparison of the state there too. The state travels to no other router,
+though (bgpfcd does not implement RFC 8097, the extended community that
+would carry it): RFC 4271 §9.1.1 wants an external route's degree of
+preference sent to internal neighbors as its LOCAL_PREF, and RFC 6811 §5
+notes that a preference no attribute carries may need the state propagated
+for routing to stay correct. With internal neighbors, either run
+`prefer-valid` on every router of the AS with the same caches, or fold the
+state into LOCAL_PREF by policy, which does reach them.
+
+The other common behaviours are policies:
+
+- The state as a LOCAL_PREF, as Juniper, FRR and BIRD do it, which
+  internal neighbors see and the operator weighs against their own tiers:
+  `enforcement off;` and an import policy such as
+  `term v { match rpki valid; set local-pref 110; action next; }
+  term i { match rpki invalid; set local-pref 90; action next; }
+  term rest { action accept; }`. To break ties within each commercial tier
+  only, use offsets inside it, such as 200, 199 and 198 for customers and
+  100, 99 and 98 for transit.
+- Invalid routes held, and Valid ones preferred to `not-found` ones:
+  `enforcement drop-invalid;` and `match rpki valid; set local-pref ...;`.
+- Invalid routes rejected from some neighbors only: `enforcement off;` and
+  `match rpki invalid; action reject;` in those neighbors' import policies.
+  Such routes are held for their state too (see **RPKI** above), so they
+  are used again once they are no longer Invalid.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; no neighbor's `export` policy has
-`set rpki`; the HTTP listen address is a
-loopback address; timer constraints above; `extended-next-hop` only with
-`ipv4-unicast` in `families`; `maximum-prefix` only for a family in
-`families`; an `rpki` block has a `mode`, at least one `cache` with `mode
-external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
-`reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
-its MIN.
+`set rpki`; the HTTP listen address is a loopback address; timer
+constraints above; `extended-next-hop` only with `ipv4-unicast` in
+`families`; `maximum-prefix` only for a family in `families`; an `rpki`
+block has a `mode`, at least one `cache` with `mode external`, no cache
+twice, `connect-timeout` ≤ `response-timeout` ≤ `reply-timeout`,
+`max-vrps` at least 1, and a `backoff` MAX no lower than its MIN.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
