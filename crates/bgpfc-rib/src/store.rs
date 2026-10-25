@@ -461,7 +461,14 @@ impl<V> PrefixMap<V> {
         self.v4.into_values().chain(self.v6.into_values())
     }
 
-    #[cfg(test)]
+    /// Every entry, taken out, in prefix order.
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = (Prefix, V)> {
+        self.v4
+            .into_iter()
+            .map(|(k, v)| (k.prefix(), v))
+            .chain(self.v6)
+    }
+
     pub(crate) fn insert(&mut self, prefix: Prefix, value: V) -> Option<V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.insert(k, value),
@@ -469,7 +476,6 @@ impl<V> PrefixMap<V> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn remove(&mut self, prefix: Prefix) -> Option<V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.remove(&k),

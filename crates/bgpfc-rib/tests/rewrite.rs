@@ -142,6 +142,7 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     })
 }
 

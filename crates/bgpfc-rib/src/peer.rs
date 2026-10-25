@@ -3,7 +3,8 @@
 //! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
 //! per-family prefix limit), §6.3 a) (our own address is no next hop);
-//! RFC 7911 §5 (the families taken with Path Identifiers).
+//! RFC 7911 §5 (the families sent and taken with Path Identifiers, and how
+//! many paths are sent).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -11,6 +12,16 @@ use std::time::Duration;
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
+
+/// How many paths of a prefix to send a peer with ADD-PATH (RFC 7911 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathLimit {
+    /// The `n` best by the decision process, among those export policy
+    /// accepts; `n` is at least one.
+    Best(u32),
+    /// Every path export policy accepts.
+    All,
+}
 
 /// The session parameters the RIB needs: who the peer is, which families
 /// it speaks, and how to encode UPDATEs for it.
@@ -58,6 +69,10 @@ pub struct PeerInfo {
     /// before each prefix, several paths for one (RFC 7911 §5). Within
     /// `receive_families`.
     pub add_path_receive: Vec<AddressFamily>,
+    /// The families we send the peer routes of with Path Identifiers, and
+    /// how many paths of a prefix (RFC 7911 §5). Within `families`. The
+    /// routes of any other family go as before, one best path per prefix.
+    pub add_path_send: Vec<(AddressFamily, PathLimit)>,
 }
 
 impl PeerInfo {
@@ -89,6 +104,16 @@ impl PeerInfo {
     #[must_use]
     pub fn receives_paths(&self, family: AddressFamily) -> bool {
         self.add_path_receive.contains(&family)
+    }
+
+    /// How many paths of a prefix of `family` to send the peer, if it is
+    /// sent them with Path Identifiers at all (RFC 7911 §5).
+    #[must_use]
+    pub fn path_limit(&self, family: AddressFamily) -> Option<PathLimit> {
+        self.add_path_send
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, l)| *l)
     }
 
     /// The prefix limit for `family`, if there is one (RFC 4271 §6.7).

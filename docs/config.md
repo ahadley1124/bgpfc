@@ -269,12 +269,17 @@ Identifier bgpfcd gave it while it is sent, through changes to its
 attributes, and when it is withdrawn the withdrawal names that
 identifier; a path that drops out of the `N` best and comes back may be
 numbered anew. The identifiers are local to the neighbor and mean
-nothing: bgpfcd takes the next unused number of the neighbor's family,
-starting at 1. The `advertisement-interval` paces all the paths of a
-prefix as one destination: when it holds a prefix back, the neighbor
-keeps what it was sent and gets the paths the prefix has when the
-interval ends, withdrawals going at once as for any prefix. `show
-routes` and the HTTP API show a path's identifier where it has one (`docs/control.md`).
+nothing: a new path takes the smallest number from 1 that no other path
+sent to the neighbor for that prefix has, counting those a withdrawal in
+the same step frees, so that an identifier is not reused while its
+withdrawal may still be on the way. The `advertisement-interval` paces
+all the paths of a prefix as one destination: when it holds a prefix
+back, the neighbor keeps what it was sent and gets the paths the prefix
+has when the interval ends. A path that is gone is withdrawn at once, as
+for any prefix; one that only dropped out of the `N` best is withdrawn
+with the announcements that displace it, so the neighbor keeps it until
+its replacement can go. `show routes` and the
+HTTP API show a path's identifier where it has one (`docs/control.md`).
 A reload that only changes `N`, or `N` to `all`, applies at once to the
 running session, without a reset, sending or withdrawing the paths the
 change adds or takes away.

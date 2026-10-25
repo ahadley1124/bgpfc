@@ -5,20 +5,22 @@
 //! routes again when the validation source changes (RFC 6811 §4). The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
+//! The `add_path` group is the cost of RFC 7911: three paths to every
+//! prefix from one peer, and the same sent to a peer that takes them.
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PeerInfo, Rib};
+use bgpfc_rib::{Output, PathLimit, PeerInfo, Rib};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
-use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
+use bgpfc_wire::types::{AddressFamily, Asn, PathId, RouterId};
+use bgpfc_wire::update::{DecodedUpdate, PathIds, PeerKind, UpdateMessage};
 use criterion::Criterion;
 
 /// Run one RIB input and collect what it produced.
@@ -60,6 +62,7 @@ fn peer(i: u8) -> PeerInfo {
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     }
 }
 
@@ -68,7 +71,6 @@ fn paced_peer(i: u8) -> PeerInfo {
     PeerInfo {
         advertisement_interval: Duration::from_secs(30),
         prefix_limits: Vec::new(),
-        add_path_receive: Vec::new(),
         ..peer(i)
     }
 }
@@ -236,6 +238,8 @@ fn bench(c: &mut Criterion) {
     });
     group.finish();
     revalidation(c, routes, &v4, &v6);
+    add_path_receive(c, routes);
+    add_path_send(c, routes);
 }
 
 /// RFC 6811 §4 at scale. Every route of a table from one peer, exported to
@@ -312,6 +316,150 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
             black_box(outputs(|o| rib.validation_changed(change, now, o)))
         });
     });
+    group.finish();
+}
+
+/// `updates` as a peer sends them with ADD-PATH: every prefix with Path
+/// Identifier `id`.
+fn with_path_id(updates: &[DecodedUpdate], id: u32) -> Vec<DecodedUpdate> {
+    updates
+        .iter()
+        .map(|u| {
+            let m = &u.message;
+            let ids = PathIds {
+                nlri: vec![PathId(id); m.nlri.len()],
+                mp_reach: vec![PathId(id); m.mp_reach.as_ref().map_or(0, |r| r.nlri.len())],
+                ..PathIds::default()
+            };
+            let mut u = u.clone();
+            u.message.path_ids = Some(Box::new(ids));
+            u
+        })
+        .collect()
+}
+
+/// A peer that sends three paths of each prefix (`receive`), or is sent up
+/// to `limit` of them.
+fn path_peer(i: u8, receive: bool, limit: Option<PathLimit>) -> PeerInfo {
+    let families = [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST];
+    PeerInfo {
+        add_path_receive: if receive {
+            families.to_vec()
+        } else {
+            Vec::new()
+        },
+        add_path_send: limit.map_or(Vec::new(), |l| families.map(|f| (f, l)).to_vec()),
+        ..peer(i)
+    }
+}
+
+/// Three plain peers' tables, each with its own origin: three paths to
+/// every prefix, as three upstreams would send them.
+fn plain_tables(routes: u32) -> Vec<Vec<DecodedUpdate>> {
+    [(65_001u32, 7), (65_003, 8), (65_004, 9)]
+        .iter()
+        .map(|(asn, origin)| {
+            let mut u = updates(routes * 4 / 5, false, *asn, *origin);
+            u.extend(updates(routes / 5, true, *asn, *origin));
+            u
+        })
+        .collect()
+}
+
+/// A RIB that has the three tables of `plain` from peers 1, 3 and 4.
+fn with_three_tables(plain: &[Vec<DecodedUpdate>]) -> (Rib, Instant) {
+    let now = Instant::now();
+    let mut rib = Rib::new(Asn(65_000));
+    let mut out = Vec::new();
+    for (i, t) in [1u8, 3, 4].iter().zip(plain) {
+        outputs(|o| rib.peer_up(peer(*i), now, o));
+        feed(&mut rib, peer(*i).addr, t, now, &mut out);
+    }
+    (rib, now)
+}
+
+/// RFC 7911 at scale: what holding three paths to every prefix costs next
+/// to holding one (`insert_*_from_one_peer_to_one_peer` above).
+fn add_path_receive(c: &mut Criterion, routes: u32) {
+    let mut group = c.benchmark_group("add_path");
+    group.sample_size(10);
+    let tables: Vec<Vec<DecodedUpdate>> = plain_tables(routes)
+        .iter()
+        .zip(1u32..)
+        .map(|(t, id)| with_path_id(t, id))
+        .collect();
+    let load = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(path_peer(1, true, None), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        for t in &tables {
+            feed(&mut rib, peer(1).addr, t, now, &mut out);
+        }
+        rib
+    };
+    group.bench_function(format!("receive_{routes}_prefixes_3_paths_each"), |b| {
+        b.iter(load);
+    });
+    group.bench_function(
+        format!("withdraw_{routes}_prefixes_3_paths_each_on_peer_down"),
+        |b| {
+            b.iter_batched(
+                load,
+                |mut rib| black_box(outputs(|o| rib.peer_down(peer(1).addr, Instant::now(), o))),
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
+/// What sending paths costs: the whole table to a peer that comes up, and
+/// a round of changes to one of the paths of every prefix, to a peer sent
+/// all the paths and to one sent the two best.
+fn add_path_send(c: &mut Criterion, routes: u32) {
+    let mut group = c.benchmark_group("add_path");
+    group.sample_size(10);
+    let plain = plain_tables(routes);
+    let changed: Vec<DecodedUpdate> = {
+        let mut u = updates(routes * 4 / 5, false, 65_003, 10);
+        u.extend(updates(routes / 5, true, 65_003, 10));
+        u
+    };
+    for (name, limit) in [("all", PathLimit::All), ("best_2", PathLimit::Best(2))] {
+        group.bench_function(
+            format!("send_{name}_of_3_paths_of_{routes}_prefixes_to_a_new_peer"),
+            |b| {
+                b.iter_batched(
+                    || with_three_tables(&plain),
+                    |(mut rib, now)| {
+                        let sender = path_peer(5, false, Some(limit));
+                        black_box(outputs(|o| rib.peer_up(sender, now, o)))
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_function(
+            format!("change_one_of_3_paths_of_{routes}_prefixes_sent_{name}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let (mut rib, now) = with_three_tables(&plain);
+                        outputs(|o| rib.peer_up(path_peer(5, false, Some(limit)), now, o));
+                        (rib, now)
+                    },
+                    |(mut rib, now)| {
+                        let mut out = Vec::new();
+                        feed(&mut rib, peer(3).addr, &changed, now, &mut out);
+                        rib
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
     group.finish();
 }
 

@@ -107,6 +107,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     }
 }
 

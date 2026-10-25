@@ -66,6 +66,7 @@ fn peers() -> Vec<PeerInfo> {
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
             add_path_receive: if i == 2 { Vec::new() } else { vec![V4] },
+            add_path_send: Vec::new(),
         })
         .collect()
 }

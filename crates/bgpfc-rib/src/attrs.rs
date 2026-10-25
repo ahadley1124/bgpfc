@@ -5,7 +5,7 @@
 //! optional transitive attributes are carried with the Partial bit);
 //! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 8950 §3 (IPv4
 //! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities);
-//! RFC 7911 §3 (the Path Identifiers of announced prefixes).
+//! RFC 7911 §3 (the Path Identifiers of announced and sent prefixes).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
@@ -18,7 +18,7 @@ use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Afi, PathId};
-use bgpfc_wire::update::{DecodedUpdate, UpdateMessage};
+use bgpfc_wire::update::{DecodedUpdate, PathIds, UpdateMessage};
 
 /// An optional transitive attribute this implementation does not know,
 /// kept for forwarding (RFC 4271 §5).
@@ -208,6 +208,27 @@ impl PathAttrs {
             }
         }
         m.attributes.sort_by_key(PathAttribute::code);
+        m
+    }
+
+    /// As [`PathAttrs::to_update`], for a family sent with Path Identifiers
+    /// (RFC 7911 §3): `ids[i]` goes with `nlri[i]`, in whichever field the
+    /// prefixes went.
+    #[must_use]
+    pub fn to_update_paths(
+        &self,
+        family: AddressFamily,
+        nlri: Vec<Prefix>,
+        ids: Vec<PathId>,
+    ) -> UpdateMessage {
+        let mut m = self.to_update(family, nlri);
+        let mut path_ids = PathIds::default();
+        if m.mp_reach.is_some() {
+            path_ids.mp_reach = ids;
+        } else {
+            path_ids.nlri = ids;
+        }
+        m.path_ids = Some(Box::new(path_ids));
         m
     }
 

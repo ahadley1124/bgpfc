@@ -1620,6 +1620,7 @@ mod tests {
             advertisement_interval: Duration::ZERO,
             prefix_limits: vec![(v4, 1000)],
             add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],

@@ -331,6 +331,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         advertisement_interval: interval,
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     }
 }
 
