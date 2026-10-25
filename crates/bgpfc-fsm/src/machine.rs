@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::{Capability, NextHopEncoding, next_hop_encodings};
+use bgpfc_wire::capability::{Capability, NextHopEncoding, add_path_abilities, next_hop_encodings};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, FsmSubcode, OpenSubcode};
 use bgpfc_wire::header::MessageType;
 use bgpfc_wire::notification::NotificationMessage;
@@ -796,6 +796,8 @@ impl Fsm {
         } else {
             Vec::new()
         };
+        let (add_path_receive, add_path_send) =
+            negotiate_add_path(ours, &open.capabilities, &families);
         if families.is_empty() {
             // RFC 5492 §5: Unsupported Capability, Data = the capabilities
             // we require, encoded as in the OPEN.
@@ -828,6 +830,8 @@ impl Fsm {
             receive_families,
             extended_next_hop_receive,
             extended_next_hop_send,
+            add_path_receive,
+            add_path_send,
             peer_capabilities: open.capabilities.clone(),
         })
     }
@@ -1087,6 +1091,34 @@ fn negotiate_families(ours: &[Capability], theirs: &[Capability]) -> Vec<Address
         .into_iter()
         .filter(|f| theirs.contains(f))
         .collect()
+}
+
+/// RFC 7911 §5, for each family of the session: "For a BGP speaker to be
+/// able to send multiple paths to its peer, that BGP speaker MUST
+/// advertise the ADD-PATH Capability with the Send/Receive field set to
+/// either 2 or 3, and MUST receive from its peer the ADD-PATH Capability
+/// with the Send/Receive field set to either 1 or 3, for the
+/// corresponding <AFI, SAFI>." Without both, "the BGP speaker MUST follow
+/// the procedures defined in [RFC4271]" for the family, in that direction.
+/// Returns the families we receive with Path Identifiers and those we send
+/// with them.
+fn negotiate_add_path(
+    ours: &[Capability],
+    theirs: &[Capability],
+    families: &[AddressFamily],
+) -> (Vec<AddressFamily>, Vec<AddressFamily>) {
+    let (mut receive, mut send) = (Vec::new(), Vec::new());
+    for family in families {
+        let (our_receive, our_send) = add_path_abilities(ours, *family);
+        let (their_receive, their_send) = add_path_abilities(theirs, *family);
+        if our_receive && their_send {
+            receive.push(*family);
+        }
+        if our_send && their_receive {
+            send.push(*family);
+        }
+    }
+    (receive, send)
 }
 
 #[cfg(test)]

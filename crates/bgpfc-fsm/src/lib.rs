@@ -18,7 +18,8 @@
 //! sides advertised it; routes of every family we advertised are taken);
 //! RFC 6793 §3 (four-octet AS negotiation); RFC 8654 §4 (Extended Message
 //! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
-//! RFC 7607 §2 (never claim AS 0).
+//! RFC 7607 §2 (never claim AS 0); RFC 7911 §4, §5 (ADD-PATH negotiation,
+//! per family and direction).
 #![forbid(unsafe_code)]
 
 mod machine;
@@ -270,6 +271,16 @@ pub struct Session {
     /// them (RFC 8950 §4), and so did we. Within
     /// `extended_next_hop_receive`.
     pub extended_next_hop_send: Vec<AddressFamily>,
+    /// The families in `families` whose routes the peer sends us with a
+    /// Path Identifier for each (RFC 7911 §5): we advertised the ADD-PATH
+    /// capability with the ability to receive multiple paths for the
+    /// family, and the peer with the ability to send them.
+    pub add_path_receive: Vec<AddressFamily>,
+    /// The families in `families` whose routes we may send the peer with a
+    /// Path Identifier for each, several for one prefix (RFC 7911 §5): we
+    /// advertised the ability to send multiple paths for the family, and
+    /// the peer to receive them.
+    pub add_path_send: Vec<AddressFamily>,
     /// Capabilities the peer advertised, verbatim.
     pub peer_capabilities: Vec<Capability>,
 }

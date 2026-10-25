@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, UpdateSubcode};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
@@ -455,6 +455,9 @@ fn open_negotiation() {
     // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
     assert_eq!(s.extended_next_hop_receive, vec![]);
     assert_eq!(s.extended_next_hop_send, vec![]);
+    // RFC 7911 §5: nobody advertised ADD-PATH.
+    assert_eq!(s.add_path_receive, vec![]);
+    assert_eq!(s.add_path_send, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
     assert_eq!(
         f.timer(TimerKind::Keepalive).deadline(),
@@ -664,6 +667,165 @@ fn extended_next_hop_follows_the_ipv4_unicast_family() {
     assert_eq!(
         (&s.extended_next_hop_receive, &s.extended_next_hop_send),
         (&vec![], &vec![])
+    );
+}
+
+fn add_path(tuples: &[(AddressFamily, AddPathMode)]) -> Capability {
+    Capability::AddPath(
+        tuples
+            .iter()
+            .map(|(family, mode)| AddPathTuple {
+                family: *family,
+                mode: *mode,
+            })
+            .collect(),
+    )
+}
+
+/// RFC 7911 §5 between `config()` with `ours` added and a peer advertising
+/// IPv4 and IPv6 unicast and `theirs`: (families received with Path
+/// Identifiers, families sent with them).
+fn negotiated_add_path(
+    ours: Vec<Capability>,
+    theirs: Vec<Capability>,
+) -> (Vec<AddressFamily>, Vec<AddressFamily>) {
+    let mut cfg = config();
+    cfg.capabilities.extend(ours);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let mut caps = vec![
+        Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+        Capability::Multiprotocol(AddressFamily::IPV6_UNICAST),
+    ];
+    caps.extend(theirs);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+        now,
+    );
+    let s = f.session().unwrap();
+    (s.add_path_receive.clone(), s.add_path_send.clone())
+}
+
+#[test]
+fn add_path_is_negotiated_per_family_and_direction() {
+    use AddPathMode::{Both, Receive, Send};
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    let negotiated = negotiated_add_path;
+    // RFC 7911 §5: we send once we advertised Send (2 or 3) and the peer
+    // Receive (1 or 3); we receive once we advertised Receive and the peer
+    // Send. Every combination of the three values for one family.
+    let cases = [
+        // (ours, theirs, we receive, we send)
+        (Receive, Receive, false, false),
+        (Receive, Send, true, false),
+        (Receive, Both, true, false),
+        (Send, Receive, false, true),
+        (Send, Send, false, false),
+        (Send, Both, false, true),
+        (Both, Receive, false, true),
+        (Both, Send, true, false),
+        (Both, Both, true, true),
+    ];
+    for (ours, theirs, receive, send) in cases {
+        assert_eq!(
+            negotiated(
+                vec![add_path(&[(v4, ours)])],
+                vec![add_path(&[(v4, theirs)])]
+            ),
+            (
+                if receive { vec![v4] } else { vec![] },
+                if send { vec![v4] } else { vec![] }
+            ),
+            "ours {ours:?}, theirs {theirs:?}"
+        );
+    }
+    // Per family: IPv4 both ways, IPv6 we only send.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Both), (v6, Send)])],
+            vec![add_path(&[(v4, Both), (v6, Receive)])]
+        ),
+        (vec![v4], vec![v4, v6])
+    );
+    // One side silent: the RFC 4271 procedures hold, both ways.
+    assert_eq!(
+        negotiated(vec![add_path(&[(v4, Both)])], vec![]),
+        (vec![], vec![])
+    );
+    assert_eq!(
+        negotiated(vec![], vec![add_path(&[(v4, Both)])]),
+        (vec![], vec![])
+    );
+    // A family only one side lists is not negotiated.
+    assert_eq!(
+        negotiated(vec![add_path(&[(v6, Both)])], vec![add_path(&[(v4, Both)])]),
+        (vec![], vec![])
+    );
+    // RFC 7911 §4 asks for one instance, RFC 5492 §4 allows several: the
+    // tuples of both count, and a family listed twice has either ability.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Receive)]), add_path(&[(v4, Send)])],
+            vec![add_path(&[(v4, Both)]), add_path(&[(v6, Both)])]
+        ),
+        (vec![v4], vec![v4])
+    );
+    // A tuple the peer sent with a value other than 1 to 3 made its
+    // capability one that is not understood, and nothing was negotiated.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Both)])],
+            vec![Capability::Unknown {
+                code: 69,
+                value: vec![0, 1, 1, 0],
+            }]
+        ),
+        (vec![], vec![])
+    );
+}
+
+#[test]
+fn add_path_needs_the_family_negotiated() {
+    use AddPathMode::Both;
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    // RFC 4760 §8 first: a family the peer did not advertise is not
+    // exchanged, so ADD-PATH for it has nothing to apply to.
+    let mut cfg = config();
+    cfg.capabilities.push(add_path(&[(v4, Both), (v6, Both)]));
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let theirs = vec![
+        Capability::Multiprotocol(v4),
+        add_path(&[(v4, Both), (v6, Both)]),
+    ];
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(s.families, vec![v4]);
+    assert_eq!(
+        (&s.add_path_receive, &s.add_path_send),
+        (&vec![v4], &vec![v4])
+    );
+    // IPv4 unicast alone without any Multiprotocol capability is implicit
+    // (RFC 4760 §8), and ADD-PATH for it applies.
+    let mut cfg = Config::new(LOCAL_AS, rid(1), PEER_AS);
+    cfg.capabilities = vec![add_path(&[(v4, Both)])];
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(
+            PEER_AS,
+            hold(30),
+            rid(2),
+            vec![add_path(&[(v4, Both)])],
+        )),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(
+        (&s.add_path_receive, &s.add_path_send),
+        (&vec![v4], &vec![v4])
     );
 }
 
