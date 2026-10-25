@@ -676,6 +676,19 @@ fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
     }
 }
 
+/// `r`, a route to `prefix`, for the control plane.
+fn route_report(prefix: Prefix, r: &bgpfc_rib::RouteRef<'_>, best: bool) -> RouteReport {
+    RouteReport {
+        prefix,
+        peer: r.peer,
+        attrs: std::sync::Arc::clone(r.attrs),
+        best,
+        rov: r.rov,
+        rov_set: r.rov_set,
+        held: r.held,
+    }
+}
+
 fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
     match q {
         RibQuery::Peers => RibReply::Peers(
@@ -685,40 +698,48 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
         ),
         RibQuery::Routes {
             family,
-            prefix,
+            prefix: Some(prefix),
+            held,
+            ..
+        } => RibReply::Routes(
+            // RFC 6811 §2: the Adj-RIBs-In keep a route held for its
+            // state; it comes after the candidates, of which the first is
+            // the best.
+            rib.routes(*family, *prefix)
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !held || r.held.is_some())
+                .map(|(i, r)| route_report(*prefix, r, i == 0 && r.held.is_none()))
+                .collect(),
+        ),
+        RibQuery::Routes {
+            family,
+            prefix: None,
             after,
-        } => match prefix {
-            Some(prefix) => {
-                let best = rib
-                    .loc_rib(*family)
-                    .find(|(p, _)| p == prefix)
-                    .map(|(_, b)| b.peer);
-                RibReply::Routes(
-                    rib.candidates(*family, *prefix)
-                        .iter()
-                        .map(|c| RouteReport {
-                            prefix: *prefix,
-                            peer: c.peer,
-                            attrs: std::sync::Arc::clone(c.attrs),
-                            best: best == Some(c.peer),
-                            rov: c.rov,
-                        })
-                        .collect(),
-                )
+            held: false,
+        } => RibReply::Routes(
+            rib.loc_rib_after(*family, *after)
+                .take(PAGE)
+                .map(|(prefix, b)| route_report(prefix, &b, true))
+                .collect(),
+        ),
+        RibQuery::Routes {
+            family,
+            prefix: None,
+            after,
+            held: true,
+        } => {
+            let mut page: Vec<RouteReport> = Vec::new();
+            for (prefix, r) in rib.held_after(*family, *after) {
+                // A page ends between two destinations, so that the next,
+                // after the last prefix, misses none of their routes.
+                if page.len() >= PAGE && page.last().is_some_and(|l| l.prefix != prefix) {
+                    break;
+                }
+                page.push(route_report(prefix, &r, false));
             }
-            None => RibReply::Routes(
-                rib.loc_rib_after(*family, *after)
-                    .take(PAGE)
-                    .map(|(prefix, b)| RouteReport {
-                        prefix,
-                        peer: b.peer,
-                        attrs: std::sync::Arc::clone(b.attrs),
-                        best: true,
-                        rov: b.rov,
-                    })
-                    .collect(),
-            ),
-        },
+            RibReply::Routes(page)
+        }
         RibQuery::FibRoutes { after } => {
             RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
         }
@@ -1261,6 +1282,7 @@ mod tests {
             family: V4,
             prefix: None,
             after: None,
+            held: false,
         };
         match answer(rib, &q) {
             RibReply::Routes(routes) => routes
@@ -1384,6 +1406,7 @@ mod tests {
                 family: V4,
                 prefix: None,
                 after: None,
+                held: false,
             };
             tx.send(RibMsg::Query(q, reply)).unwrap();
             match answer.recv_timeout(Duration::from_secs(10)) {
@@ -1788,6 +1811,224 @@ mod tests {
         assert_eq!(
             fields[5..],
             [("route", "held".to_owned()), ("by", "policy".to_owned())]
+        );
+    }
+
+    /// A route as `answer` lists it: prefix, peer, best, the looked-up
+    /// state, the one set, and why it is held.
+    type Listed = (
+        String,
+        String,
+        bool,
+        RovState,
+        Option<RovState>,
+        Option<bgpfc_rib::Held>,
+    );
+
+    /// What `answer` says to a routes query.
+    fn listed_routes(rib: &Rib, q: &RibQuery) -> Vec<Listed> {
+        match answer(rib, q) {
+            RibReply::Routes(routes) => routes
+                .iter()
+                .map(|r| {
+                    (
+                        r.prefix.to_string(),
+                        r.peer.to_string(),
+                        r.best,
+                        r.rov,
+                        r.rov_set,
+                        r.held,
+                    )
+                })
+                .collect(),
+            other => panic!("asked for routes, got {other:?}"),
+        }
+    }
+
+    /// A RIB under drop-invalid with VRPs for AS 64496 alone, and routes:
+    /// 192.0.2.1 (AS 65001) to two prefixes, both Invalid and held;
+    /// 192.0.2.2 (AS 64496) to 203.0.113.0/24, Valid; 192.0.2.3 (AS
+    /// 65003) to 198.51.100.0/24, Invalid, which import policy sets valid
+    /// (RFC 6811 §3).
+    fn held_routes() -> Rib {
+        use bgpfc_rib::Enforcement;
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.254; local-as 65000;
+             policy IN {
+                 term pin { match neighbor 192.0.2.3; set rpki valid; action accept; }
+                 term all { action accept; }
+             }
+             policy OUT { term all { action accept; } }
+             neighbor 192.0.2.1 { remote-as 65001; import IN; export OUT; }
+             neighbor 192.0.2.2 { remote-as 64496; import IN; export OUT; }
+             neighbor 192.0.2.3 { remote-as 65003; import IN; export OUT; }",
+        )
+        .unwrap();
+        let engine = bgpfc_policy::Engine::new(&cfg).unwrap();
+        let now = Instant::now();
+        let mut rib = Rib::with_policies(Asn(65_000), Box::new(engine));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        let on = all(&[
+            vrp("203.0.113.0/24", 24, 64_496),
+            vrp("198.51.100.0/24", 24, 64_496),
+        ]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        let both: &[&str] = &["198.51.100.0/24", "203.0.113.0/24"];
+        for (peer, peer_as, prefixes) in [
+            ("192.0.2.1", 65_001, both),
+            ("192.0.2.2", 64_496, &both[1..]),
+            ("192.0.2.3", 65_003, &both[..1]),
+        ] {
+            let msg = up(peer, peer_as, PeerKind::External);
+            handle(&mut rib, &mut settings, msg, now);
+            handle(
+                &mut rib,
+                &mut settings,
+                routes(peer, peer_as, prefixes),
+                now,
+            );
+        }
+        rib
+    }
+
+    #[test]
+    fn routes_query_lists_held_routes() {
+        // RFC 6811 §2: under drop-invalid the Adj-RIB-In keeps the Invalid
+        // route, which `show routes PREFIX` lists after the candidates and
+        // `show routes held` alone; an import policy that sets the state
+        // (RFC 6811 §3) shows it beside the one looked up.
+        use RovState::{Invalid, Valid};
+        let rib = held_routes();
+        let query = |prefix: Option<&str>, held| RibQuery::Routes {
+            family: V4,
+            prefix: prefix.map(|p| p.parse().unwrap()),
+            after: None,
+            held,
+        };
+        let r = |p: &str, peer: &str, best, rov, set, held| {
+            (p.to_owned(), peer.to_owned(), best, rov, set, held)
+        };
+        let by = Some(bgpfc_rib::Held::Enforcement);
+        // Every route to a destination: the best, then the held one.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("203.0.113.0/24"), false)),
+            [
+                r("203.0.113.0/24", "192.0.2.2", true, Valid, None, None),
+                r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by),
+            ]
+        );
+        // Import policy set valid on the route from 192.0.2.3, which is
+        // used, and best; 192.0.2.1's own is held.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("198.51.100.0/24"), false)),
+            [
+                r(
+                    "198.51.100.0/24",
+                    "192.0.2.3",
+                    true,
+                    Invalid,
+                    Some(Valid),
+                    None
+                ),
+                r("198.51.100.0/24", "192.0.2.1", false, Invalid, None, by),
+            ]
+        );
+        // Only the held: of the destination, and of the family.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("203.0.113.0/24"), true)),
+            [r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by)]
+        );
+        let held = [
+            r("198.51.100.0/24", "192.0.2.1", false, Invalid, None, by),
+            r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by),
+        ];
+        assert_eq!(listed_routes(&rib, &query(None, true)), held);
+        // The next page starts after a destination.
+        let after = RibQuery::Routes {
+            family: V4,
+            prefix: None,
+            after: Some("198.51.100.0/24".parse().unwrap()),
+            held: true,
+        };
+        assert_eq!(listed_routes(&rib, &after), held[1..]);
+        // The Loc-RIB has the best routes only.
+        assert_eq!(
+            listed_routes(&rib, &query(None, false)),
+            [
+                r(
+                    "198.51.100.0/24",
+                    "192.0.2.3",
+                    true,
+                    Invalid,
+                    Some(Valid),
+                    None
+                ),
+                r("203.0.113.0/24", "192.0.2.2", true, Valid, None, None),
+            ]
+        );
+        assert_eq!(listed_routes(&rib, &query(Some("192.0.2.0/24"), false)), []);
+    }
+
+    #[test]
+    fn a_page_of_held_routes_ends_between_destinations() {
+        // `show routes held` takes the routes a page at a time, each page
+        // after the last prefix of the one before: one that ended inside
+        // a destination would lose the rest of its routes.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        let on = all(&[vrp("10.0.0.0/8", 24, 64_496)]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        // One route to the first destination, two to each of the others:
+        // the page reaches PAGE inside a destination.
+        let prefixes: Vec<String> = (0..=PAGE / 2 + 1)
+            .map(|i| {
+                let [_, _, x, y] = u32::try_from(i).unwrap().to_be_bytes();
+                format!("10.{x}.{y}.0/24")
+            })
+            .collect();
+        let all_of: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        for (peer, peer_as, sent) in [
+            ("192.0.2.1", 65_001, &all_of[..]),
+            ("192.0.2.2", 65_002, &all_of[1..]),
+        ] {
+            handle(
+                &mut rib,
+                &mut settings,
+                up(peer, peer_as, PeerKind::External),
+                now,
+            );
+            handle(&mut rib, &mut settings, routes(peer, peer_as, sent), now);
+        }
+        let page = |after: Option<&str>| {
+            let q = RibQuery::Routes {
+                family: V4,
+                prefix: None,
+                after: after.map(|p| p.parse().unwrap()),
+                held: true,
+            };
+            listed_routes(&rib, &q)
+        };
+        let first = page(None);
+        // 1 + 2 * 2047 routes, then both of the next destination's.
+        assert_eq!(first.len(), PAGE + 1);
+        let last = &prefixes[PAGE / 2];
+        assert_eq!(first[PAGE - 1].0, *last);
+        assert_eq!(first[PAGE].0, *last);
+        let second = page(Some(last));
+        assert_eq!(
+            second
+                .iter()
+                .map(|r| (r.0.as_str(), r.1.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (prefixes[PAGE / 2 + 1].as_str(), "192.0.2.1"),
+                (prefixes[PAGE / 2 + 1].as_str(), "192.0.2.2")
+            ]
         );
     }
 }

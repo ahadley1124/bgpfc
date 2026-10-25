@@ -747,7 +747,7 @@ fn assert_extended_next_hop_off_towards_c(
     let c = lab.c_addr.to_string();
     let ok = wait_for(Duration::from_secs(15), || {
         let (out, _) = ctl(&["show", "neighbor", &c]);
-        out.contains("Established") && out.contains("routes received 1 advertised 0")
+        out.contains("Established") && out.contains("routes received 1 held 0 advertised 0")
     });
     let (out, _) = ctl(&["show", "neighbor", &c]);
     assert!(ok, "{out}\n{}", bgpfcd.log_text());
@@ -848,7 +848,7 @@ fn prefix_limit_and_restart_limit_with_bird() {
     assert!(ok, "{out}");
     let ok = wait_for(ESTABLISH, || {
         let (out, _) = ctl(&["show", "neighbor", &b_addr]);
-        out.contains("ipv4-unicast received 3 advertised 0 maximum-prefix 10")
+        out.contains("ipv4-unicast received 3 held 0 advertised 0 maximum-prefix 10")
     });
     let (out, _) = ctl(&["show", "neighbor", &b_addr]);
     assert!(ok, "{out}\n{}", bgpfcd.log_text());

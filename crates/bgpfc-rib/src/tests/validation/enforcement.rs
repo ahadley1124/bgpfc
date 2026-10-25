@@ -148,6 +148,48 @@ fn invalid_routes_are_held_not_used_under_drop_invalid() {
 }
 
 #[test]
+fn held_routes_are_listed_a_part_at_a_time() {
+    // `held_after` continues the listing after a destination, as a
+    // control plane taking it a page at a time asks for it.
+    let mut rib = Rib::new(LOCAL_AS);
+    outputs(|o| rib.set_enforcement(DropInvalid, now(), o));
+    let (e1, e2) = two_peers(&mut rib);
+    let roas = vrps(&[("192.0.2.0/23", 24, 64_497), ("203.0.113.0/24", 24, 64_497)]);
+    outputs(|o| rib.validation_changed(all(roas), now(), o));
+    send(
+        &mut rib,
+        &e1,
+        &["192.0.2.0/24", "192.0.3.0/24", "198.51.100.0/24"],
+    );
+    let a = attrs(&[65_002, 64_496], "10.0.0.2");
+    let update = announce(&["192.0.3.0/24", "203.0.113.0/24"], &a);
+    outputs(|o| rib.update(e2.addr, &update, now(), o));
+    let after = |from: Option<&str>| -> Vec<(Prefix, IpAddr)> {
+        rib.held_after(V4, from.map(p))
+            .map(|(q, r)| (q, r.peer))
+            .collect()
+    };
+    let every = vec![
+        (p("192.0.2.0/24"), e1.addr),
+        (p("192.0.3.0/24"), e1.addr),
+        (p("192.0.3.0/24"), e2.addr),
+        (p("203.0.113.0/24"), e2.addr),
+    ];
+    assert_eq!(after(None), every);
+    assert_eq!(
+        rib.held(V4).map(|(q, r)| (q, r.peer)).collect::<Vec<_>>(),
+        every
+    );
+    // After a destination: both routes of the next, none of its own.
+    assert_eq!(after(Some("192.0.2.0/24")), every[1..]);
+    assert_eq!(after(Some("192.0.3.0/24")), every[3..]);
+    // A prefix the table does not have works as well.
+    assert_eq!(after(Some("198.51.100.0/24")), every[3..]);
+    assert_eq!(after(Some("203.0.113.0/24")), vec![]);
+    assert_eq!(rib.held_after(V6, None).count(), 0);
+}
+
+#[test]
 fn a_held_invalid_route_returns_when_it_becomes_valid_without_an_update() {
     // Issue #59: "A route flipping from Invalid to Valid produces an
     // advertisement", with no UPDATE (RFC 6811 §4).

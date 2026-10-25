@@ -30,8 +30,8 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
+| `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -52,8 +52,9 @@ A body line that starts with `.` is sent as `..`. One request per
 connection; the daemon closes after the response. Requests over 4096
 bytes are refused.
 
-`show routes` of a whole family and `show fib` can list millions of
-routes. The daemon takes them from the RIB and the FIB 4096 at a time and
+`show routes` of a whole family, held routes or not, and `show fib` can
+list millions of routes. The daemon takes them from the RIB and the FIB
+about 4096 at a time (all the held routes of a destination in one go) and
 writes each part as it comes, so the listing is not one snapshot: a
 route that changes meanwhile may show either way. If the daemon cannot
 finish a listing, the response ends without its `.` line, which the client
@@ -78,7 +79,7 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/status` | `show status` |
 | `GET /v1/neighbors` | `show neighbors` |
 | `GET /v1/neighbors/{addr}` | `show neighbor ADDR` (`404` if unknown) |
-| `GET /v1/routes?family=ipv4\|ipv6[&prefix=P]` | `show routes` |
+| `GET /v1/routes?family=ipv4\|ipv6[&prefix=P][&held=1]` | `show routes` |
 | `GET /v1/fib` | `show fib` |
 | `GET /v1/rpki` | `show rpki` |
 | `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
@@ -93,17 +94,20 @@ Example objects:
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
-  "received":2,"advertised":1,
-  "prefixes":[{"family":"ipv4-unicast","received":2,"advertised":1,"limit":1000},
-              {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
+  "received":2,"held":1,"advertised":1,
+  "prefixes":[{"family":"ipv4-unicast","received":2,"held":1,"advertised":1,"limit":1000},
+              {"family":"ipv6-unicast","received":0,"held":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
              "families":["ipv4-unicast","ipv6-unicast"],
              "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","best":true,"rov":"disabled","as_path":[64511],"communities":[],
-  "large_communities":[]}]
+  "peer":"198.51.100.1","best":true,"rov":"valid","rov_set":null,"held":null,"as_path":[64511],
+  "communities":[],"large_communities":[]},
+ {"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","local_pref":null,"med":null,
+  "peer":"198.51.100.2","best":false,"rov":"invalid","rov_set":null,"held":"enforcement",
+  "as_path":[64497],"communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
@@ -129,6 +133,18 @@ member:
 | `invalid` | at least one VRP covers the prefix, but none matches the route |
 | `not-found` | no VRP covers the prefix |
 | `disabled` | origin validation is not performed |
+
+When import policy sets the state a route is used with (`set rpki`, RFC
+6811 §3), `show routes` prints it after the looked-up one, as in
+`invalid>valid`, and the JSON has it as `rov_set` (`null` otherwise).
+A route the Adj-RIB-In holds for its state is no candidate for route
+selection (RFC 6811 §2: kept, but out of the decision process as
+configured): `show routes PREFIX` lists it after the candidates, marked
+`!`, with `held by enforcement` (the `rpki` block's `enforcement` rules
+out the state it is used with) or `held by policy` (the import policy
+rejects it in its state and would accept it in another); the JSON has
+`held` (`enforcement`, `policy` or `null`). `show routes held` lists every
+held route of a family, and `show neighbor` counts them per family.
 
 `disabled` is kept apart from `not-found`, which RFC 6811 §2 suggests for
 a route that was not validated, so that a route nobody checked can be told

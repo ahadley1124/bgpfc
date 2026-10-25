@@ -1226,10 +1226,20 @@ impl Rib {
     /// Every route of `family` the Adj-RIBs-In hold for its validation
     /// state and that is no candidate, in prefix order.
     pub fn held(&self, family: AddressFamily) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
+        self.held_after(family, None)
+    }
+
+    /// [`Rib::held`] for the destinations after `from`: a long listing
+    /// taken a part at a time, each part starting where the last ended.
+    pub fn held_after(
+        &self,
+        family: AddressFamily,
+        from: Option<Prefix>,
+    ) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
         self.tables
             .get(family)
             .into_iter()
-            .flat_map(store::PrefixMap::iter)
+            .flat_map(move |t| t.after(from))
             .flat_map(move |(p, d)| {
                 d.routes()[d.candidates()..]
                     .iter()

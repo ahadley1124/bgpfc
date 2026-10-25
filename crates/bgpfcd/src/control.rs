@@ -10,7 +10,9 @@
 //! against the prefix limit); RFC 8210 §10 (the cache list, the cache
 //! whose data is in use, marked as to source, and the one the client talks
 //! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
-//! with the VRPs that Cover and Match it).
+//! with the VRPs that Cover and Match it; the routes the Adj-RIBs-In hold
+//! for their state, listed and counted), §3 (the state import policy set
+//! beside the one looked up).
 
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -27,6 +29,7 @@ use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
+use bgpfc_rib::Held;
 use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
@@ -83,6 +86,8 @@ pub(crate) enum Command {
     ShowRoutes {
         family: AddressFamily,
         prefix: Option<Prefix>,
+        /// Only the routes held for their validation state.
+        held: bool,
     },
     ShowFib,
     ShowStatus,
@@ -122,14 +127,16 @@ impl Command {
             ["show", "routes", rest @ ..] => {
                 let mut family = AddressFamily::IPV4_UNICAST;
                 let mut prefix = None;
+                let mut held = false;
                 for r in rest {
                     match *r {
                         "ipv4" => family = AddressFamily::IPV4_UNICAST,
                         "ipv6" => family = AddressFamily::IPV6_UNICAST,
+                        "held" => held = true,
                         p => {
-                            let parsed: Prefix = p
-                                .parse()
-                                .map_err(|_| format!("`{p}` is not ipv4, ipv6 or a prefix"))?;
+                            let parsed: Prefix = p.parse().map_err(|_| {
+                                format!("`{p}` is not ipv4, ipv6, held or a prefix")
+                            })?;
                             family = if matches!(parsed, Prefix::V6 { .. }) {
                                 AddressFamily::IPV6_UNICAST
                             } else {
@@ -139,7 +146,11 @@ impl Command {
                         }
                     }
                 }
-                Ok(Command::ShowRoutes { family, prefix })
+                Ok(Command::ShowRoutes {
+                    family,
+                    prefix,
+                    held,
+                })
             }
             ["show", "fib"] => Ok(Command::ShowFib),
             ["show", "status"] => Ok(Command::ShowStatus),
@@ -205,7 +216,12 @@ impl Command {
                             .map_err(|_| (400, format!("bad prefix {p}")))
                     })
                     .transpose()?;
-                Ok(Command::ShowRoutes { family, prefix })
+                let held = matches!(r.param("held"), Some("1" | "true" | "yes"));
+                Ok(Command::ShowRoutes {
+                    family,
+                    prefix,
+                    held,
+                })
             }
             ("GET", ["v1", "fib"]) => Ok(Command::ShowFib),
             ("GET", ["v1", "rpki"]) => Ok(Command::ShowRpki),
@@ -286,7 +302,8 @@ pub(crate) fn execute<'a>(ctx: &'a Ctx, cmd: &Command) -> Result<Answer<'a>, Str
         Command::ShowRoutes {
             family,
             prefix: None,
-        } => Listing::routes(ctx, *family).map(Answer::Listing),
+            held,
+        } => Listing::routes(ctx, *family, *held).map(Answer::Listing),
         Command::ShowFib => Listing::fib(ctx).map(Answer::Listing),
         _ => reply(ctx, cmd).map(Answer::Reply),
     }
@@ -307,11 +324,15 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
             let stats = rib_peers(ctx)?;
             Ok(render_neighbor(&reports[0], &stats))
         }
-        // One destination and every candidate route to it. Without one,
-        // execute answers with a listing.
-        Command::ShowRoutes { family, prefix } => {
-            Ok(render_routes(&rib_routes(ctx, *family, *prefix, None)?))
-        }
+        // One destination and every route the Adj-RIBs-In hold for it.
+        // Without one, execute answers with a listing.
+        Command::ShowRoutes {
+            family,
+            prefix,
+            held,
+        } => Ok(render_routes(&rib_routes(
+            ctx, *family, *prefix, None, *held,
+        )?)),
         // invariant: execute answers it with a listing.
         Command::ShowFib => unreachable!("show fib is a listing"),
         Command::ShowStatus => status(ctx),
@@ -742,36 +763,54 @@ fn rib_peers(ctx: &Ctx) -> Result<Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats
     }
 }
 
-fn counts(stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)], addr: IpAddr) -> (usize, usize) {
+/// A neighbor's routes, in all or in one family: received (what the RFC
+/// 4271 §6.7 limit counts), how many of those the Adj-RIB-In holds for
+/// their validation state and are no candidates (RFC 6811 §2), and
+/// advertised.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    received: usize,
+    held: usize,
+    advertised: usize,
+}
+
+/// `n` for JSON.
+fn num(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+fn counts(stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)], addr: IpAddr) -> Counts {
+    let sum = |v: &[(AddressFamily, usize)]| v.iter().map(|(_, n)| n).sum();
     stats
         .iter()
         .find(|(i, _)| i.addr == addr)
-        .map_or((0, 0), |(_, s)| {
-            (
-                s.received.iter().map(|(_, n)| n).sum(),
-                s.advertised.iter().map(|(_, n)| n).sum(),
-            )
+        .map_or(Counts::default(), |(_, s)| Counts {
+            received: sum(&s.received),
+            held: sum(&s.held),
+            advertised: sum(&s.advertised),
         })
 }
 
-/// Per family of an Established neighbor: routes received (what the
-/// RFC 4271 §6.7 limit counts), routes advertised, and the limit.
+/// Per family of an Established neighbor: its routes, and the limit.
 fn per_family(
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
     addr: IpAddr,
-) -> Vec<(AddressFamily, usize, usize, Option<u32>)> {
+) -> Vec<(AddressFamily, Counts, Option<u32>)> {
     let Some((info, s)) = stats.iter().find(|(i, _)| i.addr == addr) else {
         return Vec::new();
     };
+    let of = |v: &[(AddressFamily, usize)], family| {
+        v.iter().find(|(f, _)| *f == family).map_or(0, |(_, n)| *n)
+    };
     s.received
         .iter()
-        .map(|(family, received)| {
-            let advertised = s
-                .advertised
-                .iter()
-                .find(|(f, _)| f == family)
-                .map_or(0, |(_, n)| *n);
-            (*family, *received, advertised, info.prefix_limit(*family))
+        .map(|&(family, received)| {
+            let counts = Counts {
+                received,
+                held: of(&s.held, family),
+                advertised: of(&s.advertised, family),
+            };
+            (family, counts, info.prefix_limit(family))
         })
         .collect()
 }
@@ -781,7 +820,7 @@ fn write_neighbor(
     r: &PeerReport,
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
 ) {
-    let (received, advertised) = counts(stats, r.addr);
+    let all = counts(stats, r.addr);
     j.begin_object()
         .field_display("address", r.addr)
         .field_num("remote_as", r.remote_as.0)
@@ -791,14 +830,16 @@ fn write_neighbor(
         .field_bool("restart_limit_reached", r.restart_limit_reached)
         .field_num("updates_in", r.updates_in)
         .field_num("updates_out", r.updates_out)
-        .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
-        .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX));
+        .field_num("received", num(all.received))
+        .field_num("held", num(all.held))
+        .field_num("advertised", num(all.advertised));
     j.key("prefixes").begin_array();
-    for (family, received, advertised, limit) in per_family(stats, r.addr) {
+    for (family, c, limit) in per_family(stats, r.addr) {
         j.begin_object()
             .field_display("family", family)
-            .field_num("received", u64::try_from(received).unwrap_or(u64::MAX))
-            .field_num("advertised", u64::try_from(advertised).unwrap_or(u64::MAX))
+            .field_num("received", num(c.received))
+            .field_num("held", num(c.held))
+            .field_num("advertised", num(c.advertised))
             .field_opt_num("limit", limit)
             .end_object();
     }
@@ -852,7 +893,7 @@ fn render_neighbors(
     let mut j = Json::new();
     j.begin_array();
     for r in reports {
-        let (received, advertised) = counts(stats, r.addr);
+        let c = counts(stats, r.addr);
         lines.push(format!(
             "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
             r.addr,
@@ -860,8 +901,8 @@ fn render_neighbors(
             // `State` writes itself without the padding a width asks for.
             r.state.to_string(),
             r.since.as_secs(),
-            received,
-            advertised
+            c.received,
+            c.advertised
         ));
         write_neighbor(&mut j, r, stats);
     }
@@ -873,17 +914,23 @@ fn render_neighbors(
 }
 
 fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)]) -> Reply {
-    let (received, advertised) = counts(stats, r.addr);
+    let all = counts(stats, r.addr);
     let mut lines = vec![
         format!("neighbor {}", r.addr),
         format!("  remote-as {}", r.remote_as),
         format!("  state {} for {}s", r.state, r.since.as_secs()),
         format!("  updates in {} out {}", r.updates_in, r.updates_out),
-        format!("  routes received {received} advertised {advertised}"),
+        format!(
+            "  routes received {} held {} advertised {}",
+            all.received, all.held, all.advertised
+        ),
     ];
-    for (family, received, advertised, limit) in per_family(stats, r.addr) {
+    for (family, c, limit) in per_family(stats, r.addr) {
         lines.push(format!(
-            "    {family} received {received} advertised {advertised}{}",
+            "    {family} received {} held {} advertised {}{}",
+            c.received,
+            c.held,
+            c.advertised,
             limit.map_or(String::new(), |l| format!(" maximum-prefix {l}"))
         ));
     }
@@ -958,26 +1005,40 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
     }
 }
 
+/// One route of `show routes`: `*` marks the best, `!` a route held for
+/// its validation state, whose reason follows the peer. The `rov` column
+/// has the state the lookup gave the route (RFC 6811 §2) and, after `>`,
+/// the one import policy set (RFC 6811 §3), which the route is used with;
+/// it outgrows its column then.
 fn route_line(r: &RouteReport) -> String {
     let a = &r.attrs;
     let path: Vec<String> = a.as_path.asns().map(|x| x.0.to_string()).collect();
+    let rov = match r.rov_set {
+        Some(set) => format!("{}>{}", r.rov, set),
+        None => r.rov.as_str().to_owned(),
+    };
     // `Prefix` and `Origin` write themselves without the padding a width
     // asks for, so they are padded as strings.
     format!(
-        "{}{:<43} {:<40} {:<8} {:>5} {:>7} {:<9} {} via {}",
-        if r.best { "*" } else { " " },
+        "{}{:<43} {:<40} {:<8} {:>5} {:>7} {:<9} {} via {}{}",
+        match (r.best, r.held) {
+            (true, _) => "*",
+            (false, Some(_)) => "!",
+            (false, None) => " ",
+        },
         r.prefix.to_string(),
         a.next_hop_addr(),
         a.origin.to_string(),
         a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
         a.med.map_or("-".to_owned(), |v| v.to_string()),
-        r.rov.as_str(),
+        rov,
         if path.is_empty() {
             "-".to_owned()
         } else {
             path.join(" ")
         },
-        r.peer
+        r.peer,
+        r.held.map_or(String::new(), |by| format!(" held by {by}"))
     )
 }
 
@@ -992,6 +1053,8 @@ fn route_json(j: &mut Json, r: &RouteReport) {
         .field_display("peer", r.peer)
         .field_bool("best", r.best)
         .field_str("rov", r.rov.as_str())
+        .field_opt("rov_set", r.rov_set.map(RovState::as_str))
+        .field_opt("held", r.held.map(Held::as_str))
         .key("as_path")
         .begin_array();
     for asn in a.as_path.asns() {
@@ -1008,13 +1071,15 @@ fn route_json(j: &mut Json, r: &RouteReport) {
     j.end_array().end_object();
 }
 
-/// A page of the Loc-RIB of `family` after `after`, or every candidate
-/// route to `prefix`.
+/// A page of the Loc-RIB of `family` after `after`, or every route the
+/// Adj-RIBs-In hold for `prefix`; with `held`, only those held for their
+/// validation state.
 fn rib_routes(
     ctx: &Ctx,
     family: AddressFamily,
     prefix: Option<Prefix>,
     after: Option<Prefix>,
+    held: bool,
 ) -> Result<Vec<RouteReport>, String> {
     let (tx, rx) = sync_channel(1);
     ctx.rib
@@ -1023,6 +1088,7 @@ fn rib_routes(
                 family,
                 prefix,
                 after,
+                held,
             },
             tx,
         ))
@@ -1116,7 +1182,8 @@ impl<'a, T> Pages<'a, T> {
     }
 }
 
-/// A long listing: `show routes` of a whole family, `show fib`. A full
+/// A long listing: `show routes` of a whole family, of its Loc-RIB or of
+/// the routes held for their validation state, and `show fib`. A full
 /// table has a million routes or more, so it is taken from the RIB and the
 /// FIB a page at a time and written as it comes, rather than copied,
 /// rendered in both forms and written whole (which took several hundred
@@ -1142,9 +1209,9 @@ struct FibRow {
 }
 
 impl<'a> Listing<'a> {
-    fn routes(ctx: &'a Ctx, family: AddressFamily) -> Result<Listing<'a>, String> {
+    fn routes(ctx: &'a Ctx, family: AddressFamily, held: bool) -> Result<Listing<'a>, String> {
         let pages = Pages::open(
-            move |after| rib_routes(ctx, family, None, after),
+            move |after| rib_routes(ctx, family, None, after, held),
             |r: &RouteReport| r.prefix,
         )?;
         Ok(Listing::Routes(pages))
@@ -1620,8 +1687,8 @@ mod tests {
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
+            held: vec![(v4, 2), (v6, 0)],
             advertised: vec![(v4, 4), (v6, 0)],
-            ..Default::default()
         };
         let report = PeerReport {
             addr,
@@ -1649,18 +1716,21 @@ mod tests {
             restart_limit_reached: false,
         };
         let r = render_neighbor(&report, &[(info, stats)]);
-        // RFC 4271 §6.7: what the limit counts, next to the limit.
+        // RFC 4271 §6.7: what the limit counts, next to the limit, with
+        // the routes held for their validation state among them.
         for line in [
-            "  routes received 15 advertised 4",
-            "    ipv4-unicast received 12 advertised 4 maximum-prefix 1000",
-            "    ipv6-unicast received 3 advertised 0",
+            "  routes received 15 held 2 advertised 4",
+            "    ipv4-unicast received 12 held 2 advertised 4 maximum-prefix 1000",
+            "    ipv6-unicast received 3 held 0 advertised 0",
         ] {
             assert!(r.lines.contains(&line.to_owned()), "{line}: {:?}", r.lines);
         }
         assert!(
-            r.json.contains(
-                r#""prefixes":[{"family":"ipv4-unicast","received":12,"advertised":4,"limit":1000},{"family":"ipv6-unicast","received":3,"advertised":0,"limit":null}]"#
-            ),
+            r.json.contains(concat!(
+                r#""received":15,"held":2,"advertised":4,"prefixes":["#,
+                r#"{"family":"ipv4-unicast","received":12,"held":2,"advertised":4,"limit":1000},"#,
+                r#"{"family":"ipv6-unicast","received":3,"held":0,"advertised":0,"limit":null}]"#
+            )),
             "{}",
             r.json
         );
@@ -1802,6 +1872,8 @@ mod tests {
             }),
             best: false,
             rov: RovState::Disabled,
+            rov_set: None,
+            held: None,
         }
     }
 
@@ -1809,7 +1881,8 @@ mod tests {
     fn routes_render_as_lines_and_json() {
         // Two routes to one destination, from different origin ASes: a
         // VRP for AS 64496 makes one valid and the other invalid. The
-        // invalid one stays a candidate (RFC 6811 §2).
+        // invalid one stays a candidate (RFC 6811 §2) where nothing acts
+        // on its state, as under `enforcement off`.
         let mut best = route(
             "192.0.2.0/24",
             "198.51.100.1",
@@ -1841,18 +1914,18 @@ mod tests {
             ]
         );
         // docs/control.md: `local_pref` and `med` are numbers, or null;
-        // `rov` is the state's name.
+        // `rov` is the state's name; nothing set or held.
         assert_eq!(
             r.json,
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
                 r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
-                r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
-                r#""large_communities":[]},"#,
+                r#""rov":"valid","rov_set":null,"held":null,"as_path":[64511,64496],"#,
+                r#""communities":["64511:100"],"large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
                 r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
-                r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
-                r#""large_communities":[]}]"#
+                r#""rov":"invalid","rov_set":null,"held":null,"as_path":[64497],"#,
+                r#""communities":["64511:100"],"large_communities":[]}]"#
             )
         );
         // Every state, by its name, both ways.
@@ -1874,6 +1947,195 @@ mod tests {
     }
 
     #[test]
+    fn routes_render_held_routes_and_overrides() {
+        // RFC 6811 §2: the routes the Adj-RIB-In holds for their state are
+        // listed after the candidates, marked `!` with the reason; §3: a
+        // state import policy set is shown after the looked-up one.
+        let mut best = route("192.0.2.0/24", "198.51.100.1", &[64_496], None, None);
+        best.best = true;
+        best.rov = RovState::Invalid;
+        best.rov_set = Some(RovState::Valid);
+        let mut dropped = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, None);
+        dropped.rov = RovState::Invalid;
+        dropped.held = Some(Held::Enforcement);
+        let mut rejected = route("192.0.2.0/24", "198.51.100.3", &[64_498], None, None);
+        rejected.rov = RovState::NotFound;
+        rejected.held = Some(Held::Policy);
+        let r = render_routes(&[best, dropped, rejected]);
+        assert_eq!(
+            r.lines[1..],
+            [
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64496 via 198.51.100.1",
+                    "*192.0.2.0/24", "198.51.100.1", "igp", "-", "-", "invalid>valid"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2 \
+                     held by enforcement",
+                    "!192.0.2.0/24", "198.51.100.2", "igp", "-", "-", "invalid"
+                ),
+                format!(
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64498 via 198.51.100.3 \
+                     held by policy",
+                    "!192.0.2.0/24", "198.51.100.3", "igp", "-", "-", "not-found"
+                ),
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
+                r#""local_pref":null,"med":null,"peer":"198.51.100.1","best":true,"#,
+                r#""rov":"invalid","rov_set":"valid","held":null,"as_path":[64496],"#,
+                r#""communities":["64511:100"],"large_communities":[]},"#,
+                r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
+                r#""local_pref":null,"med":null,"peer":"198.51.100.2","best":false,"#,
+                r#""rov":"invalid","rov_set":null,"held":"enforcement","as_path":[64497],"#,
+                r#""communities":["64511:100"],"large_communities":[]},"#,
+                r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.3","origin":"igp","#,
+                r#""local_pref":null,"med":null,"peer":"198.51.100.3","best":false,"#,
+                r#""rov":"not-found","rov_set":null,"held":"policy","as_path":[64498],"#,
+                r#""communities":["64511:100"],"large_communities":[]}]"#
+            )
+        );
+        // The same lines in a listing of the held routes of a family.
+        let mut held = route("2001:db8::/32", "198.51.100.2", &[64_497], None, None);
+        held.rov = RovState::Invalid;
+        held.held = Some(Held::Enforcement);
+        let listing = Listing::Routes(Pages::starting(
+            vec![held.clone()],
+            |_| Ok(Vec::new()),
+            |r| r.prefix,
+        ));
+        let mut text = Vec::new();
+        let mut lines = proto::Lines::begin(&mut text).unwrap();
+        listing.write_lines(&mut lines).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert_eq!(text.lines().nth(2), Some(route_line(&held).as_str()));
+        assert!(route_line(&held).starts_with("!2001:db8::/32 "));
+    }
+
+    #[test]
+    fn neighbor_detail_counts_held_routes() {
+        // The summary table keeps its columns; the JSON of every neighbor
+        // has the held routes, in all and per family.
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let info = bgpfc_rib::PeerInfo {
+            addr,
+            local_addr: "192.0.2.1".parse().unwrap(),
+            remote_as: Asn(65_001),
+            router_id: RouterId::new(2).unwrap(),
+            kind: bgpfc_wire::update::PeerKind::External,
+            families: vec![v4],
+            receive_families: vec![v4],
+            four_octet_as: true,
+            extended_messages: false,
+            extended_next_hop: Vec::new(),
+            advertisement_interval: Duration::ZERO,
+            prefix_limits: Vec::new(),
+        };
+        let stats = bgpfc_rib::PeerStats {
+            received: vec![(v4, 7)],
+            held: vec![(v4, 3)],
+            advertised: vec![(v4, 1)],
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let all = [(info, stats)];
+        let r = render_neighbors(std::slice::from_ref(&report), &all);
+        assert_eq!(
+            r.lines[1],
+            format!(
+                "{:<40} {:>10} {:<12} {:>8}s {:>9} {:>9}",
+                "192.0.2.2", "65001", "Established", "5", "7", "1"
+            )
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#""received":7,"held":3,"advertised":1,"prefixes":["#,
+                r#"{"family":"ipv4-unicast","received":7,"held":3,"advertised":1,"limit":null}]"#
+            )),
+            "{}",
+            r.json
+        );
+        let r = render_neighbor(&report, &all);
+        assert!(
+            r.lines
+                .contains(&"    ipv4-unicast received 7 held 3 advertised 1".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        // Not in the RIB: nothing held.
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  routes received 0 held 0 advertised 0".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""received":0,"held":0,"advertised":0"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn parses_held_and_transitions_commands() {
+        let p = |s: &str| -> Prefix { s.parse().unwrap() };
+        let routes = |family, prefix: Option<&str>, held| Command::ShowRoutes {
+            family,
+            prefix: prefix.map(p),
+            held,
+        };
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        for (text, expected) in [
+            ("show routes held", routes(v4, None, true)),
+            ("show routes ipv6 held", routes(v6, None, true)),
+            ("show routes held ipv6", routes(v6, None, true)),
+            (
+                "show routes 192.0.2.0/24 held",
+                routes(v4, Some("192.0.2.0/24"), true),
+            ),
+            (
+                "show routes 2001:db8::/32",
+                routes(v6, Some("2001:db8::/32"), false),
+            ),
+        ] {
+            assert_eq!(Command::parse(&words(text)), Ok(expected), "{text}");
+        }
+        let err = Command::parse(&words("show routes hold")).unwrap_err();
+        assert!(err.contains("ipv4, ipv6, held or a prefix"), "{err}");
+        assert!(!routes(v4, None, true).is_write());
+        let get = |path: &str| {
+            http::Request::read_from(&mut format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+                .unwrap()
+        };
+        for (path, expected) in [
+            ("/v1/routes?held=1", routes(v4, None, true)),
+            ("/v1/routes?family=ipv6&held=yes", routes(v6, None, true)),
+            ("/v1/routes?family=ipv4&held=0", routes(v4, None, false)),
+            (
+                "/v1/routes?prefix=192.0.2.0/24&held=true",
+                routes(v4, Some("192.0.2.0/24"), true),
+            ),
+        ] {
+            assert_eq!(Command::from_http(&get(path)), Ok(expected), "{path}");
+        }
+    }
+
+    #[test]
     fn parses_commands() {
         assert_eq!(
             Command::parse(&words("show neighbors")),
@@ -1887,14 +2149,16 @@ mod tests {
             Command::parse(&words("show routes ipv6")),
             Ok(Command::ShowRoutes {
                 family: AddressFamily::IPV6_UNICAST,
-                prefix: None
+                prefix: None,
+                held: false
             })
         );
         assert_eq!(
             Command::parse(&words("show routes 2001:db8::/32")),
             Ok(Command::ShowRoutes {
                 family: AddressFamily::IPV6_UNICAST,
-                prefix: Some("2001:db8::/32".parse().unwrap())
+                prefix: Some("2001:db8::/32".parse().unwrap()),
+                held: false
             })
         );
         assert_eq!(
@@ -1977,7 +2241,8 @@ mod tests {
             Command::from_http(&get("/v1/routes?family=ipv6&prefix=2001:db8::/32")),
             Ok(Command::ShowRoutes {
                 family: AddressFamily::IPV6_UNICAST,
-                prefix: Some("2001:db8::/32".parse().unwrap())
+                prefix: Some("2001:db8::/32".parse().unwrap()),
+                held: false
             })
         );
         assert_eq!(
