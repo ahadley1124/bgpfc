@@ -227,10 +227,14 @@ impl Destination {
     /// The best route, if any: the first, unless that is held, which only
     /// happens when every route is.
     pub(crate) fn best(&self) -> Option<&Route> {
-        if self.is_empty() {
-            return None;
-        }
-        Some(self.route(0)).filter(|r| !r.held)
+        // One match, as `routes().first()` was before identifiers: this is
+        // called for every route that comes and goes.
+        let first = match self {
+            Destination::One(r) => Some(r),
+            Destination::Many(v) => v.first(),
+            Destination::Paths(v) => v.first().map(|p| &p.route),
+        };
+        first.filter(|r| !r.held)
     }
 
     /// How many of the routes are candidates; they come first.
