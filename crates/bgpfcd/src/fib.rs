@@ -86,7 +86,13 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
 }
 
 fn report(applied: &[Applied]) {
+    // Below info only failures are written: test the level once rather
+    // than for each of a batch's operations.
+    let info = bgpfc_log::enabled(bgpfc_log::Level::Info);
     for a in applied {
+        if a.result.is_ok() && !info {
+            continue;
+        }
         let (what, prefix, gateway) = match &a.op {
             Op::Set { prefix, gateway } => ("install", prefix, gateway),
             Op::Delete { prefix, gateway } => ("delete", prefix, gateway),

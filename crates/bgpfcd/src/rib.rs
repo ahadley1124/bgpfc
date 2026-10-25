@@ -236,6 +236,10 @@ impl Sink for Deliver<'_> {
 }
 
 fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
+    // Counting the prefixes costs more than the test.
+    if !bgpfc_log::enabled(bgpfc_log::Level::Debug) {
+        return;
+    }
     let announced = update.announcements().count();
     let withdrawn = update.withdrawals().count();
     bgpfc_log::debug!(
