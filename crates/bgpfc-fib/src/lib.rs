@@ -341,6 +341,7 @@ impl Fib {
         }
     }
 
+    #[cfg(not(miri))]
     fn next_seq(&mut self) -> u32 {
         self.seq = self.seq.wrapping_add(1).max(1);
         self.seq
