@@ -335,8 +335,13 @@ gets it, set to the neighbor's AS; a route that carries the attribute is
 not sent to a provider, a peer or an RS; and a route sent to a customer,
 a peer or an RS-Client without it gets it, set to our AS. The procedures
 cannot be changed by policy. A neighbor without a `role` is not subject to
-them, and the attribute passes through it unchanged. The procedures
-apply to IPv4 unicast and IPv6 unicast, the only families bgpfc speaks.
+them, and the attribute passes through it unchanged. With `add-path`, each
+path is a route of its own (RFC 7911 §5): a leak takes the one path the
+neighbor sent it under, by its Path Identifier, and leaves the others to
+the prefix, and each path sent goes through the procedures on its own, so
+a neighbor sent several may be sent some of a prefix's paths and not
+others. The procedures apply to IPv4 unicast and IPv6 unicast, the only
+families bgpfc speaks.
 Roles are for external sessions: a `role` on a neighbor whose `remote-as`
 is our own is an error (RFC 9234 §4).
 
