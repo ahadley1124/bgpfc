@@ -420,3 +420,79 @@ fn internal_sessions_pass_the_attribute_on_unchanged() {
     });
     assert_eq!(sent_otc(&out, &internal), [Some(Asn(65_001))]);
 }
+
+/// A policy that tries to undo the procedures: it clears the attribute on
+/// import and on export, and sets one on routes that have none.
+struct TamperWithOtc;
+
+impl crate::Policies for TamperWithOtc {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
+        let mut a = a.clone();
+        a.otc = a.otc.map_or(Some(Asn(65_098)), |_| None);
+        crate::Verdict::Modified(a)
+    }
+
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        _: RovState,
+    ) -> crate::Verdict {
+        let mut a = a.clone();
+        a.otc = a.otc.map_or(Some(Asn(65_097)), |_| None);
+        crate::Verdict::Modified(a)
+    }
+}
+
+#[test]
+fn policy_cannot_change_the_procedures() {
+    // RFC 9234 §5: "The operator MUST NOT have the ability to modify the
+    // procedures defined in this section", and a set attribute "MUST be
+    // preserved unchanged". The policy language has no statement for it;
+    // the RIB holds to it whatever a `Policies` does.
+    let (provider, other) = (
+        with_role("10.0.0.1", 65_001, 1, Some(Role::Customer)),
+        with_role("10.0.0.2", 65_002, 2, Some(Role::Customer)),
+    );
+    let customer = with_role("10.0.0.3", 65_003, 3, Some(Role::Provider));
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(TamperWithOtc));
+    for s in [&provider, &other, &customer] {
+        outputs(|o| rib.peer_up(s.clone(), now(), o));
+    }
+    // From a provider: the attribute is added on the way in, and stays.
+    let out = outputs(|o| {
+        rib.update(
+            provider.addr,
+            &route("192.0.2.0/24", 65_001, None),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(best_otc(&rib, "192.0.2.0/24"), vec![Some(Asn(65_001))]);
+    // It does not reach the other provider, whatever export policy does...
+    assert_eq!(sends(&out, other.addr).len(), 0);
+    // ...and reaches the customer with the provider's AS, not the
+    // policy's.
+    assert_eq!(sent_otc(&out, &customer), [Some(Asn(65_001))]);
+    // From the customer, without it: none is added on the way in, and
+    // the policy's cannot be sent to the provider.
+    let out = outputs(|o| {
+        rib.update(
+            customer.addr,
+            &route("198.51.100.0/24", 65_003, None),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(best_otc(&rib, "198.51.100.0/24"), vec![None]);
+    assert_eq!(sent_otc(&out, &provider), [None]);
+}

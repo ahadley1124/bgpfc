@@ -1408,7 +1408,12 @@ impl Sessions {
             Verdict::Reject => None,
             Verdict::Accept => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
-            Verdict::Modified(a) => {
+            Verdict::Modified(mut a) => {
+                // RFC 9234 §5: "The operator MUST NOT have the ability to
+                // modify the procedures", and a set attribute "MUST be
+                // preserved unchanged": whatever a policy made of the
+                // route, the attribute is the route's own.
+                a.otc = best.attrs.otc;
                 export::permitted(family, &a, to).then_some(Exported::Changed(a))
             }
         }
@@ -2037,7 +2042,12 @@ fn judge(
 ) -> Judged {
     match policies.import(info, family, prefix, attrs, rov) {
         Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+        Verdict::Modified(mut a) => {
+            // RFC 9234 §5: the ingress procedure has run, and no policy
+            // may undo it or change the attribute (see `exported`).
+            a.otc = attrs.otc;
+            Judged::Accepted(interner.intern(a))
+        }
         Verdict::Reject => {
             let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
                 !matches!(
