@@ -121,10 +121,42 @@ fn run(
                     rib.refresh(peer, family, &mut out);
                 }
             }
+            RibMsg::FibMode(mode, reply) => {
+                // Changes already made go first.
+                out.flush();
+                fib_mode(&rib, fib, mode, reply);
+            }
         }
         out.flush();
         #[cfg(feature = "profiling")]
         loads.after(seen, &rib);
+    }
+}
+
+/// Routes in one `FibMsg::Reconcile`.
+const RECONCILE_BATCH: usize = 4096;
+
+/// Switch the FIB's mode. Going to install, the FIB reconciles what is
+/// installed against every route the RIB has (README, "FIB dry-run"),
+/// which go to it in batches through the bounded queue rather than as one
+/// table-sized list.
+fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: SyncSender<usize>) {
+    let send = |msg| fib.send(msg).is_ok();
+    let mut ok = send(FibMsg::SetMode(mode));
+    if mode == bgpfc_fib::Mode::Install {
+        let mut batch = Vec::with_capacity(RECONCILE_BATCH);
+        for route in rib.fib_routes() {
+            batch.push(route);
+            if batch.len() == RECONCILE_BATCH {
+                ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
+                batch.reserve(RECONCILE_BATCH);
+            }
+        }
+        ok &= send(FibMsg::Reconcile(batch));
+    }
+    ok &= send(FibMsg::ReconcileEnd(reply));
+    if !ok {
+        bgpfc_log::error!("fib thread gone");
     }
 }
 
@@ -267,5 +299,6 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .collect(),
             ),
         },
+        RibQuery::FibRoutes => RibReply::FibRoutes(rib.fib_routes().collect()),
     }
 }

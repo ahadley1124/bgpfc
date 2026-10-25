@@ -1,10 +1,10 @@
 //! Desired versus installed: the operations that turn one into the other
 //! (AGENTS.md §3, "FIB thread"). Pure, so it can be property-tested.
 
-use std::collections::btree_map::Entry as Slot;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 
@@ -141,28 +141,29 @@ impl Gateways {
     }
 }
 
-/// The gateway the RIB wants for a prefix and the one the kernel has.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Entry {
-    desired: Option<GwId>,
-    installed: Option<GwId>,
-}
-
 /// Octets one IPv4 route takes in a [`Routes`] table node: the key and the
-/// two gateway indices (for `bgpfcd --print-sizes`).
-pub const ROUTE_SIZE: usize = size_of::<Ipv4Key>() + size_of::<Entry>();
+/// gateway index (for `bgpfcd --print-sizes`).
+pub const ROUTE_SIZE: usize = size_of::<Ipv4Key>() + size_of::<GwId>();
 
-/// The desired and the installed routes in one map, so that the routes
-/// the kernel already has the way the RIB wants them are stored once.
-/// [`Routes::plan`] gives the same operations as [`plan`] on the two
-/// tables apart.
+/// The routes the kernel has with our protocol number, as far as we know,
+/// each gateway stored once. What the RIB wants is not kept here: a change
+/// comes with the next hop it replaces, which is all dry-run needs to
+/// report, and a full reconcile walks the RIB's routes in prefix order
+/// against these ([`Routes::merge`]), as [`plan`] does with two tables.
 #[derive(Debug, Default)]
 pub struct Routes {
     /// IPv4 routes, keyed in 5 octets rather than a `Prefix`'s 18: a full
     /// table is mostly B-tree nodes, eleven keys each.
-    v4: BTreeMap<Ipv4Key, Entry>,
-    v6: BTreeMap<Prefix, Entry>,
+    v4: BTreeMap<Ipv4Key, GwId>,
+    v6: BTreeMap<Prefix, GwId>,
     gateways: Gateways,
+}
+
+/// How far a reconcile ([`Routes::merge`]) has come: every installed route
+/// up to `done`, inclusive, has been dealt with.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Merge {
+    done: Option<Prefix>,
 }
 
 impl Routes {
@@ -172,30 +173,26 @@ impl Routes {
         Routes::default()
     }
 
-    /// The gateway the RIB wants for `prefix`.
-    #[must_use]
-    pub fn desired(&self, prefix: &Prefix) -> Option<IpAddr> {
-        let id = self.get(*prefix)?.desired?;
-        Some(self.gateways.addr(id))
-    }
-
     /// The gateway the kernel has for `prefix`, as far as we know.
     #[must_use]
     pub fn installed(&self, prefix: &Prefix) -> Option<IpAddr> {
-        let id = self.get(*prefix)?.installed?;
-        Some(self.gateways.addr(id))
+        let id = match Ipv4Key::new(*prefix) {
+            Some(k) => self.v4.get(&k),
+            None => self.v6.get(prefix),
+        }?;
+        Some(self.gateways.addr(*id))
     }
 
-    /// Set what the RIB wants for `prefix` (`None`: no route) and return
-    /// what it wanted before.
-    pub fn set_desired(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Option<IpAddr> {
-        let new = gateway.map(|g| self.gateways.hold(g));
-        let old = self.change(prefix, |e| std::mem::replace(&mut e.desired, new));
-        old.map(|id| {
-            let addr = self.gateways.addr(id);
-            self.gateways.release(id);
-            addr
-        })
+    /// Routes installed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    /// Whether no route is installed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
     }
 
     /// Record that the kernel carried out `op`.
@@ -208,67 +205,64 @@ impl Routes {
 
     /// Replace what is believed installed with `kernel` (the startup dump).
     pub fn set_installed(&mut self, kernel: &Table) {
-        let prefixes: Vec<Prefix> = self
-            .iter()
-            .filter(|(_, e)| e.installed.is_some())
-            .map(|(p, _)| p)
-            .collect();
-        for prefix in prefixes {
-            self.install(prefix, None);
-        }
+        *self = Routes::new();
         for (prefix, gateway) in kernel {
             self.install(*prefix, Some(*gateway));
         }
     }
 
-    /// Want no route at all (shutdown).
-    pub fn clear_desired(&mut self) {
-        let prefixes: Vec<Prefix> = self
-            .iter()
-            .filter(|(_, e)| e.desired.is_some())
-            .map(|(p, _)| p)
-            .collect();
-        for prefix in prefixes {
-            self.set_desired(prefix, None);
-        }
+    /// The operations that remove every installed route, in prefix order.
+    #[must_use]
+    pub fn delete_all(&self) -> Vec<Op> {
+        self.after(None)
+            .map(|(prefix, id)| Op::Delete {
+                prefix,
+                gateway: self.gateways.addr(id),
+            })
+            .collect()
     }
 
-    /// The operations, in the order [`plan`] gives them, that make the
-    /// installed routes the desired ones.
-    #[must_use]
-    pub fn plan(&self) -> Vec<Op> {
-        let mut ops = Vec::new();
-        for (prefix, e) in self.iter() {
-            if let Some(d) = e.desired
-                && e.installed != Some(d)
-            {
-                ops.push(Op::Set {
-                    prefix,
-                    gateway: self.gateways.addr(d),
-                });
-            }
-        }
-        for (prefix, e) in self.iter() {
-            if let (None, Some(i)) = (e.desired, e.installed) {
+    /// Reconcile part of a desired table: `desired` continues, in prefix
+    /// order, the routes `merge` has seen. Adds to `ops` a `Set` for each
+    /// route missing or with another gateway, and a `Delete` for each
+    /// installed route that the desired table skips; [`Routes::merge_end`]
+    /// deletes those past its end. Together they give what [`plan`] gives
+    /// for the whole desired table, in prefix order. The operations are
+    /// worked out from what is installed before any of them is carried
+    /// out, so each prefix must come once.
+    pub fn merge(&self, merge: &mut Merge, desired: &[(Prefix, IpAddr)], ops: &mut Vec<Op>) {
+        for &(prefix, gateway) in desired {
+            debug_assert!(merge.done.is_none_or(|d| d < prefix), "out of order");
+            for (stale, id) in self.after(merge.done).take_while(|(p, _)| *p < prefix) {
                 ops.push(Op::Delete {
-                    prefix,
-                    gateway: self.gateways.addr(i),
+                    prefix: stale,
+                    gateway: self.gateways.addr(id),
                 });
             }
+            if self.installed(&prefix) != Some(gateway) {
+                ops.push(Op::Set { prefix, gateway });
+            }
+            merge.done = Some(prefix);
         }
-        ops
     }
 
-    /// The desired routes as a table (for reports).
-    #[must_use]
-    pub fn desired_table(&self) -> Table {
-        self.table(|e| e.desired)
+    /// End a reconcile: delete what is installed past the last desired
+    /// route.
+    pub fn merge_end(&self, merge: Merge, ops: &mut Vec<Op>) {
+        for (stale, id) in self.after(merge.done) {
+            ops.push(Op::Delete {
+                prefix: stale,
+                gateway: self.gateways.addr(id),
+            });
+        }
     }
 
     /// The installed routes as a table (for reports).
     #[must_use]
     pub fn installed_table(&self) -> Table {
-        self.table(|e| e.installed)
+        self.after(None)
+            .map(|(p, id)| (p, self.gateways.addr(id)))
+            .collect()
     }
 
     /// Distinct gateways in use.
@@ -277,67 +271,35 @@ impl Routes {
         self.gateways.len()
     }
 
-    fn table(&self, which: impl Fn(&Entry) -> Option<GwId>) -> Table {
-        self.iter()
-            .filter_map(|(p, e)| which(e).map(|id| (p, self.gateways.addr(id))))
-            .collect()
+    /// The installed routes after `from` (all of them for `None`), in
+    /// prefix order: IPv4 sorts first.
+    fn after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, GwId)> + '_ {
+        let (v4, v6) = match from {
+            None => (Some(self.v4.range(..)), self.v6.range(..)),
+            Some(p) => match Ipv4Key::new(p) {
+                Some(k) => (
+                    Some(self.v4.range((Excluded(k), Unbounded))),
+                    self.v6.range(..),
+                ),
+                None => (None, self.v6.range((Excluded(p), Unbounded))),
+            },
+        };
+        v4.into_iter()
+            .flatten()
+            .map(|(k, id)| (k.prefix(), *id))
+            .chain(v6.map(|(p, id)| (*p, *id)))
     }
 
     fn install(&mut self, prefix: Prefix, gateway: Option<IpAddr>) {
         let new = gateway.map(|g| self.gateways.hold(g));
-        let old = self.change(prefix, |e| std::mem::replace(&mut e.installed, new));
+        let old = match (Ipv4Key::new(prefix), new) {
+            (Some(k), Some(id)) => self.v4.insert(k, id),
+            (Some(k), None) => self.v4.remove(&k),
+            (None, Some(id)) => self.v6.insert(prefix, id),
+            (None, None) => self.v6.remove(&prefix),
+        };
         if let Some(id) = old {
             self.gateways.release(id);
-        }
-    }
-
-    fn get(&self, prefix: Prefix) -> Option<&Entry> {
-        match Ipv4Key::new(prefix) {
-            Some(k) => self.v4.get(&k),
-            None => self.v6.get(&prefix),
-        }
-    }
-
-    /// Every entry in prefix order (IPv4 sorts first).
-    fn iter(&self) -> impl Iterator<Item = (Prefix, &Entry)> {
-        self.v4
-            .iter()
-            .map(|(k, e)| (k.prefix(), e))
-            .chain(self.v6.iter().map(|(p, e)| (*p, e)))
-    }
-
-    /// Change `prefix`'s entry, dropping it when it holds nothing after;
-    /// one lookup either way.
-    fn change<T>(&mut self, prefix: Prefix, f: impl FnOnce(&mut Entry) -> T) -> T {
-        match Ipv4Key::new(prefix) {
-            Some(k) => change_in(&mut self.v4, k, f),
-            None => change_in(&mut self.v6, prefix, f),
-        }
-    }
-}
-
-fn change_in<K: Ord, T>(
-    map: &mut BTreeMap<K, Entry>,
-    key: K,
-    f: impl FnOnce(&mut Entry) -> T,
-) -> T {
-    {
-        match map.entry(key) {
-            Slot::Occupied(mut o) => {
-                let out = f(o.get_mut());
-                if *o.get() == Entry::default() {
-                    o.remove();
-                }
-                out
-            }
-            Slot::Vacant(v) => {
-                let mut e = Entry::default();
-                let out = f(&mut e);
-                if e != Entry::default() {
-                    v.insert(e);
-                }
-                out
-            }
         }
     }
 }
@@ -393,46 +355,64 @@ mod tests {
 
     #[test]
     fn routes_store_each_gateway_once() {
-        assert_eq!(size_of::<Entry>(), 8);
-        assert_eq!(ROUTE_SIZE, 13);
+        assert_eq!(ROUTE_SIZE, 9);
         let mut r = Routes::new();
-        assert_eq!(r.set_desired(p("10.0.0.0/8"), Some(ip("1.1.1.1"))), None);
-        assert_eq!(r.set_desired(p("10.1.0.0/16"), Some(ip("1.1.1.1"))), None);
+        let set = |prefix, gateway| Op::Set {
+            prefix: p(prefix),
+            gateway: ip(gateway),
+        };
+        r.apply(&set("10.0.0.0/8", "1.1.1.1"));
+        r.apply(&set("10.1.0.0/16", "1.1.1.1"));
         assert_eq!(r.gateways(), 1);
-        assert_eq!(r.desired(&p("10.1.0.0/16")), Some(ip("1.1.1.1")));
-        assert_eq!(r.installed(&p("10.1.0.0/16")), None);
-        for op in r.plan() {
+        assert_eq!(r.installed(&p("10.1.0.0/16")), Some(ip("1.1.1.1")));
+        // A new gateway for one prefix; the old one is still used.
+        r.apply(&set("10.1.0.0/16", "2.2.2.2"));
+        assert_eq!(r.gateways(), 2);
+        assert_eq!(r.len(), 2);
+        // Removing everything empties the gateways too.
+        for op in r.delete_all() {
             r.apply(&op);
         }
-        assert_eq!(r.installed_table(), r.desired_table());
-        assert_eq!(r.plan(), vec![]);
-        // A new gateway for one prefix; the old one is still used.
-        assert_eq!(
-            r.set_desired(p("10.1.0.0/16"), Some(ip("2.2.2.2"))),
-            Some(ip("1.1.1.1"))
-        );
-        assert_eq!(r.gateways(), 2);
-        assert_eq!(
-            r.plan(),
-            vec![Op::Set {
-                prefix: p("10.1.0.0/16"),
-                gateway: ip("2.2.2.2")
-            }]
-        );
-        // Wanting nothing: deletes with the installed gateways, then the
-        // map and the gateways empty out.
-        r.clear_desired();
-        let ops = r.plan();
-        assert_eq!(ops.len(), 2);
-        assert!(ops.iter().all(|o| matches!(o, Op::Delete { .. })));
-        for op in &ops {
-            r.apply(op);
-        }
         assert_eq!(r.gateways(), 0);
-        assert!(r.v4.is_empty() && r.v6.is_empty());
+        assert!(r.is_empty());
         // A freed gateway slot is reused.
-        r.set_desired(p("10.0.0.0/8"), Some(ip("3.3.3.3")));
+        r.apply(&set("10.0.0.0/8", "3.3.3.3"));
         assert_eq!(r.gateways.addrs.len(), 2);
+    }
+
+    #[test]
+    fn merge_walks_both_families_in_order() {
+        let installed: Table = [
+            (p("10.0.0.0/8"), ip("1.1.1.1")),
+            (p("10.2.0.0/16"), ip("3.3.3.3")),
+            (p("2001:db8::/32"), ip("1.1.1.1")),
+            (p("2001:db8:1::/48"), ip("1.1.1.1")),
+        ]
+        .into_iter()
+        .collect();
+        let mut r = Routes::new();
+        r.set_installed(&installed);
+        let mut merge = Merge::default();
+        let mut ops = Vec::new();
+        r.merge(&mut merge, &[(p("10.1.0.0/16"), ip("2.2.2.2"))], &mut ops);
+        r.merge(&mut merge, &[(p("2001:db8::/32"), ip("1.1.1.1"))], &mut ops);
+        r.merge_end(merge, &mut ops);
+        let delete = |prefix, gateway| Op::Delete {
+            prefix: p(prefix),
+            gateway: ip(gateway),
+        };
+        assert_eq!(
+            ops,
+            vec![
+                delete("10.0.0.0/8", "1.1.1.1"),
+                Op::Set {
+                    prefix: p("10.1.0.0/16"),
+                    gateway: ip("2.2.2.2")
+                },
+                delete("10.2.0.0/16", "3.3.3.3"),
+                delete("2001:db8:1::/48", "1.1.1.1"),
+            ]
+        );
     }
 
     #[test]

@@ -256,11 +256,13 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
                 .map_err(|_| "rib thread gone".to_owned())?;
             match rx.recv_timeout(QUERY_TIMEOUT) {
                 Ok(RibReply::Routes(routes)) => Ok(render_routes(&routes)),
-                Ok(RibReply::Peers(_)) => Err("unexpected reply".to_owned()),
+                Ok(_) => Err("unexpected reply".to_owned()),
                 Err(_) => Err("rib did not answer".to_owned()),
             }
         }
         Command::ShowFib => {
+            // What is installed first: a route the RIB adds meanwhile
+            // shows as pending rather than as stale.
             let (tx, rx) = sync_channel(1);
             ctx.fib
                 .send(FibMsg::Query(tx))
@@ -268,7 +270,15 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
             let report = rx
                 .recv_timeout(QUERY_TIMEOUT)
                 .map_err(|_| "fib did not answer".to_owned())?;
-            Ok(render_fib(&report))
+            let (tx, rx) = sync_channel(1);
+            ctx.rib
+                .send(RibMsg::Query(RibQuery::FibRoutes, tx))
+                .map_err(|_| "rib thread gone".to_owned())?;
+            match rx.recv_timeout(QUERY_TIMEOUT) {
+                Ok(RibReply::FibRoutes(desired)) => Ok(render_fib(&report, &desired)),
+                Ok(_) => Err("unexpected reply".to_owned()),
+                Err(_) => Err("rib did not answer".to_owned()),
+            }
         }
         Command::ShowStatus => status(ctx),
         Command::ClearNeighbor {
@@ -288,9 +298,9 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         }
         Command::FibMode(mode) => {
             let (tx, rx) = sync_channel(1);
-            ctx.fib
-                .send(FibMsg::SetMode(*mode, tx))
-                .map_err(|_| "fib thread gone".to_owned())?;
+            ctx.rib
+                .send(RibMsg::FibMode(*mode, tx))
+                .map_err(|_| "rib thread gone".to_owned())?;
             let ops = rx
                 .recv_timeout(QUERY_TIMEOUT)
                 .map_err(|_| "fib did not answer".to_owned())?;
@@ -315,10 +325,9 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
     let (tx, rx) = sync_channel(1);
     let mode = ctx
         .fib
-        .send(FibMsg::Query(tx))
+        .send(FibMsg::Mode(tx))
         .ok()
-        .and_then(|()| rx.recv_timeout(QUERY_TIMEOUT).ok())
-        .map(|f| f.mode);
+        .and_then(|()| rx.recv_timeout(QUERY_TIMEOUT).ok());
     let mut j = Json::new();
     j.begin_object()
         .field_str("version", env!("CARGO_PKG_VERSION"))
@@ -423,7 +432,7 @@ fn rib_peers(ctx: &Ctx) -> Result<Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats
         .map_err(|_| "rib thread gone".to_owned())?;
     match rx.recv_timeout(QUERY_TIMEOUT) {
         Ok(RibReply::Peers(p)) => Ok(p),
-        Ok(RibReply::Routes(_)) => Err("unexpected reply".to_owned()),
+        Ok(_) => Err("unexpected reply".to_owned()),
         Err(_) => Err("rib did not answer".to_owned()),
     }
 }
@@ -605,14 +614,14 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
     }
 }
 
-fn render_fib(f: &FibReport) -> Reply {
+fn render_fib(f: &FibReport, desired: &bgpfc_fib::Table) -> Reply {
     let mut lines = vec![format!("mode {}", f.mode)];
     let mut j = Json::new();
     j.begin_object()
         .field_display("mode", f.mode)
         .key("routes")
         .begin_array();
-    for (prefix, gateway) in &f.desired {
+    for (prefix, gateway) in desired {
         let installed = f.installed.get(prefix) == Some(gateway);
         lines.push(format!(
             "{:<44} via {:<40} {}",
@@ -627,7 +636,7 @@ fn render_fib(f: &FibReport) -> Reply {
             .end_object();
     }
     for (prefix, gateway) in &f.installed {
-        if !f.desired.contains_key(prefix) {
+        if !desired.contains_key(prefix) {
             lines.push(format!("{prefix:<44} via {gateway:<40} stale"));
             j.begin_object()
                 .field_display("prefix", prefix)

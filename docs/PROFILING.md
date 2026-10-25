@@ -316,7 +316,8 @@ of microseconds.
 
 prints `size_of` for the structures a route is made of (`Prefix` 18,
 `Destination` 24 with its first route inline, `Route` 16 for each further
-one, `PathAttrs` 184, a FIB route 26 octets on x86-64), and for the
+one, `PathAttrs` 184, an installed IPv4 route in the FIB 9 octets on
+x86-64), and for the
 messages and the per-peer state.
 
 ## External profilers

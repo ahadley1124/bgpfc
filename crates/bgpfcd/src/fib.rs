@@ -5,7 +5,7 @@
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use bgpfc_fib::{Applied, Fib, Mode, Op};
+use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
 
 use crate::messages::{FibMsg, FibReport};
 
@@ -33,23 +33,44 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
 fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
     // Kept between batches, so that applying one allocates nothing.
     let mut applied = Vec::new();
+    // A switch to install in progress, and the operations it took.
+    let mut merge: Option<Merge> = None;
+    let mut ops = 0;
     while let Ok(msg) = rx.recv() {
+        applied.clear();
         match msg {
             FibMsg::Changes(changes) => {
-                applied.clear();
-                fib.set_all(changes.iter().map(|c| (c.prefix, c.next_hop)), &mut applied);
-                report(&applied);
+                let changes = changes.iter().map(|c| Change {
+                    prefix: c.prefix,
+                    gateway: c.next_hop,
+                    previous: c.previous,
+                });
+                fib.set_all(changes, &mut applied);
             }
-            FibMsg::SetMode(mode, reply) => {
+            FibMsg::SetMode(mode) => {
                 bgpfc_log::info!("fib: mode", mode = mode);
-                let applied = fib.set_mode(mode);
-                report(&applied);
-                let _ = reply.send(applied.len());
+                fib.set_mode(mode);
+                merge = (mode == Mode::Install).then(Merge::default);
+                ops = 0;
+            }
+            FibMsg::Reconcile(routes) => {
+                if let Some(m) = &mut merge {
+                    fib.reconcile(m, &routes, &mut applied);
+                }
+            }
+            FibMsg::ReconcileEnd(reply) => {
+                if let Some(m) = merge.take() {
+                    fib.reconcile_end(m, &mut applied);
+                }
+                let _ = reply.send(ops + applied.len());
+                ops = 0;
+            }
+            FibMsg::Mode(reply) => {
+                let _ = reply.send(fib.mode());
             }
             FibMsg::Query(reply) => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    desired: fib.desired(),
                     installed: fib.installed(),
                 });
             }
@@ -59,6 +80,8 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
                 return;
             }
         }
+        ops += applied.len();
+        report(&applied);
     }
 }
 

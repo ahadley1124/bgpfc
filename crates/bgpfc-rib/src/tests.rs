@@ -475,12 +475,14 @@ fn announce_withdraw_and_fib_changes() {
             FibChange {
                 family: V4,
                 prefix: p("192.0.2.0/24"),
-                next_hop: Some(ip("10.0.0.1"))
+                next_hop: Some(ip("10.0.0.1")),
+                previous: None,
             },
             FibChange {
                 family: V4,
                 prefix: p("198.51.100.0/24"),
-                next_hop: Some(ip("10.0.0.1"))
+                next_hop: Some(ip("10.0.0.1")),
+                previous: None,
             },
         ]
     );
@@ -512,6 +514,7 @@ fn announce_withdraw_and_fib_changes() {
     let b = attrs(&[65_002], "10.0.0.2");
     let out = outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.2")));
+    assert_eq!(fib(&out)[0].previous, Some(ip("10.0.0.1")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
     // e2 had e1's route; its own is not sent back, so it is withdrawn.
@@ -524,6 +527,15 @@ fn announce_withdraw_and_fib_changes() {
     // Withdraw from e2: back to e1's route; e2 gets it, e1 gets a withdraw.
     let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+    assert_eq!(fib(&out)[0].previous, Some(ip("10.0.0.2")));
+    // What the FIB is given when it reconciles in full, in prefix order.
+    assert_eq!(
+        rib.fib_routes().collect::<Vec<_>>(),
+        vec![
+            (p("192.0.2.0/24"), ip("10.0.0.1")),
+            (p("198.51.100.0/24"), ip("10.0.0.1"))
+        ]
+    );
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
@@ -534,6 +546,8 @@ fn announce_withdraw_and_fib_changes() {
     let f = fib(&out);
     assert_eq!(f.len(), 2);
     assert!(f.iter().all(|c| c.next_hop.is_none()));
+    assert!(f.iter().all(|c| c.previous == Some(ip("10.0.0.1"))));
+    assert_eq!(rib.fib_routes().count(), 0);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m[0].withdrawn.len(), 2);
     assert_eq!(rib.loc_rib(V4).count(), 0);

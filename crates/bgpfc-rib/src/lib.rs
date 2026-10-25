@@ -99,6 +99,8 @@ pub struct FibChange {
     pub prefix: Prefix,
     /// The new next hop, or `None` when the destination is gone.
     pub next_hop: Option<IpAddr>,
+    /// The next hop it replaces, or `None` when the destination is new.
+    pub previous: Option<IpAddr>,
 }
 
 /// What the RIB asks its owner to do after an input.
@@ -621,6 +623,17 @@ impl Rib {
             .map(|r| self.s.route_ref(r))
     }
 
+    /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
+    /// then IPv6 unicast, each in prefix order, so in one prefix order
+    /// throughout (what `bgpfc_fib::Routes::merge` takes).
+    pub fn fib_routes(&self) -> impl Iterator<Item = (Prefix, IpAddr)> {
+        [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
+            .into_iter()
+            .filter_map(|f| self.tables.get(f))
+            .flat_map(Table::iter)
+            .filter_map(|(p, d)| d.best().map(|r| (p, r.attrs.next_hop_addr())))
+    }
+
     /// The Adj-RIB-Out for `addr` and `family`.
     pub fn adj_rib_out(
         &self,
@@ -774,6 +787,7 @@ impl Sessions {
                 family,
                 prefix,
                 next_hop: new.map(|r| r.attrs.next_hop_addr()),
+                previous: old.map(|r| r.attrs.next_hop_addr()),
             }));
             self.disseminate(family, prefix, new, batches);
         }

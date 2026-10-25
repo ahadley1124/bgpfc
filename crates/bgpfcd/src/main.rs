@@ -328,8 +328,8 @@ impl Coordinator<'_> {
                     if new.fib.mode != self.config.fib.mode {
                         let (tx, rx) = sync_channel(1);
                         if self
-                            .fib_tx
-                            .send(FibMsg::SetMode(fib::mode_of(new.fib.mode), tx))
+                            .rib_tx
+                            .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
                             .is_ok()
                         {
                             let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
