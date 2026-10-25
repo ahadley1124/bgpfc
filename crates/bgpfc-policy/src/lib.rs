@@ -260,15 +260,17 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
     }
 }
 
-fn edit<T: Copy + Ord>(set: &mut Vec<T>, op: CommunityOp, vals: &[T]) {
+fn edit<T: Copy + Ord>(set: &mut Box<[T]>, op: CommunityOp, vals: &[T]) {
+    let mut v = std::mem::take(set).into_vec();
     match op {
-        CommunityOp::Add => set.extend_from_slice(vals),
-        CommunityOp::Remove => set.retain(|c| !vals.contains(c)),
+        CommunityOp::Add => v.extend_from_slice(vals),
+        CommunityOp::Remove => v.retain(|c| !vals.contains(c)),
         CommunityOp::Replace => {
-            set.clear();
-            set.extend_from_slice(vals);
+            v.clear();
+            v.extend_from_slice(vals);
         }
     }
+    *set = v.into_boxed_slice();
 }
 
 /// The policies of a configuration, applied per neighbor.

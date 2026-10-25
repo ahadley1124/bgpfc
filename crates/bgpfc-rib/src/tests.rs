@@ -54,10 +54,10 @@ fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
         local_pref: None,
         atomic_aggregate: false,
         aggregator: None,
-        communities: Vec::new(),
-        ext_communities: Vec::new(),
-        large_communities: Vec::new(),
-        unknown: Vec::new(),
+        communities: Box::default(),
+        ext_communities: Box::default(),
+        large_communities: Box::default(),
+        unknown: Box::default(),
     }
 }
 
@@ -376,10 +376,10 @@ fn non_transitive_extended_communities_stay_in_the_as() {
     let mut a = attrs(&[65_001], "10.0.0.1");
     let transitive = ExtendedCommunity::two_octet_as(2, true, 1, 1);
     let local_only = ExtendedCommunity::two_octet_as(2, false, 1, 2);
-    a.ext_communities = vec![transitive, local_only];
+    a.ext_communities = vec![transitive, local_only].into();
     a.normalise();
     let e = export(LOCAL_AS, V4, src, &a, &ext).unwrap();
-    assert_eq!(e.ext_communities, vec![transitive]);
+    assert_eq!(*e.ext_communities, [transitive]);
     let i = export(LOCAL_AS, V4, src, &a, &int).unwrap();
     assert_eq!(i.ext_communities.len(), 2);
 }
@@ -394,11 +394,11 @@ fn well_known_communities_limit_export() {
         kind: from.kind,
     };
     let mut a = attrs(&[65_001], "10.0.0.1");
-    a.communities = vec![Community::NO_EXPORT];
+    a.communities = vec![Community::NO_EXPORT].into();
     a.normalise();
     assert!(export(LOCAL_AS, V4, src, &a, &ext).is_none());
     assert!(export(LOCAL_AS, V4, src, &a, &int).is_some());
-    a.communities = vec![Community::NO_ADVERTISE];
+    a.communities = vec![Community::NO_ADVERTISE].into();
     assert!(export(LOCAL_AS, V4, src, &a, &ext).is_none());
     assert!(export(LOCAL_AS, V4, src, &a, &int).is_none());
 }
@@ -756,23 +756,25 @@ fn attributes_round_trip_through_an_update() {
         asn: Asn(65_001),
         address: Ipv4Addr::new(1, 1, 1, 1),
     });
-    a.communities = vec![Community::new(65_001, 2), Community::new(65_001, 1)];
+    a.communities = vec![Community::new(65_001, 2), Community::new(65_001, 1)].into();
     a.large_communities = vec![bgpfc_wire::community::LargeCommunity {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     a.unknown = vec![crate::attrs::UnknownAttribute {
         flags: 0xc0,
         code: 200,
         value: vec![1, 2],
-    }];
+    }]
+    .into();
     a.normalise();
     let m = a.to_update(V4, vec![p("192.0.2.0/24")]);
     let back = PathAttrs::from_update(&m, V4).unwrap();
     assert_eq!(
-        back.communities,
-        vec![Community::new(65_001, 1), Community::new(65_001, 2)]
+        *back.communities,
+        [Community::new(65_001, 1), Community::new(65_001, 2)]
     );
     // The Partial bit is set on the forwarded unknown attribute.
     assert_eq!(back.unknown[0].flags, 0xe0);
@@ -1061,18 +1063,20 @@ fn attribute_hash_follows_every_field() {
         asn: Asn(65_001),
         address: Ipv4Addr::new(1, 1, 1, 1),
     });
-    base.communities = vec![Community::new(65_001, 1)];
-    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)];
+    base.communities = vec![Community::new(65_001, 1)].into();
+    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)].into();
     base.large_communities = vec![LargeCommunity {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     base.unknown = vec![crate::attrs::UnknownAttribute {
         flags: 0xc0,
         code: 200,
         value: vec![1, 2],
-    }];
+    }]
+    .into();
     assert_eq!(hasher.hash_one(&base), hasher.hash_one(base.clone()));
     let changes: Vec<fn(&mut PathAttrs)> = vec![
         |a| a.origin = Origin::Egp,
@@ -1083,8 +1087,12 @@ fn attribute_hash_follows_every_field() {
         |a| a.local_pref = Some(5),
         |a| a.atomic_aggregate = true,
         |a| a.aggregator = None,
-        |a| a.communities.push(Community::new(65_001, 2)),
-        |a| a.ext_communities.clear(),
+        |a| {
+            a.communities = [&a.communities[..], &[Community::new(65_001, 2)]]
+                .concat()
+                .into();
+        },
+        |a| a.ext_communities = Box::default(),
         |a| a.large_communities[0].local2 = 4,
         |a| a.unknown[0].value.push(3),
         |a| {

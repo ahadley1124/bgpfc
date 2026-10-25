@@ -49,14 +49,29 @@ pub struct PathAttrs {
     pub atomic_aggregate: bool,
     /// AGGREGATOR.
     pub aggregator: Option<Aggregator>,
-    /// COMMUNITIES, sorted and unique.
-    pub communities: Vec<Community>,
+    /// COMMUNITIES, sorted and unique. The lists are boxed slices, not
+    /// `Vec`s: an interned set never grows, and a table has one set per
+    /// path, so the capacity field would cost 32 octets a set (four
+    /// lists) for nothing.
+    pub communities: Box<[Community]>,
     /// Extended Communities, sorted and unique.
-    pub ext_communities: Vec<ExtendedCommunity>,
+    pub ext_communities: Box<[ExtendedCommunity]>,
     /// Large Communities, sorted and unique.
-    pub large_communities: Vec<LargeCommunity>,
+    pub large_communities: Box<[LargeCommunity]>,
     /// Unknown optional transitive attributes, by type code.
-    pub unknown: Vec<UnknownAttribute>,
+    pub unknown: Box<[UnknownAttribute]>,
+}
+
+/// Sort `list` and drop repeats; the common case, already so, allocates
+/// nothing.
+fn sort_unique<T: Ord + Copy>(list: &mut Box<[T]>) {
+    if list.is_sorted_by(|a, b| a < b) {
+        return;
+    }
+    let mut v = std::mem::take(list).into_vec();
+    v.sort_unstable();
+    v.dedup();
+    *list = v.into_boxed_slice();
 }
 
 impl PathAttrs {
@@ -74,12 +89,13 @@ impl PathAttrs {
             local_pref: None,
             atomic_aggregate: false,
             aggregator: None,
-            communities: Vec::new(),
-            ext_communities: Vec::new(),
-            large_communities: Vec::new(),
-            unknown: Vec::new(),
+            communities: Box::default(),
+            ext_communities: Box::default(),
+            large_communities: Box::default(),
+            unknown: Box::default(),
         };
         let mut next_hop = None;
+        let mut unknown = Vec::new();
         for a in &m.attributes {
             match a {
                 PathAttribute::Origin(o) => attrs.origin = *o,
@@ -89,11 +105,13 @@ impl PathAttrs {
                 PathAttribute::LocalPref(v) => attrs.local_pref = Some(*v),
                 PathAttribute::AtomicAggregate => attrs.atomic_aggregate = true,
                 PathAttribute::Aggregator(g) => attrs.aggregator = Some(*g),
-                PathAttribute::Communities(c) => attrs.communities.clone_from(c),
-                PathAttribute::ExtendedCommunities(c) => attrs.ext_communities.clone_from(c),
-                PathAttribute::LargeCommunities(c) => attrs.large_communities.clone_from(c),
+                PathAttribute::Communities(c) => attrs.communities = c.as_slice().into(),
+                PathAttribute::ExtendedCommunities(c) => {
+                    attrs.ext_communities = c.as_slice().into();
+                }
+                PathAttribute::LargeCommunities(c) => attrs.large_communities = c.as_slice().into(),
                 PathAttribute::Unknown { flags, code, value } => {
-                    attrs.unknown.push(UnknownAttribute {
+                    unknown.push(UnknownAttribute {
                         flags: *flags,
                         code: *code,
                         value: value.clone(),
@@ -109,6 +127,7 @@ impl PathAttrs {
             next_hop = Some(r.next_hop);
         }
         attrs.next_hop = next_hop?;
+        attrs.unknown = unknown.into_boxed_slice();
         attrs.normalise();
         Some(attrs)
     }
@@ -116,12 +135,9 @@ impl PathAttrs {
     /// Sort and deduplicate the sets so equal attribute sets compare
     /// equal whatever order they arrived in.
     pub fn normalise(&mut self) {
-        self.communities.sort_unstable();
-        self.communities.dedup();
-        self.ext_communities.sort_unstable();
-        self.ext_communities.dedup();
-        self.large_communities.sort_unstable();
-        self.large_communities.dedup();
+        sort_unique(&mut self.communities);
+        sort_unique(&mut self.ext_communities);
+        sort_unique(&mut self.large_communities);
         self.unknown.sort_by_key(|u| u.code);
     }
 
@@ -186,16 +202,16 @@ impl PathAttrs {
             out.push(PathAttribute::Aggregator(a));
         }
         if !self.communities.is_empty() {
-            out.push(PathAttribute::Communities(self.communities.clone()));
+            out.push(PathAttribute::Communities(self.communities.to_vec()));
         }
         if !self.ext_communities.is_empty() {
             out.push(PathAttribute::ExtendedCommunities(
-                self.ext_communities.clone(),
+                self.ext_communities.to_vec(),
             ));
         }
         if !self.large_communities.is_empty() {
             out.push(PathAttribute::LargeCommunities(
-                self.large_communities.clone(),
+                self.large_communities.to_vec(),
             ));
         }
         for u in &self.unknown {

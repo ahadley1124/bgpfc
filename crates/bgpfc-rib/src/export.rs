@@ -105,7 +105,14 @@ pub fn export(
             out.local_pref = None;
             // RFC 4360 §6: non-transitive extended communities stay in
             // the AS.
-            out.ext_communities.retain(|c| c.is_transitive());
+            if out.ext_communities.iter().any(|c| !c.is_transitive()) {
+                out.ext_communities = out
+                    .ext_communities
+                    .iter()
+                    .copied()
+                    .filter(|c| c.is_transitive())
+                    .collect();
+            }
         }
         PeerKind::Internal => {
             // RFC 4271 §5.1.2 b), §5.1.3, §5.1.4: AS_PATH, NEXT_HOP and MED
