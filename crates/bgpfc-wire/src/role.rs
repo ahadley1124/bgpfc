@@ -71,6 +71,17 @@ impl Role {
     }
 }
 
+/// The BGP Role configured for a session and how the peer's is checked
+/// (RFC 9234 §4.2): what the OPEN exchange needs to know of a neighbor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalRole {
+    /// Our Role, advertised in the BGP Role capability (§4.1).
+    pub role: Role,
+    /// "Strict mode" (§4.2): the connection is rejected with Role
+    /// Mismatch when the peer sends no BGP Role capability.
+    pub strict: bool,
+}
+
 impl fmt::Display for Role {
     /// The name the configuration uses; an unassigned value is
     /// `unassigned(N)`.

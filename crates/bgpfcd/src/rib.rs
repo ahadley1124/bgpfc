@@ -633,6 +633,7 @@ mod tests {
             receive_families: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_receive: Vec::new(),
             extended_next_hop_send: Vec::new(),
+            role: None,
             peer_capabilities: Vec::new(),
         }
     }

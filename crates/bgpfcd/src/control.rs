@@ -1542,6 +1542,7 @@ mod tests {
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_send: vec![AddressFamily::IPV4_UNICAST],
+            role: None,
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -1640,6 +1641,7 @@ mod tests {
                 receive_families: vec![v4, v6],
                 extended_next_hop_receive: Vec::new(),
                 extended_next_hop_send: Vec::new(),
+                role: None,
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,

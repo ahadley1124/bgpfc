@@ -49,7 +49,7 @@ pub use mp::{MpReach, MpUnreach, NextHop};
 pub use notification::{NotificationMessage, ShutdownCommunicationError};
 pub use open::OpenMessage;
 pub use prefix::Prefix;
-pub use role::Role;
+pub use role::{LocalRole, Role};
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
 pub use update::{
