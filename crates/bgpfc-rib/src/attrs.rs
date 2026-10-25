@@ -377,18 +377,35 @@ impl Interner {
             self.set.insert(held);
         }
         drop(attrs);
+        self.shrink();
     }
 
     /// Drop entries no route uses any more.
     pub fn sweep(&mut self) {
         self.set.retain(|a| Arc::strong_count(a) > 1);
         self.swept_at = self.set.len();
+        self.shrink();
+    }
+
+    /// Give back most of the table once it is mostly empty, as after a peer
+    /// with a full table goes: a hash table keeps its capacity otherwise.
+    /// Halving the length each time keeps this O(1) per removal.
+    fn shrink(&mut self) {
+        if self.set.capacity() > 64 && self.set.len() < self.set.capacity() / 4 {
+            self.set.shrink_to(self.set.len() * 2);
+        }
     }
 
     /// Distinct attribute sets held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.set.len()
+    }
+
+    /// Entries the table has room for without growing.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.set.capacity()
     }
 
     /// Whether nothing is interned.

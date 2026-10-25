@@ -1088,3 +1088,18 @@ fn attribute_hash_follows_every_field() {
         );
     }
 }
+
+#[test]
+fn interner_gives_its_table_back_when_emptied() {
+    let mut i = crate::attrs::Interner::default();
+    let held: Vec<_> = (0..1000u32)
+        .map(|n| i.intern(attrs(&[n + 1], "10.0.0.1")))
+        .collect();
+    let full = i.capacity();
+    assert!(full >= 1000);
+    for a in held {
+        i.release(a);
+    }
+    assert_eq!(i.len(), 0);
+    assert!(i.capacity() < full / 4, "{} of {full}", i.capacity());
+}
