@@ -4,13 +4,14 @@
 //! ignored, never an error); RFC 4760 §8 (Multiprotocol Extensions, code 1);
 //! RFC 2918 §2 (Route Refresh, code 2); RFC 8950 §4 (Extended Next Hop
 //! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 9234
-//! §4.1 (BGP Role, code 9); RFC 6793 §3 (Four-octet AS, code 65); RFC 7911
-//! §4 (ADD-PATH, code 69).
+//! §4.1 (BGP Role, code 9); RFC 4724 §3 and RFC 8538 §2 (Graceful Restart,
+//! code 64); RFC 6793 §3 (Four-octet AS, code 65); RFC 7911 §4 (ADD-PATH,
+//! code 69).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
 use crate::role::Role;
-use crate::types::{AddressFamily, Afi, Asn, Safi};
+use crate::types::{AddressFamily, Afi, Asn, RestartTime, Safi};
 
 /// One capability TLV.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -27,6 +28,10 @@ pub enum Capability {
     /// BGP Role: the speaker's relationship to the other end of an eBGP
     /// session (RFC 9234 §4.1).
     Role(Role),
+    /// Graceful Restart: the speaker's Restart State, Restart Time and, per
+    /// `<AFI, SAFI>`, whether its forwarding state was preserved (RFC 4724
+    /// §3), with the Graceful Notification bit (RFC 8538 §2).
+    GracefulRestart(GracefulRestart),
     /// Four-octet AS number support, carrying the speaker's ASN (RFC 6793 §3).
     FourOctetAs(Asn),
     /// ADD-PATH: per `<AFI, SAFI>`, whether the speaker can receive and/or
@@ -53,6 +58,7 @@ impl Capability {
             Capability::ExtendedNextHop(_) => 5,
             Capability::ExtendedMessage => 6,
             Capability::Role(_) => 9,
+            Capability::GracefulRestart(_) => 64,
             Capability::FourOctetAs(_) => 65,
             Capability::AddPath(_) => 69,
             Capability::Unknown { code, .. } => *code,
@@ -98,6 +104,7 @@ impl Capability {
                 out.put_u8(1);
                 out.put_u8(role.to_u8());
             }
+            Capability::GracefulRestart(gr) => gr.encode(out)?,
             Capability::FourOctetAs(asn) => {
                 out.put_u8(4);
                 out.put_u32(asn.0);
@@ -173,6 +180,12 @@ impl Capability {
             // Role Mismatch for the FSM to answer, not a malformed
             // capability.
             9 if len == 1 => Capability::Role(Role::from_u8(v.u8().map_err(|_| malformed())?)),
+            // RFC 4724 §3: the flags and Restart Time in two octets, then
+            // whole four-octet tuples (so a length of 2 plus a multiple of
+            // 4: "0 to 63" of them).
+            64 if GracefulRestart::is_whole(usize::from(len)) => {
+                Capability::GracefulRestart(GracefulRestart::decode(&mut v)?)
+            }
             // RFC 6793 §3: length 4, the speaker's ASN.
             65 if len == 4 => Capability::FourOctetAs(Asn(v.u32().map_err(|_| malformed())?)),
             // RFC 7911 §4: whole four-octet tuples.
@@ -207,7 +220,7 @@ impl Capability {
                     }
                 }
             }
-            1 | 2 | 5 | 6 | 9 | 65 | 69 => return Err(malformed()),
+            1 | 2 | 5 | 6 | 9 | 64 | 65 | 69 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -330,6 +343,144 @@ pub struct AddPathTuple {
 impl AddPathTuple {
     /// Octets per tuple on the wire (RFC 7911 §4).
     const WIRE_LEN: usize = 4;
+}
+
+/// The Graceful Restart capability (RFC 4724 §3, RFC 8538 §2).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GracefulRestart {
+    /// The Restart State bit: the speaker has restarted, and its peer must
+    /// not wait for its End-of-RIB before advertising to it (RFC 4724 §3).
+    pub restarting: bool,
+    /// The Graceful Notification bit: the speaker keeps the routes of a
+    /// peer it exchanged the bit with over a NOTIFICATION, other than a
+    /// Hard Reset (RFC 8538 §2, §4).
+    pub notification: bool,
+    /// The estimated time the session takes to come back after a restart
+    /// (RFC 4724 §3). Irrelevant when no family is listed.
+    pub restart_time: RestartTime,
+    /// The families the speaker supports Graceful Restart for. None means
+    /// it cannot preserve forwarding state, but follows the Receiving
+    /// Speaker procedures and sends End-of-RIB (RFC 4724 §3).
+    pub families: Vec<GracefulRestartFamily>,
+}
+
+/// One `<AFI, SAFI, Flags>` tuple of the Graceful Restart capability
+/// (RFC 4724 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GracefulRestartFamily {
+    /// The `<AFI, SAFI>` the tuple is about.
+    pub family: AddressFamily,
+    /// The Forwarding State bit: the forwarding state for the family's
+    /// routes has been preserved during the restart (RFC 4724 §3).
+    pub forwarding: bool,
+}
+
+impl GracefulRestartFamily {
+    /// Octets per tuple on the wire (RFC 4724 §3): AFI (2), SAFI (1),
+    /// flags (1).
+    const WIRE_LEN: usize = 4;
+
+    /// RFC 4724 §3: the Forwarding State bit is the most significant of the
+    /// flags octet; the rest are reserved.
+    const FORWARDING: u8 = 0x80;
+}
+
+impl GracefulRestart {
+    /// Octets before the tuples (RFC 4724 §3): four bits of flags and
+    /// twelve of Restart Time.
+    const HEAD_LEN: usize = 2;
+
+    /// RFC 4724 §3: the Restart State bit is the most significant of the
+    /// four flag bits.
+    const RESTARTING: u8 = 0x8;
+
+    /// RFC 8538 §2: the Graceful Notification bit is the second.
+    const NOTIFICATION: u8 = 0x4;
+
+    /// The most tuples a capability holds: "0 to 63" (RFC 4724 §3), the
+    /// ones that fit the one-octet Capability Length.
+    pub const MAX_FAMILIES: usize =
+        (255 - GracefulRestart::HEAD_LEN) / GracefulRestartFamily::WIRE_LEN;
+
+    /// Whether the speaker listed `family`.
+    #[must_use]
+    pub fn family(&self, family: AddressFamily) -> Option<GracefulRestartFamily> {
+        self.families.iter().copied().find(|f| f.family == family)
+    }
+
+    /// Whether a Capability Length of `len` octets holds the flags and
+    /// Restart Time and a whole number of tuples (RFC 4724 §3).
+    const fn is_whole(len: usize) -> bool {
+        len >= GracefulRestart::HEAD_LEN
+            && (len - GracefulRestart::HEAD_LEN).is_multiple_of(GracefulRestartFamily::WIRE_LEN)
+    }
+
+    /// Append the length and the value (RFC 4724 §3).
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let len = GracefulRestart::HEAD_LEN + self.families.len() * GracefulRestartFamily::WIRE_LEN;
+        let len = u8::try_from(len).map_err(|_| EncodeError::TooLong {
+            what: "graceful restart capability",
+            len,
+            max: usize::from(u8::MAX),
+        })?;
+        out.put_u8(len);
+        let mut flags = 0u8;
+        if self.restarting {
+            flags |= GracefulRestart::RESTARTING;
+        }
+        if self.notification {
+            flags |= GracefulRestart::NOTIFICATION;
+        }
+        out.put_u16((u16::from(flags) << 12) | self.restart_time.secs());
+        for t in &self.families {
+            out.put_u16(t.family.afi.to_u16());
+            out.put_u8(t.family.safi.to_u8());
+            out.put_u8(if t.forwarding {
+                GracefulRestartFamily::FORWARDING
+            } else {
+                0
+            });
+        }
+        Ok(())
+    }
+
+    /// Decode a value whose length is two plus a multiple of four. The
+    /// reserved bits are "ignored by the receiver" (RFC 4724 §3).
+    fn decode(v: &mut Reader<'_>) -> Result<GracefulRestart, DecodeError> {
+        let head = v.u16().map_err(|_| malformed())?;
+        // The four flag bits, then twelve of Restart Time.
+        let flags = u8::try_from(head >> 12).unwrap_or(0);
+        // invariant: twelve bits always fit.
+        let restart_time = RestartTime::new(head & 0x0fff).unwrap_or(RestartTime::MAX);
+        let mut families = Vec::with_capacity(v.remaining() / GracefulRestartFamily::WIRE_LEN);
+        while !v.is_empty() {
+            let afi = Afi::from_u16(v.u16().map_err(|_| malformed())?);
+            let safi = Safi::from_u8(v.u8().map_err(|_| malformed())?);
+            let flags = v.u8().map_err(|_| malformed())?;
+            families.push(GracefulRestartFamily {
+                family: AddressFamily { afi, safi },
+                forwarding: flags & GracefulRestartFamily::FORWARDING != 0,
+            });
+        }
+        Ok(GracefulRestart {
+            restarting: flags & GracefulRestart::RESTARTING != 0,
+            notification: flags & GracefulRestart::NOTIFICATION != 0,
+            restart_time,
+            families,
+        })
+    }
+}
+
+/// The Graceful Restart capability `caps` carry: "If more than one
+/// instance of the Graceful Restart Capability is carried in the
+/// capability advertisement, the receiver of the advertisement MUST ignore
+/// all but the last instance" (RFC 4724 §3).
+#[must_use]
+pub fn graceful_restart(caps: &[Capability]) -> Option<&GracefulRestart> {
+    caps.iter().rev().find_map(|c| match c {
+        Capability::GracefulRestart(gr) => Some(gr),
+        _ => None,
+    })
 }
 
 /// What the ADD-PATH capabilities in `caps` say about `family`: the
@@ -659,6 +810,153 @@ mod tests {
         );
     }
 
+    fn gr(
+        restarting: bool,
+        notification: bool,
+        secs: u16,
+        families: &[(AddressFamily, bool)],
+    ) -> Capability {
+        Capability::GracefulRestart(GracefulRestart {
+            restarting,
+            notification,
+            restart_time: RestartTime::new(secs).unwrap(),
+            families: families
+                .iter()
+                .map(|&(family, forwarding)| GracefulRestartFamily { family, forwarding })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn graceful_restart_follows_rfc_4724_section_3() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // No family: the speaker cannot preserve forwarding state but
+        // follows the Receiving Speaker procedures; 0x0078 is 120 seconds
+        // with no flag. This is what BIRD sends by default.
+        round_trip(&gr(false, false, 120, &[]), &[64, 2, 0x00, 0x78]);
+        // RFC 4724 §3: the Restart State bit is the most significant bit
+        // of the flags.
+        round_trip(&gr(true, false, 120, &[]), &[64, 2, 0x80, 0x78]);
+        // RFC 8538 §2: the Graceful Notification bit is the second. Both,
+        // as FRR sends them: 0xc078.
+        round_trip(&gr(false, true, 120, &[]), &[64, 2, 0x40, 0x78]);
+        round_trip(&gr(true, true, 120, &[]), &[64, 2, 0xc0, 0x78]);
+        // One tuple: AFI 1, SAFI 1, the Forwarding State bit the most
+        // significant of the flags octet.
+        round_trip(
+            &gr(false, true, 120, &[(v4, true)]),
+            &[64, 6, 0x40, 0x78, 0, 1, 1, 0x80],
+        );
+        round_trip(
+            &gr(true, true, 300, &[(v4, true), (v6, false)]),
+            &[64, 10, 0xc1, 0x2c, 0, 1, 1, 0x80, 0, 2, 1, 0x00],
+        );
+        // The most the twelve bits of Restart Time hold.
+        round_trip(&gr(false, false, 4095, &[]), &[64, 2, 0x0f, 0xff]);
+        round_trip(&gr(true, true, 4095, &[]), &[64, 2, 0xcf, 0xff]);
+        round_trip(&gr(false, false, 0, &[]), &[64, 2, 0x00, 0x00]);
+        assert_eq!(gr(false, false, 0, &[]).code(), 64);
+        // A family this implementation does not speak is still a tuple.
+        let odd = AddressFamily {
+            afi: Afi::Unknown(25),
+            safi: Safi::Unknown(65),
+        };
+        round_trip(
+            &gr(false, false, 1, &[(odd, true)]),
+            &[64, 6, 0x00, 0x01, 0, 25, 65, 0x80],
+        );
+    }
+
+    #[test]
+    fn graceful_restart_ignores_reserved_bits() {
+        // RFC 4724 §3: reserved bits "MUST be set to zero by the sender and
+        // ignored by the receiver", in the flags and in each tuple's flags.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        for (wire, want) in [
+            (
+                &[64, 6, 0x30, 0x78, 0, 1, 1, 0x7f][..],
+                gr(false, false, 120, &[(v4, false)]),
+            ),
+            (
+                &[64, 6, 0xf0, 0x78, 0, 1, 1, 0xff][..],
+                gr(true, true, 120, &[(v4, true)]),
+            ),
+        ] {
+            assert_eq!(
+                Capability::decode(&mut Reader::new(wire)).unwrap(),
+                want,
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graceful_restart_length_must_be_two_plus_whole_tuples() {
+        for wire in [
+            &[64, 0][..],
+            &[64, 1, 0x00][..],
+            &[64, 3, 0x00, 0x78, 0][..],
+            &[64, 5, 0x00, 0x78, 0, 1, 1][..],
+            &[64, 7, 0x00, 0x78, 0, 1, 1, 0x80, 0][..],
+            &[64, 6, 0x00, 0x78, 0, 1][..], // truncated value
+            &[64][..],
+        ] {
+            let e = Capability::decode(&mut Reader::new(wire)).unwrap_err();
+            assert_eq!(
+                e,
+                DecodeError::open(OpenSubcode::Unspecific, vec![]),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graceful_restart_holds_at_most_63_tuples() {
+        // RFC 4724 §3: "0 to 63 of the tuples"; 63 fill 254 of the 255
+        // octets a capability may hold.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let mut out = Vec::new();
+        gr(false, false, 120, &[(v4, true); 63])
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 2 + 254);
+        assert_eq!(GracefulRestart::MAX_FAMILIES, 63);
+        assert_eq!(
+            gr(false, false, 120, &[(v4, true); 64]).encode(&mut Vec::new()),
+            Err(EncodeError::TooLong {
+                what: "graceful restart capability",
+                len: 258,
+                max: 255,
+            })
+        );
+    }
+
+    #[test]
+    fn the_last_graceful_restart_capability_counts() {
+        // RFC 4724 §3: "the receiver of the advertisement MUST ignore all
+        // but the last instance".
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let caps = [
+            gr(false, false, 10, &[]),
+            Capability::RouteRefresh,
+            gr(true, false, 20, &[(v4, true)]),
+            Capability::ExtendedMessage,
+        ];
+        let last = graceful_restart(&caps).unwrap();
+        assert_eq!(last.restart_time.secs(), 20);
+        assert!(last.restarting && !last.notification);
+        assert_eq!(
+            last.family(v4),
+            Some(GracefulRestartFamily {
+                family: v4,
+                forwarding: true
+            })
+        );
+        assert_eq!(last.family(AddressFamily::IPV6_UNICAST), None);
+        assert_eq!(graceful_restart(&caps[1..2]), None);
+    }
+
     #[test]
     fn multiprotocol_ignores_the_reserved_octet() {
         // RFC 4760 §8: Res. SHOULD be zero and is ignored by the receiver.
@@ -671,13 +969,14 @@ mod tests {
 
     #[test]
     fn unknown_capabilities_are_kept_not_rejected() {
-        // Graceful Restart (64) with a two-octet value, and an empty one.
+        // Prestandard Route Refresh (128) with a two-octet value, and
+        // another with none.
         round_trip(
             &Capability::Unknown {
-                code: 64,
+                code: 128,
                 value: vec![0x40, 0x78],
             },
-            &[64, 2, 0x40, 0x78],
+            &[128, 2, 0x40, 0x78],
         );
         round_trip(
             &Capability::Unknown {
@@ -711,6 +1010,7 @@ mod tests {
             &[9, 0][..],                      // role with no Role Value
             &[9, 2, 0, 3][..],                // role with two octets
             &[9, 1][..],                      // role truncated
+            &[64, 3, 0, 0, 0][..],            // graceful restart: a partial tuple
             &[65, 2, 0xfd, 0xe8][..],         // 4-octet AS with two octets
             &[65, 4, 0, 0][..],               // truncated value
             &[1][..],                         // truncated length

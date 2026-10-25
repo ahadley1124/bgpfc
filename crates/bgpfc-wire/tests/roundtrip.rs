@@ -13,7 +13,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bgpfc_wire::as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
-use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
+use bgpfc_wire::capability::{
+    AddPathMode, AddPathTuple, Capability, GracefulRestart, GracefulRestartFamily, NextHopEncoding,
+};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::error::UpdateSubcode;
@@ -27,7 +29,7 @@ use bgpfc_wire::prefix::{
 use bgpfc_wire::reader::Reader;
 use bgpfc_wire::role::Role;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
-use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, PathId, RouterId, Safi};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, PathId, RestartTime, RouterId, Safi};
 use bgpfc_wire::update::{
     AddPathFamilies, DecodeContext, EncodeContext, PathIds, PeerKind, UpdateMessage,
 };
@@ -114,6 +116,29 @@ fn add_path_tuple() -> impl Strategy<Value = AddPathTuple> {
     })
 }
 
+/// RFC 4724 §3 and RFC 8538 §2: any flags, any Restart Time of twelve bits,
+/// and at most 63 tuples of any family, with or without the Forwarding
+/// State bit.
+fn graceful_restart() -> impl Strategy<Value = GracefulRestart> {
+    (
+        any::<bool>(),
+        any::<bool>(),
+        0u16..=4095,
+        vec((address_family(), any::<bool>()), 0..=63),
+    )
+        .prop_map(
+            |(restarting, notification, secs, families)| GracefulRestart {
+                restarting,
+                notification,
+                restart_time: RestartTime::new(secs).unwrap(),
+                families: families
+                    .into_iter()
+                    .map(|(family, forwarding)| GracefulRestartFamily { family, forwarding })
+                    .collect(),
+            },
+        )
+}
+
 fn capability() -> impl Strategy<Value = Capability> {
     prop_oneof![
         address_family().prop_map(Capability::Multiprotocol),
@@ -126,8 +151,12 @@ fn capability() -> impl Strategy<Value = Capability> {
         vec(next_hop_encoding(), 0..=42).prop_map(Capability::ExtendedNextHop),
         // RFC 7911 §4: at most 63 four-octet tuples fit the length octet.
         vec(add_path_tuple(), 0..=63).prop_map(Capability::AddPath),
+        graceful_restart().prop_map(Capability::GracefulRestart),
         (
-            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 9 | 65 | 69)),
+            any::<u8>().prop_filter("known code", |c| !matches!(
+                c,
+                1 | 2 | 5 | 6 | 9 | 64 | 65 | 69
+            )),
             vec(any::<u8>(), 0..=255)
         )
             .prop_map(|(code, value)| Capability::Unknown { code, value }),
@@ -592,6 +621,31 @@ proptest! {
             let mut again = Vec::new();
             c.encode(&mut again).unwrap();
             prop_assert_eq!(again, wire);
+        } else {
+            prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
+        }
+    }
+
+    #[test]
+    fn graceful_restart_accepts_exactly_two_plus_whole_tuples(value in vec(any::<u8>(), 0..=255)) {
+        // RFC 4724 §3: two octets of flags and Restart Time, then whole
+        // four-octet tuples; anything else is malformed (RFC 4271 §6.2).
+        // The reserved bits are ignored on receipt, so the capability
+        // re-encodes to the octets received with them cleared.
+        let mut wire = vec![64, u8::try_from(value.len()).unwrap()];
+        wire.extend_from_slice(&value);
+        let decoded = Capability::decode(&mut Reader::new(&wire));
+        if value.len() >= 2 && (value.len() - 2) % 4 == 0 {
+            let c = decoded.unwrap();
+            prop_assert!(matches!(&c, Capability::GracefulRestart(g) if g.families.len() == (value.len() - 2) / 4));
+            let mut cleared = wire.clone();
+            cleared[2] &= 0xcf;
+            for tuple in cleared[4..].chunks_mut(4) {
+                tuple[3] &= 0x80;
+            }
+            let mut again = Vec::new();
+            c.encode(&mut again).unwrap();
+            prop_assert_eq!(again, cleared);
         } else {
             prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
         }

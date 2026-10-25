@@ -136,6 +136,39 @@ impl fmt::Display for HoldTime {
     }
 }
 
+/// Restart Time in seconds: the 12-bit field of the Graceful Restart
+/// capability (RFC 4724 §3), so at most 4095.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RestartTime(u16);
+
+impl RestartTime {
+    /// The largest Restart Time the 12-bit field holds (RFC 4724 §3).
+    pub const MAX: RestartTime = RestartTime(0x0fff);
+
+    /// Validate a Restart Time: at most 4095 seconds, the most twelve bits
+    /// hold (RFC 4724 §3).
+    #[must_use]
+    pub const fn new(secs: u16) -> Option<RestartTime> {
+        if secs <= RestartTime::MAX.0 {
+            Some(RestartTime(secs))
+        } else {
+            None
+        }
+    }
+
+    /// Seconds.
+    #[must_use]
+    pub const fn secs(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for RestartTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s", self.0)
+    }
+}
+
 /// Address Family Identifier (RFC 4760 §3; IANA "Address Family Numbers").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Afi {
@@ -281,6 +314,16 @@ mod tests {
         assert_eq!(HoldTime::new(2), None);
         assert_eq!(HoldTime::new(3).unwrap().secs(), 3);
         assert_eq!(HoldTime::new(90).unwrap().to_string(), "90s");
+    }
+
+    #[test]
+    fn restart_time_is_twelve_bits() {
+        // RFC 4724 §3: "Restart Time in seconds (12 bits)".
+        assert_eq!(RestartTime::new(0).unwrap().secs(), 0);
+        assert_eq!(RestartTime::new(120).unwrap().to_string(), "120s");
+        assert_eq!(RestartTime::new(4095), Some(RestartTime::MAX));
+        assert_eq!(RestartTime::new(4096), None);
+        assert_eq!(RestartTime::new(u16::MAX), None);
     }
 
     #[test]
