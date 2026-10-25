@@ -11,6 +11,7 @@ use std::time::Duration;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::role::LocalRole;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::error::Pos;
@@ -504,6 +505,11 @@ pub struct Neighbor {
     /// per prefix for, and how many (RFC 7911 §5), in file order. Empty by
     /// default: one path per prefix.
     pub add_path_send: Vec<(AddressFamily, AddPathSend)>,
+    /// `role` and `role-strict`: our BGP Role on the session (RFC 9234
+    /// §4), with strict mode (§4.2) if asked for. `None` by default: no
+    /// Role is advertised and the Only to Customer procedures (§5) do not
+    /// apply. Validation allows it only on an external session.
+    pub role: Option<LocalRole>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -540,5 +546,8 @@ impl Neighbor {
                 .iter()
                 .map(|(family, _)| family)
                 .eq(other.add_path_send.iter().map(|(family, _)| family))
+            // RFC 9234 §4.1: the Role is in the OPEN, and the OTC
+            // procedures of §5 follow it for routes already held.
+            && self.role == other.role
     }
 }

@@ -30,8 +30,8 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)); a route the neighbor sent under a Path Identifier (RFC 7911 §3) ends in `id N`, which tells apart the several paths one neighbor has to a prefix |
+| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; and a route with the Only to Customer attribute ends in `otc ASN` (see [Only to Customer](#only-to-customer)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -98,14 +98,15 @@ Example objects:
               {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
+             "role":{"local":"customer","remote":"provider"},
              "families":["ipv4-unicast","ipv6-unicast"],
              "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]},
              "add_path":{"receive":["ipv4-unicast"],
                          "send":[{"family":"ipv4-unicast","paths":"all"}]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","path_id":7,"best":true,"rov":"disabled","as_path":[64511],
-  "communities":[],"large_communities":[]}]
+  "otc":64511,"peer":"198.51.100.1","path_id":7,"best":true,"rov":"disabled",
+  "as_path":[64511],"communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
@@ -123,9 +124,10 @@ Example objects:
 
 With ADD-PATH (RFC 7911, `add-path` in `docs/config.md`) a neighbor can
 have several routes to one prefix. Each route that came with a Path
-Identifier shows it: `show routes PREFIX` ends the line in `id N`, and
-`GET /v1/routes` has a `path_id` member, a number that is absent for a
-route from a neighbor, or of a family, without ADD-PATH. Zero is an
+Identifier shows it: `show routes PREFIX` has `id N` after the neighbor
+(before any `otc N`), and `GET /v1/routes` has a `path_id` member, a
+number that is absent for a route from a neighbor, or of a family,
+without ADD-PATH. Zero is an
 identifier like any other (RFC 7911 §3), so `"path_id":0` and `id 0`
 name a path. The identifier is the neighbor's own: it is what the
 neighbor numbered its path with, and means nothing to another neighbor.
@@ -172,6 +174,34 @@ from the same VRPs the RIB validates with.
 Routes also carry an ASPA verdict. Until ASPA verification exists, its
 only value is `disabled`, so it is not shown.
 
+## Only to Customer
+
+A neighbor with a `role` (`docs/config.md`, "BGP Roles") takes part in the
+RFC 9234 §5 procedures, which `show routes` and `GET /v1/routes` make
+visible. A route's `otc` member (an `otc N` suffix on its line) is the AS in
+its Only to Customer attribute, or `null` (no suffix) if it has none. It is
+the attribute as the RIB holds the route: as received, or with the
+neighbor's AS where the ingress procedure added it. The attribute that goes
+out may differ: the egress procedure adds our AS to a route without one
+that is sent to a customer, a peer or an RS-Client, when the UPDATE is
+built, and `show routes` does not show that.
+
+A neighbor's `session.role` is `null` without a `role`; otherwise `local` is
+our Role and `remote` the Role the neighbor sent, or `null` if it sent none
+(permitted unless the neighbor has `role-strict yes`). Both are named as
+in the configuration: `provider`, `rs`, `rs-client`, `customer`, `peer`.
+
+A route that is a route leak by RFC 9234 §5 never reaches the Loc-RIB or
+the neighbor's received count: it came with the attribute from a customer
+or an RS-Client, or from a peer with an AS other than the peer's in it.
+bgpfcd logs it once per UPDATE as a warning (`msg="rib: route leak, routes
+ignored"` with `peer`, `family`, `otc`, the number of `routes` and the
+`first` prefix) and keeps the session up. A route the neighbor sent before
+for the same prefix is withdrawn, as for an AS loop; with ADD-PATH, the one
+it sent under the same Path Identifier (RFC 7911 §5). A session that is
+refused for its Roles is logged with the NOTIFICATION it sent, OPEN Message
+Error / Role Mismatch (subcode 11).
+
 ## RPKI
 
 `show rpki` and `GET /v1/rpki` report the `rpki` block (`docs/config.md`,
@@ -207,7 +237,8 @@ Without a client, in `mode disabled`, every member but `mode` and
 named with `-c`. A file that fails to parse, validate or compile leaves the
 running configuration untouched and reports the errors. Otherwise, per
 `docs/config.md`: new neighbors start; removed ones stop with Cease / Peer
-De-configured; neighbors whose session parameters changed stop with Cease /
+De-configured; neighbors whose session parameters changed (a `role` and `role-strict`
+among them) stop with Cease /
 Other Configuration Change and start again; neighbors whose import or
 export policy changed get a ROUTE-REFRESH and a re-export of the
 difference; a changed `advertisement-interval` applies to the running

@@ -10,7 +10,8 @@
 //! (`add-path`); RFC 8210 §6, §7,
 //! §9 and §10 (the `rpki` block: the Expire Interval cap and the
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
-//! the cache list with preferences).
+//! the cache list with preferences); RFC 9234 §4, §4.2 (`role`,
+//! `role-strict`).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

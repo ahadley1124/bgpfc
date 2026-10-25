@@ -7,13 +7,14 @@
 //! Time); RFC 4271 §10 (`KeepaliveTime` below the Hold Time); RFC 8950 §4
 //! (`extended-next-hop` qualifies a configured family); RFC 4271 §6.7
 //! (`maximum-prefix` bounds a configured family); RFC 7911 §4 (`add-path`
-//! qualifies a configured family).
+//! qualifies a configured family); RFC 9234 §4 (a BGP Role is for an
+//! external session).
 
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::ast::{Config, Match, SendHoldTime};
-use crate::error::ConfigError;
+use crate::ast::{Config, Match, Neighbor, SendHoldTime};
+use crate::error::{ConfigError, Pos};
 
 /// Every problem found, or nothing.
 pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
@@ -81,54 +82,75 @@ pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
                 ),
             );
         }
-        // RFC 8950 §4: the capability only says how a family's next hop
-        // may be encoded; it cannot make the family usable, which is the
-        // Multiprotocol capability's job (RFC 4760 §8).
-        for family in &n.extended_next_hop {
-            if !n.families.contains(family) {
-                err(
-                    n.pos,
-                    format!(
-                        "neighbor {}: extended-next-hop needs the {family} family (RFC 8950 §4)",
-                        n.addr
-                    ),
-                );
-            }
-        }
-        // RFC 7911 §4: the ADD-PATH tuple is for a family the session
-        // exchanges (RFC 4760 §8), so one for a family that is not
-        // configured could never be negotiated.
-        let send = n.add_path_send.iter().map(|(f, _)| f);
-        for (what, family) in n
-            .add_path_receive
-            .iter()
-            .map(|f| ("receive", f))
-            .chain(send.map(|f| ("send", f)))
+        // RFC 9234 §4: "The BGP Role characterizes the relationship between
+        // the eBGP speakers forming a session"; §5 asks that the OTC
+        // procedures not be used inside an AS. A session to our own AS is
+        // internal, so a Role there is a mistake worth naming.
+        if let Some(local) = n.role
+            && n.remote_as == cfg.local_as
         {
-            if !n.families.contains(family) {
-                err(
-                    n.pos,
-                    format!(
-                        "neighbor {}: add-path {what} for {family}, which is not in its families",
-                        n.addr
-                    ),
-                );
-            }
+            err(
+                n.pos,
+                format!(
+                    "neighbor {}: role {} needs an external session, but remote-as {} is our own AS (RFC 9234 §4)",
+                    n.addr, local.role, n.remote_as.0
+                ),
+            );
         }
-        // RFC 4760 §8: a family not configured is never negotiated, so a
-        // limit on it could never apply; say so rather than ignore it.
-        for (family, _) in &n.maximum_prefix {
-            if !n.families.contains(family) {
-                err(
-                    n.pos,
-                    format!(
-                        "neighbor {}: maximum-prefix for {family}, which is not in its families",
-                        n.addr
-                    ),
-                );
-            }
-        }
+        check_families(n, &mut err);
     }
 
     errors
+}
+
+/// The checks that a neighbor's per-family statements name a family it is
+/// configured for.
+fn check_families(n: &Neighbor, err: &mut impl FnMut(Pos, String)) {
+    // RFC 8950 §4: the capability only says how a family's next hop
+    // may be encoded; it cannot make the family usable, which is the
+    // Multiprotocol capability's job (RFC 4760 §8).
+    for family in &n.extended_next_hop {
+        if !n.families.contains(family) {
+            err(
+                n.pos,
+                format!(
+                    "neighbor {}: extended-next-hop needs the {family} family (RFC 8950 §4)",
+                    n.addr
+                ),
+            );
+        }
+    }
+    // RFC 7911 §4: the ADD-PATH tuple is for a family the session
+    // exchanges (RFC 4760 §8), so one for a family that is not
+    // configured could never be negotiated.
+    let send = n.add_path_send.iter().map(|(f, _)| f);
+    for (what, family) in n
+        .add_path_receive
+        .iter()
+        .map(|f| ("receive", f))
+        .chain(send.map(|f| ("send", f)))
+    {
+        if !n.families.contains(family) {
+            err(
+                n.pos,
+                format!(
+                    "neighbor {}: add-path {what} for {family}, which is not in its families",
+                    n.addr
+                ),
+            );
+        }
+    }
+    // RFC 4760 §8: a family not configured is never negotiated, so a
+    // limit on it could never apply; say so rather than ignore it.
+    for (family, _) in &n.maximum_prefix {
+        if !n.families.contains(family) {
+            err(
+                n.pos,
+                format!(
+                    "neighbor {}: maximum-prefix for {family}, which is not in its families",
+                    n.addr
+                ),
+            );
+        }
+    }
 }

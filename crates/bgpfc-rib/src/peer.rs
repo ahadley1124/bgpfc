@@ -4,12 +4,13 @@
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
 //! per-family prefix limit), §6.3 a) (our own address is no next hop);
 //! RFC 7911 §5 (the families sent and taken with Path Identifiers, and how
-//! many paths are sent).
+//! many paths are sent); RFC 9234 §4 (our BGP Role on the session).
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use bgpfc_wire::mp::NextHop;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
 
@@ -73,6 +74,11 @@ pub struct PeerInfo {
     /// how many paths of a prefix (RFC 7911 §5). Within `families`. The
     /// routes of any other family go as before, one best path per prefix.
     pub add_path_send: Vec<(AddressFamily, PathLimit)>,
+    /// Our BGP Role on the session, when one is configured and the session
+    /// external (RFC 9234 §4): the session takes part in the Only to
+    /// Customer procedures of §5 (see [`otc`](crate::otc)). `None` for a
+    /// session with no Role, which leaves the attribute alone.
+    pub role: Option<Role>,
 }
 
 impl PeerInfo {

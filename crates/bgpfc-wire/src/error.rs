@@ -3,7 +3,7 @@
 //!
 //! Implements: RFC 4271 §4.5 (error codes and subcodes), §6.1 and §6.2,
 //! RFC 5492 §5 (Unsupported Capability), RFC 6608 §3 (FSM subcodes),
-//! RFC 4486 §3 (Cease subcodes).
+//! RFC 4486 §3 (Cease subcodes), RFC 9234 §4.2 and §7 (Role Mismatch).
 
 use std::fmt;
 
@@ -93,6 +93,10 @@ pub enum OpenSubcode {
     UnacceptableHoldTime = 6,
     /// The peer lacks a capability this speaker requires (RFC 5492 §5).
     UnsupportedCapability = 7,
+    /// The BGP Roles of the two speakers do not correspond, or the peer
+    /// sent no Role capability where one is required (RFC 9234 §4.2).
+    /// Values 8 to 10 are deprecated (RFC 9234 §7) and never sent.
+    RoleMismatch = 11,
 }
 
 /// UPDATE Message Error subcodes (RFC 4271 §4.5, §6.3). Subcode 7 is
@@ -174,6 +178,7 @@ pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
         (ErrorCode::Open, 4) => "Unsupported Optional Parameter",
         (ErrorCode::Open, 6) => "Unacceptable Hold Time",
         (ErrorCode::Open, 7) => "Unsupported Capability",
+        (ErrorCode::Open, 11) => "Role Mismatch",
         (ErrorCode::Update, 1) => "Malformed Attribute List",
         (ErrorCode::Update, 2) => "Unrecognized Well-known Attribute",
         (ErrorCode::Update, 3) => "Missing Well-known Attribute",
@@ -344,6 +349,9 @@ mod tests {
         assert!(e.to_string().contains("subcode 7"));
         let e = DecodeError::update(UpdateSubcode::MalformedAsPath, vec![]);
         assert_eq!((e.code, e.subcode), (ErrorCode::Update, 11));
+        // RFC 9234 §4.2: Role Mismatch is OPEN Message Error subcode 11.
+        let e = DecodeError::open(OpenSubcode::RoleMismatch, vec![]);
+        assert_eq!((e.code, e.subcode), (ErrorCode::Open, 11));
     }
 
     #[test]
@@ -357,8 +365,12 @@ mod tests {
         for s in [1u8, 2, 3] {
             assert!(subcode_name(ErrorCode::MessageHeader, s).is_some());
         }
-        for s in [0u8, 1, 2, 3, 4, 6, 7] {
+        for s in [0u8, 1, 2, 3, 4, 6, 7, 11] {
             assert!(subcode_name(ErrorCode::Open, s).is_some());
+        }
+        // RFC 9234 §7: 8 to 10 are deprecated, 5 was never defined.
+        for s in [5u8, 8, 9, 10] {
+            assert_eq!(subcode_name(ErrorCode::Open, s), None);
         }
         for s in [1u8, 2, 3, 4, 5, 6, 8, 9, 10, 11] {
             assert!(subcode_name(ErrorCode::Update, s).is_some());

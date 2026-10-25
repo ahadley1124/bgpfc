@@ -6,7 +6,7 @@
 //! AGGREGATOR), §5 (categories and flag rules); RFC 7606 §4 (attribute
 //! length errors); RFC 6793 §3 (four-octet AGGREGATOR); RFC 1997, RFC 4360,
 //! RFC 8092 (community attributes); RFC 4760 §3, §4 (`MP_REACH_NLRI`,
-//! `MP_UNREACH_NLRI`).
+//! `MP_UNREACH_NLRI`); RFC 9234 §5 (Only to Customer).
 //!
 //! Deciding what a malformed attribute means for the UPDATE as a whole
 //! (RFC 7606) is done in [`crate::update`]; this module only parses.
@@ -67,6 +67,8 @@ pub mod code {
     pub const AS4_AGGREGATOR: u8 = 18;
     /// Large Communities (RFC 8092).
     pub const LARGE_COMMUNITIES: u8 = 32;
+    /// Only to Customer, OTC (RFC 9234 §5, §7).
+    pub const ONLY_TO_CUSTOMER: u8 = 35;
 }
 
 /// ORIGIN values (RFC 4271 §4.3 a).
@@ -145,6 +147,9 @@ pub enum PathAttribute {
     ExtendedCommunities(Vec<ExtendedCommunity>),
     /// Large Communities, optional transitive (RFC 8092 §3).
     LargeCommunities(Vec<LargeCommunity>),
+    /// Only to Customer, optional transitive: the AS that set it (RFC 9234
+    /// §5). Four octets.
+    OnlyToCustomer(Asn),
     /// An optional transitive attribute this implementation does not know,
     /// carried unchanged with its flags so that it can be passed on with
     /// the Partial bit set (RFC 4271 §5).
@@ -175,6 +180,7 @@ impl PathAttribute {
             PathAttribute::MpUnreach(_) => code::MP_UNREACH_NLRI,
             PathAttribute::ExtendedCommunities(_) => code::EXTENDED_COMMUNITIES,
             PathAttribute::LargeCommunities(_) => code::LARGE_COMMUNITIES,
+            PathAttribute::OnlyToCustomer(_) => code::ONLY_TO_CUSTOMER,
             PathAttribute::Unknown { code, .. } => *code,
         }
     }
@@ -225,6 +231,7 @@ impl PathAttribute {
             PathAttribute::MpUnreach(m) => m.encode(&mut value),
             PathAttribute::ExtendedCommunities(cs) => encode_extended_communities(cs, &mut value),
             PathAttribute::LargeCommunities(cs) => encode_large_communities(cs, &mut value),
+            PathAttribute::OnlyToCustomer(asn) => value.put_u32(asn.0),
             PathAttribute::Unknown { value: v, .. } => value.put_bytes(v),
         }
         encode_attribute(self.flags(), self.code(), &value, out)
@@ -233,7 +240,8 @@ impl PathAttribute {
 
 /// The Optional and Transitive bits a known attribute type must carry
 /// (RFC 4271 §4.3, §5; RFC 1997; RFC 4760 §3, §4; RFC 4360 §2; RFC 6793 §3;
-/// RFC 8092 §3). `None` for codes this implementation does not know.
+/// RFC 8092 §3; RFC 9234 §5). `None` for codes this implementation does not
+/// know.
 #[must_use]
 pub const fn expected_flags(code: u8) -> Option<u8> {
     Some(match code {
@@ -248,7 +256,8 @@ pub const fn expected_flags(code: u8) -> Option<u8> {
         | code::EXTENDED_COMMUNITIES
         | code::AS4_PATH
         | code::AS4_AGGREGATOR
-        | code::LARGE_COMMUNITIES => flags::OPTIONAL | flags::TRANSITIVE,
+        | code::LARGE_COMMUNITIES
+        | code::ONLY_TO_CUSTOMER => flags::OPTIONAL | flags::TRANSITIVE,
         _ => return None,
     })
 }
@@ -410,6 +419,11 @@ mod tests {
                 vec![0xc0, 32, 12, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3],
             ),
             (
+                // RFC 9234 §5: optional transitive, type 35, four octets.
+                PathAttribute::OnlyToCustomer(Asn(65_001)),
+                vec![0xc0, 35, 4, 0, 0, 0xfd, 0xe9],
+            ),
+            (
                 PathAttribute::Unknown {
                     flags: 0xe0,
                     code: 99,
@@ -501,6 +515,7 @@ mod tests {
         assert_eq!(expected_flags(code::AGGREGATOR), Some(0xc0));
         assert_eq!(expected_flags(code::AS4_PATH), Some(0xc0));
         assert_eq!(expected_flags(code::LARGE_COMMUNITIES), Some(0xc0));
+        assert_eq!(expected_flags(code::ONLY_TO_CUSTOMER), Some(0xc0));
         assert_eq!(expected_flags(99), None);
     }
 }

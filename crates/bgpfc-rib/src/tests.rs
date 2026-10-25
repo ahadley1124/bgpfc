@@ -23,6 +23,7 @@ use crate::{FibChange, Output, Rib};
 
 mod add_path;
 mod adj_rib_in;
+mod roles;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
@@ -58,7 +59,7 @@ fn p(s: &str) -> Prefix {
     s.parse().unwrap()
 }
 
-fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
+pub(crate) fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
     let next_hop = match ip(next_hop) {
         IpAddr::V4(a) => NextHop::Ipv4(a),
         IpAddr::V6(a) => NextHop::Ipv6 {
@@ -78,10 +79,11 @@ fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
         ext_communities: Box::default(),
         large_communities: Box::default(),
         unknown: Box::default(),
+        otc: None,
     }
 }
 
-fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
+pub(crate) fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     let addr = ip(addr);
     let local_addr = match addr {
         IpAddr::V4(_) => ip("10.0.0.254"),
@@ -108,6 +110,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
+        role: None,
     }
 }
 
@@ -1401,6 +1404,55 @@ fn attributes_round_trip_through_an_update() {
     assert_eq!(announced(&withdraw(&["192.0.2.0/24"])).count(), 0);
     assert!(a.has_community(Community::new(65_001, 2)));
     assert_eq!(a.next_hop_afi(), bgpfc_wire::types::Afi::Ipv4);
+}
+
+#[test]
+fn only_to_customer_is_part_of_the_attribute_set() {
+    // RFC 9234 §5: kept as received and "preserved unchanged".
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.otc = Some(Asn(65_001));
+    let d = announce(&["192.0.2.0/24"], &a);
+    assert_eq!(
+        d.message.attribute(35),
+        Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+    );
+    let (_, next_hop, _, _) = announced(&d).next().unwrap();
+    assert_eq!(PathAttrs::from_update(&d.message, next_hop), a);
+    // A route without it, or with another value, is another set.
+    let mut i = crate::attrs::Interner::default();
+    let with = i.intern(a.clone());
+    let without = i.intern(attrs(&[65_001], "10.0.0.1"));
+    let other = {
+        let mut b = a.clone();
+        b.otc = Some(Asn(65_002));
+        i.intern(b)
+    };
+    assert_eq!(i.len(), 3);
+    assert!(Arc::ptr_eq(&with, &i.intern(a)));
+    assert!(!Arc::ptr_eq(&with, &without) && !Arc::ptr_eq(&with, &other));
+}
+
+#[test]
+fn only_to_customer_is_passed_on_unchanged_without_roles() {
+    // A session with no BGP Role takes no part in RFC 9234 §5 procedures,
+    // but the attribute is still transitive: it reaches the next peer
+    // exactly as received, without the Partial bit an unknown attribute
+    // would get.
+    let from = peer("10.0.0.1", 65_001, 1);
+    let to = peer("10.0.0.2", 65_002, 2);
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.otc = Some(Asn(65_009));
+    let mut rib = Rib::new(LOCAL_AS);
+    let mut out = Vec::new();
+    rib.peer_up(from.clone(), now(), &mut out);
+    rib.peer_up(to.clone(), now(), &mut out);
+    out.clear();
+    rib.update(from.addr, &announce(&["192.0.2.0/24"], &a), now(), &mut out);
+    let sent = decode_sent(sends(&out, to.addr)[0], &to);
+    assert_eq!(
+        sent[0].attribute(35),
+        Some(&PathAttribute::OnlyToCustomer(Asn(65_009)))
+    );
 }
 
 #[test]

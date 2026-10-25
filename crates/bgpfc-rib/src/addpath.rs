@@ -24,7 +24,7 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, PathId};
+use bgpfc_wire::types::{AddressFamily, Asn, PathId};
 
 use crate::attrs::{Interner, PathAttrs};
 use crate::decision::{self, Candidate};
@@ -133,12 +133,13 @@ struct Plan {
 /// withdrawn, as displaced if it is in `displaced`. A new path takes the
 /// smallest identifier from 1 up that no path of `old` has, the ones about
 /// to be withdrawn included, so that none is handed out again while it may
-/// still be on its way.
+/// still be on its way. `local_as` is our AS, for the rewrite's Only to
+/// Customer attribute (RFC 9234 §5).
 fn plan(
     old: &[SentPath],
     (chosen, displaced): (&[Chosen], &[Chosen]),
     how: Sync,
-    family: AddressFamily,
+    (local_as, family): (Asn, AddressFamily),
     info: &PeerInfo,
 ) -> Plan {
     let mut plan = Plan::default();
@@ -162,7 +163,7 @@ fn plan(
         };
         let same = match &path.exported {
             Exported::Own(a) if Arc::ptr_eq(a, &sent.attrs) => true,
-            e => export::same_rewrite(family, &sent.attrs, e.attrs(), info),
+            e => export::same_rewrite(local_as, family, &sent.attrs, e.attrs(), info),
         };
         if how == Sync::Full || !same {
             plan.announce.push(Announce {
@@ -303,7 +304,7 @@ impl Sessions {
             old,
             (open.chosen(), open.displaced()),
             how,
-            family,
+            (self.cx.local_as, family),
             &self.peer(id).info,
         );
         if plan.withdraw.is_empty() && plan.announce.is_empty() {
@@ -509,12 +510,13 @@ mod tests {
     use bgpfc_wire::as_path::AsPath;
     use bgpfc_wire::attribute::Origin;
     use bgpfc_wire::mp::NextHop;
-    use bgpfc_wire::types::{Asn, RouterId};
+    use bgpfc_wire::types::RouterId;
     use bgpfc_wire::update::PeerKind;
 
     use super::*;
 
     const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
+    const LOCAL: Asn = Asn(65_000);
 
     fn attrs(asn: u32) -> Arc<PathAttrs> {
         Arc::new(PathAttrs {
@@ -529,6 +531,7 @@ mod tests {
             ext_communities: Box::default(),
             large_communities: Box::default(),
             unknown: Box::default(),
+            otc: None,
         })
     }
 
@@ -548,6 +551,7 @@ mod tests {
             prefix_limits: Vec::new(),
             add_path_receive: Vec::new(),
             add_path_send: vec![(V4, PathLimit::All)],
+            role: None,
         }
     }
 
@@ -577,7 +581,7 @@ mod tests {
             &[],
             (&[chosen(1, 0, &a), chosen(2, 0, &a), chosen(1, 7, &a)], &[]),
             Sync::Change,
-            V4,
+            (LOCAL, V4),
             &info(),
         );
         assert_eq!(
@@ -611,7 +615,7 @@ mod tests {
         let a = attrs(65_001);
         let old = [sent(1, 0, 1, &a), sent(2, 0, 3, &a), sent(3, 0, 4, &a)];
         let new: Vec<Chosen> = (1..=6).map(|src| chosen(src, 0, &a)).collect();
-        let p = plan(&old, (&new, &[]), Sync::Change, V4, &info());
+        let p = plan(&old, (&new, &[]), Sync::Change, (LOCAL, V4), &info());
         assert_eq!(p.withdraw, vec![]);
         assert_eq!(
             p.announce
@@ -630,7 +634,7 @@ mod tests {
         // Now (2, 0) with other attributes, (3, 0) as it was, and a new
         // (5, 0); (1, 0) is gone.
         let new = [chosen(2, 0, &b), chosen(3, 0, &a), chosen(5, 0, &a)];
-        let p = plan(&old, (&new, &[]), Sync::Change, V4, &info());
+        let p = plan(&old, (&new, &[]), Sync::Change, (LOCAL, V4), &info());
         assert_eq!(
             p.withdraw,
             vec![Withdraw {
@@ -656,7 +660,7 @@ mod tests {
             ]
         );
         // A route refresh sends them all again, under the same identifiers.
-        let p = plan(&old, (&new, &[]), Sync::Full, V4, &info());
+        let p = plan(&old, (&new, &[]), Sync::Full, (LOCAL, V4), &info());
         assert_eq!(
             p.withdraw,
             vec![Withdraw {
@@ -682,7 +686,7 @@ mod tests {
             &old,
             (&[chosen(3, 0, &a)], &[chosen(2, 0, &a)]),
             Sync::Change,
-            V4,
+            (LOCAL, V4),
             &info(),
         );
         assert_eq!(
@@ -704,7 +708,13 @@ mod tests {
     fn the_same_source_with_another_identifier_is_another_path() {
         let a = attrs(65_001);
         let old = [sent(1, 5, 1, &a)];
-        let p = plan(&old, (&[chosen(1, 6, &a)], &[]), Sync::Change, V4, &info());
+        let p = plan(
+            &old,
+            (&[chosen(1, 6, &a)], &[]),
+            Sync::Change,
+            (LOCAL, V4),
+            &info(),
+        );
         assert_eq!(
             p.withdraw,
             vec![Withdraw {
@@ -721,7 +731,13 @@ mod tests {
             }]
         );
         // Nothing changed: nothing to do.
-        let p = plan(&old, (&[chosen(1, 5, &a)], &[]), Sync::Change, V4, &info());
+        let p = plan(
+            &old,
+            (&[chosen(1, 5, &a)], &[]),
+            Sync::Change,
+            (LOCAL, V4),
+            &info(),
+        );
         assert_eq!(p, Plan::default());
     }
 }

@@ -12,7 +12,7 @@
 //! within the Expire
 //! Interval's range; `backoff` within the Retry Interval's), §7
 //! (`version`), §9 (port 323), §10 (`cache` and its `preference`);
-//! RFC 1123 §2.1 (cache host names).
+//! RFC 1123 §2.1 (cache host names); RFC 9234 §4 (`role`, `role-strict`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::ast::{
@@ -1162,6 +1163,11 @@ struct NeighborBuilder {
     add_path_receive: Vec<(AddressFamily, bool)>,
     /// `add-path send FAMILY ...`, each family once; `off` is kept out.
     add_path_send: Vec<(AddressFamily, Option<AddPathSend>)>,
+    role: Once<Role>,
+    role_strict: Once<bool>,
+    /// Where `role-strict yes` stands, for the error when there is no
+    /// `role` to be strict about.
+    role_strict_at: Option<Pos>,
 }
 
 impl NeighborBuilder {
@@ -1186,6 +1192,9 @@ impl NeighborBuilder {
             maximum_prefix: Vec::new(),
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
+            role: Once::new("role"),
+            role_strict: Once::new("role-strict"),
+            role_strict_at: None,
         }
     }
 
@@ -1285,6 +1294,14 @@ impl NeighborBuilder {
             }
             "maximum-prefix" => self.maximum_prefix(l, t),
             "add-path" => self.add_path(l, t),
+            "role" => self.role(l, t),
+            "role-strict" => {
+                let v = l.yes_no(t);
+                if v == Some(true) {
+                    self.role_strict_at.get_or_insert(t.pos);
+                }
+                self.role_strict.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
     }
@@ -1363,6 +1380,28 @@ impl NeighborBuilder {
         }
     }
 
+    /// `role NAME`: one of the five Roles of RFC 9234 §4.1, Table 1, by the
+    /// names the RFC uses. It is ours, not the neighbor's.
+    fn role(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| match a.value.as_str() {
+            "provider" => Some(Role::Provider),
+            "rs" => Some(Role::RouteServer),
+            "rs-client" => Some(Role::RouteServerClient),
+            "customer" => Some(Role::Customer),
+            "peer" => Some(Role::Peer),
+            other => {
+                l.err(
+                    a.pos,
+                    format!(
+                        "`{other}` is not a BGP role: expected provider, rs, rs-client, customer or peer"
+                    ),
+                );
+                None
+            }
+        });
+        self.role.set(l, t.pos, v);
+    }
+
     /// `maximum-prefix FAMILY N`, at most once per family (RFC 4271 §6.7).
     fn maximum_prefix(&mut self, l: &mut Lowerer, t: &Statement) {
         let Some([family, limit]) = l.args(t, 2) else {
@@ -1397,6 +1436,16 @@ impl NeighborBuilder {
             if !present {
                 l.err(pos, format!("neighbor {addr} has no `{kw}`"));
             }
+        }
+        // RFC 9234 §4.2: strict mode is about the Role capability we sent,
+        // and one is sent only for a configured Role.
+        if let Some(at) = self.role_strict_at
+            && !self.role.seen
+        {
+            l.err(
+                at,
+                format!("neighbor {addr}: `role-strict yes` needs a `role` (RFC 9234 §4.2)"),
+            );
         }
         Some(Neighbor {
             pos,
@@ -1447,6 +1496,10 @@ impl NeighborBuilder {
                 .into_iter()
                 .filter_map(|(family, send)| send.map(|send| (family, send)))
                 .collect(),
+            role: self.role.value.map(|role| LocalRole {
+                role,
+                strict: self.role_strict.value.unwrap_or(false),
+            }),
         })
     }
 }

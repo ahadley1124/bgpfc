@@ -22,7 +22,8 @@
 //! NLRI, only when negotiated); RFC 7911 §3, §5 (a Path Identifier before
 //! each NLRI tuple of the Withdrawn Routes field, the NLRI field,
 //! `MP_REACH_NLRI` and `MP_UNREACH_NLRI`, only for the families and the
-//! direction ADD-PATH was negotiated for).
+//! direction ADD-PATH was negotiated for); RFC 9234 §5 (a malformed Only to
+//! Customer attribute is treat-as-withdraw).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -747,6 +748,21 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
         code::LARGE_COMMUNITIES => match decode_large_communities(v) {
             Ok(cs) => Outcome::Keep(PathAttribute::LargeCommunities(cs)),
             Err(_) => length_error(),
+        },
+        // RFC 9234 §5: "The OTC Attribute is considered malformed if the
+        // length value is not 4. An UPDATE message with a malformed OTC
+        // Attribute SHALL be handled using the approach of
+        // 'treat-as-withdraw'", with RFC 7606 §7's Attribute Length Error.
+        // The value is an AS number and kept whatever it is: the RFC names
+        // no check on it, and "once the OTC Attribute has been set, it MUST
+        // be preserved unchanged".
+        // NOTE(interop): FRR 8.4 treats a value of 0 as malformed
+        // (treat-as-withdraw); BIRD 2.14 and RFC 9234 §5 do not. Following
+        // the RFC, it is kept; from a peer it is a leak anyway, as no AS 0
+        // is a peer's.
+        code::ONLY_TO_CUSTOMER => match u32_value(v) {
+            Some(a) => Outcome::Keep(PathAttribute::OnlyToCustomer(Asn(a))),
+            None => length_error(),
         },
         // RFC 6793 §6: AS4_* from a NEW speaker are discarded; otherwise a
         // malformed one is discarded too.
@@ -1754,6 +1770,142 @@ mod tests {
         assert_eq!(
             d.treated_as_withdraw.unwrap().subcode,
             UpdateSubcode::AttributeLengthError as u8
+        );
+    }
+
+    /// `announce()` as a four-octet session sends it, with `attr` added
+    /// to its path attributes.
+    fn announce_with(attr: &[u8]) -> Vec<u8> {
+        let mut wire = announce().encode(&ENC4).unwrap();
+        let at = wire.len() - 2;
+        wire.splice(at..at, attr.iter().copied());
+        wire[3] += u8::try_from(attr.len()).unwrap();
+        wire
+    }
+
+    #[test]
+    fn only_to_customer_round_trips() {
+        // RFC 9234 §5: optional transitive, type code 35, four octets.
+        let mut m = announce();
+        m.attributes
+            .push(PathAttribute::OnlyToCustomer(Asn(65_001)));
+        m.attributes.sort_by_key(PathAttribute::code);
+        let wire = m.encode(&ENC4).unwrap();
+        let attr = [0xc0, 35, 4, 0, 0, 0xfd, 0xe9];
+        assert!(wire.windows(attr.len()).any(|w| w == attr), "{wire:?}");
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(d.message, m);
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.discarded, vec![]);
+        // It is an AS number of four octets also towards a two-octet
+        // speaker: RFC 9234 §5 has no two-octet form and no AS4_ twin.
+        let wire = m.encode(&ENC2).unwrap();
+        assert!(wire.windows(attr.len()).any(|w| w == attr), "{wire:?}");
+        assert_eq!(UpdateMessage::decode(&wire, &EBGP2).unwrap().message, m);
+        // Internal sessions carry it too ("once set, preserved").
+        let wire = m.encode(&ENC4).unwrap();
+        assert_eq!(UpdateMessage::decode(&wire, &IBGP4).unwrap().message, m);
+        // The value is whatever the AS put there, AS 0 included.
+        for asn in [0, 1, 4_200_000_000, u32::MAX] {
+            let mut wire = vec![0xc0, 35, 4];
+            wire.extend_from_slice(&asn.to_be_bytes());
+            let d = UpdateMessage::decode(&announce_with(&wire), &EBGP4).unwrap();
+            assert_eq!(
+                d.message.attribute(code::ONLY_TO_CUSTOMER),
+                Some(&PathAttribute::OnlyToCustomer(Asn(asn)))
+            );
+        }
+        // A Partial bit set by a speaker that did not know it is dropped
+        // with the rest of the flags we re-derive, and the value is kept.
+        let d = UpdateMessage::decode(&announce_with(&[0xe0, 35, 4, 0, 0, 0xfd, 0xe9]), &EBGP4)
+            .unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+    }
+
+    #[test]
+    fn bird_update_with_otc_is_read_and_written_back() {
+        // Captured from BIRD 2.14, AS 65001, `local role provider`, sending
+        // a static route to its customer: ORIGIN, AS_PATH 65001, NEXT_HOP,
+        // and the Only to Customer attribute (RFC 9234 §5: 0xc0, type 35,
+        // length 4) set to its own AS, as §5 egress 1 has it.
+        let wire = [
+            0, 0, // withdrawn routes length
+            0, 27, // total path attribute length
+            0x40, 1, 1, 0, // ORIGIN igp
+            0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9, // AS_PATH seq 65001
+            0x40, 3, 4, 10, 77, 0, 2, // NEXT_HOP
+            0xc0, 35, 4, 0, 0, 0xfd, 0xe9, // OTC 65001
+            24, 192, 0, 2, // NLRI 192.0.2.0/24
+        ];
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.discarded, vec![]);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+        assert_eq!(d.message.nlri, vec![p("192.0.2.0/24")]);
+        // The canonical form: the encoder writes the same octets.
+        assert_eq!(d.message.encode(&ENC4).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_malformed_only_to_customer_is_treat_as_withdraw() {
+        // RFC 9234 §5: "considered malformed if the length value is not 4";
+        // the UPDATE "SHALL be handled using the approach of
+        // 'treat-as-withdraw'" (RFC 7606 §2), without a session reset.
+        for len in [0usize, 1, 3, 5, 8] {
+            let mut attr = vec![0xc0, 35, u8::try_from(len).unwrap()];
+            attr.extend(std::iter::repeat_n(7, len));
+            let d = UpdateMessage::decode(&announce_with(&attr), &EBGP4).unwrap();
+            let e = d.treated_as_withdraw.clone().unwrap();
+            assert_eq!(e.code, ErrorCode::Update, "length {len}");
+            assert_eq!(e.subcode, UpdateSubcode::AttributeLengthError as u8);
+            // RFC 4271 §6.3: the Data field is the attribute.
+            assert_eq!(e.data, attr);
+            assert_eq!(d.announcements().count(), 0);
+            assert_eq!(
+                d.withdrawals().collect::<Vec<_>>(),
+                vec![(AddressFamily::IPV4_UNICAST, p("10.0.0.0/8"))]
+            );
+        }
+    }
+
+    #[test]
+    fn only_to_customer_flags_must_be_optional_transitive() {
+        // RFC 7606 §3 c): the category bits in conflict with the registry
+        // are treat-as-withdraw for an attribute with no milder rule.
+        for flags in [0x40, 0x80, 0x00] {
+            let attr = [flags, 35, 4, 0, 0, 0xfd, 0xe9];
+            let d = UpdateMessage::decode(&announce_with(&attr), &EBGP4).unwrap();
+            let e = d.treated_as_withdraw.clone().unwrap();
+            assert_eq!(e.subcode, UpdateSubcode::AttributeFlagsError as u8);
+            assert_eq!(e.data, attr);
+            assert_eq!(d.message.attribute(code::ONLY_TO_CUSTOMER), None);
+        }
+    }
+
+    #[test]
+    fn a_repeated_only_to_customer_is_discarded() {
+        // RFC 7606 §3 g): the first occurrence is kept.
+        let mut attrs = vec![0xc0, 35, 4, 0, 0, 0xfd, 0xe9];
+        attrs.extend_from_slice(&[0xc0, 35, 4, 0, 0, 0xfd, 0xea]);
+        let d = UpdateMessage::decode(&announce_with(&attrs), &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+        assert_eq!(
+            d.discarded,
+            vec![DiscardedAttribute {
+                code: 35,
+                reason: DiscardReason::Duplicate
+            }]
         );
     }
 

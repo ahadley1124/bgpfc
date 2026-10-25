@@ -63,6 +63,7 @@ fn peers(interval: Duration, limits: [PathLimit; 2]) -> Vec<PeerInfo> {
                 4 => vec![(V4, limits[1])],
                 _ => Vec::new(),
             },
+            role: None,
         })
         .collect()
 }

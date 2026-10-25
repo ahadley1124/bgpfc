@@ -110,10 +110,13 @@ neighbor-item
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
              | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
+             | "role" role ";"                       (* default none; external sessions only *)
+             | "role-strict" yes-no ";"              (* default no; needs a role *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
 family       = "ipv4-unicast" | "ipv6-unicast" ;
+role         = "provider" | "rs" | "rs-client" | "customer" | "peer" ;
 ```
 
 Value syntax:
@@ -308,6 +311,35 @@ loses a collision (RFC 4271 §6.8), after which the session goes on with the
 other one; neither counts toward the limit or ends a run. `0` never
 restarts after a damped failure; `off` always does.
 
+**BGP Roles.** `role customer;` says that our Role on the session is
+Customer: the neighbor is our transit provider (RFC 9234 §4). The names
+are those of RFC 9234 §4.1, and the Role is ours, the one the OPEN
+carries in the BGP Role capability, not the neighbor's. `provider` makes
+the neighbor our customer, `rs` and `rs-client` a route server and its
+client, `peer` a lateral peer. The neighbor must state the matching Role
+(Provider with Customer, RS with RS-Client, Peer with Peer, RFC 9234
+§4.2, Table 2); if it states another, or several that differ, the
+session is refused with OPEN Message Error / Role Mismatch (subcode 11).
+A neighbor that states none is accepted, with our Role, unless
+`role-strict yes;` asks for the receipt of its capability (RFC 9234 §4.2,
+"strict mode"), in which case the session is refused with Role Mismatch
+too. Strict mode is off by default, as RFC 9234 §8 asks, and needs a
+`role`.
+
+With a `role` the neighbor takes part in the Only to Customer procedures
+of RFC 9234 §5 (`docs/control.md`, "Only to Customer"): a route received
+with the OTC attribute from a customer or an RS-Client, or from a peer
+with an OTC other than the peer's AS, is a route leak and is dropped; a
+route received from a provider, a peer or an RS without the attribute
+gets it, set to the neighbor's AS; a route that carries the attribute is
+not sent to a provider, a peer or an RS; and a route sent to a customer,
+a peer or an RS-Client without it gets it, set to our AS. The procedures
+cannot be changed by policy. A neighbor without a `role` is not subject to
+them, and the attribute passes through it unchanged. The procedures
+apply to IPv4 unicast and IPv6 unicast, the only families bgpfc speaks.
+Roles are for external sessions: a `role` on a neighbor whose `remote-as`
+is our own is an error (RFC 9234 §4).
+
 **RPKI.** The `rpki` block says where the Validated ROA Payloads (VRPs)
 come from that give every route its RFC 6811 origin validation state
 (`docs/control.md`, "Validation state"). Without the block, or with `mode
@@ -405,7 +437,8 @@ reported with the position of the item at fault: every `prefix-list` and
 has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
-family in `families`; an `rpki` block has a `mode`, at least one `cache` with `mode
+family in `families`; a `role` only on an external session, and
+`role-strict yes` only with a `role`; an `rpki` block has a `mode`, at least one `cache` with `mode
 external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN.
@@ -416,9 +449,9 @@ Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`, and the number of paths
-`add-path send` sends; `restart-limit` included, and so are the families
-`add-path` is on for, since the capability is in the OPEN) reset with
-Cease / Other Configuration Change and start again, and
+`add-path send` sends; `restart-limit`, `role` and `role-strict` included,
+and so are the families `add-path` is on for, since the capability is in
+the OPEN) reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
 supports it. A changed `advertisement-interval` applies to the running

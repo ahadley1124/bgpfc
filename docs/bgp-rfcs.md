@@ -25,8 +25,8 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 21 are `done`, 6 `partial`,
-19 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 21 are `done`, 7 `partial`,
+18 `later`, 47 `no` and 61 `n/a`.
 
 **Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 7911, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
 
@@ -45,6 +45,11 @@ Of the 154 RFCs below, 21 are `done`, 6 `partial`,
   Identifier) and §2.3 (equal identifiers in a collision: the larger AS
   keeps its connection).
 - RFC 7454 (BCP 194): GTSM (RFC 5082).
+- RFC 9234: the Role capability and the Only to Customer procedures are
+  done (§4, §5). The one MUST row left is §3.1: a Customer, RS-Client or
+  Peer must send only routes learned from a customer, and bgpfc enforces
+  that through the attribute, so a route learned over a session with no
+  Role is the operator's policy to keep from a provider.
 - RFC 8326: an option to tag our announcements with `GRACEFUL_SHUTDOWN`.
 
 **Smaller items found in the review:**
@@ -56,7 +61,7 @@ Of the 154 RFCs below, 21 are `done`, 6 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8481, 8538, 8893, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
 `bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
@@ -126,7 +131,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [9774](https://datatracker.ietf.org/doc/html/rfc9774) | Deprecation of AS_SET and AS_CONFED_SET in BGP | PS | `done` | `allow-as-set yes` per neighbor accepts `AS_SET` against §3. |
 | [6938](https://datatracker.ietf.org/doc/html/rfc6938) | Deprecation of BGP Path Attributes: DPA, ADVERTISER, and RCID_PATH / CLUSTER_ID | PS | `n/a` | IANA only. Received ones are unrecognised optional attributes (RFC 4271 §5). |
 | [8093](https://datatracker.ietf.org/doc/html/rfc8093) | Deprecation of BGP Path Attribute Values 30, 31, 129, 241, 242, and 243 | PS | `n/a` | IANA only. Received ones are unrecognised optional attributes (RFC 4271 §5). |
-| [9234](https://datatracker.ietf.org/doc/html/rfc9234) | Route Leak Prevention and Detection Using Roles in UPDATE and OPEN Messages | PS | `later` | AGENTS.md §9. |
+| [9234](https://datatracker.ietf.org/doc/html/rfc9234) | Route Leak Prevention and Detection Using Roles in UPDATE and OPEN Messages | PS | `partial` | `role` and `role-strict` per neighbor: the Role capability, the Role Mismatch NOTIFICATION, and the OTC attribute set and checked on ingress and egress (§4, §5), tested against BIRD. Open in [COMPLIANCE.md](../COMPLIANCE.md): routes learned over a session with no Role are not marked and are the operator's policy to keep from a provider (§3.1, MUST NOT, partial). |
 
 ## Attributes, communities and AS numbers
 

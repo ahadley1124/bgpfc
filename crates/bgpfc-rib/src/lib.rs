@@ -29,7 +29,11 @@
 //! alone is kept), §3 (policy sees
 //! the validation state, see [`Policies`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
-//! [`Rib::validation_changed`]).
+//! [`Rib::validation_changed`]);
+//! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
+//! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
+//! attribute is added and checked on the way out, see [`otc`] and
+//! [`export`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -44,6 +48,7 @@ mod addpath;
 pub mod attrs;
 pub mod decision;
 pub mod export;
+pub mod otc;
 pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
@@ -202,6 +207,24 @@ pub enum Output {
         /// The routes.
         prefixes: Vec<Prefix>,
     },
+    /// Routes ignored because they are route leaks by RFC 9234 §5: they
+    /// came with the Only to Customer attribute from a customer or an
+    /// RS-Client, or from a peer with another AS in it. Such a route "MUST
+    /// be considered ineligible", so it is not kept and one the peer sent
+    /// before for the prefix is withdrawn. The caller logs it; no
+    /// NOTIFICATION is sent and the session stays up.
+    RouteLeak {
+        /// The peer that sent them.
+        peer: IpAddr,
+        /// Their family.
+        family: AddressFamily,
+        /// The AS in the attribute.
+        otc: Asn,
+        /// How many routes of the UPDATE were leaks.
+        routes: usize,
+        /// The first of them.
+        first: Prefix,
+    },
     /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
     /// the validation source (see [`Rib::validation_changed`]): one report
     /// per change of the source, counted rather than listed, however many
@@ -275,6 +298,13 @@ impl PeerState {
     /// Routes of `family` in the Adj-RIB-In.
     fn received(&self, family: AddressFamily) -> usize {
         self.adj_in_count.get(family).copied().unwrap_or(0)
+    }
+
+    /// [`received`](Self::received) with the routes added minus those
+    /// removed by an UPDATE being applied, `delta`, not yet counted.
+    fn received_with(&self, family: AddressFamily, delta: &FamilyMap<isize>) -> usize {
+        self.received(family)
+            .saturating_add_signed(delta.get(family).copied().unwrap_or(0))
     }
 }
 
@@ -396,7 +426,8 @@ struct Scratch {
     /// Routes added minus routes removed, per family.
     delta: FamilyMap<isize>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
-    /// §6.3), reported before what the UPDATE changed.
+    /// §6.3) or as route leaks (RFC 9234 §5), reported before what the
+    /// UPDATE changed.
     ignored: Vec<Output>,
     batches: Batches,
 }
@@ -987,9 +1018,19 @@ impl Rib {
                 });
                 continue;
             }
-            let attrs = cx
-                .interner
-                .intern(PathAttrs::from_update(&update.message, next_hop));
+            let mut built = PathAttrs::from_update(&update.message, next_hop);
+            // RFC 9234 §5 ingress, once for this part of the UPDATE. A
+            // leak is not kept, as for the checks below: no import policy
+            // may make it eligible ("The operator MUST NOT have the
+            // ability to modify the procedures").
+            if let Err(otc) = otc::receive(info, &mut built) {
+                if let Some(table) = self.tables.get_mut(family) {
+                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
+                }
+                report_leak(scratch, info, family, otc, prefixes);
+                continue;
+            }
+            let attrs = cx.interner.intern(built);
             // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an
             // AS loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC
             // 7606 §7.2: on an external session the leftmost AS must be the
@@ -1058,15 +1099,12 @@ impl Rib {
                 // never moves the count.
                 // NOTE(interop): FRR's `maximum-prefix` without `force`
                 // and BIRD's `import limit` count accepted routes too.
-                if let Some(limit) = limit {
-                    let n = state
-                        .received(family)
-                        .saturating_add_signed(scratch.delta.get(family).copied().unwrap_or(0));
-                    if n > limit as usize {
-                        exceeded = Some((family, limit));
-                        scratch.released.push(attrs);
-                        break 'parts;
-                    }
+                if let Some(limit) = limit
+                    && state.received_with(family, &scratch.delta) > limit as usize
+                {
+                    exceeded = Some((family, limit));
+                    scratch.released.push(attrs);
+                    break 'parts;
                 }
             }
             scratch.released.push(attrs);
@@ -1568,7 +1606,12 @@ impl Sessions {
             Verdict::Reject => None,
             Verdict::Accept => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
-            Verdict::Modified(a) => {
+            Verdict::Modified(mut a) => {
+                // RFC 9234 §5: "The operator MUST NOT have the ability to
+                // modify the procedures", and a set attribute "MUST be
+                // preserved unchanged": whatever a policy made of the
+                // route, the attribute is the route's own.
+                a.otc = best.attrs.otc;
                 export::permitted(family, &a, to).then_some(Exported::Changed(a))
             }
         }
@@ -1622,7 +1665,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (before, Some(a)) => {
                 let had = before.is_some();
                 let pacing = state.pacing.or_default(family);
@@ -1714,7 +1764,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (_, Some(a)) => {
                 state.pacing.or_default(family).advertised(prefix, &pace);
                 if !had {
@@ -1748,7 +1805,13 @@ impl Sessions {
             (Some(_), None) => batch.withdraw.push(prefix),
             (Some(b), Some(a))
                 if b.is(&a)
-                    || export::same_rewrite(family, b.attrs(), a.attrs(), &self.peer(id).info) => {}
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &self.peer(id).info,
+                    ) => {}
             (_, Some(a)) => {
                 let a = a.intern(&mut self.cx.interner);
                 batch.announce(&a, prefix);
@@ -1928,7 +1991,9 @@ fn path_at(ids: &[PathId], k: usize) -> u32 {
 }
 
 /// Remove what peer `id` sent for each of the `prefixes` of one part of an
-/// UPDATE, with the Path Identifiers `ids` that go with them.
+/// UPDATE, with the Path Identifiers `ids` that go with them: the routes of
+/// an announcement that is not kept replace the peer's earlier ones for
+/// them (RFC 7911 §5: the same prefix and identifier).
 fn withdraw_all(
     peers: &[Option<PeerState>],
     table: &mut Table,
@@ -1939,6 +2004,26 @@ fn withdraw_all(
 ) {
     for (k, &prefix) in prefixes.iter().enumerate() {
         withdraw(peers, table, family, prefix, (id, path_at(ids, k)), scratch);
+    }
+}
+
+/// Report `prefixes` of `family` from the peer `from` as route leaks with
+/// `otc` (RFC 9234 §5), if there is any prefix to report.
+fn report_leak(
+    scratch: &mut Scratch,
+    from: &PeerInfo,
+    family: AddressFamily,
+    otc: Asn,
+    prefixes: &[Prefix],
+) {
+    if let Some(&first) = prefixes.first() {
+        scratch.ignored.push(Output::RouteLeak {
+            peer: from.addr,
+            family,
+            otc,
+            routes: prefixes.len(),
+            first,
+        });
     }
 }
 
@@ -2202,7 +2287,12 @@ fn judge(
 ) -> Judged {
     match policies.import(info, family, prefix, attrs, rov) {
         Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+        Verdict::Modified(mut a) => {
+            // RFC 9234 §5: the ingress procedure has run, and no policy
+            // may undo it or change the attribute (see `exported`).
+            a.otc = attrs.otc;
+            Judged::Accepted(interner.intern(a))
+        }
         Verdict::Reject => {
             let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
                 !matches!(

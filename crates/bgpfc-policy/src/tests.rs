@@ -33,6 +33,7 @@ fn attrs(path: &[u32]) -> PathAttrs {
         ext_communities: Box::default(),
         large_communities: Box::default(),
         unknown: Box::default(),
+        otc: None,
     }
 }
 
@@ -253,6 +254,7 @@ fn engine_applies_each_neighbors_policies() {
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
+        role: None,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
@@ -325,6 +327,7 @@ fn engine_tells_next_hop_self_what_the_session_negotiated() {
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
+        role: None,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
@@ -373,6 +376,7 @@ fn engine_keeps_each_neighbors_policies_apart() {
         prefix_limits: Vec::new(),
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
+        role: None,
     };
     let local_pref = |v: Verdict| match v {
         Verdict::Modified(m) => m.local_pref,

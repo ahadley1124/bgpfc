@@ -7,6 +7,7 @@ use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncod
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, UpdateSubcode};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
+use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId};
 
 use super::*;
@@ -849,6 +850,257 @@ fn bad_peer_as_and_unsupported_capability() {
         panic!()
     };
     assert_eq!(n.data, vec![1, 4, 0, 2, 0, 1]);
+}
+
+/// An OPEN from the peer with the given Role capabilities (RFC 9234 §4.1)
+/// next to its IPv4 unicast family.
+fn open_with_roles(values: &[u8]) -> OpenMessage {
+    let mut caps = vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)];
+    caps.extend(values.iter().map(|v| Capability::Role(Role::from_u8(*v))));
+    OpenMessage::new(PEER_AS, hold(30), rid(2), caps)
+}
+
+/// What `config()` with `role` and `strict` makes of `open` in `OpenSent`:
+/// the tags of the actions and the Role of the session, if it came up.
+fn role_outcome(
+    role: Option<Role>,
+    strict: bool,
+    remote_as: Asn,
+    open: OpenMessage,
+) -> (Vec<String>, Option<Role>) {
+    let mut cfg = config();
+    cfg.role = role.map(|role| LocalRole { role, strict });
+    cfg.remote_as = remote_as;
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let a = f.handle(Event::BgpOpen(open), now);
+    (tags(&a), f.session().and_then(|s| s.role))
+}
+
+#[test]
+fn our_role_is_advertised_on_external_sessions_only() {
+    // RFC 9234 §4.1: "If the BGP Role is locally configured, the eBGP
+    // speaker MUST advertise the BGP Role Capability in the BGP OPEN".
+    let sent = |role: Option<Role>, remote_as: Asn| {
+        let mut cfg = config();
+        cfg.role = role.map(|role| LocalRole {
+            role,
+            strict: false,
+        });
+        cfg.remote_as = remote_as;
+        let (mut f, now) = fsm_at(State::Connect, cfg);
+        let a = f.handle(Event::TcpCrAcked, now);
+        let Action::SendOpen(open) = &a[0] else {
+            panic!("{a:?}");
+        };
+        bgpfc_wire::capability::roles(&open.capabilities).collect::<Vec<_>>()
+    };
+    for role in [
+        Role::Provider,
+        Role::RouteServer,
+        Role::RouteServerClient,
+        Role::Customer,
+        Role::Peer,
+    ] {
+        assert_eq!(sent(Some(role), PEER_AS), [role], "{role}");
+        // RFC 9234 §4: Roles are for eBGP; an internal session has none.
+        assert_eq!(sent(Some(role), LOCAL_AS), [], "{role} internal");
+    }
+    assert_eq!(sent(None, PEER_AS), []);
+    // "MUST NOT advertise multiple versions of the BGP Role Capability".
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::Peer,
+        strict: false,
+    });
+    cfg.capabilities.push(Capability::Role(Role::Peer));
+    let (mut f, now) = fsm_at(State::Connect, cfg);
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert_eq!(bgpfc_wire::capability::roles(&open.capabilities).count(), 1);
+}
+
+#[test]
+fn allowed_role_pairs_come_up_and_others_are_a_role_mismatch() {
+    // RFC 9234 §4.2, Table 2, against every role the peer might send:
+    // the session comes up with our role when they correspond, and
+    // otherwise Role Mismatch (OPEN Message Error, subcode 11) goes out
+    // before the connection is dropped.
+    use Role::{Customer, Peer, Provider, RouteServer, RouteServerClient};
+    let all = [Provider, RouteServer, RouteServerClient, Customer, Peer];
+    let allowed = [
+        (Provider, Customer),
+        (Customer, Provider),
+        (RouteServer, RouteServerClient),
+        (RouteServerClient, RouteServer),
+        (Peer, Peer),
+    ];
+    for ours in all {
+        for theirs in all {
+            let (tags, role) = role_outcome(
+                Some(ours),
+                false,
+                PEER_AS,
+                open_with_roles(&[theirs.to_u8()]),
+            );
+            if allowed.contains(&(ours, theirs)) {
+                assert_eq!(tags, ["keepalive"], "{ours} with {theirs}");
+                assert_eq!(role, Some(ours));
+            } else {
+                assert_eq!(tags, ["notif 2/11", "drop"], "{ours} with {theirs}");
+                assert_eq!(role, None);
+            }
+        }
+    }
+    // An unassigned Role Value corresponds to nothing.
+    for v in [5u8, 100, 255] {
+        let (tags, _) = role_outcome(Some(Peer), false, PEER_AS, open_with_roles(&[v]));
+        assert_eq!(tags, ["notif 2/11", "drop"], "value {v}");
+    }
+}
+
+#[test]
+fn a_role_mismatch_carries_no_data_and_counts_as_a_failure() {
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::Customer,
+        strict: false,
+    });
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let a = f.handle(Event::BgpOpen(open_with_roles(&[Role::Peer.to_u8()])), now);
+    let Action::SendNotification(n) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert_eq!(
+        (n.code, n.subcode, &n.data[..]),
+        (ErrorCode::Open, 11, &[][..])
+    );
+    // RFC 4271 §8.2.2 OpenSent, event 19 with an unacceptable OPEN: the
+    // common path of events 21 and 22, with damping.
+    assert_eq!(f.state(), State::Idle);
+    assert_eq!(f.connect_retry_counter(), 1);
+    assert!(f.session().is_none());
+}
+
+#[test]
+fn a_missing_role_is_ignored_unless_strict() {
+    // RFC 9234 §4.2: "the BGP Speaker SHOULD ignore the absence of the BGP
+    // Role Capability and proceed with session establishment. The locally
+    // configured BGP Role is used for the procedures described in
+    // Section 5."
+    let (tags, role) = role_outcome(Some(Role::Customer), false, PEER_AS, open_with_roles(&[]));
+    assert_eq!(
+        (tags, role),
+        (vec!["keepalive".to_owned()], Some(Role::Customer))
+    );
+    // Strict mode: "if the BGP Role Capability is sent but one is not
+    // received, the connection is rejected using the Role Mismatch".
+    let (tags, role) = role_outcome(Some(Role::Customer), true, PEER_AS, open_with_roles(&[]));
+    assert_eq!(
+        (tags, role),
+        (vec!["notif 2/11".to_owned(), "drop".to_owned()], None)
+    );
+    // Strict mode accepts a corresponding Role.
+    let (tags, role) = role_outcome(
+        Some(Role::Customer),
+        true,
+        PEER_AS,
+        open_with_roles(&[Role::Provider.to_u8()]),
+    );
+    assert_eq!(
+        (tags, role),
+        (vec!["keepalive".to_owned()], Some(Role::Customer))
+    );
+}
+
+#[test]
+fn without_a_role_of_ours_the_peers_is_not_checked() {
+    // Nothing was sent, so there is nothing to correspond to (RFC 9234
+    // §4.2: "If the BGP Role Capability is advertised, and one is also
+    // received"), and strict mode, which needs a Role sent, does nothing.
+    for strict in [false, true] {
+        for theirs in [&[][..], &[3][..], &[200][..]] {
+            let (tags, role) = role_outcome(None, strict, PEER_AS, open_with_roles(theirs));
+            assert_eq!(
+                (tags, role),
+                (vec!["keepalive".to_owned()], None),
+                "{theirs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn several_role_capabilities_must_agree() {
+    // RFC 9234 §4.2: identical ones are a single capability; "If multiple
+    // BGP Role Capabilities are received and not all of them have the same
+    // value, then the BGP speaker MUST reject the connection using the Role
+    // Mismatch Notification", whatever our own Role is.
+    for ours in [None, Some(Role::Provider), Some(Role::Customer)] {
+        let (tags, role) = role_outcome(ours, false, PEER_AS, open_with_roles(&[3, 3, 3]));
+        let ok = ours.is_none_or(|o| o.pairs_with(Role::Customer));
+        assert_eq!(
+            tags,
+            if ok {
+                vec!["keepalive"]
+            } else {
+                vec!["notif 2/11", "drop"]
+            },
+            "{ours:?}"
+        );
+        assert_eq!(role.is_some(), ours.is_some() && ok);
+        for values in [&[3, 0][..], &[0, 3][..], &[3, 3, 4][..], &[4, 4, 4, 5][..]] {
+            let (tags, role) = role_outcome(ours, false, PEER_AS, open_with_roles(values));
+            assert_eq!(tags, ["notif 2/11", "drop"], "{ours:?} with {values:?}");
+            assert_eq!(role, None);
+        }
+    }
+}
+
+#[test]
+fn roles_are_for_external_sessions() {
+    // RFC 9234 §4: Roles characterise eBGP sessions. An internal session
+    // ignores our configured Role and the peer's capabilities alike (even
+    // one that would not correspond), and has no Role.
+    let (tags, role) = role_outcome(
+        Some(Role::Customer),
+        true,
+        LOCAL_AS,
+        OpenMessage::new(
+            LOCAL_AS,
+            hold(30),
+            rid(2),
+            vec![
+                Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+                Capability::Role(Role::Peer),
+            ],
+        ),
+    );
+    assert_eq!((tags, role), (vec!["keepalive".to_owned()], None));
+}
+
+#[test]
+fn the_role_survives_into_the_established_session() {
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::RouteServer,
+        strict: false,
+    });
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(open_with_roles(&[Role::RouteServerClient.to_u8()])),
+        now,
+    );
+    let up = f.handle(Event::KeepAliveMsg, now);
+    let Action::SessionUp(s) = &up[0] else {
+        panic!("{up:?}");
+    };
+    assert_eq!(s.role, Some(Role::RouteServer));
+    assert_eq!(
+        bgpfc_wire::capability::roles(&s.peer_capabilities).collect::<Vec<_>>(),
+        [Role::RouteServerClient]
+    );
 }
 
 #[test]

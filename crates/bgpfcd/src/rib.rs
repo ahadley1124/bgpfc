@@ -142,6 +142,9 @@ fn handle(
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
+                role = session
+                    .role
+                    .map_or_else(|| "none".to_owned(), |r| r.to_string()),
                 advertisement_interval = interval.as_secs()
             );
             let mut info = peer_info(peer, local_addr, &session, interval);
@@ -425,6 +428,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         // we send it is configured (`add_path_send`).
         add_path_receive: s.add_path_receive.clone(),
         add_path_send: Vec::new(),
+        role: s.role,
     }
 }
 
@@ -531,6 +535,25 @@ impl Sink for Deliver<'_> {
                     next_hop = next_hop,
                     routes = prefixes.len(),
                     prefixes = sample(&prefixes)
+                );
+            }
+            Output::RouteLeak {
+                peer,
+                family,
+                otc,
+                routes,
+                first,
+            } => {
+                // RFC 9234 §5: a route leak "MUST be considered
+                // ineligible"; nothing is sent to the peer, and the
+                // session stays up. One line per UPDATE part.
+                bgpfc_log::warn!(
+                    "rib: route leak, routes ignored",
+                    peer = peer,
+                    family = family,
+                    otc = otc.0,
+                    routes = routes,
+                    first = first
                 );
             }
             Output::Revalidated(r) => {
@@ -736,6 +759,7 @@ mod tests {
             extended_next_hop_send: Vec::new(),
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
+            role: None,
             peer_capabilities: Vec::new(),
         }
     }

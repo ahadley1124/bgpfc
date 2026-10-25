@@ -19,7 +19,8 @@
 //! RFC 6793 §3 (four-octet AS negotiation); RFC 8654 §4 (Extended Message
 //! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
 //! RFC 7607 §2 (never claim AS 0); RFC 7911 §4, §5 (ADD-PATH negotiation,
-//! per family and direction).
+//! per family and direction); RFC 9234 §4.1, §4.2 (the BGP Role
+//! capability, the allowed pairs of Roles, strict mode and Role Mismatch).
 #![forbid(unsafe_code)]
 
 mod machine;
@@ -32,6 +33,7 @@ use bgpfc_wire::capability::Capability;
 use bgpfc_wire::error::DecodeError;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
+use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 pub use bgpfc_wire::update::PeerKind;
 
@@ -281,6 +283,11 @@ pub struct Session {
     /// advertised the ability to send multiple paths for the family, and
     /// the peer to receive them.
     pub add_path_send: Vec<AddressFamily>,
+    /// Our BGP Role on the session, when one is configured and the session
+    /// is external (RFC 9234 §4.2: "the locally configured BGP Role is
+    /// used for the procedures described in Section 5", whether or not
+    /// the peer sent one). What the Only to Customer procedures follow.
+    pub role: Option<Role>,
     /// Capabilities the peer advertised, verbatim.
     pub peer_capabilities: Vec<Capability>,
 }
@@ -373,8 +380,14 @@ pub struct Config {
     pub damping: Option<Damping>,
     /// `SendHoldTime` (RFC 9687).
     pub send_hold_time: SendHoldTime,
-    /// Capabilities to advertise. Four-octet AS is added automatically.
+    /// Capabilities to advertise. Four-octet AS is added automatically, and
+    /// the BGP Role of `role`.
     pub capabilities: Vec<Capability>,
+    /// Our BGP Role on the session (RFC 9234 §4): advertised in the OPEN
+    /// and checked against the peer's (§4.2), with "strict mode" if asked
+    /// for. Roles are for eBGP sessions (§4); on an internal one it is
+    /// neither sent nor checked.
+    pub role: Option<LocalRole>,
     /// Seed for timer jitter (RFC 4271 §10); zero disables jitter, which
     /// tests rely on.
     pub jitter_seed: u64,
@@ -406,6 +419,7 @@ impl Config {
             damping: Some(Damping::default()),
             send_hold_time: SendHoldTime::Default,
             capabilities: Vec::new(),
+            role: None,
             jitter_seed: 0,
             passive: false,
             send_notification_without_open: false,

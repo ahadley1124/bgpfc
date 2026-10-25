@@ -12,7 +12,10 @@
 //! 8950 §4 (an IPv6 next hop for IPv4 NLRI only to a peer that advertised
 //! it), §5 (our own address is of the session's protocol; a next hop
 //! passed on keeps its encoding); RFC 7911 §3, §5 (a Path Identifier with
-//! each prefix sent to a peer that takes several paths).
+//! each prefix sent to a peer that takes several paths); RFC 9234 §5 (a
+//! route with the Only to Customer attribute is not sent to a provider, a
+//! peer or a route server, and one without it gets ours when sent to a
+//! customer, a peer or an RS-Client).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -30,6 +33,7 @@ use bgpfc_wire::update::{AddPathFamilies, EncodeContext, PathIds, PeerKind, Upda
 
 use crate::attrs::PathAttrs;
 use crate::decision::DEFAULT_LOCAL_PREF;
+use crate::otc;
 use crate::peer::PeerInfo;
 
 /// Where a Loc-RIB route came from, for the export rules.
@@ -81,10 +85,13 @@ pub fn export(
 /// inside the AS (no confederations here). RFC 8950 §4: an IPv6 next hop
 /// for IPv4 NLRI goes only to a peer that advertised the capability for
 /// the family, and §5: a next hop passed on unchanged keeps its encoding,
-/// so a peer that cannot take it does not get the route at all.
+/// so a peer that cannot take it does not get the route at all. RFC 9234
+/// §5: a route with the Only to Customer attribute does not go to a
+/// provider, a peer or a route server; no policy can change that, as this
+/// is asked of what policy leaves.
 #[must_use]
 pub fn permitted(family: AddressFamily, attrs: &PathAttrs, to: &PeerInfo) -> bool {
-    if attrs.has_community(Community::NO_ADVERTISE) {
+    if attrs.has_community(Community::NO_ADVERTISE) || otc::blocks_egress(attrs, to) {
         return false;
     }
     if to.kind == PeerKind::External
@@ -173,6 +180,9 @@ pub fn rewrite(
             out.local_pref = Some(attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF));
         }
     }
+    // RFC 9234 §5: the egress procedure adds the attribute, with our AS, to
+    // a route sent to a customer, a peer or an RS-Client that has none.
+    out.otc = otc::egress(local_as, attrs.otc, to);
     // RFC 2545 §3: "The link-local address shall be included in the Next
     // Hop field if and only if the BGP speaker shares a common subnet with
     // the entity identified by the global IPv6 address ... and the peer the
@@ -203,9 +213,15 @@ fn global_only(next_hop: NextHop) -> NextHop {
 /// without making either: what the session overwrites or drops is not
 /// compared. When true the rewrites are equal, so the peer needs no new
 /// UPDATE; it may be false for some equal rewrites, which only costs a
-/// redundant one.
+/// redundant one. `local_as` is our AS.
 #[must_use]
-pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &PeerInfo) -> bool {
+pub fn same_rewrite(
+    local_as: Asn,
+    family: AddressFamily,
+    a: &PathAttrs,
+    b: &PathAttrs,
+    to: &PeerInfo,
+) -> bool {
     let kept = a.origin == b.origin
         && a.as_path == b.as_path
         && a.atomic_aggregate == b.atomic_aggregate
@@ -213,6 +229,7 @@ pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &Pe
         && a.communities == b.communities
         && a.large_communities == b.large_communities
         && a.unknown == b.unknown
+        && otc::egress(local_as, a.otc, to) == otc::egress(local_as, b.otc, to)
         && (!keeps_next_hop(family, to) || global_only(a.next_hop) == global_only(b.next_hop));
     kept && match to.kind {
         PeerKind::External => {

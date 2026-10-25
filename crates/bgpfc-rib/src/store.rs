@@ -585,6 +585,7 @@ mod tests {
                 ext_communities: Box::default(),
                 large_communities: Box::default(),
                 unknown: Box::default(),
+                otc: None,
             }),
             received: None,
             peer: PeerId(peer),

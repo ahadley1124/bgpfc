@@ -8,11 +8,14 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::{Capability, NextHopEncoding, add_path_abilities, next_hop_encodings};
+use bgpfc_wire::capability::{
+    Capability, NextHopEncoding, add_path_abilities, next_hop_encodings, roles,
+};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, FsmSubcode, OpenSubcode};
 use bgpfc_wire::header::MessageType;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
+use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, HoldTime};
 use bgpfc_wire::update::PeerKind;
 
@@ -720,14 +723,74 @@ impl Fsm {
 
     /// Our OPEN (RFC 4271 §4.2; RFC 6793 §3 adds the Four-octet AS
     /// capability and `AS_TRANS`; RFC 7607 §2 never AS 0, which the config
-    /// type cannot express).
+    /// type cannot express; RFC 9234 §4.1 adds the BGP Role).
     fn build_open(&self) -> OpenMessage {
+        let mut capabilities = self.config.capabilities.clone();
+        // RFC 9234 §4.1: "If the BGP Role is locally configured, the eBGP
+        // speaker MUST advertise the BGP Role Capability" and "MUST NOT
+        // advertise multiple versions of" it.
+        if let Some(local) = self.ebgp_role()
+            && !capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::Role(_)))
+        {
+            capabilities.push(Capability::Role(local.role));
+        }
         OpenMessage::new(
             self.config.local_as,
             self.config.hold_time,
             self.config.router_id,
-            self.config.capabilities.clone(),
+            capabilities,
         )
+    }
+
+    /// The configured BGP Role if the session is external. RFC 9234 §4
+    /// gives Roles to eBGP sessions; the peer's AS is `remote_as` once its
+    /// OPEN passed the Bad Peer AS check, so this is the same before and
+    /// after it.
+    fn ebgp_role(&self) -> Option<LocalRole> {
+        self.config
+            .role
+            .filter(|_| self.config.remote_as != self.config.local_as)
+    }
+
+    /// RFC 9234 §4.2: the Role the session runs with, or the Role Mismatch
+    /// to answer. The role is the locally configured one (`None` where none
+    /// is, or on an internal session), whatever the peer sent.
+    fn negotiate_role(&self, open: &OpenMessage) -> Result<Option<Role>, DecodeError> {
+        if self.config.remote_as == self.config.local_as {
+            return Ok(None);
+        }
+        let mismatch = || DecodeError::open(OpenSubcode::RoleMismatch, Vec::new());
+        // RFC 9234 §4.2: "multiple but identical BGP Role Capabilities" are
+        // "a single BGP Role Capability"; "If multiple BGP Role
+        // Capabilities are received and not all of them have the same
+        // value", the connection is rejected. Asked of every eBGP session,
+        // for it is about what was received, not about what we sent.
+        let mut received = roles(&open.capabilities);
+        let theirs = received.next();
+        if let Some(first) = theirs
+            && received.any(|r| r != first)
+        {
+            return Err(mismatch());
+        }
+        let Some(LocalRole { role: ours, strict }) = self.ebgp_role() else {
+            return Ok(None);
+        };
+        match theirs {
+            // RFC 9234 §4.2: "If the BGP Role Capability is advertised, and
+            // one is also received from the peer, the Roles MUST correspond
+            // to the relationships in Table 2."
+            Some(theirs) if ours.pairs_with(theirs) => Ok(Some(ours)),
+            Some(_) => Err(mismatch()),
+            // RFC 9234 §4.2 strict mode: sent but not received is rejected.
+            None if strict => Err(mismatch()),
+            // RFC 9234 §4.2: "the BGP Speaker SHOULD ignore the absence of
+            // the BGP Role Capability and proceed with session
+            // establishment. The locally configured BGP Role is used for
+            // the procedures described in Section 5."
+            None => Ok(Some(ours)),
+        }
     }
 
     /// The §6.2 checks the codec cannot do, and capability negotiation.
@@ -761,6 +824,7 @@ impl Fsm {
             ours.contains(&Capability::ExtendedMessage) && open.has(&Capability::ExtendedMessage);
         // RFC 2918 §4: send ROUTE-REFRESH only if the peer advertised it.
         let route_refresh = open.has(&Capability::RouteRefresh);
+        let role = self.negotiate_role(open)?;
         let families = negotiate_families(ours, &open.capabilities);
         // RFC 4760 §8 asks both sides to advertise a family only for "a
         // bi-directional exchange"; a sender may use a capability its
@@ -832,6 +896,7 @@ impl Fsm {
             extended_next_hop_send,
             add_path_receive,
             add_path_send,
+            role,
             peer_capabilities: open.capabilities.clone(),
         })
     }

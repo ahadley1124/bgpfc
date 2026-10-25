@@ -55,6 +55,7 @@ fn info(limit: u32) -> PeerInfo {
         prefix_limits: vec![(V4, limit)],
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
+        role: None,
     }
 }
 

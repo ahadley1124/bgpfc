@@ -25,6 +25,7 @@ use bgpfc_wire::prefix::{
     Ipv4Key, Prefix, decode_prefixes, decode_prefixes_with_ids, encode_prefixes_with_ids,
 };
 use bgpfc_wire::reader::Reader;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, PathId, RouterId, Safi};
 use bgpfc_wire::update::{
@@ -119,12 +120,14 @@ fn capability() -> impl Strategy<Value = Capability> {
         Just(Capability::RouteRefresh),
         Just(Capability::ExtendedMessage),
         any::<u32>().prop_map(|a| Capability::FourOctetAs(Asn(a))),
+        // RFC 9234 §4.1: any Role Value, assigned or not.
+        any::<u8>().prop_map(|v| Capability::Role(Role::from_u8(v))),
         // RFC 8950 §4: at most 42 six-octet triples fit the length octet.
         vec(next_hop_encoding(), 0..=42).prop_map(Capability::ExtendedNextHop),
         // RFC 7911 §4: at most 63 four-octet tuples fit the length octet.
         vec(add_path_tuple(), 0..=63).prop_map(Capability::AddPath),
         (
-            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65 | 69)),
+            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 9 | 65 | 69)),
             vec(any::<u8>(), 0..=255)
         )
             .prop_map(|(code, value)| Capability::Unknown { code, value }),
@@ -248,7 +251,7 @@ fn mp_unreach() -> impl Strategy<Value = MpUnreach> {
 }
 
 fn unknown_code() -> impl Strategy<Value = u8> {
-    prop_oneof![9u8..=13, 19u8..=31, 33u8..=255]
+    prop_oneof![9u8..=13, 19u8..=31, 33u8..=34, 36u8..=255]
 }
 
 /// The optional attributes, each present or not.
@@ -287,6 +290,7 @@ fn optional_attributes() -> impl Strategy<Value = Vec<PathAttribute>> {
                     )
                 }),
         ),
+        proptest::option::of(any::<u32>().prop_map(|a| PathAttribute::OnlyToCustomer(Asn(a)))),
         proptest::option::of(
             (unknown_code(), any::<bool>(), vec(any::<u8>(), 0..=300)).prop_map(
                 |(code, partial, value)| PathAttribute::Unknown {
@@ -297,8 +301,8 @@ fn optional_attributes() -> impl Strategy<Value = Vec<PathAttribute>> {
             ),
         ),
     )
-        .prop_map(|(med, lp, aa, agg, cs, ecs, lcs, unk)| {
-            [med, lp, aa, agg, cs, ecs, lcs, unk]
+        .prop_map(|(med, lp, aa, agg, cs, ecs, lcs, otc, unk)| {
+            [med, lp, aa, agg, cs, ecs, lcs, otc, unk]
                 .into_iter()
                 .flatten()
                 .collect()
@@ -594,6 +598,25 @@ proptest! {
     }
 
     #[test]
+    fn role_capability_accepts_exactly_one_octet(value in vec(any::<u8>(), 0..=8)) {
+        // RFC 9234 §4.1: length 1; any Role Value, assigned or not, is
+        // kept and re-encoded as received. Any other length is malformed
+        // (RFC 4271 §6.2, OPEN Message Error / Unspecific).
+        let mut wire = vec![9, u8::try_from(value.len()).unwrap()];
+        wire.extend_from_slice(&value);
+        let decoded = Capability::decode(&mut Reader::new(&wire));
+        if let [v] = value[..] {
+            let c = decoded.unwrap();
+            prop_assert_eq!(&c, &Capability::Role(Role::from_u8(v)));
+            let mut again = Vec::new();
+            c.encode(&mut again).unwrap();
+            prop_assert_eq!(again, wire);
+        } else {
+            prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
+        }
+    }
+
+    #[test]
     fn open_round_trip(m in open_message(), force_extended in any::<bool>()) {
         let wire = m.encode_with(force_extended).unwrap();
         let back = OpenMessage::decode(&wire).unwrap();
@@ -867,6 +890,61 @@ proptest! {
             );
             prop_assert_eq!(d.announcements().count(), 0);
             prop_assert_eq!(d.withdrawals().count(), routes(&m));
+        }
+    }
+
+    #[test]
+    fn only_to_customer_is_four_octets_or_the_routes_are_withdrawn(
+        m in update_message(true),
+        value in vec(any::<u8>(), 0..=9),
+    ) {
+        // RFC 9234 §5: an OTC attribute of any length other than 4 is
+        // malformed and treat-as-withdraw (RFC 7606 §5.2 makes it a reset
+        // only where the UPDATE announces nothing); one of length 4 is kept
+        // with its value.
+        let mut m = m;
+        m.attributes.retain(|a| a.code() != code::ONLY_TO_CUSTOMER);
+        let mut wire = m.encode(&ENC4).unwrap();
+        let mut attr = vec![0xc0, code::ONLY_TO_CUSTOMER, u8::try_from(value.len()).unwrap()];
+        attr.extend_from_slice(&value);
+        // After the attributes, before the NLRI: it is the last of the
+        // path attributes, which any order allows (RFC 4271 §5).
+        let nlri_len = {
+            let mut nlri = Vec::new();
+            bgpfc_wire::prefix::encode_prefixes(&m.nlri, &mut nlri);
+            nlri.len()
+        };
+        let at = wire.len() - nlri_len;
+        let total = u16::from_be_bytes([wire[withdrawn_len(&wire) + 2], wire[withdrawn_len(&wire) + 3]]);
+        wire.splice(at..at, attr.iter().copied());
+        let off = withdrawn_len(&wire) + 2;
+        let total = total + u16::try_from(attr.len()).unwrap();
+        wire[off..off + 2].copy_from_slice(&total.to_be_bytes());
+        match value[..] {
+            [a, b, c, e] => {
+                let d = UpdateMessage::decode(&wire, &IBGP4).unwrap();
+                prop_assert_eq!(&d.treated_as_withdraw, &None);
+                prop_assert_eq!(
+                    d.message.attribute(code::ONLY_TO_CUSTOMER),
+                    Some(&PathAttribute::OnlyToCustomer(Asn(u32::from_be_bytes([a, b, c, e]))))
+                );
+            }
+            _ if m.has_reachable() => {
+                let d = UpdateMessage::decode(&wire, &IBGP4).unwrap();
+                prop_assert_eq!(
+                    d.treated_as_withdraw.as_ref().map(|e| e.subcode),
+                    Some(UpdateSubcode::AttributeLengthError as u8)
+                );
+                prop_assert_eq!(d.announcements().count(), 0);
+                prop_assert_eq!(d.withdrawals().count(), routes(&m));
+            }
+            _ => {
+                // RFC 7606 §5.2: nothing reachable to withdraw, so the
+                // routes of the message cannot be trusted to have been
+                // parsed, and the session resets.
+                let e = UpdateMessage::decode(&wire, &IBGP4).unwrap_err();
+                prop_assert_eq!(e.notification.subcode, UpdateSubcode::AttributeLengthError as u8);
+            }
         }
     }
 

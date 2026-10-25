@@ -3,11 +3,13 @@
 //! Implements: RFC 5492 §4 (TLV encoding), §5 (unknown capabilities are
 //! ignored, never an error); RFC 4760 §8 (Multiprotocol Extensions, code 1);
 //! RFC 2918 §2 (Route Refresh, code 2); RFC 8950 §4 (Extended Next Hop
-//! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 6793 §3
-//! (Four-octet AS, code 65); RFC 7911 §4 (ADD-PATH, code 69).
+//! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 9234
+//! §4.1 (BGP Role, code 9); RFC 6793 §3 (Four-octet AS, code 65); RFC 7911
+//! §4 (ADD-PATH, code 69).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
+use crate::role::Role;
 use crate::types::{AddressFamily, Afi, Asn, Safi};
 
 /// One capability TLV.
@@ -22,6 +24,9 @@ pub enum Capability {
     ExtendedNextHop(Vec<NextHopEncoding>),
     /// Extended Message, 65535-octet messages (RFC 8654 §3).
     ExtendedMessage,
+    /// BGP Role: the speaker's relationship to the other end of an eBGP
+    /// session (RFC 9234 §4.1).
+    Role(Role),
     /// Four-octet AS number support, carrying the speaker's ASN (RFC 6793 §3).
     FourOctetAs(Asn),
     /// ADD-PATH: per `<AFI, SAFI>`, whether the speaker can receive and/or
@@ -47,6 +52,7 @@ impl Capability {
             Capability::RouteRefresh => 2,
             Capability::ExtendedNextHop(_) => 5,
             Capability::ExtendedMessage => 6,
+            Capability::Role(_) => 9,
             Capability::FourOctetAs(_) => 65,
             Capability::AddPath(_) => 69,
             Capability::Unknown { code, .. } => *code,
@@ -86,6 +92,11 @@ impl Capability {
                     out.put_u16(t.nlri_safi);
                     out.put_u16(t.next_hop_afi.to_u16());
                 }
+            }
+            Capability::Role(role) => {
+                // RFC 9234 §4.1: length 1, the Role Value.
+                out.put_u8(1);
+                out.put_u8(role.to_u8());
             }
             Capability::FourOctetAs(asn) => {
                 out.put_u8(4);
@@ -157,6 +168,11 @@ impl Capability {
             }
             // RFC 8654 §3: length 0.
             6 if len == 0 => Capability::ExtendedMessage,
+            // RFC 9234 §4.1: length 1, the Role Value. An unassigned value is
+            // kept: RFC 9234 §4.2 has it correspond to no Role, which is a
+            // Role Mismatch for the FSM to answer, not a malformed
+            // capability.
+            9 if len == 1 => Capability::Role(Role::from_u8(v.u8().map_err(|_| malformed())?)),
             // RFC 6793 §3: length 4, the speaker's ASN.
             65 if len == 4 => Capability::FourOctetAs(Asn(v.u32().map_err(|_| malformed())?)),
             // RFC 7911 §4: whole four-octet tuples.
@@ -191,7 +207,7 @@ impl Capability {
                     }
                 }
             }
-            1 | 2 | 5 | 6 | 65 | 69 => return Err(malformed()),
+            1 | 2 | 5 | 6 | 9 | 65 | 69 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -348,6 +364,15 @@ pub fn next_hop_encodings(caps: &[Capability]) -> impl Iterator<Item = NextHopEn
         .flatten()
 }
 
+/// The Role Value of every BGP Role capability in `caps`, in order: RFC 9234
+/// §4.2 lets a speaker receive several, and acts on them together.
+pub fn roles(caps: &[Capability]) -> impl Iterator<Item = Role> + '_ {
+    caps.iter().filter_map(|c| match c {
+        Capability::Role(r) => Some(*r),
+        _ => None,
+    })
+}
+
 /// RFC 4271 §6.2: a recognised but malformed optional parameter is reported
 /// with subcode 0 (Unspecific).
 fn malformed() -> DecodeError {
@@ -387,6 +412,41 @@ mod tests {
             &Capability::FourOctetAs(Asn(4_200_000_000)),
             &[65, 4, 0xfa, 0x56, 0xea, 0x00],
         );
+    }
+
+    #[test]
+    fn role_capability_follows_rfc_9234() {
+        // RFC 9234 §4.1: code 9, length 1, then the Role Value of Table 1.
+        for (role, value) in [
+            (Role::Provider, 0),
+            (Role::RouteServer, 1),
+            (Role::RouteServerClient, 2),
+            (Role::Customer, 3),
+            (Role::Peer, 4),
+        ] {
+            round_trip(&Capability::Role(role), &[9, 1, value]);
+        }
+        // Values 5 to 255 are unassigned: kept, so that the capability
+        // round-trips and the FSM can reject the pairing (§4.2).
+        round_trip(&Capability::Role(Role::Unknown(5)), &[9, 1, 5]);
+        round_trip(&Capability::Role(Role::Unknown(255)), &[9, 1, 255]);
+        assert_eq!(Capability::Role(Role::Peer).code(), 9);
+    }
+
+    #[test]
+    fn roles_lists_every_role_capability() {
+        // RFC 9234 §4.2: several may arrive, each one counts.
+        let caps = [
+            Capability::RouteRefresh,
+            Capability::Role(Role::Customer),
+            Capability::ExtendedMessage,
+            Capability::Role(Role::Peer),
+        ];
+        assert_eq!(
+            roles(&caps).collect::<Vec<_>>(),
+            [Role::Customer, Role::Peer]
+        );
+        assert_eq!(roles(&caps[..1]).count(), 0);
     }
 
     #[test]
@@ -648,6 +708,9 @@ mod tests {
             &[5, 4, 0, 1, 0, 1][..],          // extended next hop: a partial triple
             &[5, 7, 0, 1, 0, 1, 0, 2, 0][..], // a triple and one octet more
             &[5, 6, 0, 1, 0, 1][..],          // extended next hop: truncated value
+            &[9, 0][..],                      // role with no Role Value
+            &[9, 2, 0, 3][..],                // role with two octets
+            &[9, 1][..],                      // role truncated
             &[65, 2, 0xfd, 0xe8][..],         // 4-octet AS with two octets
             &[65, 4, 0, 0][..],               // truncated value
             &[1][..],                         // truncated length

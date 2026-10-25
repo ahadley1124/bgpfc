@@ -59,6 +59,9 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
     if !paths.is_empty() {
         fsm.capabilities.push(Capability::AddPath(paths));
     }
+    // RFC 9234 §4.1, §4.2: our BGP Role, advertised and checked by the FSM
+    // on an external session.
+    fsm.role = n.role;
     // RFC 4271 §10: jitter from something that differs per process.
     fsm.jitter_seed = jitter_seed(&n.addr);
     PeerConfig {
@@ -209,6 +212,39 @@ mod tests {
         assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
+    }
+
+    #[test]
+    fn a_role_reaches_the_fsm_with_its_strict_mode() {
+        use bgpfc_wire::role::{LocalRole, Role};
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; role customer; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; role rs; role-strict yes; }
+             neighbor 192.0.2.4 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        let roles: Vec<_> = cfg
+            .neighbors
+            .iter()
+            .map(|n| peer_config(cfg.local_as, cfg.router_id, n).fsm.role)
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                Some(LocalRole {
+                    role: Role::Customer,
+                    strict: false
+                }),
+                Some(LocalRole {
+                    role: Role::RouteServer,
+                    strict: true
+                }),
+                None
+            ]
+        );
     }
 
     #[test]
