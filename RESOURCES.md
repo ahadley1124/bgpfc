@@ -2,7 +2,8 @@
 
 RFCs relevant to bgpfc, grouped by when we need them. The titles were checked
 against the RFC Editor index. Offline copies of some RFCs are in
-[`resources/`](resources/).
+[`resources/`](resources/). [`docs/bgp-rfcs.md`](docs/bgp-rfcs.md) is the
+wider list of BGP RFCs, with how far bgpfc implements each.
 
 ## v1: core protocol
 
