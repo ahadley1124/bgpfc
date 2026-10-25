@@ -407,6 +407,10 @@ impl Coordinator<'_> {
         let _ = self
             .rib_tx
             .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
+        // RFC 7911 §5: and the number of paths each ADD-PATH session sends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetAddPathLimits(wiring::add_path_limits(&new)));
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -425,13 +429,14 @@ impl Coordinator<'_> {
             p.start();
         }
         let summary = format!(
-            "added {} removed {} reset {} policy {} interval {} limit {} unchanged {}{}",
+            "added {} removed {} reset {} policy {} interval {} limit {} paths {} unchanged {}{}",
             diff.added.len(),
             diff.removed.len(),
             diff.reset.len(),
             diff.policy_changed.len(),
             diff.interval_changed.len(),
             diff.prefix_limit_changed.len(),
+            diff.add_path_send_changed.len(),
             diff.unchanged.len(),
             if notes.is_empty() {
                 String::new()

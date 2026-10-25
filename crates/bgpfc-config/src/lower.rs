@@ -8,7 +8,8 @@
 //! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
 //! is never configurable); RFC 9687 §4.4 (`send-hold-time`); RFC 8950 §4
 //! (`extended-next-hop`); RFC 4486 §4 (`restart-limit`); RFC 4271 §6.7
-//! (`maximum-prefix`); RFC 8210 §6 (`max-expire` within the Expire
+//! (`maximum-prefix`); RFC 7911 §4, §5 (`add-path`); RFC 8210 §6 (`max-expire`
+//! within the Expire
 //! Interval's range; `backoff` within the Retry Interval's), §7
 //! (`version`), §9 (port 323), §10 (`cache` and its `preference`);
 //! RFC 1123 §2.1 (cache host names).
@@ -23,9 +24,9 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::ast::{
-    Action, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http, Match,
-    Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction,
-    Term,
+    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http,
+    Match, Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime,
+    SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -1157,6 +1158,10 @@ struct NeighborBuilder {
     extended_next_hop: Once<bool>,
     restart_limit: Once<Option<u32>>,
     maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `add-path receive FAMILY yes|no`, each family once, whichever way.
+    add_path_receive: Vec<(AddressFamily, bool)>,
+    /// `add-path send FAMILY ...`, each family once; `off` is kept out.
+    add_path_send: Vec<(AddressFamily, Option<AddPathSend>)>,
 }
 
 impl NeighborBuilder {
@@ -1179,6 +1184,8 @@ impl NeighborBuilder {
             extended_next_hop: Once::new("extended-next-hop"),
             restart_limit: Once::new("restart-limit"),
             maximum_prefix: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
         }
     }
 
@@ -1277,7 +1284,82 @@ impl NeighborBuilder {
                 self.restart_limit.set(l, t.pos, v);
             }
             "maximum-prefix" => self.maximum_prefix(l, t),
+            "add-path" => self.add_path(l, t),
             _ => l.unknown(t, "`neighbor`"),
+        }
+    }
+
+    /// `add-path receive FAMILY yes|no` or `add-path send FAMILY N|all|off`,
+    /// each at most once per family (RFC 7911 §4, §5).
+    fn add_path(&mut self, l: &mut Lowerer, t: &Statement) {
+        let Some([direction, family, value]) = l.args(t, 3) else {
+            return;
+        };
+        let family = l.family(family);
+        match direction.value.as_str() {
+            "receive" => {
+                let on = match value.value.as_str() {
+                    "yes" | "on" | "true" => Some(true),
+                    "no" | "off" | "false" => Some(false),
+                    _ => {
+                        l.err(value.pos, format!("`{}` is not `yes` or `no`", value.value));
+                        None
+                    }
+                };
+                let (Some(family), Some(on)) = (family, on) else {
+                    return;
+                };
+                if self.add_path_receive.iter().any(|(f, _)| *f == family) {
+                    l.err(
+                        t.pos,
+                        format!("`add-path receive` is given more than once for {family}"),
+                    );
+                } else {
+                    self.add_path_receive.push((family, on));
+                }
+            }
+            "send" => {
+                let send = match value.value.as_str() {
+                    "all" => Some(Some(AddPathSend::All)),
+                    "off" => Some(None),
+                    _ => match value.value.parse::<u32>() {
+                        Ok(0) => {
+                            l.err(
+                                value.pos,
+                                "`add-path send` must send at least one path; \
+                                 use `off` to send one per prefix",
+                            );
+                            None
+                        }
+                        Ok(n) => Some(Some(AddPathSend::Best(n))),
+                        Err(_) => {
+                            l.err(
+                                value.pos,
+                                format!(
+                                    "`{}` is not a number of paths (1-4294967295), `all` or `off`",
+                                    value.value
+                                ),
+                            );
+                            None
+                        }
+                    },
+                };
+                let (Some(family), Some(send)) = (family, send) else {
+                    return;
+                };
+                if self.add_path_send.iter().any(|(f, _)| *f == family) {
+                    l.err(
+                        t.pos,
+                        format!("`add-path send` is given more than once for {family}"),
+                    );
+                } else {
+                    self.add_path_send.push((family, send));
+                }
+            }
+            other => l.err(
+                direction.pos,
+                format!("`{other}` is not `receive` or `send`"),
+            ),
         }
     }
 
@@ -1355,6 +1437,16 @@ impl NeighborBuilder {
                 .value
                 .unwrap_or(Some(DEFAULT_RESTART_LIMIT)),
             maximum_prefix: self.maximum_prefix,
+            add_path_receive: self
+                .add_path_receive
+                .into_iter()
+                .filter_map(|(family, on)| on.then_some(family))
+                .collect(),
+            add_path_send: self
+                .add_path_send
+                .into_iter()
+                .filter_map(|(family, send)| send.map(|send| (family, send)))
+                .collect(),
         })
     }
 }

@@ -6,7 +6,8 @@
 //! Implements: RFC 9687 §4.4 (a fixed `SendHoldTime` exceeds the Hold
 //! Time); RFC 4271 §10 (`KeepaliveTime` below the Hold Time); RFC 8950 §4
 //! (`extended-next-hop` qualifies a configured family); RFC 4271 §6.7
-//! (`maximum-prefix` bounds a configured family).
+//! (`maximum-prefix` bounds a configured family); RFC 7911 §4 (`add-path`
+//! qualifies a configured family).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -89,6 +90,26 @@ pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
                     n.pos,
                     format!(
                         "neighbor {}: extended-next-hop needs the {family} family (RFC 8950 §4)",
+                        n.addr
+                    ),
+                );
+            }
+        }
+        // RFC 7911 §4: the ADD-PATH tuple is for a family the session
+        // exchanges (RFC 4760 §8), so one for a family that is not
+        // configured could never be negotiated.
+        let send = n.add_path_send.iter().map(|(f, _)| f);
+        for (what, family) in n
+            .add_path_receive
+            .iter()
+            .map(|f| ("receive", f))
+            .chain(send.map(|f| ("send", f)))
+        {
+            if !n.families.contains(family) {
+                err(
+                    n.pos,
+                    format!(
+                        "neighbor {}: add-path {what} for {family}, which is not in its families",
                         n.addr
                     ),
                 );

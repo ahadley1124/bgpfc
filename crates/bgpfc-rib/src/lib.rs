@@ -19,6 +19,10 @@
 //! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
 //! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
 //! that ends the session, see [`Output::PrefixLimitExceeded`]);
+//! RFC 7911 §2, §3, §5 (the Adj-RIB-In keeps each path a peer sends under
+//! its Path Identifier and every one takes part in the decision process;
+//! a peer that takes several paths is sent the `n` best or all of them,
+//! each with an identifier of ours, see the private `addpath` module);
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
@@ -36,6 +40,7 @@
 //! size and how much its attributes repeat (`docs/PROFILING.md`).
 #![forbid(unsafe_code)]
 
+mod addpath;
 pub mod attrs;
 pub mod decision;
 pub mod export;
@@ -58,18 +63,19 @@ use std::time::{Duration, Instant};
 use bgpfc_rpki::{NullSource, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
-use bgpfc_wire::types::{AddressFamily, Asn};
+use bgpfc_wire::types::{AddressFamily, Asn, PathId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
 pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
-pub use peer::PeerInfo;
+pub use peer::{PathLimit, PeerInfo};
 pub use validation::Revalidation;
 
+use addpath::{Sent, Sync};
 use pacing::{Clock, Held, Jitter, Now, Offer, Pace, Pacing, Tick};
-use store::{Destination, FamilyMap, PeerId, Route, Table};
+use store::{Destination, FamilyMap, Member, PeerId, Route, Table};
 
 /// What a policy decided about a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +237,9 @@ pub struct RouteRef<'a> {
     pub rov: RovState,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
+    /// The Path Identifier its peer sent it with (RFC 7911 §3): `Some` for
+    /// a route of a family the peer sends with them, zero included.
+    pub path_id: Option<PathId>,
 }
 
 struct PeerState {
@@ -254,6 +263,9 @@ struct PeerState {
     adj_in_count: FamilyMap<usize>,
     /// The RFC 4271 §9.2.1.1 pacing state per family.
     pacing: FamilyMap<Pacing>,
+    /// What the peer has been sent of each prefix, for the families it is
+    /// sent several paths of (RFC 7911 §5); empty for any other.
+    sent: FamilyMap<Sent>,
     /// The session is going down: its routes are being removed, and it is
     /// sent nothing more.
     leaving: bool,
@@ -306,6 +318,10 @@ struct Sessions {
     peers: Vec<Option<PeerState>>,
     /// The slot of each peer that is up.
     by_addr: HashMap<IpAddr, PeerId>,
+    /// How many peers that are up are sent several paths of some family
+    /// (RFC 7911 §5), so that a change to a destination looks for them
+    /// only if there are any.
+    path_senders: usize,
     /// Pending wake-ups, earliest first. Each `Pacing` knows the one live
     /// entry per destination; an entry an earlier one replaced stays
     /// until due and is then ignored, and those of a peer that went down
@@ -429,6 +445,7 @@ impl Rib {
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
+                path_senders: 0,
                 deadlines: BinaryHeap::new(),
                 sweeps: BinaryHeap::new(),
                 clock: None,
@@ -489,6 +506,7 @@ impl Rib {
             advertised: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
             pacing: FamilyMap::default(),
+            sent: FamilyMap::default(),
             leaving: false,
         });
         for family in families {
@@ -604,6 +622,25 @@ impl Rib {
         }
         let now = self.s.tick(now);
         let mut batch = Batch::default();
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // RFC 7911 §5 with RFC 2918 §4: every path again, under the
+            // identifiers it has, and those it should not have withdrawn.
+            let held = self
+                .s
+                .peer_mut(id)
+                .pacing
+                .or_default(family)
+                .readvertise(now);
+            debug_assert!(held.iter().all(|(_, h)| h.has.is_none()));
+            if let Some(table) = self.tables.get(family) {
+                for (prefix, dest) in table.iter() {
+                    self.s
+                        .sync_paths(id, family, prefix, Some(dest), Sync::Full, &mut batch);
+                }
+            }
+            self.s.send(id, family, batch, out);
+            return;
+        }
         let held = self
             .s
             .peer_mut(id)
@@ -654,6 +691,12 @@ impl Rib {
         }
         self.s.tick(now);
         let mut batch = Batch::default();
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // What the peer has been sent is kept, so the new policies are
+            // compared with that, not with the old policies.
+            self.resync_paths(id, family, out);
+            return;
+        }
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
                 let before = self.s.exported(Some(old), family, prefix, dest.best(), id);
@@ -662,6 +705,50 @@ impl Rib {
             }
         }
         self.s.send(id, family, batch, out);
+    }
+
+    /// Bring the paths peer `id` has of `family` up to date with the
+    /// Loc-RIB, every destination, paced like any other change (RFC 7911
+    /// §5, RFC 4271 §9.2.1.1).
+    fn resync_paths(&mut self, id: PeerId, family: AddressFamily, out: &mut impl Sink) {
+        let mut batch = Batch::default();
+        if let Some(table) = self.tables.get(family) {
+            for (prefix, dest) in table.iter() {
+                self.s
+                    .sync_paths(id, family, prefix, Some(dest), Sync::Change, &mut batch);
+            }
+        }
+        self.s.send(id, family, batch, out);
+    }
+
+    /// Change how many paths of a prefix peer `addr` is sent, per family
+    /// (RFC 7911 §5), as a reload does: what the change adds is announced
+    /// and what it takes away withdrawn. Only the number can change on a
+    /// running session; the families were negotiated in the OPEN, so a
+    /// family not sent paths of already is left alone.
+    pub fn set_add_path_limits(
+        &mut self,
+        addr: IpAddr,
+        limits: &[(AddressFamily, PathLimit)],
+        now: Instant,
+        out: &mut impl Sink,
+    ) {
+        let Some(id) = self.s.id(addr) else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for (family, current) in &mut self.s.peer_mut(id).info.add_path_send {
+            if let Some((_, new)) = limits.iter().find(|(f, _)| f == family)
+                && new != current
+            {
+                *current = *new;
+                changed.push(*family);
+            }
+        }
+        self.s.tick(now);
+        for family in changed {
+            self.resync_paths(id, family, out);
+        }
     }
 
     /// Change the `MinRouteAdvertisementIntervalTimer` of peer `addr`
@@ -759,10 +846,18 @@ impl Rib {
                 continue;
             }
             let mut batch = Batch::default();
+            let paths = self.s.peer(id).info.path_limit(family).is_some();
             for d in group {
                 let Some(held) = self.s.wake(id, family, d.prefix, d.at) else {
                     continue;
                 };
+                if paths {
+                    // RFC 7911 §5: the paths the destination has now.
+                    let dest = self.tables.get(family).and_then(|t| t.get(d.prefix));
+                    self.s
+                        .sync_paths(id, family, d.prefix, dest, Sync::Release, &mut batch);
+                    continue;
+                }
                 let best = self
                     .tables
                     .get(family)
@@ -809,7 +904,13 @@ impl Rib {
             for o in scratch.ignored.drain(..) {
                 out.put(o);
             }
-            merge_repeats(&mut scratch.dirty, scratch.withdrawn, &mut scratch.order);
+            if update.message.path_ids.is_some() {
+                // RFC 7911 §3: several paths of one prefix may be in one
+                // UPDATE, and so a destination may change more than twice.
+                merge_all(&mut scratch.dirty, &mut scratch.order);
+            } else {
+                merge_repeats(&mut scratch.dirty, scratch.withdrawn, &mut scratch.order);
+            }
             self.finish(&mut scratch, now, out);
         }
         self.scratch = scratch;
@@ -844,19 +945,24 @@ impl Rib {
         // by RFC 4760 §7.
         let unused =
             |family: AddressFamily| state.disabled.contains(&family) || !info.receives(family);
-        for (family, prefix) in update.withdrawals() {
+        // RFC 7911 §5: a withdrawal names a path by its prefix and
+        // identifier (zero where the family has none); "If a BGP speaker
+        // receives a message to withdraw a prefix with a Path Identifier
+        // not seen before, it SHOULD silently ignore it", which finding no
+        // such route does.
+        for (family, prefix, path) in update.withdrawn_paths() {
             #[cfg(feature = "profiling")]
             let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_REMOVE);
             if unused(family) {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(peers, table, family, prefix, id, scratch);
+                withdraw(peers, table, family, prefix, (id, path.0), scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
         let mut exceeded = None;
-        'parts: for (family, next_hop, prefixes) in attrs::announced(update) {
+        'parts: for (family, next_hop, prefixes, path_ids) in attrs::announced(update) {
             if unused(family) {
                 continue;
             }
@@ -871,9 +977,7 @@ impl Rib {
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
                 if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
+                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.ignored.push(Output::InvalidNextHop {
                     peer: info.addr,
@@ -896,9 +1000,7 @@ impl Rib {
                 || attrs.as_path.first_asn() == Some(info.remote_as);
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
                 if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
+                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.released.push(attrs);
                 continue;
@@ -915,9 +1017,12 @@ impl Rib {
             let origin = RouteOrigin::from_as_path(&attrs.as_path, cx.local_as);
             let aspa = cx.validation.aspa(&attrs.as_path);
             let limit = info.prefix_limit(family);
-            for &prefix in prefixes {
+            for (k, &prefix) in prefixes.iter().enumerate() {
                 #[cfg(feature = "profiling")]
                 let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_INSERT);
+                // RFC 7911 §5: the route is the prefix with its Path
+                // Identifier; a newer one for both replaces the older.
+                let path = path_at(path_ids, k);
                 let rov = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
@@ -930,13 +1035,13 @@ impl Rib {
                 match judged.into_route(&attrs, id, rov, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
-                        announce(peers, table, family, prefix, route, scratch);
+                        announce(peers, table, family, prefix, route, path, scratch);
                     }
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it.
                     None => {
                         if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(peers, table, family, prefix, id, scratch);
+                            withdraw(peers, table, family, prefix, (id, path), scratch);
                         }
                     }
                 }
@@ -1001,11 +1106,18 @@ impl Rib {
         self.s.tick(now);
         for d in &scratch.dirty {
             if !d.merged {
+                // The destination as it is now, for the peers sent several
+                // paths of it; nothing to look up if there are none.
+                let dest = if self.s.path_senders > 0 {
+                    self.tables.get(d.family).and_then(|t| t.get(d.prefix))
+                } else {
+                    None
+                };
                 self.s.changed(
                     d.family,
                     d.prefix,
-                    d.old.as_ref(),
-                    d.new.as_ref(),
+                    (d.old.as_ref(), d.new.as_ref()),
+                    dest,
                     &mut scratch.batches,
                     out,
                 );
@@ -1035,7 +1147,7 @@ impl Rib {
             .get(family)
             .into_iter()
             .flat_map(move |t| t.after(from))
-            .filter_map(|(p, d)| d.best().map(|r| (p, self.s.route_ref(r))))
+            .filter_map(move |(p, d)| d.best().map(|r| (p, self.s.route_ref(family, r, d.id(0)))))
     }
 
     /// The candidate routes to `prefix`, the best first: those import
@@ -1044,12 +1156,12 @@ impl Rib {
     /// them.
     #[must_use]
     pub fn candidates(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
-        self.tables
-            .get(family)
-            .and_then(|t| t.get(prefix))
-            .map_or(&[][..], |d| &d.routes()[..d.candidates()])
-            .iter()
-            .map(|r| self.s.route_ref(r))
+        let Some(dest) = self.tables.get(family).and_then(|t| t.get(prefix)) else {
+            return Vec::new();
+        };
+        dest.iter()
+            .take(dest.candidates())
+            .map(|(r, id)| self.s.route_ref(family, r, id))
             .collect()
     }
 
@@ -1083,6 +1195,16 @@ impl Rib {
         let Some(id) = self.s.id(addr) else {
             return Vec::new().into_iter();
         };
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // RFC 7911 §5: every path it has been sent, a prefix more than
+            // once if it has several.
+            let paths = self.sent_paths(addr, family);
+            return paths
+                .into_iter()
+                .map(|(prefix, _, attrs)| (prefix, attrs))
+                .collect::<Vec<_>>()
+                .into_iter();
+        }
         let pacing = self.s.peer(id).pacing.get(family);
         let mut out = Vec::new();
         if let Some(table) = self.tables.get(family) {
@@ -1106,6 +1228,35 @@ impl Rib {
             out.sort_by_key(|(p, _)| *p);
         }
         out.into_iter()
+    }
+
+    /// The paths peer `addr` has been sent of `family`, in prefix order,
+    /// each with the Path Identifier it was sent with (RFC 7911 §5) and
+    /// the attributes as the export policy left them, before the session
+    /// rewrite (RFC 4271 §5.1). Empty unless the peer is sent several
+    /// paths of the family: what any other peer has is [`Rib::adj_rib_out`].
+    #[must_use]
+    pub fn sent_paths(
+        &self,
+        addr: IpAddr,
+        family: AddressFamily,
+    ) -> Vec<(Prefix, PathId, Arc<PathAttrs>)> {
+        let Some(id) = self.s.id(addr) else {
+            return Vec::new();
+        };
+        let Some(sent) = self.s.peer(id).sent.get(family) else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = sent
+            .iter()
+            .flat_map(|(prefix, paths)| {
+                paths
+                    .iter()
+                    .map(move |p| (prefix, PathId(p.tx), Arc::clone(&p.attrs)))
+            })
+            .collect();
+        out.sort_by_key(|(prefix, id, _)| (*prefix, *id));
+        out
     }
 
     /// Route counts for `addr`.
@@ -1184,6 +1335,7 @@ impl Sessions {
             self.by_addr.insert(state.info.addr, id);
             id
         };
+        self.path_senders += usize::from(!state.info.add_path_send.is_empty());
         self.peers[id.index()] = Some(state);
     }
 
@@ -1194,6 +1346,15 @@ impl Sessions {
             return;
         };
         if let Some(state) = self.peers[id.index()].take() {
+            self.path_senders -= usize::from(!state.info.add_path_send.is_empty());
+            // The attribute sets of the paths it was sent.
+            for sent in state.sent.into_values() {
+                for (_, paths) in sent.into_entries() {
+                    for p in paths.into_vec() {
+                        self.cx.interner.release(p.attrs);
+                    }
+                }
+            }
             for pacing in state.pacing.into_values() {
                 for h in pacing.into_held() {
                     if let Some(has) = h.has {
@@ -1238,17 +1399,22 @@ impl Sessions {
         }
     }
 
-    fn route_ref<'a>(&self, r: &'a Route) -> RouteRef<'a> {
+    /// A route of `family` as the control plane sees it, which has the Path
+    /// Identifier `id` it came with if its peer sends them (RFC 7911 §3).
+    fn route_ref<'a>(&self, family: AddressFamily, r: &'a Route, id: u32) -> RouteRef<'a> {
+        let peer = self.peer(r.peer);
         RouteRef {
-            peer: self.peer(r.peer).neighbor.addr,
+            peer: peer.neighbor.addr,
             attrs: &r.attrs,
             rov: r.rov,
             aspa: r.aspa,
+            path_id: peer.info.receives_paths(family).then_some(PathId(id)),
         }
     }
 
-    /// Remove `id`'s route from `dest`, if it has one, and settle the
-    /// destination. Whether it still has routes.
+    /// Remove `id`'s routes from `dest`, if it has any, and settle the
+    /// destination. Whether it still has routes. A peer sent with ADD-PATH
+    /// has a route for each path (RFC 7911 §5).
     fn remove_route(
         &mut self,
         family: AddressFamily,
@@ -1258,15 +1424,33 @@ impl Sessions {
         batches: &mut Batches,
         out: &mut impl Sink,
     ) -> bool {
-        let Some(i) = dest.position(id) else {
+        let Some(i) = dest.position_of_peer(id) else {
             return true;
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
+        // More only for a peer sent with ADD-PATH, so nothing is allocated
+        // for any other.
+        let mut more: Vec<Route> = Vec::new();
+        while !dest.is_empty()
+            && let Some(next) = dest.position_of_peer(id)
+        {
+            more.push(dest.remove(next));
+        }
         decide(&self.peers, dest);
-        self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
+        self.changed(
+            family,
+            prefix,
+            (old.as_ref(), dest.best()),
+            Some(dest),
+            batches,
+            out,
+        );
         drop(old);
         self.release_route(removed);
+        for r in more {
+            self.release_route(r);
+        }
         !dest.is_empty()
     }
 
@@ -1287,8 +1471,8 @@ impl Sessions {
         &mut self,
         family: AddressFamily,
         prefix: Prefix,
-        old: Option<&Route>,
-        new: Option<&Route>,
+        (old, new): (Option<&Route>, Option<&Route>),
+        dest: Option<&Destination>,
         batches: &mut Batches,
         out: &mut impl Sink,
     ) {
@@ -1310,6 +1494,11 @@ impl Sessions {
         if route_changed || state_changed {
             self.disseminate(family, prefix, old, new, batches);
         }
+        // RFC 7911 §5: a peer sent several paths hears of a change to any
+        // of them, not only to the best.
+        if self.path_senders > 0 {
+            self.sync_senders(family, prefix, dest, batches);
+        }
     }
 
     /// Phase 3: every peer is told about the best route going from `old`
@@ -1328,7 +1517,9 @@ impl Sessions {
             let Some(to) = &self.peers[i] else {
                 continue;
             };
-            if to.leaving || !to.info.speaks(family) {
+            // A peer sent several paths is brought up to date with the
+            // destination as a whole (`sync_senders`).
+            if to.leaving || !to.info.speaks(family) || to.info.path_limit(family).is_some() {
                 continue;
             }
             // invariant: fewer than 2^32 peers.
@@ -1667,15 +1858,28 @@ fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
 
 /// Phase 2: put the best of `dest`'s candidates first.
 fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
-    let routes = dest.routes();
-    let best = decision::best(dest.candidates(), |i| Candidate {
-        // invariant: a route's peer slot is occupied (Sessions::peer).
-        from: peers[routes[i].peer.index()].as_ref().unwrap().neighbor,
-        attrs: &routes[i].attrs,
-    });
+    let n = dest.candidates();
+    let best = match &*dest {
+        Destination::One(r) => pick(peers, std::slice::from_ref(r), n),
+        Destination::Many(v) => pick(peers, v, n),
+        Destination::Paths(v) => pick(peers, v, n),
+    };
     if let Some(i) = best {
         dest.promote(i);
     }
+}
+
+/// The best of the first `n` of `routes`.
+fn pick<T: Member>(peers: &[Option<PeerState>], routes: &[T], n: usize) -> Option<usize> {
+    decision::best(n, |i| Candidate {
+        // invariant: a route's peer slot is occupied (Sessions::peer).
+        from: peers[routes[i].route().peer.index()]
+            .as_ref()
+            .unwrap()
+            .neighbor,
+        attrs: &routes[i].route().attrs,
+        path_id: routes[i].id(),
+    })
 }
 
 /// Remove every route `id` sent from `table`, a table of `family`, noting
@@ -1688,13 +1892,23 @@ fn drop_routes(
     scratch: &mut Scratch,
 ) {
     table.retain(|prefix, dest| {
-        if let Some(i) = dest.position(id) {
+        if let Some(mut i) = dest.position_of_peer(id) {
             let old = dest.best().cloned();
-            let removed = dest.remove(i);
-            scratch.released.push(removed.attrs);
-            scratch.released.extend(removed.received);
+            // A peer sent with ADD-PATH has a route for each path.
+            loop {
+                let removed = dest.remove(i);
+                scratch.released.push(removed.attrs);
+                scratch.released.extend(removed.received);
+                *scratch.delta.or_default(family) -= 1;
+                if dest.is_empty() {
+                    break;
+                }
+                match dest.position_of_peer(id) {
+                    Some(next) => i = next,
+                    None => break,
+                }
+            }
             decide(peers, dest);
-            *scratch.delta.or_default(family) -= 1;
             scratch.dirty.push(Dirty {
                 family,
                 prefix,
@@ -1707,19 +1921,41 @@ fn drop_routes(
     });
 }
 
-/// Remove peer `id`'s route to `prefix`, if there is one, and note the
+/// The Path Identifier of the `k`th prefix of a part of an UPDATE, whose
+/// `ids` are as many as its prefixes or none (RFC 7911 §3).
+fn path_at(ids: &[PathId], k: usize) -> u32 {
+    ids.get(k).map_or(0, |i| i.0)
+}
+
+/// Remove what peer `id` sent for each of the `prefixes` of one part of an
+/// UPDATE, with the Path Identifiers `ids` that go with them.
+fn withdraw_all(
+    peers: &[Option<PeerState>],
+    table: &mut Table,
+    family: AddressFamily,
+    (prefixes, ids): (&[Prefix], &[PathId]),
+    id: PeerId,
+    scratch: &mut Scratch,
+) {
+    for (k, &prefix) in prefixes.iter().enumerate() {
+        withdraw(peers, table, family, prefix, (id, path_at(ids, k)), scratch);
+    }
+}
+
+/// Remove the route peer `id` sent for `prefix` with Path Identifier
+/// `path` (zero where it sends none), if there is one, and note the
 /// destination's best route before and after.
 fn withdraw(
     peers: &[Option<PeerState>],
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
-    id: PeerId,
+    from: (PeerId, u32),
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, id, scratch),
-        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, id, scratch),
+        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, from, scratch),
+        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, from, scratch),
     }
 }
 
@@ -1729,14 +1965,14 @@ fn withdraw_in<K: Ord>(
     key: K,
     family: AddressFamily,
     prefix: Prefix,
-    id: PeerId,
+    (id, path): (PeerId, u32),
     scratch: &mut Scratch,
 ) {
     let Slot::Occupied(mut slot) = map.entry(key) else {
         return;
     };
     let dest = slot.get_mut();
-    let Some(i) = dest.position(id) else {
+    let Some(i) = dest.position(id, path) else {
         return;
     };
     let old = dest.best().cloned();
@@ -1758,19 +1994,37 @@ fn withdraw_in<K: Ord>(
     });
 }
 
-/// Add or replace `route`'s peer's route to `prefix` and note the
-/// destination's best route before and after.
+/// Add or replace the route `route`'s peer sent for `prefix` with Path
+/// Identifier `path` (zero where it sends none), and note the destination's
+/// best route before and after.
 fn announce(
     peers: &[Option<PeerState>],
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     route: Route,
+    path: u32,
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(peers, &mut table.v4, k, family, prefix, route, scratch),
-        None => announce_in(peers, &mut table.v6, prefix, family, prefix, route, scratch),
+        Some(k) => announce_in(
+            peers,
+            &mut table.v4,
+            k,
+            family,
+            prefix,
+            (route, path),
+            scratch,
+        ),
+        None => announce_in(
+            peers,
+            &mut table.v6,
+            prefix,
+            family,
+            prefix,
+            (route, path),
+            scratch,
+        ),
     }
 }
 
@@ -1780,7 +2034,7 @@ fn announce_in<K: Ord>(
     key: K,
     family: AddressFamily,
     prefix: Prefix,
-    route: Route,
+    (route, path): (Route, u32),
     scratch: &mut Scratch,
 ) {
     let (old, new) = match map.entry(key) {
@@ -1788,15 +2042,15 @@ fn announce_in<K: Ord>(
             // A new destination: its one route is the best, unless it is
             // held.
             let new = (!route.held).then(|| route.clone());
-            slot.insert(Destination::One(route));
+            slot.insert(Destination::single(route, path));
             *scratch.delta.or_default(family) += 1;
             (None, new)
         }
         Slot::Occupied(mut slot) => {
             let dest = slot.get_mut();
             let old = dest.best().cloned();
-            if let Some(i) = dest.position(route.peer) {
-                let r = &dest.routes()[i];
+            if let Some(i) = dest.position(route.peer, path) {
+                let r = dest.route(i);
                 if Arc::ptr_eq(&r.attrs, &route.attrs)
                     && r.received.as_ref().map(Arc::as_ptr)
                         == route.received.as_ref().map(Arc::as_ptr)
@@ -1810,7 +2064,7 @@ fn announce_in<K: Ord>(
                 scratch.released.push(replaced.attrs);
                 scratch.released.extend(replaced.received);
             } else {
-                dest.push(route);
+                dest.push(route, path);
                 *scratch.delta.or_default(family) += 1;
             }
             decide(peers, dest);

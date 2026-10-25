@@ -776,6 +776,28 @@ fn per_family(
         .collect()
 }
 
+/// The paths per prefix `info` sends, per family (RFC 7911 §5): `all`, or
+/// how many of the best.
+fn send_limit(limit: bgpfc_rib::PathLimit) -> String {
+    match limit {
+        bgpfc_rib::PathLimit::All => "all".to_owned(),
+        bgpfc_rib::PathLimit::Best(n) => n.to_string(),
+    }
+}
+
+/// `ipv4-unicast=all ipv6-unicast=2` for the families `addr` is sent paths
+/// for; empty when it is sent one path per prefix.
+fn send_limits(
+    stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    addr: IpAddr,
+) -> Vec<(AddressFamily, bgpfc_rib::PathLimit)> {
+    stats
+        .iter()
+        .find(|(i, _)| i.addr == addr)
+        .map(|(i, _)| i.add_path_send.clone())
+        .unwrap_or_default()
+}
+
 fn write_neighbor(
     j: &mut Json,
     r: &PeerReport,
@@ -831,6 +853,26 @@ fn write_neighbor(
             j.end_array().key("send").begin_array();
             for f in &s.extended_next_hop_send {
                 j.display(f);
+            }
+            j.end_array().end_object();
+            // RFC 7911 §5: the families whose routes come with Path
+            // Identifiers from the peer, and those sent to it with them,
+            // each with how many paths of a prefix.
+            j.key("add_path")
+                .begin_object()
+                .key("receive")
+                .begin_array();
+            for f in &s.add_path_receive {
+                j.display(f);
+            }
+            j.end_array().key("send").begin_array();
+            for (family, limit) in send_limits(stats, r.addr) {
+                j.begin_object().field_display("family", family);
+                match limit {
+                    bgpfc_rib::PathLimit::All => j.field_str("paths", "all"),
+                    bgpfc_rib::PathLimit::Best(n) => j.field_num("paths", n),
+                };
+                j.end_object();
             }
             j.end_array().end_object().end_object();
         }
@@ -923,6 +965,25 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
                 list(&s.extended_next_hop_send)
             ));
         }
+        if !s.add_path_receive.is_empty() || !s.add_path_send.is_empty() {
+            let receive: Vec<String> = s.add_path_receive.iter().map(ToString::to_string).collect();
+            let send: Vec<String> = send_limits(stats, r.addr)
+                .into_iter()
+                .map(|(f, l)| format!("{f}={}", send_limit(l)))
+                .collect();
+            let list = |v: Vec<String>| {
+                if v.is_empty() {
+                    "none".to_owned()
+                } else {
+                    v.join(",")
+                }
+            };
+            lines.push(format!(
+                "  add-path receive {} send {}",
+                list(receive),
+                list(send)
+            ));
+        }
         lines.push(format!(
             "  families {}",
             s.families
@@ -978,7 +1039,9 @@ fn route_line(r: &RouteReport) -> String {
             path.join(" ")
         },
         r.peer
-    )
+    ) + &r
+        .path_id
+        .map_or(String::new(), |id| format!(" id {}", id.0))
 }
 
 fn route_json(j: &mut Json, r: &RouteReport) {
@@ -989,8 +1052,13 @@ fn route_json(j: &mut Json, r: &RouteReport) {
         .field_display("origin", a.origin)
         .field_opt_num("local_pref", a.local_pref)
         .field_opt_num("med", a.med)
-        .field_display("peer", r.peer)
-        .field_bool("best", r.best)
+        .field_display("peer", r.peer);
+    // RFC 7911 §3: the identifier its peer sent it with, for the families
+    // the peer sends them for.
+    if let Some(id) = r.path_id {
+        j.field_num("path_id", id.0);
+    }
+    j.field_bool("best", r.best)
         .field_str("rov", r.rov.as_str())
         .key("as_path")
         .begin_array();
@@ -1542,6 +1610,8 @@ mod tests {
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_send: vec![AddressFamily::IPV4_UNICAST],
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -1599,6 +1669,138 @@ mod tests {
     }
 
     #[test]
+    fn routes_show_the_path_identifier_their_peer_sent_where_it_sent_one() {
+        // RFC 7911 §3: two paths of one peer to one prefix are told apart
+        // by the identifier alone.
+        let plain = route("192.0.2.0/24", "198.51.100.1", &[65_001], None, None);
+        let mut with = route("192.0.2.0/24", "198.51.100.2", &[65_002], None, None);
+        with.path_id = Some(bgpfc_wire::types::PathId(7));
+        let zero = RouteReport {
+            path_id: Some(bgpfc_wire::types::PathId(0)),
+            ..with.clone()
+        };
+        assert!(
+            !route_line(&plain).contains(" id "),
+            "{}",
+            route_line(&plain)
+        );
+        assert!(
+            route_line(&with).ends_with("via 198.51.100.2 id 7"),
+            "{}",
+            route_line(&with)
+        );
+        // Zero is an identifier like another (RFC 7911 §3).
+        assert!(
+            route_line(&zero).ends_with("via 198.51.100.2 id 0"),
+            "{}",
+            route_line(&zero)
+        );
+        let json = |r: &RouteReport| {
+            let mut j = Json::new();
+            route_json(&mut j, r);
+            j.finish()
+        };
+        assert!(!json(&plain).contains("path_id"), "{}", json(&plain));
+        assert!(
+            json(&with).contains(r#""peer":"198.51.100.2","path_id":7,"best":false"#),
+            "{}",
+            json(&with)
+        );
+        assert!(json(&zero).contains(r#""path_id":0"#), "{}", json(&zero));
+    }
+
+    #[test]
+    fn neighbor_detail_shows_the_add_path_families_and_how_many_paths_go() {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: true,
+            route_refresh: true,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            add_path_receive: vec![v4],
+            add_path_send: vec![v4, v6],
+            peer_capabilities: Vec::new(),
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let info = bgpfc_rib::PeerInfo {
+            addr,
+            local_addr: "192.0.2.1".parse().unwrap(),
+            remote_as: Asn(65_001),
+            router_id: RouterId::new(2).unwrap(),
+            kind: bgpfc_wire::update::PeerKind::External,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            four_octet_as: true,
+            extended_messages: true,
+            extended_next_hop: Vec::new(),
+            advertisement_interval: Duration::ZERO,
+            prefix_limits: Vec::new(),
+            add_path_receive: vec![v4],
+            add_path_send: vec![
+                (v4, bgpfc_rib::PathLimit::All),
+                (v6, bgpfc_rib::PathLimit::Best(2)),
+            ],
+        };
+        let stats = bgpfc_rib::PeerStats {
+            received: vec![(v4, 2), (v6, 0)],
+            advertised: vec![(v4, 5), (v6, 3)],
+        };
+        let r = render_neighbor(&report, &[(info, stats)]);
+        assert!(
+            r.lines.contains(
+                &"  add-path receive ipv4-unicast send ipv4-unicast=all,ipv6-unicast=2".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(
+                r#""add_path":{"receive":["ipv4-unicast"],"send":[{"family":"ipv4-unicast","paths":"all"},{"family":"ipv6-unicast","paths":2}]}"#
+            ),
+            "{}",
+            r.json
+        );
+        // Not negotiated: no line, empty lists.
+        let mut plain = report.clone();
+        if let Some(s) = &mut plain.session {
+            s.add_path_receive.clear();
+            s.add_path_send.clear();
+        }
+        let r = render_neighbor(&plain, &[]);
+        assert!(
+            !r.lines.iter().any(|l| l.contains("add-path")),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""add_path":{"receive":[],"send":[]}"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
     fn neighbor_detail_counts_routes_per_family_against_the_limit() {
         use bgpfc_wire::types::HoldTime;
         let addr: IpAddr = "192.0.2.2".parse().unwrap();
@@ -1617,6 +1819,8 @@ mod tests {
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::ZERO,
             prefix_limits: vec![(v4, 1000)],
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
@@ -1640,6 +1844,8 @@ mod tests {
                 receive_families: vec![v4, v6],
                 extended_next_hop_receive: Vec::new(),
                 extended_next_hop_send: Vec::new(),
+                add_path_receive: Vec::new(),
+                add_path_send: Vec::new(),
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,
@@ -1799,6 +2005,7 @@ mod tests {
                 large_communities: Box::default(),
                 unknown: Box::default(),
             }),
+            path_id: None,
             best: false,
             rov: RovState::Disabled,
         }

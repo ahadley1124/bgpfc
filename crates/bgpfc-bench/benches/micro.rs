@@ -77,6 +77,7 @@ const CTX: DecodeContext = DecodeContext {
     peer: PeerKind::External,
     allow_as_set: false,
     extended_next_hop: false,
+    add_path: bgpfc_wire::update::AddPathFamilies::NONE,
 };
 
 fn peer() -> PeerInfo {
@@ -94,6 +95,8 @@ fn peer() -> PeerInfo {
         // The daemon's default for an external peer (RFC 4271 §10).
         advertisement_interval: default_interval(PeerKind::External),
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     }
 }
 
@@ -271,7 +274,7 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
 /// tells apart (RFC 4271 §9.1.2.2 f), so every step runs; and interning
 /// an attribute set already held, as each UPDATE does once per family.
 fn decision(filter: Option<&str>, update: &DecodedUpdate) {
-    let (_, next_hop, _) = announced(update)
+    let (_, next_hop, ..) = announced(update)
         .next()
         .expect("the synthetic UPDATE announces");
     let attrs = Arc::new(PathAttrs::from_update(&update.message, next_hop));
@@ -293,6 +296,7 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
                     black_box(best(neighbors.len(), |i| Candidate {
                         from: neighbors[i],
                         attrs: &attrs,
+                        path_id: 0,
                     }));
                 }
                 10_000

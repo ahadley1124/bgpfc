@@ -310,6 +310,7 @@ fn states_are_set_on_arrival_from_the_source() {
         .encode(&EncodeContext {
             four_octet_as: false,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         })
         .unwrap();
     let ctx = DecodeContext {
@@ -317,6 +318,7 @@ fn states_are_set_on_arrival_from_the_source() {
         peer: PeerKind::External,
         allow_as_set: false,
         extended_next_hop: false,
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
     send(
         &mut rib,

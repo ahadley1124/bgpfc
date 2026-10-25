@@ -434,6 +434,16 @@ pub enum SendHoldTime {
     Seconds(u16),
 }
 
+/// What `add-path send` sends for a family (RFC 7911 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddPathSend {
+    /// `add-path send FAMILY N`: the N best paths of each prefix by the
+    /// decision process, among those export policy accepts.
+    Best(u32),
+    /// `add-path send FAMILY all`: every path export policy accepts.
+    All,
+}
+
 /// A `neighbor` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Neighbor {
@@ -487,6 +497,13 @@ pub struct Neighbor {
     /// exceeding it ends the session with Cease / Maximum Number of
     /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
     pub maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `add-path receive FAMILY yes`: the families to accept several paths
+    /// per prefix for (RFC 7911 §4, §5), in file order. Empty by default.
+    pub add_path_receive: Vec<AddressFamily>,
+    /// `add-path send FAMILY N | all`: the families to send several paths
+    /// per prefix for, and how many (RFC 7911 §5), in file order. Empty by
+    /// default: one path per prefix.
+    pub add_path_send: Vec<(AddressFamily, AddPathSend)>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -496,9 +513,12 @@ pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
     /// the session reset, are the same. Description, policies, the
-    /// advertisement interval and the prefix limits are not session
-    /// parameters: the interval paces what the RIB sends and the limits
-    /// bound what it keeps, and both change without a reset.
+    /// advertisement interval, the prefix limits and how many paths
+    /// `add-path send` sends are not session parameters: the interval
+    /// paces what the RIB sends, the limits bound what it keeps and the
+    /// paths sent are what it sends, and all change without a reset. The
+    /// families `add-path` is on for are: the capability says so in the
+    /// OPEN (RFC 7911 §4).
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr
@@ -514,5 +534,11 @@ impl Neighbor {
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
+            && self.add_path_receive == other.add_path_receive
+            && self
+                .add_path_send
+                .iter()
+                .map(|(family, _)| family)
+                .eq(other.add_path_send.iter().map(|(family, _)| family))
     }
 }

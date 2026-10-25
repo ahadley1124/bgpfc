@@ -108,6 +108,8 @@ neighbor-item
              | "extended-next-hop" yes-no ";"        (* default no *)
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
+             | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
+             | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -233,6 +235,59 @@ neighbor then restarts like after any other damped failure, so a peer
 that keeps sending too many routes is retried `restart-limit` times and
 then left Idle; `restart-limit 0` leaves it Idle at once.
 
+`add-path receive FAMILY yes` and `add-path send FAMILY N` or `all`
+advertise the ADD-PATH capability of RFC 7911 for the family and use it
+once the neighbor advertises the other half: bgpfcd sends the capability
+with Receive for a family it takes several paths for and with Send for
+one it sends several for, both in one capability. A family is exchanged
+with Path Identifiers in a direction only when the two sides agree
+(RFC 7911 §5): we receive them when we advertised Receive and the
+neighbor Send, and send them when we advertised Send and the neighbor
+Receive; otherwise the family is exchanged as without ADD-PATH in that
+direction. Neither is on unless configured, and a session without it
+costs nothing for it. The family must be one of the neighbor's
+`families`; `no` and `off` say nothing and may be left out. `N` is a
+number from 1 to 4294967295; `0` is refused, since sending no more than
+the one best path is what `off` is for: it advertises no Send for the
+family, where `1` still sends Path Identifiers to a neighbor that takes
+them.
+
+With `add-path receive`, each path the neighbor sends for a prefix is
+kept under the Path Identifier it came with, and every one of them takes
+part in the decision process (RFC 4271 §9.1) next to the paths of other
+neighbors; import policy runs on each, and `maximum-prefix` counts each.
+The kernel still gets the one best path per prefix. A withdrawal names a
+path, and one for a Path Identifier bgpfcd does not hold is ignored
+(RFC 7911 §5). Several paths from one neighbor to one prefix tie-break
+like paths from different neighbors, and then on the lowest Path
+Identifier, so the choice does not depend on arrival order.
+
+With `add-path send FAMILY N`, bgpfcd sends the neighbor the `N` best
+paths for each prefix, in the order of the decision process, among those
+its export policy accepts and that RFC 4271 §9.2 allows it to send to
+that neighbor (a path is never sent back to the neighbor it came from).
+`all` sends every such path. RFC 7911 §5 asks that the best path be
+among them unless it came from that neighbor, which both do: the best
+path that can be sent is always the first. A path keeps the Path
+Identifier bgpfcd gave it while it is sent, through changes to its
+attributes, and when it is withdrawn the withdrawal names that
+identifier; a path that drops out of the `N` best and comes back may be
+numbered anew. The identifiers are local to the neighbor and mean
+nothing: a new path takes the smallest number from 1 that no other path
+sent to the neighbor for that prefix has, counting those a withdrawal in
+the same step frees, so that an identifier is not reused while its
+withdrawal may still be on the way. The `advertisement-interval` paces
+all the paths of a prefix as one destination: when it holds a prefix
+back, the neighbor keeps what it was sent and gets the paths the prefix
+has when the interval ends. A path that is gone is withdrawn at once, as
+for any prefix; one that only dropped out of the `N` best is withdrawn
+with the announcements that displace it, so the neighbor keeps it until
+its replacement can go. `show routes` and the
+HTTP API show a path's identifier where it has one (`docs/control.md`).
+A reload that only changes `N`, or `N` to `all`, applies at once to the
+running session, without a reset, sending or withdrawing the paths the
+change adds or takes away.
+
 `restart-limit` bounds the automatic restarts after failures, as RFC 4486
 §4 asks. Some failures damp the restart (RFC 4271 §8.2.2): a NOTIFICATION
 we send for an error, an expired timer or a local stop such as an output
@@ -349,8 +404,8 @@ reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
-`ipv4-unicast` in `families`; `maximum-prefix` only for a family in
-`families`; an `rpki` block has a `mode`, at least one `cache` with `mode
+`ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
+family in `families`; an `rpki` block has a `mode`, at least one `cache` with `mode
 external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN.
@@ -360,8 +415,10 @@ it fails, the running configuration stays and the errors are logged.
 Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
-`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
-reset with Cease / Other Configuration Change and start again, and
+`advertisement-interval` and `maximum-prefix`, and the number of paths
+`add-path send` sends; `restart-limit` included, and so are the families
+`add-path` is on for, since the capability is in the OPEN) reset with
+Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
 supports it. A changed `advertisement-interval` applies to the running

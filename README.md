@@ -11,7 +11,7 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five rows
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 7911. RFC 4271 has five rows
 > open. Two need the host's interfaces and routes, which bgpfc does not track,
 > so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
 > and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
@@ -44,6 +44,15 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)).
+- ADD-PATH (RFC 7911), per neighbor and family, off unless configured:
+  `add-path receive FAMILY yes` keeps every path a neighbor sends for a prefix
+  under its Path Identifier and runs the decision process over all of them,
+  and `add-path send FAMILY N` or `all` sends a neighbor the N best paths of
+  each prefix, or every path export policy accepts, each under an identifier
+  of bgpfcd's own that stays with it while it is sent. The kernel still gets
+  the one best path. `bgpfcctl show routes PREFIX` and the HTTP API show the
+  identifier a path came with. Sessions that do not use it pay nothing for it.
+  Interop tests run it in both directions against BIRD and FRR.
 - An RFC 6811 origin validation state on every route, from VRPs fetched over
   RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
   with failover in order of preference; `bgpfcctl show rpki` reports the
@@ -86,7 +95,8 @@ against.
 | Kernel FIB | rtnetlink, a dedicated route protocol number, main table, dry-run toggle |
 | Control | `bgpfcctl` over a Unix socket, plus a read-only-by-default HTTP/JSON API on localhost |
 
-Only single best path, with no ECMP. Linux only.
+Only a single best path goes to the kernel, with no ECMP, also on sessions
+that exchange several paths (ADD-PATH, RFC 7911, added after v1). Linux only.
 
 ### Next: RPKI route origin validation
 
@@ -112,8 +122,7 @@ Routinator is a separate program; bgpfc neither bundles nor links it.
 
 ASPA (planned for v1.1.0), origin validation on export (RFC 8893), BGP roles
 and OTC (RFC 9234), RFC 8212 default policy, graceful restart (RFC 4724),
-ADD-PATH (RFC 7911), route reflection (RFC 4456), multipath, and
-TCP-MD5/TCP-AO.
+route reflection (RFC 4456), multipath, and TCP-MD5/TCP-AO.
 
 The full reference list is in [`RESOURCES.md`](RESOURCES.md).
 

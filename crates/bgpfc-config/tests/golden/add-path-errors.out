@@ -1,0 +1,33 @@
+add-path-errors.conf:7:35: `maybe` is not `yes` or `no`
+      add-path receive ipv4-unicast maybe;
+                                    ^
+add-path-errors.conf:9:5: `add-path receive` is given more than once for ipv4-unicast
+      add-path receive ipv4-unicast no;
+      ^
+add-path-errors.conf:10:5: `add-path` takes 3 arguments, found 2
+      add-path receive ipv4;
+      ^
+add-path-errors.conf:11:22: `ipv4` is not `ipv4-unicast` or `ipv6-unicast`
+      add-path receive ipv4 yes;
+                       ^
+add-path-errors.conf:12:32: `add-path send` must send at least one path; use `off` to send one per prefix
+      add-path send ipv4-unicast 0;
+                                 ^
+add-path-errors.conf:13:32: `many` is not a number of paths (1-4294967295), `all` or `off`
+      add-path send ipv4-unicast many;
+                                 ^
+add-path-errors.conf:14:32: `4294967296` is not a number of paths (1-4294967295), `all` or `off`
+      add-path send ipv4-unicast 4294967296;
+                                 ^
+add-path-errors.conf:16:5: `add-path send` is given more than once for ipv6-unicast
+      add-path send ipv6-unicast all;
+      ^
+add-path-errors.conf:17:14: `both` is not `receive` or `send`
+      add-path both ipv6-unicast yes;
+               ^
+add-path-errors.conf:18:5: `add-path` takes 3 arguments, found 0
+      add-path;
+      ^
+add-path-errors.conf:19:5: `add-path` takes 3 arguments, found 4
+      add-path send ipv4-unicast 2 3;
+      ^

@@ -21,6 +21,7 @@ use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
+mod add_path;
 mod adj_rib_in;
 mod validation;
 
@@ -31,9 +32,8 @@ fn routes(rib: &Rib, family: AddressFamily, prefix: Prefix) -> Vec<(IpAddr, crat
         .get(family)
         .and_then(|t| t.get(prefix))
         .map(|d| {
-            d.routes()
-                .iter()
-                .map(|r| (rib.s.peer(r.peer).info.addr, r.clone()))
+            d.iter()
+                .map(|(r, _)| (rib.s.peer(r.peer).info.addr, r.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -106,6 +106,8 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         // §9.2.1.1 tests below are about when.
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
     }
 }
 
@@ -118,6 +120,7 @@ fn best_of(routes: &[(&PeerInfo, PathAttrs)]) -> Option<usize> {
     best(routes.len(), |i| Candidate {
         from: Neighbor::of(routes[i].0),
         attrs: &routes[i].1,
+        path_id: 0,
     })
 }
 
@@ -157,6 +160,7 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         peer: to.kind,
         allow_as_set: false,
         extended_next_hop: to.extended_next_hop.contains(&V4),
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
     messages
         .iter()
@@ -1382,7 +1386,7 @@ fn attributes_round_trip_through_an_update() {
     let d = announce(&["192.0.2.0/24"], &a);
     let parts: Vec<_> = announced(&d).collect();
     assert_eq!(parts.len(), 1);
-    let (family, next_hop, prefixes) = parts[0];
+    let (family, next_hop, prefixes, _) = parts[0];
     assert_eq!((family, prefixes), (V4, &[p("192.0.2.0/24")][..]));
     let back = PathAttrs::from_update(&d.message, next_hop);
     assert_eq!(

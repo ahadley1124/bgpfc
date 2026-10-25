@@ -180,6 +180,8 @@ Config {
                 10,
             ),
             maximum_prefix: [],
+            add_path_receive: [],
+            add_path_send: [],
         },
     ],
 }

@@ -275,6 +275,12 @@ pub enum EncodeError {
     /// NLRI of this family with an IPv6 next hop, for a peer with which
     /// Extended Next Hop Encoding was not negotiated (RFC 8950 §4).
     NextHopNotNegotiated(AddressFamily),
+    /// Path Identifiers on NLRI of a family with which ADD-PATH was not
+    /// negotiated for sending (RFC 7911 §5).
+    PathIdsNotNegotiated(AddressFamily),
+    /// NLRI of a family with which ADD-PATH was negotiated for sending,
+    /// without a Path Identifier for each prefix (RFC 7911 §3, §5).
+    PathIdsMissing(AddressFamily),
     /// A field or message does not fit its length field.
     TooLong {
         /// What was too long.
@@ -296,6 +302,13 @@ impl fmt::Display for EncodeError {
             EncodeError::NextHopNotNegotiated(family) => write!(
                 f,
                 "IPv6 next hop for {family} without the Extended Next Hop Encoding capability"
+            ),
+            EncodeError::PathIdsNotNegotiated(family) => {
+                write!(f, "Path Identifiers for {family} without ADD-PATH")
+            }
+            EncodeError::PathIdsMissing(family) => write!(
+                f,
+                "{family} NLRI without a Path Identifier for every prefix, with ADD-PATH"
             ),
             EncodeError::TooLong { what, len, max } => {
                 write!(

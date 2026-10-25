@@ -4,7 +4,8 @@
 //! Implements: RFC 4271 §4.3 (the well-known attributes), §5 (unknown
 //! optional transitive attributes are carried with the Partial bit);
 //! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 8950 §3 (IPv4
-//! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities).
+//! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities);
+//! RFC 7911 §3 (the Path Identifiers of announced and sent prefixes).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
@@ -16,8 +17,8 @@ use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, flags};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Afi};
-use bgpfc_wire::update::{DecodedUpdate, UpdateMessage};
+use bgpfc_wire::types::{AddressFamily, Afi, PathId};
+use bgpfc_wire::update::{DecodedUpdate, PathIds, UpdateMessage};
 
 /// An optional transitive attribute this implementation does not know,
 /// kept for forwarding (RFC 4271 §5).
@@ -80,21 +81,30 @@ fn sort_unique<T: Ord + Copy>(list: &mut Box<[T]>) {
 /// unicast may come in both at once (RFC 7606 §5.1), and in the latter with
 /// an IPv6 next hop (RFC 8950 §3). Empty when treated as withdraw; the
 /// NLRI field is left out when `NEXT_HOP` is missing, which the decoder
-/// already turned into treat-as-withdraw.
+/// already turned into treat-as-withdraw. Each part comes with the Path
+/// Identifiers of its prefixes (RFC 7911 §3), as many as the prefixes or
+/// none when its family has no ADD-PATH.
 pub fn announced(
     update: &DecodedUpdate,
-) -> impl Iterator<Item = (AddressFamily, NextHop, &[Prefix])> {
+) -> impl Iterator<Item = (AddressFamily, NextHop, &[Prefix], &[PathId])> {
     let m = &update.message;
     let live = update.treated_as_withdraw.is_none();
     let nlri = m
         .next_hop()
         .filter(|_| live && !m.nlri.is_empty())
-        .map(|n| (AddressFamily::IPV4_UNICAST, NextHop::Ipv4(n), &m.nlri[..]));
+        .map(|n| {
+            (
+                AddressFamily::IPV4_UNICAST,
+                NextHop::Ipv4(n),
+                &m.nlri[..],
+                m.nlri_ids(),
+            )
+        });
     let mp = m
         .mp_reach
         .as_ref()
         .filter(|r| live && !r.nlri.is_empty())
-        .map(|r| (r.family, r.next_hop, &r.nlri[..]));
+        .map(|r| (r.family, r.next_hop, &r.nlri[..], m.mp_reach_ids()));
     nlri.into_iter().chain(mp)
 }
 
@@ -198,6 +208,27 @@ impl PathAttrs {
             }
         }
         m.attributes.sort_by_key(PathAttribute::code);
+        m
+    }
+
+    /// As [`PathAttrs::to_update`], for a family sent with Path Identifiers
+    /// (RFC 7911 §3): `ids[i]` goes with `nlri[i]`, in whichever field the
+    /// prefixes went.
+    #[must_use]
+    pub fn to_update_paths(
+        &self,
+        family: AddressFamily,
+        nlri: Vec<Prefix>,
+        ids: Vec<PathId>,
+    ) -> UpdateMessage {
+        let mut m = self.to_update(family, nlri);
+        let mut path_ids = PathIds::default();
+        if m.mp_reach.is_some() {
+            path_ids.mp_reach = ids;
+        } else {
+            path_ids.nlri = ids;
+        }
+        m.path_ids = Some(Box::new(path_ids));
         m
     }
 

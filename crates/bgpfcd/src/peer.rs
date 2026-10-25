@@ -953,12 +953,16 @@ fn decode_context(session: Option<&Session>, allow_as_set: bool) -> DecodeContex
             extended_next_hop: s
                 .extended_next_hop_receive
                 .contains(&AddressFamily::IPV4_UNICAST),
+            // RFC 7911 §5: the peer sends Path Identifiers for the
+            // families we advertised Receive for and it advertised Send.
+            add_path: bgpfc_wire::update::AddPathFamilies::of(&s.add_path_receive),
         },
         None => DecodeContext {
             four_octet_as: false,
             peer: PeerKind::External,
             allow_as_set,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         },
     }
 }
@@ -1127,6 +1131,43 @@ mod tests {
     }
 
     #[test]
+    fn path_identifiers_are_decoded_where_we_receive_them_and_only_there() {
+        // RFC 7911 §5: for IPv4 unicast both sides agreed, so the NLRI
+        // field carries an identifier before each prefix; for IPv6 unicast
+        // the peer advertised Send but we never advertised Receive.
+        use bgpfc_wire::capability::{AddPathMode, AddPathTuple};
+        use bgpfc_wire::types::PathId;
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let tuple = |family, mode| AddPathTuple { family, mode };
+        let ours = vec![
+            Capability::Multiprotocol(v4),
+            Capability::Multiprotocol(v6),
+            Capability::AddPath(vec![tuple(v4, AddPathMode::Receive)]),
+        ];
+        let theirs = vec![
+            Capability::Multiprotocol(v4),
+            Capability::Multiprotocol(v6),
+            Capability::AddPath(vec![
+                tuple(v4, AddPathMode::Send),
+                tuple(v6, AddPathMode::Send),
+            ]),
+        ];
+        let s = negotiated(ours, theirs);
+        assert_eq!(s.add_path_receive, vec![v4]);
+        let ctx = decode_context(Some(&s), false);
+        assert!(ctx.add_path.contains(v4));
+        assert!(!ctx.add_path.contains(v6));
+        // Before the session is up there are none.
+        assert!(decode_context(None, false).add_path.is_empty());
+        // 0 attributes, NLRI: id 7, 192.0.2.0/24.
+        let body = [0, 0, 0, 0, 0, 0, 0, 7, 24, 192, 0, 2];
+        let d = UpdateMessage::decode(&body, &ctx).unwrap();
+        assert_eq!(d.message.nlri, vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(d.message.path_ids.unwrap().nlri, vec![PathId(7)]);
+    }
+
+    #[test]
     fn ipv6_next_hops_for_ipv4_routes_are_taken_once_we_advertised_rfc8950() {
         use bgpfc_wire::as_path::AsPath;
         use bgpfc_wire::attribute::Origin;
@@ -1157,6 +1198,7 @@ mod tests {
             .encode(&EncodeContext {
                 four_octet_as: true,
                 extended_next_hop: true,
+                add_path: bgpfc_wire::update::AddPathFamilies::NONE,
             })
             .unwrap();
         let decode = |s: &Session| UpdateMessage::decode(&body, &decode_context(Some(s), false));

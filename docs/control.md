@@ -30,8 +30,8 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
+| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)); a route the neighbor sent under a Path Identifier (RFC 7911 §3) ends in `id N`, which tells apart the several paths one neighbor has to a prefix |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -99,11 +99,13 @@ Example objects:
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
              "families":["ipv4-unicast","ipv6-unicast"],
-             "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
+             "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]},
+             "add_path":{"receive":["ipv4-unicast"],
+                         "send":[{"family":"ipv4-unicast","paths":"all"}]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","best":true,"rov":"disabled","as_path":[64511],"communities":[],
-  "large_communities":[]}]
+  "peer":"198.51.100.1","path_id":7,"best":true,"rov":"disabled","as_path":[64511],
+  "communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
@@ -116,6 +118,29 @@ Example objects:
 {"prefix":"192.0.2.0/24","origin":64496,"rov":"valid",
  "vrps":[{"prefix":"192.0.2.0/24","max_length":24,"asn":64496,"matches":true}]}
 ```
+
+## Path identifiers
+
+With ADD-PATH (RFC 7911, `add-path` in `docs/config.md`) a neighbor can
+have several routes to one prefix. Each route that came with a Path
+Identifier shows it: `show routes PREFIX` ends the line in `id N`, and
+`GET /v1/routes` has a `path_id` member, a number that is absent for a
+route from a neighbor, or of a family, without ADD-PATH. Zero is an
+identifier like any other (RFC 7911 §3), so `"path_id":0` and `id 0`
+name a path. The identifier is the neighbor's own: it is what the
+neighbor numbered its path with, and means nothing to another neighbor.
+The routes bgpfcd sends are numbered by bgpfcd (RFC 7911 §5); they are
+not listed here, which shows the Loc-RIB and its candidates. Without a
+prefix, `show routes` lists the best route of each prefix, with the
+identifier of that path.
+
+`show neighbor` and `GET /v1/neighbors/{addr}` have the ADD-PATH families
+the session negotiated. In the text, `add-path receive FAMILIES send
+FAMILY=PATHS ...` where `PATHS` is `all` or a number; in JSON,
+`add_path.receive`, a list of families, and `add_path.send`, a list of
+`{"family": ..., "paths": "all" | N}`. A session without ADD-PATH has no
+such line, and empty lists. The `advertised` counts of a neighbor that is
+sent several paths count paths, not prefixes.
 
 ## Validation state
 

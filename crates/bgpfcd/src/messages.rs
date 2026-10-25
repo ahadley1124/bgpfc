@@ -206,6 +206,9 @@ pub(crate) struct RouteReport {
     pub(crate) peer: IpAddr,
     /// Its attributes.
     pub(crate) attrs: std::sync::Arc<bgpfc_rib::PathAttrs>,
+    /// The Path Identifier its peer sent it with (RFC 7911 §3), for a
+    /// family the peer sends them for.
+    pub(crate) path_id: Option<bgpfc_wire::types::PathId>,
     /// Whether it is the chosen route.
     pub(crate) best: bool,
     /// Its RFC 6811 §2 origin validation state, judged on the route as
@@ -241,6 +244,9 @@ pub(crate) type Intervals = HashMap<IpAddr, Option<Duration>>;
 /// Each neighbor's `maximum-prefix` limits per family (RFC 4271 §6.7).
 pub(crate) type PrefixLimits = HashMap<IpAddr, Vec<(AddressFamily, u32)>>;
 
+/// Each neighbor's `add-path send` limits per family (RFC 7911 §5).
+pub(crate) type AddPathLimits = HashMap<IpAddr, Vec<(AddressFamily, bgpfc_rib::PathLimit)>>;
+
 /// The per-neighbor settings the RIB thread applies to sessions as they
 /// come up, and to running ones after a reload.
 #[derive(Clone, Debug, Default)]
@@ -249,6 +255,8 @@ pub(crate) struct RibSettings {
     pub(crate) intervals: Intervals,
     /// `maximum-prefix` limits.
     pub(crate) prefix_limits: PrefixLimits,
+    /// `add-path send` limits.
+    pub(crate) add_path_send: AddPathLimits,
 }
 
 /// What peer threads tell the RIB thread.
@@ -304,6 +312,10 @@ pub(crate) enum RibMsg {
     /// The prefix limits after a reload, applied like the intervals; a
     /// session already over a new limit ends (RFC 4271 §6.7).
     SetPrefixLimits(PrefixLimits),
+    /// The `add-path send` limits after a reload: a running session sends
+    /// the number of paths it now says, without a reset (RFC 7911 §5);
+    /// which families have ADD-PATH is a session parameter and resets.
+    SetAddPathLimits(AddPathLimits),
     /// Re-send the Adj-RIB-Out of every family to `peer` in full (a soft
     /// reset, RFC 2918 §4).
     Resend {

@@ -262,8 +262,10 @@ impl Pass<'_> {
         // Whether a route moved between the candidates and the held
         // routes, and which ones no state admits any more.
         let mut moved = false;
-        let mut dropped: Vec<PeerId> = Vec::new();
-        for route in dest.routes_mut() {
+        let mut dropped: Vec<(PeerId, u32)> = Vec::new();
+        for i in 0..dest.len() {
+            let id = dest.id(i);
+            let route = dest.route_mut(i);
             self.tally.routes += 1;
             // RFC 6811 §2, on the route as received, as on its arrival.
             let received = Arc::clone(route.received());
@@ -302,7 +304,7 @@ impl Pass<'_> {
                 Judged::Dropped => {
                     let n = peer.adj_in_count.or_default(self.family);
                     *n = n.saturating_sub(1);
-                    dropped.push(route.peer);
+                    dropped.push((route.peer, id));
                     (Arc::clone(&received), true)
                 }
             };
@@ -318,10 +320,10 @@ impl Pass<'_> {
         }
         if moved {
             // Candidates first; a stable sort keeps their order.
-            dest.routes_mut().sort_by_key(|r| r.held);
+            dest.sort_candidates_first();
         }
-        for peer in dropped {
-            if let Some(i) = dest.position(peer) {
+        for (peer, id) in dropped {
+            if let Some(i) = dest.position(peer, id) {
                 let r = dest.remove(i);
                 self.scratch.released.push(r.attrs);
                 self.scratch.released.extend(r.received);

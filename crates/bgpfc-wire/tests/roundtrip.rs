@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bgpfc_wire::as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, code};
-use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::error::UpdateSubcode;
@@ -21,11 +21,15 @@ use bgpfc_wire::header::{Header, MessageType, frame};
 use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop, is_global_ipv6, is_host_ipv4};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::prefix::{Ipv4Key, Prefix, decode_prefixes};
+use bgpfc_wire::prefix::{
+    Ipv4Key, Prefix, decode_prefixes, decode_prefixes_with_ids, encode_prefixes_with_ids,
+};
 use bgpfc_wire::reader::Reader;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
-use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
-use bgpfc_wire::update::{DecodeContext, EncodeContext, PeerKind, UpdateMessage};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, PathId, RouterId, Safi};
+use bgpfc_wire::update::{
+    AddPathFamilies, DecodeContext, EncodeContext, PathIds, PeerKind, UpdateMessage,
+};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -101,6 +105,14 @@ fn next_hop_encoding() -> impl Strategy<Value = NextHopEncoding> {
     ]
 }
 
+/// RFC 7911 §4 tuples: any family, a Send/Receive value of 1 to 3.
+fn add_path_tuple() -> impl Strategy<Value = AddPathTuple> {
+    (address_family(), 1u8..=3).prop_map(|(family, mode)| AddPathTuple {
+        family,
+        mode: AddPathMode::from_u8(mode).unwrap(),
+    })
+}
+
 fn capability() -> impl Strategy<Value = Capability> {
     prop_oneof![
         address_family().prop_map(Capability::Multiprotocol),
@@ -109,8 +121,10 @@ fn capability() -> impl Strategy<Value = Capability> {
         any::<u32>().prop_map(|a| Capability::FourOctetAs(Asn(a))),
         // RFC 8950 §4: at most 42 six-octet triples fit the length octet.
         vec(next_hop_encoding(), 0..=42).prop_map(Capability::ExtendedNextHop),
+        // RFC 7911 §4: at most 63 four-octet tuples fit the length octet.
+        vec(add_path_tuple(), 0..=63).prop_map(Capability::AddPath),
         (
-            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65)),
+            any::<u8>().prop_filter("known code", |c| !matches!(c, 1 | 2 | 5 | 6 | 65 | 69)),
             vec(any::<u8>(), 0..=255)
         )
             .prop_map(|(code, value)| Capability::Unknown { code, value }),
@@ -323,9 +337,53 @@ fn update_message(confed: bool) -> impl Strategy<Value = UpdateMessage> {
                     mp_reach,
                     mp_unreach,
                     attributes,
+                    path_ids: None,
                 }
             },
         )
+}
+
+/// Which of IPv4 and IPv6 unicast have ADD-PATH (RFC 7911 §5), any
+/// combination.
+fn add_path_families() -> impl Strategy<Value = AddPathFamilies> {
+    (any::<bool>(), any::<bool>()).prop_map(|(v4, v6)| {
+        let mut on = Vec::new();
+        if v4 {
+            on.push(AddressFamily::IPV4_UNICAST);
+        }
+        if v6 {
+            on.push(AddressFamily::IPV6_UNICAST);
+        }
+        AddPathFamilies::of(&on)
+    })
+}
+
+/// `m` with a Path Identifier from `pool` for each prefix of the lists
+/// whose family is in `on`, and none for the others (RFC 7911 §3, §5).
+fn with_path_ids(mut m: UpdateMessage, on: AddPathFamilies, pool: &[u32]) -> UpdateMessage {
+    let mut next = pool.iter().cycle();
+    let mut ids = |family: AddressFamily, n: usize| -> Vec<PathId> {
+        if on.contains(family) {
+            (0..n).map(|_| PathId(*next.next().unwrap())).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let ids = PathIds {
+        withdrawn: ids(v4, m.withdrawn.len()),
+        nlri: ids(v4, m.nlri.len()),
+        mp_reach: m
+            .mp_reach
+            .as_ref()
+            .map_or(Vec::new(), |r| ids(r.family, r.nlri.len())),
+        mp_unreach: m
+            .mp_unreach
+            .as_ref()
+            .map_or(Vec::new(), |u| ids(u.family, u.withdrawn.len())),
+    };
+    m.path_ids = (!ids.is_empty()).then(|| Box::new(ids));
+    m
 }
 
 /// The round trips negotiate RFC 8950 so that IPv4 NLRI may carry an IPv6
@@ -335,6 +393,7 @@ const IBGP4: DecodeContext = DecodeContext {
     peer: PeerKind::Internal,
     allow_as_set: true,
     extended_next_hop: true,
+    add_path: AddPathFamilies::NONE,
 };
 const IBGP2: DecodeContext = DecodeContext {
     four_octet_as: false,
@@ -348,10 +407,12 @@ const EBGP4: DecodeContext = DecodeContext {
 const ENC4: EncodeContext = EncodeContext {
     four_octet_as: true,
     extended_next_hop: true,
+    add_path: AddPathFamilies::NONE,
 };
 const ENC2: EncodeContext = EncodeContext {
     four_octet_as: false,
     extended_next_hop: true,
+    add_path: AddPathFamilies::NONE,
 };
 
 // ---------------------------------------------------------------- round trips
@@ -405,6 +466,24 @@ proptest! {
         let mut wire = Vec::new();
         bgpfc_wire::prefix::encode_prefixes(&ps, &mut wire);
         prop_assert_eq!(decode_prefixes(&wire, Afi::Ipv6).unwrap(), ps);
+    }
+
+    #[test]
+    fn extended_prefix_list_round_trip(
+        entries in vec((prefix_v4(), any::<u32>()), 0..=10),
+        entries6 in vec((prefix_v6(), any::<u32>()), 0..=10),
+    ) {
+        // RFC 7911 §3: Path Identifier, then the tuple, per prefix; the
+        // same prefix may recur with other identifiers.
+        for (afi, entries) in [(Afi::Ipv4, entries), (Afi::Ipv6, entries6)] {
+            let (ps, ids): (Vec<Prefix>, Vec<PathId>) =
+                entries.into_iter().map(|(p, id)| (p, PathId(id))).unzip();
+            let mut wire = Vec::new();
+            encode_prefixes_with_ids(&ps, &ids, &mut wire);
+            let (back, back_ids) = decode_prefixes_with_ids(&wire, afi).unwrap();
+            prop_assert_eq!(back, ps);
+            prop_assert_eq!(back_ids, ids);
+        }
     }
 
     #[test]
@@ -485,6 +564,27 @@ proptest! {
         if value.len() % 6 == 0 {
             let c = decoded.unwrap();
             prop_assert!(matches!(&c, Capability::ExtendedNextHop(t) if t.len() == value.len() / 6));
+            let mut again = Vec::new();
+            c.encode(&mut again).unwrap();
+            prop_assert_eq!(again, wire);
+        } else {
+            prop_assert_eq!(decoded.unwrap_err().code, ErrorCode::Open);
+        }
+    }
+
+    #[test]
+    fn add_path_accepts_exactly_whole_tuples(value in vec(any::<u8>(), 0..=255)) {
+        // RFC 7911 §4: whole four-octet tuples decode and re-encode to the
+        // same octets, as an ADD-PATH capability when every Send/Receive
+        // value is 1 to 3 and as an unknown one otherwise; anything else is
+        // malformed.
+        let mut wire = vec![69, u8::try_from(value.len()).unwrap()];
+        wire.extend_from_slice(&value);
+        let decoded = Capability::decode(&mut Reader::new(&wire));
+        if value.len() % 4 == 0 {
+            let c = decoded.unwrap();
+            let understood = value.chunks(4).all(|t| (1..=3).contains(&t[3]));
+            prop_assert_eq!(matches!(c, Capability::AddPath(_)), understood);
             let mut again = Vec::new();
             c.encode(&mut again).unwrap();
             prop_assert_eq!(again, wire);
@@ -605,6 +705,117 @@ proptest! {
     }
 
     #[test]
+    fn update_with_path_ids_round_trip(
+        m in update_message(true),
+        on in add_path_families(),
+        pool in vec(any::<u32>(), 1..8),
+    ) {
+        // RFC 7911 §3, §5: the families negotiated for ADD-PATH carry a
+        // Path Identifier before each tuple, in all four lists, and the
+        // others do not.
+        let m = with_path_ids(m, on, &pool);
+        let enc = EncodeContext { add_path: on, ..ENC4 };
+        let dec = DecodeContext { add_path: on, ..IBGP4 };
+        let wire = m.encode(&enc).unwrap();
+        let d = UpdateMessage::decode(&wire, &dec).unwrap();
+        prop_assert_eq!(&d.treated_as_withdraw, &None);
+        prop_assert_eq!(&d.discarded, &vec![]);
+        prop_assert_eq!(&d.disabled, &vec![]);
+        prop_assert_eq!(&d.message, &m);
+        prop_assert_eq!(d.message.encode(&enc).unwrap(), wire);
+        // The withdrawals name the identifiers the fields carried.
+        let mut expected: Vec<(AddressFamily, Prefix, PathId)> = Vec::new();
+        let ids = |l: &[PathId], i: usize| l.get(i).copied().unwrap_or_default();
+        expected.extend(m.withdrawn.iter().enumerate().map(|(i, p)| {
+            (AddressFamily::IPV4_UNICAST, *p, ids(m.withdrawn_ids(), i))
+        }));
+        if let Some(u) = &m.mp_unreach {
+            expected.extend(
+                u.withdrawn.iter().enumerate().map(|(i, p)| (u.family, *p, ids(m.mp_unreach_ids(), i))),
+            );
+        }
+        prop_assert_eq!(d.withdrawn_paths().collect::<Vec<_>>(), expected);
+        // The same message is not an UPDATE a session without ADD-PATH
+        // for a family would be sent.
+        if !on.is_empty() && m.path_ids.is_some() {
+            prop_assert!(m.encode(&ENC4).is_err());
+        }
+    }
+
+    #[test]
+    fn a_family_with_add_path_needs_an_identifier_for_each_prefix(
+        m in update_message(true),
+        pool in vec(any::<u32>(), 1..8),
+    ) {
+        // RFC 7911 §5: "the speaker MUST generate a route update for the
+        // <AFI, SAFI> based on the combination of the address prefix and
+        // the Path Identifier": a prefix without one is not encoded, and
+        // a plain session is never sent one.
+        let both = AddPathFamilies::of(&[AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]);
+        let enc = EncodeContext { add_path: both, ..ENC4 };
+        let with = with_path_ids(m.clone(), both, &pool);
+        let lists_with_prefixes = routes(&m) > 0;
+        if lists_with_prefixes {
+            prop_assert!(m.encode(&enc).is_err(), "no identifiers at all");
+            prop_assert!(with.encode(&ENC4).is_err(), "identifiers on a plain session");
+            // One too few in the first non-empty list.
+            let mut short = (*with.path_ids.clone().unwrap()).clone();
+            for list in [&mut short.withdrawn, &mut short.nlri, &mut short.mp_reach, &mut short.mp_unreach] {
+                if !list.is_empty() {
+                    list.pop();
+                    break;
+                }
+            }
+            let short = UpdateMessage { path_ids: Some(Box::new(short)), ..with };
+            prop_assert!(short.encode(&enc).is_err(), "one identifier short");
+        } else {
+            prop_assert!(m.encode(&enc).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_route_treated_as_withdrawn_is_withdrawn_by_its_path_identifier(
+        m in update_message(true),
+        on in add_path_families(),
+        pool in vec(any::<u32>(), 1..8),
+        bad in non_host_v4(),
+    ) {
+        // RFC 7606 §2 with RFC 7911 §3: what an UPDATE announced is
+        // treated as withdrawn, a path at a time.
+        let mut m = with_path_ids(m, on, &pool);
+        for a in &mut m.attributes {
+            if let PathAttribute::NextHop(n) = a {
+                *n = bad;
+            }
+        }
+        let enc = EncodeContext { add_path: on, ..ENC4 };
+        let dec = DecodeContext { add_path: on, ..IBGP4 };
+        let d = UpdateMessage::decode(&m.encode(&enc).unwrap(), &dec).unwrap();
+        if !m.nlri.is_empty() {
+            prop_assert!(d.treated_as_withdraw.is_some());
+            prop_assert_eq!(d.announcements().count(), 0);
+            // Withdrawn Routes, MP_UNREACH_NLRI, then what the NLRI field
+            // and MP_REACH_NLRI announced, each by its own identifier.
+            let all = |family, prefixes: &[Prefix], ids: &[PathId]| {
+                prefixes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (family, *p, ids.get(i).copied().unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            };
+            let mut wanted = all(AddressFamily::IPV4_UNICAST, &m.withdrawn, m.withdrawn_ids());
+            if let Some(u) = &m.mp_unreach {
+                wanted.extend(all(u.family, &u.withdrawn, m.mp_unreach_ids()));
+            }
+            wanted.extend(all(AddressFamily::IPV4_UNICAST, &m.nlri, m.nlri_ids()));
+            if let Some(r) = &m.mp_reach {
+                wanted.extend(all(r.family, &r.nlri, m.mp_reach_ids()));
+            }
+            prop_assert_eq!(d.withdrawn_paths().collect::<Vec<_>>(), wanted);
+        }
+    }
+
+    #[test]
     fn update_round_trip_two_octet(m in update_message(false)) {
         // RFC 6793 §4.2.2 / §4.2.3: AS4_PATH and AS4_AGGREGATOR carry the
         // four-octet information across a two-octet session and are merged
@@ -715,10 +926,23 @@ proptest! {
         let _ = UpdateMessage::decode(&bytes, &IBGP4);
         let _ = UpdateMessage::decode(&bytes, &IBGP2);
         let _ = UpdateMessage::decode(&bytes, &EBGP4);
+        // ... and with ADD-PATH on for either family or both (RFC 7911 §3).
+        for on in [
+            &[AddressFamily::IPV4_UNICAST][..],
+            &[AddressFamily::IPV6_UNICAST][..],
+            &[AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST][..],
+        ] {
+            let ctx = DecodeContext { add_path: AddPathFamilies::of(on), ..IBGP4 };
+            let _ = UpdateMessage::decode(&bytes, &ctx);
+            let _ = MpReach::decode_with(&bytes, flag, ctx.add_path);
+            let _ = MpUnreach::decode_with(&bytes, ctx.add_path);
+        }
         let _ = Capability::decode(&mut Reader::new(&bytes));
         let _ = AsPath::decode(&bytes, flag);
         let _ = decode_prefixes(&bytes, Afi::Ipv4);
         let _ = decode_prefixes(&bytes, Afi::Ipv6);
+        let _ = decode_prefixes_with_ids(&bytes, Afi::Ipv4);
+        let _ = decode_prefixes_with_ids(&bytes, Afi::Ipv6);
         let _ = MpReach::decode(&bytes, flag);
         let _ = MpUnreach::decode(&bytes);
     }

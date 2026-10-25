@@ -66,7 +66,7 @@ impl Rib {
             d.destinations += table.len();
             for dest in table.values() {
                 d.candidate_bytes += dest.heap_bytes();
-                for c in dest.routes() {
+                for (c, _) in dest.iter() {
                     d.routes += 1;
                     d.pre_policy += usize::from(c.received.is_some());
                     if by_ptr.insert(Arc::as_ptr(&c.attrs).addr()) {
@@ -198,6 +198,8 @@ mod tests {
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::from_secs(30),
             prefix_limits: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
         }
     }
 
