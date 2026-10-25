@@ -241,6 +241,56 @@ impl Policies for ByState {
     }
 }
 
+/// Policy that sets the validation state too (RFC 6811 §3), from the
+/// lookup and the route: an Invalid route with a MED is taken as Valid,
+/// one without is rejected; a `NotFound` route from the Egp origin is
+/// taken as Invalid, which export then keeps from every peer.
+struct Setter;
+
+impl Policies for Setter {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        match rov {
+            RovState::Invalid if a.med.is_some() => {
+                let mut a = a.clone();
+                a.local_pref = Some(250);
+                Verdict::ModifiedRestated(a, RovState::Valid)
+            }
+            RovState::Invalid => Verdict::Reject,
+            RovState::NotFound if a.origin == Origin::Egp => Verdict::Restated(RovState::Invalid),
+            RovState::Valid => {
+                let mut a = a.clone();
+                a.local_pref = Some(300);
+                Verdict::Modified(a)
+            }
+            RovState::NotFound | RovState::Disabled => Verdict::Accept,
+        }
+    }
+
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        match rov {
+            RovState::Invalid => Verdict::Reject,
+            other => ByState.export(peer, family, prefix, a, other),
+        }
+    }
+}
+
+/// How a test builds its RIB's policies.
+type Policy = fn() -> Box<dyn Policies>;
+
 /// A VRP over the prefixes the steps use: one of them, or 192.0.0.0/16
 /// (index 3) which covers all three, with a maximum length that may be
 /// too short for them, for an AS the paths use.
@@ -305,10 +355,16 @@ fn outcome(rib: &Rib, infos: &[PeerInfo]) -> Outcome {
 /// later one only the prefixes its VRPs differ in from the last, and a
 /// change marked in `merged` is held back and given together with the
 /// next, as a consumer that fell behind would (`ValidationChange`).
-fn interleaved(steps: &[Step], sources: &[VrpSet], at: &[usize], merged: &[bool]) -> Outcome {
+fn interleaved(
+    steps: &[Step],
+    sources: &[VrpSet],
+    at: &[usize],
+    merged: &[bool],
+    policies: Policy,
+) -> Outcome {
     let infos = peers();
     let now = Instant::now();
-    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
+    let mut rib = Rib::with_policies(LOCAL_AS, policies());
     for info in &infos {
         outputs(|o| rib.peer_up(info.clone(), now, o));
     }
@@ -354,10 +410,10 @@ fn interleaved(steps: &[Step], sources: &[VrpSet], at: &[usize], merged: &[bool]
 }
 
 /// The final validation source first, then the decisive steps.
-fn source_first(steps: &[Step], source: Option<&VrpSet>) -> Outcome {
+fn source_first(steps: &[Step], source: Option<&VrpSet>, policies: Policy) -> Outcome {
     let infos = peers();
     let now = Instant::now();
-    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
+    let mut rib = Rib::with_policies(LOCAL_AS, policies());
     if let Some(source) = source {
         outputs(|o| {
             rib.validation_changed(
@@ -392,6 +448,30 @@ fn shuffle<T>(items: &mut [T], seed: u64) {
     }
 }
 
+/// The check of `loc_rib_follows_the_validation_source_in_any_interleaving`
+/// for the policies `policies` builds.
+fn follows_the_source(
+    steps: &[Step],
+    sources: Vec<Vec<Vrp>>,
+    at: &[usize],
+    merged: &[bool],
+    seed: u64,
+    policies: Policy,
+) -> Result<(), TestCaseError> {
+    let sources: Vec<VrpSet> = sources
+        .into_iter()
+        .map(|v| v.into_iter().collect())
+        .collect();
+    let mut at = at[..sources.len()].to_vec();
+    at.sort_unstable();
+    let got = interleaved(steps, &sources, &at, merged, policies);
+    let mut decisive = last_words(steps);
+    shuffle(&mut decisive, seed);
+    let expected = source_first(&decisive, sources.last(), policies);
+    prop_assert_eq!(got, expected);
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -406,15 +486,25 @@ proptest! {
         merged in proptest::collection::vec(any::<bool>(), 4),
         seed in any::<u64>(),
     ) {
-        let sources: Vec<VrpSet> =
-            sources.into_iter().map(|v| v.into_iter().collect()).collect();
-        let mut at = at[..sources.len()].to_vec();
-        at.sort_unstable();
-        let got = interleaved(&steps, &sources, &at, &merged);
-        let mut decisive = last_words(&steps);
-        shuffle(&mut decisive, seed);
-        let expected = source_first(&decisive, sources.last());
-        prop_assert_eq!(got, expected);
+        follows_the_source(&steps, sources, &at, &merged, seed, || Box::new(ByState))?;
+    }
+
+    /// The same, with policy that sets the state of the routes it
+    /// accepts: the state a route holds is a function of its lookup and
+    /// policy, so the lookup is what the source's changes are compared
+    /// with (RFC 6811 §3, §4).
+    #[test]
+    fn loc_rib_follows_the_validation_source_when_policy_sets_states(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+        seed in any::<u64>(),
+    ) {
+        follows_the_source(&steps, sources, &at, &merged, seed, || Box::new(Setter))?;
     }
 }
 

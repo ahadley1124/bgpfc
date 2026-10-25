@@ -26,8 +26,8 @@
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
-//! alone is kept), §3 (policy sees
-//! the validation state, see [`Policies`]), §4 (the affected routes are
+//! alone is kept), §3 (policy sees the validation state and may set it,
+//! see [`Policies`] and [`Verdict`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]);
 //! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
@@ -83,20 +83,48 @@ use pacing::{Clock, Held, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, Member, PeerId, Route, Table};
 
 /// What a policy decided about a route.
+///
+/// RFC 6811 §3 asks that policy can "match and set the validation state of
+/// routes". Matching needs only the state a policy is told; setting is
+/// what [`Verdict::Restated`] and [`Verdict::ModifiedRestated`] carry back
+/// to the RIB, which then holds the route with that state, as its
+/// validation state, in place of the one the lookup gave. A state is
+/// local to the speaker (RFC 6811 §2: "a local property or attribute of
+/// the Route"), so it only means something on import; export policy may
+/// set it for the terms that follow in its own run, and the RIB ignores
+/// what an export verdict restates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Keep the route with its attributes as they are.
     Accept,
     /// Keep the route with these attributes instead.
     Modified(PathAttrs),
+    /// Keep the route with its attributes as they are, and this
+    /// validation state in place of the one it was given (RFC 6811 §3).
+    Restated(RovState),
+    /// Keep the route with these attributes and this validation state.
+    ModifiedRestated(PathAttrs, RovState),
     /// Drop the route.
     Reject,
+}
+
+impl Verdict {
+    /// The validation state this verdict gives the route, if it sets one.
+    #[must_use]
+    pub fn rov(&self) -> Option<RovState> {
+        match self {
+            Verdict::Restated(rov) | Verdict::ModifiedRestated(_, rov) => Some(*rov),
+            Verdict::Accept | Verdict::Modified(_) | Verdict::Reject => None,
+        }
+    }
 }
 
 /// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
 /// policy, §9.1.3 export policy). `peer` is the peer the route came from
 /// on import and the peer it is going to on export. `rov` is the route's
-/// validation state, which policy must be able to match (RFC 6811 §3).
+/// validation state: on import the one the lookup gave it, on export the
+/// one it holds, which import policy may have set. Policy must be able to
+/// match and set it (RFC 6811 §3, see [`Verdict`]).
 pub trait Policies: Send {
     /// Decide whether and how a route held in the Adj-RIB-In becomes a
     /// candidate for the decision process.
@@ -256,7 +284,8 @@ pub struct RouteRef<'a> {
     pub peer: IpAddr,
     /// Its attributes.
     pub attrs: &'a Arc<PathAttrs>,
-    /// Its RFC 6811 §2 validation state.
+    /// Its RFC 6811 §2 validation state: the lookup's, unless import
+    /// policy set another (RFC 6811 §3).
     pub rov: RovState,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
@@ -1064,16 +1093,16 @@ impl Rib {
                 // RFC 7911 §5: the route is the prefix with its Path
                 // Identifier; a newer one for both replaces the older.
                 let path = path_at(path_ids, k);
-                let rov = cx.validation.rov(prefix, origin);
+                let lookup = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
                     &mut cx.interner,
                     info,
                     (family, prefix),
                     &attrs,
-                    rov,
+                    lookup,
                 );
-                match judged.into_route(&attrs, id, rov, aspa) {
+                match judged.into_route(&attrs, id, lookup, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
                         announce(peers, table, family, prefix, route, path, scratch);
@@ -1604,9 +1633,11 @@ impl Sessions {
         let policies = policies.unwrap_or(&*self.cx.policies);
         match policies.export(to, family, prefix, &best.attrs, best.rov) {
             Verdict::Reject => None,
-            Verdict::Accept => export::permitted(family, &best.attrs, to)
+            // RFC 6811 §2: the state is local to the speaker and does not
+            // go to the peer, so a state export policy set is no change.
+            Verdict::Accept | Verdict::Restated(_) => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
-            Verdict::Modified(mut a) => {
+            Verdict::Modified(mut a) | Verdict::ModifiedRestated(mut a, _) => {
                 // RFC 9234 §5: "The operator MUST NOT have the ability to
                 // modify the procedures", and a set attribute "MUST be
                 // preserved unchanged": whatever a policy made of the
@@ -2223,8 +2254,10 @@ fn merge_all(dirty: &mut [Dirty], order: &mut Vec<u32>) {
 
 /// What import policy makes of a route (see [`judge`]).
 enum Judged {
-    /// A candidate for Phase 2, with these attributes.
-    Accepted(Arc<PathAttrs>),
+    /// A candidate for Phase 2, with these attributes and this validation
+    /// state, which is the lookup's unless policy set another (RFC 6811
+    /// §3).
+    Accepted(Arc<PathAttrs>, RovState),
     /// Rejected with the route's validation state, accepted with another:
     /// held in the Adj-RIB-In, and no candidate.
     Held,
@@ -2234,18 +2267,19 @@ enum Judged {
 
 impl Judged {
     /// The route `peer` sent with `received`, as import policy judged it,
-    /// with validation verdicts `rov` and `aspa`; `None` when it is not
-    /// kept.
+    /// with the verdicts of the lookup, `lookup` and `aspa`; `None` when
+    /// it is not kept. A route held for its validation state keeps the
+    /// state of the lookup: it was never given another.
     fn into_route(
         self,
         received: &Arc<PathAttrs>,
         peer: PeerId,
-        rov: RovState,
+        lookup: RovState,
         aspa: AspaState,
     ) -> Option<Route> {
-        let (attrs, held) = match self {
-            Judged::Accepted(a) => (a, false),
-            Judged::Held => (Arc::clone(received), true),
+        let (attrs, rov, held) = match self {
+            Judged::Accepted(a, rov) => (a, rov, false),
+            Judged::Held => (Arc::clone(received), lookup, true),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -2254,6 +2288,7 @@ impl Judged {
             received,
             peer,
             rov,
+            lookup,
             aspa,
             held,
         })
@@ -2261,8 +2296,10 @@ impl Judged {
 }
 
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
-/// sent for `prefix` of `family`, with `attrs` as received and validation
-/// state `rov`, is a candidate for Phase 2, and with which attributes.
+/// sent for `prefix` of `family`, with `attrs` as received and the
+/// validation state `rov` the lookup gave it, is a candidate for Phase 2,
+/// and with which attributes and validation state (RFC 6811 §3: policy
+/// may set the state).
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -2286,12 +2323,11 @@ fn judge(
     rov: RovState,
 ) -> Judged {
     match policies.import(info, family, prefix, attrs, rov) {
-        Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(mut a) => {
-            // RFC 9234 §5: the ingress procedure has run, and no policy
-            // may undo it or change the attribute (see `exported`).
-            a.otc = attrs.otc;
-            Judged::Accepted(interner.intern(a))
+        Verdict::Accept => Judged::Accepted(Arc::clone(attrs), rov),
+        Verdict::Restated(state) => Judged::Accepted(Arc::clone(attrs), state),
+        Verdict::Modified(a) => Judged::Accepted(modified(interner, attrs, a), rov),
+        Verdict::ModifiedRestated(a, state) => {
+            Judged::Accepted(modified(interner, attrs, a), state)
         }
         Verdict::Reject => {
             let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
@@ -2307,4 +2343,13 @@ fn judge(
             }
         }
     }
+}
+
+/// The interned attributes import policy made of a route that arrived with
+/// `received`.
+fn modified(interner: &mut Interner, received: &PathAttrs, mut made: PathAttrs) -> Arc<PathAttrs> {
+    // RFC 9234 §5: the ingress procedure has run, and no policy may undo it
+    // or change the attribute (see `Sessions::exported`).
+    made.otc = received.otc;
+    interner.intern(made)
 }

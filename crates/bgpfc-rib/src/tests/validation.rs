@@ -1030,3 +1030,341 @@ fn a_change_for_the_whole_table_gives_its_room_back() {
     assert!(rib.scratch.dirty.capacity() <= crate::Scratch::KEEP);
     assert!(rib.scratch.released.capacity() <= crate::Scratch::KEEP);
 }
+
+/// Import policy that sets the state of the routes `from` gives to `to`
+/// (RFC 6811 §3), tagging them with `tag` when it does; export policy
+/// that records the state it is told and, when `export_sets`, sets one.
+struct Restate {
+    from: RovState,
+    to: RovState,
+    tag: Option<Community>,
+    export_sets: bool,
+    told: Seen,
+}
+
+impl Policies for Restate {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        self.told.lock().unwrap().push(("import", p, rov));
+        if rov != self.from {
+            return Verdict::Accept;
+        }
+        match self.tag {
+            None => Verdict::Restated(self.to),
+            Some(c) => {
+                let mut a = a.clone();
+                a.communities = a.communities.iter().copied().chain([c]).collect();
+                a.normalise();
+                Verdict::ModifiedRestated(a, self.to)
+            }
+        }
+    }
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        self.told.lock().unwrap().push(("export", p, rov));
+        if self.export_sets {
+            Verdict::Restated(RovState::Invalid)
+        } else {
+            Verdict::Accept
+        }
+    }
+}
+
+fn restating(from: RovState, to: RovState, tag: Option<Community>, told: &Seen) -> Restate {
+    Restate {
+        from,
+        to,
+        tag,
+        export_sets: false,
+        told: Arc::clone(told),
+    }
+}
+
+#[test]
+fn import_policy_sets_the_validation_state_of_a_route() {
+    // RFC 6811 §3: policy can set the state. The route is held with it, the
+    // decision process, export policy and the control plane see it, and the
+    // lookup is what the source is compared with from then on.
+    use RovState::{Invalid, NotFound, Valid};
+    let told = Seen::default();
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(restating(Invalid, Valid, None, &told)));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    let other_as = vrps(&[("192.0.2.0/24", 24, 64_497)]);
+    outputs(|o| rib.validation_changed(all(other_as.clone()), now(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+            now(),
+            o,
+        );
+    });
+    let c = rib.candidates(V4, p("192.0.2.0/24"));
+    assert_eq!((c.len(), c[0].rov), (1, Valid));
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.rov, Valid);
+    let stored = routes(&rib, V4, p("192.0.2.0/24"));
+    assert_eq!((stored[0].1.rov, stored[0].1.lookup), (Valid, Invalid));
+    // Export policy is told the state the route holds, not the lookup.
+    assert_eq!(
+        told.lock().unwrap().clone(),
+        vec![
+            ("import", p("192.0.2.0/24"), Invalid),
+            ("export", p("192.0.2.0/24"), Valid),
+        ]
+    );
+
+    // The same lookup again: nothing is judged again, so there is nothing
+    // to report and policy is not asked.
+    told.lock().unwrap().clear();
+    let out = outputs(|o| rib.validation_changed(all(other_as.clone()), now(), o));
+    assert_eq!(out, vec![]);
+    assert!(told.lock().unwrap().is_empty());
+
+    // The lookup moves from Invalid to NotFound: judged again, and policy
+    // no longer sets a state, so the route holds the lookup's.
+    let none = VrpSet::new();
+    let out = outputs(|o| rib.validation_changed(delta(&other_as, none.clone()), now(), o));
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(
+            1,
+            &[(Invalid, NotFound, 1)],
+            &["192.0.2.0/24"],
+            0
+        ))
+    );
+    let stored = routes(&rib, V4, p("192.0.2.0/24"));
+    assert_eq!((stored[0].1.rov, stored[0].1.lookup), (NotFound, NotFound));
+    assert_eq!(
+        told.lock().unwrap().clone(),
+        vec![
+            ("import", p("192.0.2.0/24"), NotFound),
+            // Its state changed, which export policy may look at: asked
+            // about the route as it was, and as it is.
+            ("export", p("192.0.2.0/24"), Valid),
+            ("export", p("192.0.2.0/24"), NotFound),
+        ]
+    );
+
+    // And back to Invalid: restated to Valid again, though the lookup moved
+    // from NotFound to Invalid, so the report counts the lookup.
+    let out = outputs(|o| rib.validation_changed(delta(&none, other_as), now(), o));
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(
+            1,
+            &[(NotFound, Invalid, 1)],
+            &["192.0.2.0/24"],
+            0
+        ))
+    );
+    let stored = routes(&rib, V4, p("192.0.2.0/24"));
+    assert_eq!((stored[0].1.rov, stored[0].1.lookup), (Valid, Invalid));
+}
+
+#[test]
+fn a_route_given_the_same_state_by_two_lookups_changes_nothing_when_the_lookup_moves() {
+    // The state policy sets is the same before and after the lookup moves,
+    // so the route is the same to the FIB and to export policy: nothing is
+    // installed or sent. The move itself is still a change of the source's
+    // verdict, and counted.
+    use RovState::{Invalid, NotFound, Valid};
+    struct EveryUnknownIsValid;
+    impl Policies for EveryUnknownIsValid {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            rov: RovState,
+        ) -> Verdict {
+            if matches!(rov, Invalid | NotFound) {
+                Verdict::Restated(Valid)
+            } else {
+                Verdict::Accept
+            }
+        }
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
+            Verdict::Accept
+        }
+    }
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(EveryUnknownIsValid));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    outputs(|o| rib.validation_changed(all(VrpSet::new()), now(), o));
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sends(&out, e2.addr).len(), 1);
+    let other_as = vrps(&[("192.0.2.0/24", 24, 64_497)]);
+    let out = outputs(|o| rib.validation_changed(delta(&VrpSet::new(), other_as), now(), o));
+    assert_eq!(
+        report(&out),
+        Some(&revalidation(
+            1,
+            &[(NotFound, Invalid, 1)],
+            &["192.0.2.0/24"],
+            0
+        ))
+    );
+    assert_eq!(fib(&out), vec![]);
+    assert_eq!(sends(&out, e2.addr).len(), 0);
+    assert_eq!(rib.candidates(V4, p("192.0.2.0/24"))[0].rov, Valid);
+}
+
+#[test]
+fn a_route_restated_by_policy_on_arrival_is_not_a_held_one() {
+    // A policy that rejects Invalid routes but sets the state of those it
+    // would reject to NotFound first never rejects them: set and match are
+    // in one run of the policy, so the route is a candidate.
+    use RovState::{Invalid, NotFound};
+    struct SetThenFilter;
+    impl Policies for SetThenFilter {
+        fn import(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            rov: RovState,
+        ) -> Verdict {
+            // The two terms of `set rpki not-found; ...; match rpki
+            // invalid; reject` seen from outside: the state after the
+            // first is what the second tests.
+            let after_set = if rov == Invalid { NotFound } else { rov };
+            if after_set == Invalid {
+                Verdict::Reject
+            } else if after_set != rov {
+                Verdict::Restated(after_set)
+            } else {
+                Verdict::Accept
+            }
+        }
+        fn export(
+            &self,
+            _: &PeerInfo,
+            _: AddressFamily,
+            _: Prefix,
+            _: &PathAttrs,
+            _: RovState,
+        ) -> Verdict {
+            Verdict::Accept
+        }
+    }
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(SetThenFilter));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.validation_changed(all(vrps(&[("192.0.2.0/24", 24, 64_497)])), now(), o));
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+            now(),
+            o,
+        );
+    });
+    let c = rib.candidates(V4, p("192.0.2.0/24"));
+    assert_eq!((c.len(), c[0].rov), (1, NotFound));
+    assert_eq!(
+        routes(&rib, V4, p("192.0.2.0/24"))[0].1.lookup,
+        Invalid,
+        "the lookup is kept beside the state policy set"
+    );
+}
+
+#[test]
+fn a_state_export_policy_sets_is_not_sent_or_kept() {
+    // RFC 6811 §2: the state is local to the speaker. Export policy may
+    // set it for its own later terms, but the route that goes out is the
+    // route's own set, and the route keeps the state it had.
+    let told = Seen::default();
+    let mut rib = Rib::with_policies(
+        LOCAL_AS,
+        Box::new(Restate {
+            from: RovState::Disabled,
+            to: RovState::Disabled,
+            tag: None,
+            export_sets: true,
+            told: Arc::clone(&told),
+        }),
+    );
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    let a = attrs(&[65_001], "10.0.0.1");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), now(), o));
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
+    assert_eq!(
+        rib.candidates(V4, p("192.0.2.0/24"))[0].rov,
+        RovState::Disabled
+    );
+    assert_eq!(
+        rib.adj_rib_out(e2.addr, V4)
+            .map(|(prefix, _)| prefix)
+            .collect::<Vec<_>>(),
+        vec![p("192.0.2.0/24")]
+    );
+}
+
+#[test]
+fn restated_attributes_are_interned_like_any_modified_ones() {
+    // `ModifiedRestated` carries new attributes: they are interned and
+    // shared by the routes that get the same ones, and the Adj-RIB-In
+    // keeps the attributes as received for the next judgment.
+    use RovState::Valid;
+    let tag = Community::new(65_000, 7);
+    let told = Seen::default();
+    let policy = restating(RovState::Disabled, Valid, Some(tag), &told);
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    let a = attrs(&[65_001], "10.0.0.1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+            now(),
+            o,
+        );
+    });
+    let one = rib.candidates(V4, p("192.0.2.0/24"));
+    let two = rib.candidates(V4, p("198.51.100.0/24"));
+    assert_eq!((one[0].rov, two[0].rov), (Valid, Valid));
+    assert_eq!(one[0].attrs.communities.as_ref(), [tag]);
+    assert!(Arc::ptr_eq(one[0].attrs, two[0].attrs));
+    let stored = routes(&rib, V4, p("192.0.2.0/24"));
+    assert_eq!(stored[0].1.received().communities.len(), 0);
+}

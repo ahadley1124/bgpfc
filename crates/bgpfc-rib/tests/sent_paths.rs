@@ -321,8 +321,8 @@ fn expected(
         }
         match policy.export(target, V4, p, c.attrs, c.rov) {
             Verdict::Reject => {}
-            Verdict::Accept => open.push((k, (**c.attrs).clone())),
-            Verdict::Modified(a) => open.push((k, a)),
+            Verdict::Accept | Verdict::Restated(_) => open.push((k, (**c.attrs).clone())),
+            Verdict::Modified(a) | Verdict::ModifiedRestated(a, _) => open.push((k, a)),
         }
     }
     let exportable = open.iter().map(|(_, a)| who(a)).collect();

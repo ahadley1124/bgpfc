@@ -47,9 +47,10 @@ pub struct Revalidation {
     /// Routes held in the Adj-RIBs-In that the change affected, each
     /// validated again.
     pub routes: usize,
-    /// How many of them moved from one RFC 6811 state to another:
-    /// `(from, to, routes)` for each pair that occurred, in the order of
-    /// [`RovState::ALL`] by `from`, then by `to`.
+    /// How many of them moved from one RFC 6811 state to another, as the
+    /// lookup judged them (a state import policy sets, RFC 6811 §3, is not
+    /// the lookup's): `(from, to, routes)` for each pair that occurred, in
+    /// the order of [`RovState::ALL`] by `from`, then by `to`.
     pub changes: Vec<(RovState, RovState, usize)>,
     /// Destinations with a route whose state changed.
     pub destinations: usize,
@@ -258,7 +259,7 @@ impl Pass<'_> {
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let old = dest.best().cloned();
         let mut changed = false;
-        let mut restated = false;
+        let mut lookup_moved = false;
         // Whether a route moved between the candidates and the held
         // routes, and which ones no state admits any more.
         let mut moved = false;
@@ -270,16 +271,19 @@ impl Pass<'_> {
             // RFC 6811 §2, on the route as received, as on its arrival.
             let received = Arc::clone(route.received());
             let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
-            let rov = self.source.rov(prefix, origin);
+            let lookup = self.source.rov(prefix, origin);
             let aspa = self.source.aspa(&received.as_path);
-            if rov == route.rov && aspa == route.aspa {
+            // The lookup is compared with the lookup before it, not with
+            // the state the route holds, which policy may have set
+            // (RFC 6811 §3).
+            if lookup == route.lookup && aspa == route.aspa {
                 continue;
             }
-            if rov != route.rov {
-                self.tally.moved[slot(route.rov)][slot(rov)] += 1;
-                restated = true;
+            if lookup != route.lookup {
+                self.tally.moved[slot(route.lookup)][slot(lookup)] += 1;
+                lookup_moved = true;
             }
-            route.rov = rov;
+            route.lookup = lookup;
             route.aspa = aspa;
             // Always found: the Adj-RIBs-In hold routes only of peers
             // that are up, as a peer's routes go with it.
@@ -293,11 +297,11 @@ impl Pass<'_> {
                 &peer.info,
                 (self.family, prefix),
                 &received,
-                rov,
+                lookup,
             );
-            let (attrs, held) = match judged {
-                Judged::Accepted(attrs) => (attrs, false),
-                Judged::Held => (Arc::clone(&received), true),
+            let (attrs, rov, held) = match judged {
+                Judged::Accepted(attrs, rov) => (attrs, rov, false),
+                Judged::Held => (Arc::clone(&received), lookup, true),
                 // Policy accepted the route with some state when it was
                 // last judged, so only a change of policy since, before
                 // the ROUTE-REFRESH that follows one, can leave none.
@@ -305,9 +309,10 @@ impl Pass<'_> {
                     let n = peer.adj_in_count.or_default(self.family);
                     *n = n.saturating_sub(1);
                     dropped.push((route.peer, id));
-                    (Arc::clone(&received), true)
+                    (Arc::clone(&received), lookup, true)
                 }
             };
+            route.rov = rov;
             let replaced = std::mem::replace(&mut route.attrs, attrs);
             let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
             self.scratch.released.push(replaced);
@@ -329,7 +334,7 @@ impl Pass<'_> {
                 self.scratch.released.extend(r.received);
             }
         }
-        if restated {
+        if lookup_moved {
             self.tally.destinations += 1;
             if self.tally.sample.len() < Revalidation::SAMPLE {
                 self.tally.sample.push(prefix);
