@@ -21,7 +21,7 @@ use bgpfc_bench::table::Table;
 use bgpfc_rib::attrs::announced;
 use bgpfc_rib::decision::{Candidate, Neighbor, best};
 use bgpfc_rib::pacing::default_interval;
-use bgpfc_rib::{Interner, PathAttrs, PeerInfo, Rib};
+use bgpfc_rib::{Enforcement, Interner, PathAttrs, PeerInfo, Rib, RovState};
 use bgpfc_wire::header::HEADER_LEN;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
@@ -290,10 +290,15 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
             timed(|| {
                 for _ in 0..10_000 {
                     let neighbors = black_box(&neighbors);
-                    black_box(best(neighbors.len(), |i| Candidate {
-                        from: neighbors[i],
-                        attrs: &attrs,
-                    }));
+                    black_box(best(
+                        neighbors.len(),
+                        |i| Candidate {
+                            from: neighbors[i],
+                            attrs: &attrs,
+                            rov: RovState::Disabled,
+                        },
+                        Enforcement::Off,
+                    ));
                 }
                 10_000
             }),

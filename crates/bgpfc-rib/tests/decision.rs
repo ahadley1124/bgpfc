@@ -1,7 +1,9 @@
 //! Route selection against a model written from RFC 4271 §9.1.2 and
 //! §9.1.2.2 as literally as the text allows (AGENTS.md §5, `bgpfc-rib`
-//! row), and its independence of the order of the candidates (issue #47:
-//! "deterministic (property-tested over shuffled input orders)").
+//! row), with the validation step of `prefer-valid` before them (RFC 6811
+//! §5, issue #47), and its independence of the order of the candidates
+//! (issue #47: "deterministic (property-tested over shuffled input
+//! orders)").
 //!
 //! The model reads the routes as the test drew them, not through the
 //! crate's accessors, so that it checks those too.
@@ -9,8 +11,8 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use bgpfc_rib::PathAttrs;
 use bgpfc_rib::decision::{Candidate, Neighbor, best};
+use bgpfc_rib::{Enforcement, PathAttrs, RovState};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::mp::NextHop;
@@ -38,29 +40,45 @@ struct Drawn {
     neighbor: usize,
     internal: bool,
     router_id: u32,
+    /// The state the lookup gave it, and the one import policy set.
+    rov: RovState,
+    set: Option<RovState>,
+}
+
+fn state() -> impl Strategy<Value = RovState> {
+    proptest::sample::select(RovState::ALL.to_vec())
 }
 
 fn drawn() -> impl Strategy<Value = Drawn> {
     (
-        proptest::option::of(prop_oneof![Just(50u32), Just(100), Just(200)]),
-        1usize..=3,
-        0u8..3,
-        proptest::option::of(0u32..3),
-        0usize..2,
-        any::<bool>(),
-        1u32..=3,
+        (
+            proptest::option::of(prop_oneof![Just(50u32), Just(100), Just(200)]),
+            1usize..=3,
+            0u8..3,
+            proptest::option::of(0u32..3),
+        ),
+        (0usize..2, any::<bool>(), 1u32..=3),
+        (state(), proptest::option::weighted(0.2, state())),
     )
         .prop_map(
-            |(local_pref, hops, origin, med, neighbor, internal, router_id)| Drawn {
-                local_pref,
-                hops,
-                origin: Origin::from_u8(origin).unwrap(),
-                med,
-                neighbor,
-                internal,
-                router_id,
+            |((local_pref, hops, origin, med), (neighbor, internal, router_id), (rov, set))| {
+                Drawn {
+                    local_pref,
+                    hops,
+                    origin: Origin::from_u8(origin).unwrap(),
+                    med,
+                    neighbor,
+                    internal,
+                    router_id,
+                    rov,
+                    set,
+                }
             },
         )
+}
+
+fn enforcement() -> impl Strategy<Value = Enforcement> {
+    proptest::sample::select(Enforcement::ALL.to_vec())
 }
 
 /// The address of the `i`th peer.
@@ -68,8 +86,9 @@ fn addr(i: usize) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, u8::try_from(i + 1).unwrap()))
 }
 
-/// The neighbor and attributes of route `d` from the `i`th peer.
-fn build(i: usize, d: &Drawn) -> (Neighbor, PathAttrs) {
+/// The neighbor, attributes and the state it is used with of route `d`
+/// from the `i`th peer.
+fn build(i: usize, d: &Drawn) -> (Neighbor, PathAttrs, RovState) {
     let neighbor = NEIGHBORS[d.neighbor];
     let from = Neighbor {
         addr: addr(i),
@@ -98,26 +117,44 @@ fn build(i: usize, d: &Drawn) -> (Neighbor, PathAttrs) {
         large_communities: Box::default(),
         unknown: Box::default(),
     };
-    (from, attrs)
+    (from, attrs, d.set.unwrap_or(d.rov))
 }
 
-/// What `best` chooses among `routes`.
-fn chosen(routes: &[(Neighbor, PathAttrs)]) -> Option<usize> {
-    best(routes.len(), |i| Candidate {
-        from: routes[i].0,
-        attrs: &routes[i].1,
-    })
+/// What `best` chooses among `routes` under `enforcement`.
+fn chosen(routes: &[(Neighbor, PathAttrs, RovState)], enforcement: Enforcement) -> Option<usize> {
+    best(
+        routes.len(),
+        |i| Candidate {
+            from: routes[i].0,
+            attrs: &routes[i].1,
+            rov: routes[i].2,
+        },
+        enforcement,
+    )
 }
 
 /// The route RFC 4271 chooses among `routes`, the `i`th from the `i`th
-/// peer.
-fn model(routes: &[Drawn]) -> Option<usize> {
+/// peer, under `enforcement`.
+fn model(routes: &[Drawn], enforcement: Enforcement) -> Option<usize> {
     let mut considered: Vec<usize> = (0..routes.len()).collect();
     let keep_min = |considered: &mut Vec<usize>, key: &dyn Fn(usize) -> u64| {
         if let Some(min) = considered.iter().map(|&i| key(i)).min() {
             considered.retain(|&i| key(i) == min);
         }
     };
+    // prefer-valid: Valid, then NotFound or not validated (RFC 6811 §2),
+    // then Invalid, by the state policy set if it set one (RFC 6811 §3),
+    // before the degree of preference (issue #47).
+    if enforcement == Enforcement::PreferValid {
+        keep_min(
+            &mut considered,
+            &|i| match routes[i].set.unwrap_or(routes[i].rov) {
+                RovState::Valid => 0,
+                RovState::NotFound | RovState::Disabled => 1,
+                RovState::Invalid => 2,
+            },
+        );
+    }
     // §9.1.2: "select the route that has the highest degree of
     // preference"; §9.1.1: LOCAL_PREF, which bgpfc takes as 100 where
     // nothing set it.
@@ -176,20 +213,24 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
     #[test]
-    fn best_follows_the_rfc_elimination(routes in proptest::collection::vec(drawn(), 0..=6)) {
+    fn best_follows_the_rfc_elimination(
+        routes in proptest::collection::vec(drawn(), 0..=6),
+        e in enforcement(),
+    ) {
         let built: Vec<_> = routes.iter().enumerate().map(|(i, d)| build(i, d)).collect();
-        prop_assert_eq!(chosen(&built), model(&routes));
+        prop_assert_eq!(chosen(&built, e), model(&routes, e));
     }
 
     #[test]
     fn best_is_independent_of_candidate_order(
         routes in proptest::collection::vec(drawn(), 1..=6),
+        e in enforcement(),
         seed in any::<u64>(),
     ) {
         let mut built: Vec<_> = routes.iter().enumerate().map(|(i, d)| build(i, d)).collect();
-        let first = built[chosen(&built).unwrap()].0.addr;
+        let first = built[chosen(&built, e).unwrap()].0.addr;
         shuffle(&mut built, seed);
-        prop_assert_eq!(built[chosen(&built).unwrap()].0.addr, first);
+        prop_assert_eq!(built[chosen(&built, e).unwrap()].0.addr, first);
     }
 }
 
@@ -206,18 +247,21 @@ fn many_candidates_are_chosen_from_like_a_few() {
             neighbor: usize::try_from(i % 2).unwrap(),
             internal: i % 5 == 0,
             router_id: 1 + i % 4,
+            rov: RovState::ALL[usize::try_from(i % 4).unwrap()],
+            set: None,
         })
         .collect();
-    let mut built: Vec<_> = routes
-        .iter()
-        .enumerate()
-        .map(|(i, d)| build(i, d))
-        .collect();
-    let expected = model(&routes).unwrap();
-    assert_eq!(chosen(&built), Some(expected));
-    // Reversed, the same route is chosen, now from the second word.
-    built.reverse();
-    let reversed = built.len() - 1 - expected;
-    assert!(expected < 64 && (64..128).contains(&reversed), "{expected}");
-    assert_eq!(chosen(&built), Some(reversed));
+    for e in Enforcement::ALL {
+        let mut built: Vec<_> = routes
+            .iter()
+            .enumerate()
+            .map(|(i, d)| build(i, d))
+            .collect();
+        let expected = model(&routes, e).unwrap();
+        assert_eq!(chosen(&built, e), Some(expected), "{e}");
+        // Reversed, the same route is chosen.
+        built.reverse();
+        let reversed = built.len() - 1 - expected;
+        assert_eq!(chosen(&built, e), Some(reversed), "{e}");
+    }
 }

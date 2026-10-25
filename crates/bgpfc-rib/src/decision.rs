@@ -10,25 +10,44 @@
 //! specified." Each step keeps, of the routes still under consideration,
 //! those it prefers:
 //!
-//! 1. [`Step::DegreeOfPreference`]: the highest degree of preference
+//! 1. [`Step::Validation`], under `enforcement prefer-valid` only: the
+//!    validation state the route is used with, Valid over `NotFound` (and
+//!    `disabled`) over Invalid.
+//! 2. [`Step::DegreeOfPreference`]: the highest degree of preference
 //!    (§9.1.1, §9.1.2), `LOCAL_PREF` or 100. Phase 2 breaks ties among
 //!    the routes that share it, so it comes first.
-//! 2. [`Step::AsPathLength`]: §9.1.2.2 a), the shortest `AS_PATH`.
-//! 3. [`Step::Origin`]: §9.1.2.2 b), the lowest ORIGIN.
-//! 4. [`Step::Med`]: §9.1.2.2 c), the lowest `MULTI_EXIT_DISC` of each
+//! 3. [`Step::AsPathLength`]: §9.1.2.2 a), the shortest `AS_PATH`.
+//! 4. [`Step::Origin`]: §9.1.2.2 b), the lowest ORIGIN.
+//! 5. [`Step::Med`]: §9.1.2.2 c), the lowest `MULTI_EXIT_DISC` of each
 //!    neighboring AS, among the routes still under consideration only: a
 //!    route an earlier step removed no longer counts, however low its MED.
-//! 5. [`Step::External`]: §9.1.2.2 d), routes received via EBGP over those
+//! 6. [`Step::External`]: §9.1.2.2 d), routes received via EBGP over those
 //!    received via IBGP.
-//! 6. [`Step::InteriorCost`]: §9.1.2.2 e), skipped: there is no IGP to give
+//! 7. [`Step::InteriorCost`]: §9.1.2.2 e), skipped: there is no IGP to give
 //!    a cost.
-//! 7. [`Step::RouterId`]: §9.1.2.2 f), the lowest BGP Identifier.
-//! 8. [`Step::PeerAddress`]: §9.1.2.2 g), the lowest peer address.
+//! 8. [`Step::RouterId`]: §9.1.2.2 f), the lowest BGP Identifier.
+//! 9. [`Step::PeerAddress`]: §9.1.2.2 g), the lowest peer address.
 //!
-//! The order is the RFC's own, and every step is the RFC's, applied as
-//! written, so that bgpfcd chooses as every BGP speaker of the AS that
-//! follows the RFC does (§9.1.2.2: "all the BGP speakers within an
-//! autonomous system ... follow the same route selection algorithm").
+//! Steps 2 to 9 are the RFC's own, in its order, applied as written, so
+//! that bgpfcd chooses as every BGP speaker of the AS that follows the
+//! RFC does (§9.1.2.2: "all the BGP speakers within an autonomous system
+//! ... follow the same route selection algorithm").
+//!
+//! Where the validation state enters (issue #47). RFC 6811 §5 lists
+//! "adjusting a route's degree of preference in the selection algorithm
+//! based on its validation state" among the policies an operator may
+//! configure, and RFC 4271 §9.1.1 lets the local system compute the
+//! degree of preference "based on preconfigured policy information". With
+//! `prefer-valid` the degree of preference is the pair (validation rank,
+//! `LOCAL_PREF`), compared in that order, so the rank is the first step.
+//! Below `LOCAL_PREF` it would fail in the case the mode exists for: a
+//! forged origin heard from a customer, whose routes have the higher
+//! `LOCAL_PREF`, would beat the Valid route from transit. Cisco IOS XE and
+//! XR and Nokia SR OS, the implementations with such a step, put it there
+//! too. The rank travels to no other speaker (RFC 8097 is not
+//! implemented), so internal peers should validate with the same caches
+//! or fold the state into `LOCAL_PREF` by policy instead (`match rpki`,
+//! `set local-pref`), which does travel.
 //!
 //! §9.1.2 also excludes a route whose `NEXT_HOP` cannot be resolved. There
 //! is no IGP here, so every next hop counts as resolvable (COMPLIANCE.md,
@@ -37,6 +56,7 @@
 use std::cmp::{Ordering, Reverse};
 use std::net::IpAddr;
 
+use bgpfc_rpki::{Enforcement, RovState};
 use bgpfc_wire::types::Asn;
 use bgpfc_wire::update::PeerKind;
 
@@ -78,6 +98,9 @@ pub struct Candidate<'a> {
     pub from: Neighbor,
     /// The route's attributes.
     pub attrs: &'a PathAttrs,
+    /// The validation state the route is used with: the one import
+    /// policy set, else the one the lookup gave it (RFC 6811 §3).
+    pub rov: RovState,
 }
 
 /// The `LOCAL_PREF` assumed for routes without one (external routes the
@@ -120,6 +143,14 @@ pub fn path_length(attrs: &PathAttrs) -> usize {
 /// §9.1.2.2: "selects routes to be removed from consideration").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// With `enforcement prefer-valid` only ([`Step::applies`]): the
+    /// highest [`Enforcement::rank`] of the state the route is used with,
+    /// Valid over `NotFound` over Invalid, `disabled` ranking as
+    /// `NotFound` (RFC 6811 §2). RFC 6811 §5: "adjusting a route's degree
+    /// of preference in the selection algorithm based on its validation
+    /// state"; the most significant part of the RFC 4271 §9.1.1 degree of
+    /// preference (see the module docs).
+    Validation,
     /// RFC 4271 §9.1.1, §9.1.2: the highest degree of preference, which is
     /// `LOCAL_PREF`, or [`DEFAULT_LOCAL_PREF`] when unset. Phase 2 breaks
     /// ties among the routes that have it, so it comes first.
@@ -152,7 +183,8 @@ pub enum Step {
 
 /// The steps of route selection, in the order they apply. RFC 4271
 /// §9.1.2.2: "The criteria MUST be applied in the order specified."
-pub const ORDER: [Step; 8] = [
+pub const ORDER: [Step; 9] = [
+    Step::Validation,
     Step::DegreeOfPreference,
     Step::AsPathLength,
     Step::Origin,
@@ -164,6 +196,14 @@ pub const ORDER: [Step; 8] = [
 ];
 
 impl Step {
+    /// Whether this step takes part in route selection under
+    /// `enforcement`: every step does, but [`Step::Validation`] only under
+    /// [`Enforcement::PreferValid`] ([`Enforcement::ranks`]).
+    #[must_use]
+    pub const fn applies(self, enforcement: Enforcement) -> bool {
+        !matches!(self, Step::Validation) || enforcement.ranks()
+    }
+
     /// How this step judges route `a` against route `b`: `Greater` when it
     /// prefers `a`, `Less` when it prefers `b`, `Equal` when it removes
     /// neither for the other.
@@ -193,6 +233,7 @@ impl Step {
     /// and for the interior cost, which finds every route alike.
     fn by_key<'a, W: WithKey<'a>>(self, with: W) -> Option<W::Out> {
         Some(match self {
+            Step::Validation => with.key(|c| Enforcement::rank(c.rov)),
             Step::DegreeOfPreference => with.key(Candidate::degree_of_preference),
             Step::AsPathLength => with.key(|c| Reverse(path_length(c.attrs))),
             Step::Origin => with.key(|c| Reverse(c.attrs.origin)),
@@ -245,14 +286,19 @@ fn med(c: &Candidate<'_>) -> u32 {
 /// apart from the peers they name, so it assembles each on demand.
 ///
 /// Every candidate starts under consideration, and each step of [`ORDER`]
-/// removes from consideration those it does not prefer, until one is
+/// that applies under `enforcement` ([`Step::applies`]) removes from
+/// consideration those it does not prefer, until one is
 /// left (RFC 4271 §9.1.2.2: "The algorithm terminates as soon as only
 /// one route remains in consideration"). After g) one is always left, as
 /// a destination holds at most one route per peer; should two share a
 /// peer, the first is chosen. The outcome does not depend on the order of
 /// the candidates.
 #[must_use]
-pub fn best<'a>(n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> Option<usize> {
+pub fn best<'a>(
+    n: usize,
+    candidate: impl Fn(usize) -> Candidate<'a>,
+    enforcement: Enforcement,
+) -> Option<usize> {
     #[cfg(feature = "profiling")]
     let _span = {
         bgpfc_prof::metrics::BEST_PATH_RUNS.inc();
@@ -266,15 +312,23 @@ pub fn best<'a>(n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> Option<
         // them or neither, so the first step that prefers one chooses it.
         2 => {
             let (a, b) = (candidate(0), candidate(1));
-            let decided = ORDER.iter().map(|s| s.compare(&b, &a)).find(|o| o.is_ne());
+            let decided = ORDER
+                .iter()
+                .filter(|s| s.applies(enforcement))
+                .map(|s| s.compare(&b, &a))
+                .find(|o| o.is_ne());
             Some(usize::from(decided == Some(Ordering::Greater)))
         }
-        _ => Some(eliminate(n, &candidate)),
+        _ => Some(eliminate(n, &candidate, enforcement)),
     }
 }
 
 /// [`best`] of `n` candidates, more than one.
-fn eliminate<'a>(n: usize, candidate: &impl Fn(usize) -> Candidate<'a>) -> usize {
+fn eliminate<'a>(
+    n: usize,
+    candidate: &impl Fn(usize) -> Candidate<'a>,
+    enforcement: Enforcement,
+) -> usize {
     // One bit per candidate: a word on the stack for up to 64, the usual
     // case by far (a route per peer), and the heap only beyond.
     let mut inline = [0u64; 1];
@@ -286,7 +340,7 @@ fn eliminate<'a>(n: usize, candidate: &impl Fn(usize) -> Candidate<'a>) -> usize
         &mut spilled
     };
     let mut considered = Considered::all(words, n);
-    for step in ORDER {
+    for step in ORDER.into_iter().filter(|s| s.applies(enforcement)) {
         if considered.one_left() {
             break;
         }

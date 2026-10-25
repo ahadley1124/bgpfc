@@ -28,7 +28,8 @@
 //! [`Policies`] and [`Imported`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]), §5 (enforcement: Invalid routes left out
-//! of the decision process, see [`Rib::set_enforcement`]).
+//! of the decision process, or Valid ones preferred before anything else,
+//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -703,7 +704,7 @@ impl Rib {
         let addr = self.s.peer(id).info.addr;
         self.s.peer_mut(id).leaving = true;
         for (f, table) in self.tables.iter_mut() {
-            drop_routes(&self.s.peers, table, f, id, scratch);
+            drop_routes(self.s.decide(), table, f, id, scratch);
         }
         // The peer goes with its counts: what the removals added up to
         // must not carry over to the next UPDATE's peer.
@@ -974,6 +975,10 @@ impl Rib {
             self.disable_family(id, d.family, scratch);
         }
         let Sessions { cx, peers, .. } = &mut self.s;
+        let decide = Decide {
+            peers,
+            enforcement: cx.enforcement,
+        };
         // invariant: ids are only handed out for occupied slots.
         let state = peers[id.index()].as_ref().unwrap();
         let info = &state.info;
@@ -992,7 +997,7 @@ impl Rib {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(peers, table, family, prefix, id, scratch);
+                withdraw(decide, table, family, prefix, id, scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
@@ -1013,7 +1018,7 @@ impl Rib {
             if info.is_own_address(&next_hop) {
                 if let Some(table) = self.tables.get_mut(family) {
                     for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 scratch.ignored.push(Output::InvalidNextHop {
@@ -1038,7 +1043,7 @@ impl Rib {
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
                 if let Some(table) = self.tables.get_mut(family) {
                     for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 scratch.released.push(attrs);
@@ -1072,13 +1077,13 @@ impl Rib {
                 match judged.into_route(&attrs, id, rov, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
-                        announce(peers, table, family, prefix, route, scratch);
+                        announce(decide, table, family, prefix, route, scratch);
                     }
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it.
                     None => {
                         if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(peers, table, family, prefix, id, scratch);
+                            withdraw(decide, table, family, prefix, id, scratch);
                         }
                     }
                 }
@@ -1128,7 +1133,7 @@ impl Rib {
         state.adj_in_count.insert(family, 0);
         state.adj_in_held.insert(family, 0);
         if let Some(table) = self.tables.get_mut(family) {
-            drop_routes(&self.s.peers, table, family, id, scratch);
+            drop_routes(self.s.decide(), table, family, id, scratch);
         }
         // The counts are zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
@@ -1413,6 +1418,14 @@ impl Sessions {
         }
     }
 
+    /// What Phase 2 needs of the sessions.
+    fn decide(&self) -> Decide<'_> {
+        Decide {
+            peers: &self.peers,
+            enforcement: self.cx.enforcement,
+        }
+    }
+
     fn route_ref<'a>(&self, r: &'a Route) -> RouteRef<'a> {
         RouteRef {
             peer: self.peer(r.peer).neighbor.addr,
@@ -1440,7 +1453,7 @@ impl Sessions {
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
-        decide(&self.peers, dest);
+        self.decide().run(dest);
         self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
         drop(old);
         self.release_route(removed);
@@ -1844,23 +1857,42 @@ fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
     }
 }
 
-/// Phase 2: put the best of `dest`'s candidates first.
-fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
-    let routes = dest.routes();
-    let best = decision::best(dest.candidates(), |i| Candidate {
-        // invariant: a route's peer slot is occupied (Sessions::peer).
-        from: peers[routes[i].peer.index()].as_ref().unwrap().neighbor,
-        attrs: &routes[i].attrs,
-    });
-    if let Some(i) = best {
-        dest.promote(i);
+/// What Phase 2 needs of the RIB: the peers the routes name, and the
+/// enforcement mode, which may rank the routes by validation state.
+#[derive(Clone, Copy)]
+struct Decide<'a> {
+    peers: &'a [Option<PeerState>],
+    enforcement: Enforcement,
+}
+
+impl Decide<'_> {
+    /// Phase 2: put the best of `dest`'s candidates first.
+    fn run(self, dest: &mut Destination) {
+        let routes = dest.routes();
+        let best = decision::best(
+            dest.candidates(),
+            |i| Candidate {
+                // invariant: a route's peer slot is occupied
+                // (Sessions::peer).
+                from: self.peers[routes[i].peer.index()]
+                    .as_ref()
+                    .unwrap()
+                    .neighbor,
+                attrs: &routes[i].attrs,
+                rov: routes[i].effective_rov(),
+            },
+            self.enforcement,
+        );
+        if let Some(i) = best {
+            dest.promote(i);
+        }
     }
 }
 
 /// Remove every route `id` sent from `table`, a table of `family`, noting
 /// each destination's best route before and after.
 fn drop_routes(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     id: PeerId,
@@ -1873,7 +1905,7 @@ fn drop_routes(
             scratch.note_removed(family, &removed);
             scratch.released.push(removed.attrs);
             scratch.released.extend(removed.received);
-            decide(peers, dest);
+            decide.run(dest);
             scratch.dirty.push(Dirty {
                 family,
                 prefix,
@@ -1889,7 +1921,7 @@ fn drop_routes(
 /// Remove peer `id`'s route to `prefix`, if there is one, and note the
 /// destination's best route before and after.
 fn withdraw(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -1897,13 +1929,13 @@ fn withdraw(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, id, scratch),
-        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, id, scratch),
+        Some(k) => withdraw_in(decide, &mut table.v4, k, family, prefix, id, scratch),
+        None => withdraw_in(decide, &mut table.v6, prefix, family, prefix, id, scratch),
     }
 }
 
 fn withdraw_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -1923,7 +1955,7 @@ fn withdraw_in<K: Ord>(
     scratch.note_removed(family, &removed);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
-    decide(peers, dest);
+    decide.run(dest);
     let new = dest.best().cloned();
     if dest.is_empty() {
         slot.remove();
@@ -1940,7 +1972,7 @@ fn withdraw_in<K: Ord>(
 /// Add or replace `route`'s peer's route to `prefix` and note the
 /// destination's best route before and after.
 fn announce(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -1948,13 +1980,21 @@ fn announce(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(peers, &mut table.v4, k, family, prefix, route, scratch),
-        None => announce_in(peers, &mut table.v6, prefix, family, prefix, route, scratch),
+        Some(k) => announce_in(decide, &mut table.v4, k, family, prefix, route, scratch),
+        None => announce_in(
+            decide,
+            &mut table.v6,
+            prefix,
+            family,
+            prefix,
+            route,
+            scratch,
+        ),
     }
 }
 
 fn announce_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -1994,7 +2034,7 @@ fn announce_in<K: Ord>(
                 scratch.note_added(family, &route);
                 dest.push(route);
             }
-            decide(peers, dest);
+            decide.run(dest);
             (old, dest.best().cloned())
         }
     };

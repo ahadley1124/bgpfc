@@ -31,7 +31,7 @@ use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
 use crate::store::{Destination, PeerId, Route};
 use crate::{
-    Dirty, Held, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
+    Decide, Dirty, Held, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, judge,
 };
 
 /// A table walks its affected destinations in one pass, rather than one
@@ -397,7 +397,11 @@ impl Pass<'_> {
             }
         }
         if done.changed {
-            decide(self.peers, dest);
+            Decide {
+                peers: self.peers,
+                enforcement: self.enforcement,
+            }
+            .run(dest);
             let new = dest.best();
             // A forced pass judges every route again, and most come out
             // as they were: only a destination whose best route is

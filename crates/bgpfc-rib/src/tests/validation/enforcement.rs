@@ -463,3 +463,122 @@ fn a_flapping_vrp_set_sends_at_most_one_announcement_and_one_withdrawal_per_inte
         assert_eq!((announced, withdrawn), (1, 1), "{window}: {heard:?}");
     }
 }
+
+#[test]
+fn prefer_valid_uses_the_state_import_policy_set() {
+    // RFC 6811 §3: the state import policy set is the one the route is
+    // ranked with. e1's route is Invalid but used as Valid, e3's is Valid:
+    // ranked as used they tie, and e1's lower router ID wins; ranked as
+    // looked up, e3's would.
+    let mut rib = Rib::with_policies(
+        LOCAL_AS,
+        Box::new(Override::new(RovState::Invalid, RovState::Valid)),
+    );
+    outputs(|o| rib.set_enforcement(PreferValid, now(), o));
+    let (e1, _) = two_peers(&mut rib);
+    let e3 = peer("10.0.0.3", 65_003, 3);
+    outputs(|o| rib.peer_up(e3.clone(), now(), o));
+    outputs(|o| rib.validation_changed(all(other_origin()), now(), o));
+    send(&mut rib, &e1, &["192.0.2.0/24"]);
+    // From AS 64497, the ROA's: Valid.
+    outputs(|o| {
+        rib.update(
+            e3.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_003, 64_497], "10.0.0.3")),
+            now(),
+            o,
+        );
+    });
+    // Both Valid as used: the router ID decides, e1's route.
+    let best = rib.loc_rib(V4).next().unwrap().1;
+    assert_eq!(
+        (best.peer, best.rov, best.effective_rov()),
+        (e1.addr, RovState::Invalid, RovState::Valid)
+    );
+    // Without the override, e1's route is Invalid and ranks last.
+    rib.set_policies(Box::new(crate::AcceptAll), &[], now(), &mut Vec::new());
+    let out = send(&mut rib, &e1, &["192.0.2.0/24"]);
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e3.addr);
+    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.3")));
+}
+
+#[test]
+fn prefer_valid_switch_redecides_without_holding_anything() {
+    // Switching to prefer-valid ranks the routes again: the Valid route
+    // takes over from the Invalid one with the higher LOCAL_PREF, and no
+    // route is held. Back to off, LOCAL_PREF decides again.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RaiseFrom("10.0.0.1".parse().unwrap())));
+    let (e1, e2) = two_peers(&mut rib);
+    let e3 = peer("10.0.0.3", 65_003, 3);
+    outputs(|o| rib.peer_up(e3.clone(), now(), o));
+    outputs(|o| rib.validation_changed(all(other_origin()), now(), o));
+    send(&mut rib, &e1, &["192.0.2.0/24"]);
+    outputs(|o| {
+        rib.update(
+            e3.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_003, 64_497], "10.0.0.3")),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e1.addr);
+    let out = outputs(|o| rib.set_enforcement(PreferValid, now(), o));
+    assert_eq!(
+        *rejudged(&out),
+        Rejudged {
+            from: Off,
+            to: PreferValid,
+            routes: 2,
+            held: 0,
+            released: 0,
+            best_changed: 1,
+        }
+    );
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("10.0.0.3")),
+            previous: Some(ip("10.0.0.1")),
+        }]
+    );
+    assert_eq!(sent(&out, &e2).0, vec![p("192.0.2.0/24")]);
+    assert_eq!(rib.held(V4).count(), 0);
+    assert_eq!(rib.candidates(V4, p("192.0.2.0/24")).len(), 2);
+    let out = outputs(|o| rib.set_enforcement(Off, now(), o));
+    assert_eq!(rejudged(&out).best_changed, 1);
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e1.addr);
+}
+
+/// Import policy that gives the routes of one peer `LOCAL_PREF` 200.
+struct RaiseFrom(IpAddr);
+
+impl Policies for RaiseFrom {
+    fn import(
+        &self,
+        from: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        _: RovState,
+    ) -> Imported {
+        if from.addr != self.0 {
+            return Verdict::Accept.into();
+        }
+        let mut a = a.clone();
+        a.local_pref = Some(200);
+        Verdict::Modified(a).into()
+    }
+
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
+    }
+}
