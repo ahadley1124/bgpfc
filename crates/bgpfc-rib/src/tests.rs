@@ -1120,7 +1120,7 @@ fn routes_sharing_attributes_share_one_exported_set_per_peer() {
     let _ = outputs(|o| rib.update(e1.addr, &announce(&prefixes, &a), o));
     // RFC 4271 §5.1: the rewrite differs by peer; within a peer, the
     // three routes share one set.
-    let sent = |to: &PeerInfo| {
+    let sent = |rib: &Rib, to: &PeerInfo| {
         let out: Vec<Arc<PathAttrs>> = rib
             .adj_rib_out(to.addr, V4)
             .map(|(_, a)| Arc::clone(a))
@@ -1129,12 +1129,20 @@ fn routes_sharing_attributes_share_one_exported_set_per_peer() {
         assert!(out.iter().all(|x| Arc::ptr_eq(x, &out[0])));
         Arc::clone(&out[0])
     };
-    let (external, internal) = (sent(&e2), sent(&i1));
+    let (external, internal) = (sent(&rib, &e2), sent(&rib, &i1));
     assert_eq!(external.as_path.first_asn(), Some(LOCAL_AS));
     assert_eq!(external.local_pref, None);
     assert_eq!(internal.as_path.first_asn(), Some(Asn(65_001)));
     assert_eq!(internal.local_pref, Some(100));
-    drop((external, internal));
+    // The same for a peer sent the whole table when it comes up, and the
+    // rewrites kept for that pass are dropped after it.
+    let e3 = peer("10.0.0.4", 65_003, 4);
+    let _ = outputs(|o| rib.peer_up(e3.clone(), o));
+    let late = sent(&rib, &e3);
+    assert_eq!(late.as_path.first_asn(), Some(LOCAL_AS));
+    let id = rib.s.id(e3.addr).unwrap();
+    assert!(rib.s.peer(id).memo.pass.is_none());
+    drop((external, internal, late));
     // Withdrawn, every set goes with its last route: the memo of the
     // last rewrite holds none of them.
     let _ = outputs(|o| rib.update(e1.addr, &withdraw(&prefixes), o));

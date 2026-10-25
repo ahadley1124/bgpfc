@@ -157,19 +157,29 @@ struct PeerState {
     adj_out: FamilyMap<AdjOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: FamilyMap<usize>,
-    /// The last rewrite of attributes for this peer.
-    memo: Option<ExportMemo>,
+    /// Recent rewrites of attributes for this peer.
+    memo: ExportMemo,
 }
 
-/// The last session rewrite (RFC 4271 §5.1) of attributes an export
-/// policy accepted unchanged, for one peer. It depends on nothing else
-/// that changes during the session, and the routes of one UPDATE share
-/// their attributes, so the next route mostly needs the same: the rewrite
-/// and the interner lookup run once per attribute set, not once per
-/// route. Both sets are held weakly, so the interner's counts (see
-/// `Interner::release`) do not see the memo, and an allocation it points
-/// to cannot be reused for other attributes while it does.
+/// Session rewrites (RFC 4271 §5.1) of attributes an export policy
+/// accepted unchanged, for one peer. They depend on nothing else that
+/// changes during the session, and routes share attribute sets, so the
+/// rewrite and the interner lookup can run once per set rather than once
+/// per route. The routes of one UPDATE share their set, so the last
+/// rewrite is kept. A full pass over the table (initial Adj-RIB-Out,
+/// refresh) meets the sets in prefix order instead, so for its duration
+/// every rewrite is kept, by the address of the source set. The sets are
+/// held weakly, so the interner's counts (see `Interner::release`) do not
+/// see the memo, and an allocation it points to cannot be reused for
+/// other attributes while it does.
+#[derive(Default)]
 struct ExportMemo {
+    last: Option<Rewrite>,
+    pass: Option<HashMap<usize, Rewrite>>,
+}
+
+#[derive(Clone)]
+struct Rewrite {
     family: AddressFamily,
     source: Source,
     attrs: Weak<PathAttrs>,
@@ -177,10 +187,35 @@ struct ExportMemo {
     exported: Option<Weak<PathAttrs>>,
 }
 
-impl ExportMemo {
-    /// Whether the memo is about `attrs` from `source`.
+impl Rewrite {
     fn is_for(&self, family: AddressFamily, source: Source, attrs: &Arc<PathAttrs>) -> bool {
         self.family == family && self.source == source && self.attrs.as_ptr() == Arc::as_ptr(attrs)
+    }
+}
+
+impl ExportMemo {
+    fn find(
+        &self,
+        family: AddressFamily,
+        source: Source,
+        attrs: &Arc<PathAttrs>,
+    ) -> Option<&Rewrite> {
+        if let Some(r) = &self.last
+            && r.is_for(family, source, attrs)
+        {
+            return Some(r);
+        }
+        self.pass
+            .as_ref()?
+            .get(&Arc::as_ptr(attrs).addr())
+            .filter(|r| r.is_for(family, source, attrs))
+    }
+
+    fn keep(&mut self, r: Rewrite) {
+        if let Some(pass) = &mut self.pass {
+            pass.insert(r.attrs.as_ptr().addr(), r.clone());
+        }
+        self.last = Some(r);
     }
 }
 
@@ -318,7 +353,7 @@ impl Rib {
             disabled: Vec::new(),
             adj_out: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
-            memo: None,
+            memo: ExportMemo::default(),
         });
         for family in families {
             self.refresh(addr, family, out);
@@ -375,13 +410,10 @@ impl Rib {
             return;
         }
         let mut batch = Batch::default();
-        let mut adj_out = self
-            .s
-            .peer_mut(id)
-            .adj_out
-            .remove(family)
-            .unwrap_or_default();
+        let state = self.s.peer_mut(id);
+        let mut adj_out = state.adj_out.remove(family).unwrap_or_default();
         adj_out.clear();
+        state.memo.pass = Some(HashMap::new());
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
                 if let Some(a) = self.s.exported(family, prefix, dest.best(), id) {
@@ -391,6 +423,7 @@ impl Rib {
             }
         }
         let state = self.s.peer_mut(id);
+        state.memo.pass = None;
         state.adj_out.insert(family, adj_out);
         Sessions::encode(&state.info, family, &batch, out);
     }
@@ -406,12 +439,9 @@ impl Rib {
             return;
         }
         let mut batch = Batch::default();
-        let mut adj_out = self
-            .s
-            .peer_mut(id)
-            .adj_out
-            .remove(family)
-            .unwrap_or_default();
+        let state = self.s.peer_mut(id);
+        let mut adj_out = state.adj_out.remove(family).unwrap_or_default();
+        state.memo.pass = Some(HashMap::new());
         // Phase 3 keeps every Adj-RIB-Out entry on a destination that has
         // a best route, so one pass over the table visits all of them.
         if let Some(table) = self.tables.get(family) {
@@ -436,6 +466,7 @@ impl Rib {
             }
         }
         let state = self.s.peer_mut(id);
+        state.memo.pass = None;
         state.adj_out.insert(family, adj_out);
         Sessions::encode(&state.info, family, &batch, out);
     }
@@ -830,9 +861,7 @@ impl Sessions {
         let attrs: &PathAttrs = match cx.policies.export(to, family, prefix, &best.attrs) {
             Verdict::Reject => return None,
             Verdict::Accept => {
-                if let Some(m) = &state.memo
-                    && m.is_for(family, source, &best.attrs)
-                {
+                if let Some(m) = state.memo.find(family, source, &best.attrs) {
                     // Not advertised, or the set: unless it has gone
                     // (no route uses it any more), then it is worked out
                     // again.
@@ -843,7 +872,7 @@ impl Sessions {
                 }
                 let exported = export::export(cx.local_as, family, source, &best.attrs, to)
                     .map(|a| cx.interner.intern(a));
-                state.memo = Some(ExportMemo {
+                state.memo.keep(Rewrite {
                     family,
                     source,
                     attrs: Arc::downgrade(&best.attrs),
