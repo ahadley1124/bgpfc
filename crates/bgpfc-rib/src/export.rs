@@ -125,6 +125,9 @@ pub fn prepend(as_path: &AsPath, asn: Asn) -> AsPath {
     let mut path = as_path.clone();
     match path.segments.first_mut() {
         Some(seg) if seg.kind == SegmentType::Sequence && seg.asns.len() < 255 => {
+            // One more, not double: the set is kept for as long as routes
+            // are exported with it, once per peer.
+            seg.asns.reserve_exact(1);
             seg.asns.insert(0, asn);
         }
         _ => path.segments.insert(

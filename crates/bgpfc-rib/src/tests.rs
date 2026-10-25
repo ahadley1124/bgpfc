@@ -434,6 +434,9 @@ fn prepend_respects_segment_limit_and_sets() {
     let p2 = prepend(&p1, Asn(2));
     assert_eq!(p2.segments.len(), 1);
     assert_eq!(p2.asns().collect::<Vec<_>>(), vec![Asn(2), Asn(1)]);
+    // Sized exactly: exported sets are kept as long as their routes.
+    let five = prepend(&AsPath::sequence(&[Asn(9); 4]), Asn(1));
+    assert_eq!(five.segments[0].asns.capacity(), 5);
     let full = AsPath::sequence(&vec![Asn(9); 255]);
     let p3 = prepend(&full, Asn(1));
     assert_eq!(p3.segments.len(), 2);
