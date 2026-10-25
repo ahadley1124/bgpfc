@@ -856,3 +856,210 @@ fn prefix_limit_and_restart_limit_with_bird() {
     let (out, _) = ctl(&["show", "routes"]);
     assert!(out.contains("203.0.113.0/24"), "{out}");
 }
+
+/// The AS paths in `birdc show route all` output, one per route, in the
+/// order BIRD lists them.
+fn as_paths(routes: &str) -> Vec<String> {
+    routes
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("BGP.as_path: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The AS of the BIRD that sends several paths in `add_path_with_bird`.
+const BIRD_C_AS: u32 = 65_002;
+
+/// bgpfcd between BIRD in C, which sends it three paths to one prefix, and
+/// BIRD in B, which takes them.
+struct PathLab {
+    bird_b: Bird,
+    bird_c: Bird,
+    bgpfcd: interop::Daemon,
+    socket: std::path::PathBuf,
+    /// Last, so that the namespaces go after the daemons in them.
+    lab: Lab,
+}
+
+/// What BIRD in B has for the prefix when it has all three paths: bgpfcd's
+/// AS in front of each.
+const ALL_THREE: [&str; 3] = [
+    "65000 65002",
+    "65000 65002 64999",
+    "65000 65002 64999 64998",
+];
+
+impl PathLab {
+    /// Start the three and wait for both sessions.
+    fn start(tag: &str, subnet: u8) -> PathLab {
+        let mut lab = Lab::new(tag, subnet);
+        let ns_c = lab.add_c();
+        let bird_c = Bird::three_paths(&lab, &ns_c, BIRD_C_AS);
+        let bird_b = Bird::start(
+            &lab,
+            &lab.b.clone(),
+            &BirdOpts {
+                channel: "add paths rx;".to_owned(),
+                ..bird_opts(&lab, true, &[])
+            },
+        );
+        let socket = lab.dir.join("ctl.sock");
+        let to_b = NeighborOpts {
+            advertisement_interval: Some(1),
+            extra: "add-path send ipv4-unicast all;".to_owned(),
+            ..NeighborOpts::new(lab.b_addr, BIRD_AS)
+        };
+        let to_c = NeighborOpts {
+            extra: "add-path receive ipv4-unicast yes;".to_owned(),
+            ..NeighborOpts::new(lab.c_addr, BIRD_C_AS)
+        };
+        let bgpfcd = start_bgpfcd(
+            &lab,
+            &lab.a.clone(),
+            &BgpfcdOpts {
+                local_as: BGPFC_AS,
+                router_id: lab.a_addr,
+                listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
+                neighbors: vec![to_b, to_c],
+                extra: format!("control {{ socket {}; }}", socket.display()),
+            },
+        );
+        let ok = wait_for(ESTABLISH, || {
+            bgpfcd.log_text().matches("session established").count() == 2
+        });
+        assert!(ok, "{}", bgpfcd.log_text());
+        PathLab {
+            bird_b,
+            bird_c,
+            bgpfcd,
+            socket,
+            lab,
+        }
+    }
+
+    fn ctl(&self, args: &[&str]) -> (String, bool) {
+        interop::bgpfcctl(&self.socket, args)
+    }
+
+    /// bgpfcd's candidate routes to the prefix.
+    fn candidates(&self) -> String {
+        self.ctl(&["show", "routes", "192.0.2.0/24"]).0
+    }
+
+    /// The AS paths BIRD in B has for the prefix, sorted.
+    fn paths_b(&self) -> Vec<String> {
+        let mut v = as_paths(
+            &self
+                .bird_b
+                .birdc(&self.lab, &["show", "route", "all", "192.0.2.0/24"]),
+        );
+        v.sort();
+        v
+    }
+
+    /// Wait until BIRD in B has exactly the paths `want`.
+    fn wait_for_paths_b(&self, want: &[&str]) {
+        let mut want: Vec<String> = want.iter().map(|p| (*p).to_owned()).collect();
+        want.sort();
+        let ok = wait_for(Duration::from_secs(30), || self.paths_b() == want);
+        assert!(
+            ok,
+            "wanted {want:?}, has {:?}\n{}\n{}",
+            self.paths_b(),
+            self.bird_b.birdc(&self.lab, &["show", "route", "all"]),
+            self.bgpfcd.log_text()
+        );
+    }
+
+    /// Change `add-path send ipv4-unicast OLD;` to `NEW` in the file and
+    /// reload: no session resets.
+    fn reload_send(&self, old: &str, new: &str) {
+        let cfg_path = self.lab.dir.join(format!("bgpfcd-{}.conf", self.lab.a));
+        let cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        let from = format!("add-path send ipv4-unicast {old};");
+        assert!(cfg.contains(&from), "{cfg}");
+        let to = format!("add-path send ipv4-unicast {new};");
+        std::fs::write(&cfg_path, cfg.replace(&from, &to)).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok && out.contains("paths 1"), "{out}");
+        let log = self.bgpfcd.log_text();
+        assert_eq!(log.matches("session established").count(), 2, "{log}");
+    }
+}
+
+/// RFC 7911 with BIRD in both directions, over one prefix with three
+/// paths. BIRD in C sends bgpfcd all three (`add paths tx`; bgpfcd has
+/// `add-path receive`), and bgpfcd sends them on to BIRD in B (`add paths
+/// rx`; bgpfcd has `add-path send all`). The FIB still gets one route. A
+/// path BIRD withdraws is withdrawn from B by the identifier bgpfcd gave
+/// it, and a reload to `add-path send 1`, then `2`, leaves B with the best
+/// path, then the best two.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn add_path_with_bird_in_both_directions() {
+    let t = PathLab::start("a", 21);
+    let to_b = t.lab.b_addr.to_string();
+
+    // RFC 7911 §4, §5: both capabilities were exchanged, in the direction
+    // each needs.
+    let (out, ok) = t.ctl(&["show", "neighbor", &t.lab.c_addr.to_string()]);
+    assert!(
+        ok && out.contains("add-path receive ipv4-unicast send none"),
+        "{out}"
+    );
+    let (out, ok) = t.ctl(&["show", "neighbor", &to_b]);
+    assert!(
+        ok && out.contains("add-path receive none send ipv4-unicast=all"),
+        "{out}"
+    );
+
+    // BIRD C -> bgpfcd: all three paths are kept, each under the
+    // identifier BIRD sent it with (§3), and one is best.
+    let ok = wait_for(Duration::from_secs(20), || {
+        t.candidates().matches(" id ").count() == 3
+    });
+    assert!(
+        ok,
+        "{}\n--- bird c ---\n{}\n{}",
+        t.candidates(),
+        t.bird_c.peer_status(&t.lab),
+        t.bgpfcd.log_text()
+    );
+    let routes = t.candidates();
+    assert_eq!(routes.matches("*192.0.2.0/24").count(), 1, "{routes}");
+    // The best is the shortest AS path (RFC 4271 §9.1.2.2 a).
+    let best = routes.lines().find(|l| l.starts_with('*')).unwrap();
+    assert!(best.contains(" 65002 via "), "{routes}");
+    // The kernel gets one route, whatever the number of paths.
+    let (fib, ok) = t.ctl(&["show", "fib"]);
+    assert!(ok && fib.matches("192.0.2.0/24").count() == 1, "{fib}");
+
+    // bgpfcd -> BIRD B: all three.
+    t.wait_for_paths_b(&ALL_THREE);
+    let (out, ok) = t.ctl(&["show", "neighbor", &to_b]);
+    assert!(
+        ok && out.contains("ipv4-unicast received 0 advertised 3"),
+        "{out}"
+    );
+
+    // BIRD C withdraws the middle path: bgpfcd withdraws that path from B
+    // by the identifier it gave it (§5), and B keeps the other two.
+    let _ = t.bird_c.birdc(&t.lab, &["disable", "long"]);
+    t.wait_for_paths_b(&["65000 65002", "65000 65002 64999 64998"]);
+    let ok = wait_for(Duration::from_secs(10), || {
+        t.candidates().matches(" id ").count() == 2
+    });
+    assert!(ok, "{}", t.candidates());
+    // It comes back as a path of its own.
+    let _ = t.bird_c.birdc(&t.lab, &["enable", "long"]);
+    t.wait_for_paths_b(&ALL_THREE);
+
+    // A reload that sends the best path alone applies at once, without a
+    // reset, and withdraws the other two from B; then two of the three.
+    t.reload_send("all", "1");
+    t.wait_for_paths_b(&["65000 65002"]);
+    let (out, ok) = t.ctl(&["show", "neighbor", &to_b]);
+    assert!(ok && out.contains("send ipv4-unicast=1"), "{out}");
+    t.reload_send("1", "2");
+    t.wait_for_paths_b(&["65000 65002", "65000 65002 64999"]);
+}
