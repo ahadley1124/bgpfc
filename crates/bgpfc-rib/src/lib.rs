@@ -22,7 +22,7 @@
 //! RFC 7911 §2, §3, §5 (the Adj-RIB-In keeps each path a peer sends under
 //! its Path Identifier and every one takes part in the decision process;
 //! a peer that takes several paths is sent the `n` best or all of them,
-//! each with an identifier of ours, see [`addpath`]);
+//! each with an identifier of ours, see the private `addpath` module);
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
