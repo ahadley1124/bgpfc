@@ -69,6 +69,7 @@ impl Packer {
             ctx: EncodeContext {
                 four_octet_as,
                 extended_next_hop: false,
+                add_path: bgpfc_wire::update::AddPathFamilies::NONE,
             },
             max_len: if extended { 65_535 } else { 4_096 },
         }
@@ -286,6 +287,7 @@ mod tests {
         peer: PeerKind::External,
         allow_as_set: false,
         extended_next_hop: false,
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
 
     /// Decode one framed message with the daemon's decoder.

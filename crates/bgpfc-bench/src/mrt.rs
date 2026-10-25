@@ -349,6 +349,7 @@ fn attr_set(raw: &[u8], prefix: &Prefix) -> Option<AttrSet> {
         peer: PeerKind::External,
         allow_as_set: false,
         extended_next_hop: false,
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
     let decoded = UpdateMessage::decode(&body, &ctx).ok()?;
     if decoded.treated_as_withdraw.is_some() {

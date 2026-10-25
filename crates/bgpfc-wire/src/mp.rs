@@ -6,14 +6,19 @@
 //! NLRI, told apart by its length), §4 (only once negotiated); RFC 7606
 //! §5.3 (minimum lengths, NLRI syntax), §7.11 (next hop length); RFC 4271
 //! §6.3 (a next hop is a valid IP host address), which RFC 4760 §3 applies
-//! to the next hop of `MP_REACH_NLRI` as well.
+//! to the next hop of `MP_REACH_NLRI` as well; RFC 7911 §3 (a Path
+//! Identifier before each NLRI tuple of a family with ADD-PATH).
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::prefix::{NlriError, Prefix, decode_prefixes, encode_prefixes};
+use crate::prefix::{
+    NlriError, Prefix, decode_prefixes, decode_prefixes_with_ids, encode_prefixes,
+    encode_prefixes_with_ids,
+};
 use crate::reader::{Reader, WriteBytes as _};
-use crate::types::{AddressFamily, Afi, Safi};
+use crate::types::{AddressFamily, Afi, PathId, Safi};
+use crate::update::AddPathFamilies;
 
 /// Network Address of Next Hop (RFC 4760 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -195,6 +200,21 @@ impl MpReach {
     /// §7.11, or carries a family this implementation cannot parse
     /// (anything but IPv4 and IPv6 unicast).
     pub fn decode(value: &[u8], extended_next_hop: bool) -> Result<MpReach, MpError> {
+        MpReach::decode_with(value, extended_next_hop, AddPathFamilies::NONE).map(|(m, _)| m)
+    }
+
+    /// As [`MpReach::decode`], for a session on which the families in
+    /// `add_path` carry a Path Identifier before each NLRI tuple (RFC 7911
+    /// §3): the identifiers come back beside the attribute, one per prefix
+    /// of `nlri`, and empty when the attribute's family has none.
+    ///
+    /// # Errors
+    /// As [`MpReach::decode`].
+    pub fn decode_with(
+        value: &[u8],
+        extended_next_hop: bool,
+        add_path: AddPathFamilies,
+    ) -> Result<(MpReach, Vec<PathId>), MpError> {
         if value.len() < MP_REACH_MIN_LEN {
             return Err(MpError::TooShort {
                 len: value.len(),
@@ -222,23 +242,44 @@ impl MpReach {
             family,
             len: nh_len,
         })?;
-        let nlri = decode_prefixes(r.rest(), afi).map_err(MpError::Nlri)?;
-        Ok(MpReach {
-            family,
-            next_hop,
-            nlri,
-        })
+        let (nlri, ids) = if add_path.contains(family) {
+            decode_prefixes_with_ids(r.rest(), afi).map_err(MpError::Nlri)?
+        } else {
+            (
+                decode_prefixes(r.rest(), afi).map_err(MpError::Nlri)?,
+                Vec::new(),
+            )
+        };
+        Ok((
+            MpReach {
+                family,
+                next_hop,
+                nlri,
+            },
+            ids,
+        ))
     }
 
     /// Append the attribute value: AFI, SAFI, next hop length, next hop, a
     /// zero reserved octet, NLRI (RFC 4760 §3).
     pub fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_with(&[], out);
+    }
+
+    /// As [`MpReach::encode`], with a Path Identifier before each NLRI
+    /// tuple when `ids` is not empty (RFC 7911 §3); `ids[i]` goes with
+    /// `nlri[i]`, so it must be as long as `nlri`.
+    pub fn encode_with(&self, ids: &[PathId], out: &mut Vec<u8>) {
         out.put_u16(self.family.afi.to_u16());
         out.put_u8(self.family.safi.to_u8());
         out.put_u8(self.next_hop.wire_len());
         self.next_hop.encode(out);
         out.put_u8(0);
-        encode_prefixes(&self.nlri, out);
+        if ids.is_empty() {
+            encode_prefixes(&self.nlri, out);
+        } else {
+            encode_prefixes_with_ids(&self.nlri, ids, out);
+        }
     }
 }
 
@@ -249,6 +290,20 @@ impl MpUnreach {
     /// [`MpError`] when shorter than three octets, of an unsupported family,
     /// or with syntactically incorrect NLRI (RFC 7606 §5.3).
     pub fn decode(value: &[u8]) -> Result<MpUnreach, MpError> {
+        MpUnreach::decode_with(value, AddPathFamilies::NONE).map(|(m, _)| m)
+    }
+
+    /// As [`MpUnreach::decode`], for a session on which the families in
+    /// `add_path` carry a Path Identifier before each NLRI tuple (RFC 7911
+    /// §3): the identifiers come back beside the attribute, one per
+    /// withdrawn prefix, and empty when the attribute's family has none.
+    ///
+    /// # Errors
+    /// As [`MpUnreach::decode`].
+    pub fn decode_with(
+        value: &[u8],
+        add_path: AddPathFamilies,
+    ) -> Result<(MpUnreach, Vec<PathId>), MpError> {
         if value.len() < MP_UNREACH_MIN_LEN {
             return Err(MpError::TooShort {
                 len: value.len(),
@@ -262,16 +317,34 @@ impl MpUnreach {
         if !supported(family) {
             return Err(MpError::UnsupportedFamily(family));
         }
-        let withdrawn = decode_prefixes(r.rest(), afi).map_err(MpError::Nlri)?;
-        Ok(MpUnreach { family, withdrawn })
+        let (withdrawn, ids) = if add_path.contains(family) {
+            decode_prefixes_with_ids(r.rest(), afi).map_err(MpError::Nlri)?
+        } else {
+            (
+                decode_prefixes(r.rest(), afi).map_err(MpError::Nlri)?,
+                Vec::new(),
+            )
+        };
+        Ok((MpUnreach { family, withdrawn }, ids))
     }
 
     /// Append the attribute value: AFI, SAFI, withdrawn routes
     /// (RFC 4760 §4).
     pub fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_with(&[], out);
+    }
+
+    /// As [`MpUnreach::encode`], with a Path Identifier before each tuple
+    /// when `ids` is not empty (RFC 7911 §3); `ids[i]` goes with
+    /// `withdrawn[i]`, so it must be as long as `withdrawn`.
+    pub fn encode_with(&self, ids: &[PathId], out: &mut Vec<u8>) {
         out.put_u16(self.family.afi.to_u16());
         out.put_u8(self.family.safi.to_u8());
-        encode_prefixes(&self.withdrawn, out);
+        if ids.is_empty() {
+            encode_prefixes(&self.withdrawn, out);
+        } else {
+            encode_prefixes_with_ids(&self.withdrawn, ids, out);
+        }
     }
 }
 

@@ -77,6 +77,7 @@ const CTX: DecodeContext = DecodeContext {
     peer: PeerKind::External,
     allow_as_set: false,
     extended_next_hop: false,
+    add_path: bgpfc_wire::update::AddPathFamilies::NONE,
 };
 
 fn peer() -> PeerInfo {

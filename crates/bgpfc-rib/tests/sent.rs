@@ -175,6 +175,7 @@ fn deliver(out: Vec<Output>, infos: &[PeerInfo], views: &mut [BTreeMap<Prefix, P
             peer: infos[i].kind,
             allow_as_set: false,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         };
         for m in messages {
             let d = UpdateMessage::decode(&m[HEADER_LEN..], &ctx).unwrap();

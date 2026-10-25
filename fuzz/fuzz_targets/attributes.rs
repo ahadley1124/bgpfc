@@ -8,9 +8,10 @@ use bgpfc_wire::community::{
     decode_communities, decode_extended_communities, decode_large_communities,
 };
 use bgpfc_wire::mp::{MpReach, MpUnreach};
-use bgpfc_wire::prefix::decode_prefixes;
+use bgpfc_wire::prefix::{decode_prefixes, decode_prefixes_with_ids, encode_prefixes_with_ids};
 use bgpfc_wire::reader::Reader;
-use bgpfc_wire::types::Afi;
+use bgpfc_wire::types::{AddressFamily, Afi};
+use bgpfc_wire::update::AddPathFamilies;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -33,6 +34,12 @@ fuzz_target!(|data: &[u8]| {
             // Trailing bits are zeroed on decode, so only the length matches.
             assert_eq!(again.len(), data.len());
         }
+        // RFC 7911 §3: with a Path Identifier before each tuple.
+        if let Ok((ps, ids)) = decode_prefixes_with_ids(data, afi) {
+            let mut again = Vec::new();
+            encode_prefixes_with_ids(&ps, &ids, &mut again);
+            assert_eq!(again.len(), data.len());
+        }
     }
     // Both with and without RFC 8950 negotiated for IPv4 unicast.
     for extended_next_hop in [false, true] {
@@ -46,6 +53,18 @@ fuzz_target!(|data: &[u8]| {
         let mut again = Vec::new();
         m.encode(&mut again);
         assert_eq!(MpUnreach::decode(&again).unwrap(), m);
+    }
+    // ... and with ADD-PATH negotiated for the family the attribute names.
+    let add_path = AddPathFamilies::of(&[AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]);
+    if let Ok((m, ids)) = MpReach::decode_with(data, true, add_path) {
+        let mut again = Vec::new();
+        m.encode_with(&ids, &mut again);
+        assert_eq!(MpReach::decode_with(&again, true, add_path).unwrap(), (m, ids));
+    }
+    if let Ok((m, ids)) = MpUnreach::decode_with(data, add_path) {
+        let mut again = Vec::new();
+        m.encode_with(&ids, &mut again);
+        assert_eq!(MpUnreach::decode_with(&again, add_path).unwrap(), (m, ids));
     }
     let mut r = Reader::new(data);
     while !r.is_empty() {

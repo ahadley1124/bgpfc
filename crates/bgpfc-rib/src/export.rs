@@ -297,6 +297,7 @@ impl Batch {
             // RFC 8950 §4; export already keeps such routes from a peer
             // without it, and the encoder refuses them as well.
             extended_next_hop: to.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         };
         let max_body = to.max_message_len() - HEADER_LEN;
         let mut out = Vec::new();

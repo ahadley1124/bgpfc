@@ -1025,6 +1025,7 @@ mod tests {
         let enc = EncodeContext {
             four_octet_as: true,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         };
         let mut body = m.encode(&enc).unwrap();
         let bad_reach = [0x80, 14, 9, 0, 2, 1, 4, 1, 2, 3, 4, 0];

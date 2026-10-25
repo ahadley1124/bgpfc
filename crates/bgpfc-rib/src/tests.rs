@@ -157,6 +157,7 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         peer: to.kind,
         allow_as_set: false,
         extended_next_hop: to.extended_next_hop.contains(&V4),
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
     messages
         .iter()

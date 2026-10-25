@@ -953,12 +953,14 @@ fn decode_context(session: Option<&Session>, allow_as_set: bool) -> DecodeContex
             extended_next_hop: s
                 .extended_next_hop_receive
                 .contains(&AddressFamily::IPV4_UNICAST),
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         },
         None => DecodeContext {
             four_octet_as: false,
             peer: PeerKind::External,
             allow_as_set,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         },
     }
 }
@@ -1157,6 +1159,7 @@ mod tests {
             .encode(&EncodeContext {
                 four_octet_as: true,
                 extended_next_hop: true,
+                add_path: bgpfc_wire::update::AddPathFamilies::NONE,
             })
             .unwrap();
         let decode = |s: &Session| UpdateMessage::decode(&body, &decode_context(Some(s), false));

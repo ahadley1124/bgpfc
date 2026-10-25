@@ -144,6 +144,7 @@ fn note(log: &mut Log, out: &[Output], infos: &[PeerInfo], at: Instant) {
             peer: info.kind,
             allow_as_set: false,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         };
         for m in messages {
             assert!(m.len() <= info.max_message_len());

@@ -11,8 +11,8 @@
 //! §4.2, §6; RFC 9072 §2, §3; RFC 7607 §2; RFC 6286 §2.1; RFC 4486 §3,
 //! §4; RFC 6608 §3, §4; RFC 9003 §2, §4; RFC 7606 §3–§5, §7; RFC 2545 §3;
 //! RFC 8950 §3, §4; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774
-//! §3; RFC 7911 §2, §4 (the ADD-PATH capability and the Path Identifier
-//! type).
+//! §3; RFC 7911 §2–§5 (the ADD-PATH capability, the Path Identifier and its
+//! place in the NLRI of every field and attribute that carries any).
 //!
 //! With the `profiling` feature, UPDATE and attribute decoding are timed
 //! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only
@@ -52,6 +52,6 @@ pub use prefix::Prefix;
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, PathId, RouterId, Safi};
 pub use update::{
-    DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason, DiscardedAttribute, EncodeContext,
-    PeerKind, UpdateError, UpdateMessage,
+    AddPathFamilies, DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason,
+    DiscardedAttribute, EncodeContext, PathIds, PeerKind, UpdateError, UpdateMessage,
 };
