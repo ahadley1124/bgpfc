@@ -1618,6 +1618,7 @@ mod tests {
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::ZERO,
             prefix_limits: vec![(v4, 1000)],
+            role: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],

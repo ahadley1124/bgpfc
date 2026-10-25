@@ -330,6 +330,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         extended_next_hop: s.extended_next_hop_send.clone(),
         advertisement_interval: interval,
         prefix_limits: Vec::new(),
+        role: s.role,
     }
 }
 
@@ -436,6 +437,25 @@ impl Sink for Deliver<'_> {
                     next_hop = next_hop,
                     routes = prefixes.len(),
                     prefixes = sample(&prefixes)
+                );
+            }
+            Output::RouteLeak {
+                peer,
+                family,
+                otc,
+                routes,
+                first,
+            } => {
+                // RFC 9234 §5: a route leak "MUST be considered
+                // ineligible"; nothing is sent to the peer, and the
+                // session stays up. One line per UPDATE part.
+                bgpfc_log::warn!(
+                    "rib: route leak, routes ignored",
+                    peer = peer,
+                    family = family,
+                    otc = otc.0,
+                    routes = routes,
+                    first = first
                 );
             }
             Output::Revalidated(r) => {

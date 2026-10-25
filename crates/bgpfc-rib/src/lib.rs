@@ -25,7 +25,11 @@
 //! alone is kept), §3 (policy sees
 //! the validation state, see [`Policies`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
-//! [`Rib::validation_changed`]).
+//! [`Rib::validation_changed`]);
+//! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
+//! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
+//! attribute is added and checked on the way out, see [`otc`] and
+//! [`export`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -39,6 +43,7 @@
 pub mod attrs;
 pub mod decision;
 pub mod export;
+pub mod otc;
 pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
@@ -195,6 +200,24 @@ pub enum Output {
         next_hop: NextHop,
         /// The routes.
         prefixes: Vec<Prefix>,
+    },
+    /// Routes ignored because they are route leaks by RFC 9234 §5: they
+    /// came with the Only to Customer attribute from a customer or an
+    /// RS-Client, or from a peer with another AS in it. Such a route "MUST
+    /// be considered ineligible", so it is not kept and one the peer sent
+    /// before for the prefix is withdrawn. The caller logs it; no
+    /// NOTIFICATION is sent and the session stays up.
+    RouteLeak {
+        /// The peer that sent them.
+        peer: IpAddr,
+        /// Their family.
+        family: AddressFamily,
+        /// The AS in the attribute.
+        otc: Asn,
+        /// How many routes of the UPDATE were leaks.
+        routes: usize,
+        /// The first of them.
+        first: Prefix,
     },
     /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
     /// the validation source (see [`Rib::validation_changed`]): one report
@@ -380,7 +403,8 @@ struct Scratch {
     /// Routes added minus routes removed, per family.
     delta: FamilyMap<isize>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
-    /// §6.3), reported before what the UPDATE changed.
+    /// §6.3) or as route leaks (RFC 9234 §5), reported before what the
+    /// UPDATE changed.
     ignored: Vec<Output>,
     batches: Batches,
 }
@@ -844,6 +868,13 @@ impl Rib {
         // by RFC 4760 §7.
         let unused =
             |family: AddressFamily| state.disabled.contains(&family) || !info.receives(family);
+        // An announcement not kept replaces the peer's earlier routes.
+        let replaced = |tables: &mut FamilyMap<Table>,
+                        family: AddressFamily,
+                        prefixes: &[Prefix],
+                        scratch: &mut Scratch| {
+            withdraw_each(peers, tables.get_mut(family), family, prefixes, id, scratch);
+        };
         for (family, prefix) in update.withdrawals() {
             #[cfg(feature = "profiling")]
             let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_REMOVE);
@@ -870,11 +901,7 @@ impl Rib {
             // keeping it would keep what the peer no longer advertises
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
-                if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
-                }
+                replaced(&mut self.tables, family, prefixes, scratch);
                 scratch.ignored.push(Output::InvalidNextHop {
                     peer: info.addr,
                     family,
@@ -883,9 +910,17 @@ impl Rib {
                 });
                 continue;
             }
-            let attrs = cx
-                .interner
-                .intern(PathAttrs::from_update(&update.message, next_hop));
+            let mut built = PathAttrs::from_update(&update.message, next_hop);
+            // RFC 9234 §5 ingress, once for this part of the UPDATE. A
+            // leak is not kept, as for the checks below: no import policy
+            // may make it eligible ("The operator MUST NOT have the
+            // ability to modify the procedures").
+            if let Err(otc) = otc::receive(info, &mut built) {
+                replaced(&mut self.tables, family, prefixes, scratch);
+                report_leak(scratch, info, family, otc, prefixes);
+                continue;
+            }
+            let attrs = cx.interner.intern(built);
             // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an
             // AS loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC
             // 7606 §7.2: on an external session the leftmost AS must be the
@@ -895,11 +930,7 @@ impl Rib {
             let leftmost_ok = info.kind == PeerKind::Internal
                 || attrs.as_path.first_asn() == Some(info.remote_as);
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
-                if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
-                }
+                replaced(&mut self.tables, family, prefixes, scratch);
                 scratch.released.push(attrs);
                 continue;
             }
@@ -1431,7 +1462,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (before, Some(a)) => {
                 let had = before.is_some();
                 let pacing = state.pacing.or_default(family);
@@ -1523,7 +1561,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (_, Some(a)) => {
                 state.pacing.or_default(family).advertised(prefix, &pace);
                 if !had {
@@ -1557,7 +1602,13 @@ impl Sessions {
             (Some(_), None) => batch.withdraw.push(prefix),
             (Some(b), Some(a))
                 if b.is(&a)
-                    || export::same_rewrite(family, b.attrs(), a.attrs(), &self.peer(id).info) => {}
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &self.peer(id).info,
+                    ) => {}
             (_, Some(a)) => {
                 let a = a.intern(&mut self.cx.interner);
                 batch.announce(&a, prefix);
@@ -1705,6 +1756,44 @@ fn drop_routes(
         }
         !dest.is_empty()
     });
+}
+
+/// Report `prefixes` of `family` from the peer `from` as route leaks with
+/// `otc` (RFC 9234 §5), if there is any prefix to report.
+fn report_leak(
+    scratch: &mut Scratch,
+    from: &PeerInfo,
+    family: AddressFamily,
+    otc: Asn,
+    prefixes: &[Prefix],
+) {
+    if let Some(&first) = prefixes.first() {
+        scratch.ignored.push(Output::RouteLeak {
+            peer: from.addr,
+            family,
+            otc,
+            routes: prefixes.len(),
+            first,
+        });
+    }
+}
+
+/// [`withdraw`] for each of `prefixes`, in `table` if there is one: the
+/// routes of an announcement that is not kept replace the peer's earlier
+/// ones for them.
+fn withdraw_each(
+    peers: &[Option<PeerState>],
+    table: Option<&mut Table>,
+    family: AddressFamily,
+    prefixes: &[Prefix],
+    id: PeerId,
+    scratch: &mut Scratch,
+) {
+    if let Some(table) = table {
+        for &prefix in prefixes {
+            withdraw(peers, table, family, prefix, id, scratch);
+        }
+    }
 }
 
 /// Remove peer `id`'s route to `prefix`, if there is one, and note the

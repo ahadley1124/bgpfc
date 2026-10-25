@@ -22,6 +22,7 @@ use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
 mod adj_rib_in;
+mod roles;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
@@ -58,7 +59,7 @@ fn p(s: &str) -> Prefix {
     s.parse().unwrap()
 }
 
-fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
+pub(crate) fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
     let next_hop = match ip(next_hop) {
         IpAddr::V4(a) => NextHop::Ipv4(a),
         IpAddr::V6(a) => NextHop::Ipv6 {
@@ -82,7 +83,7 @@ fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
     }
 }
 
-fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
+pub(crate) fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     let addr = ip(addr);
     let local_addr = match addr {
         IpAddr::V4(_) => ip("10.0.0.254"),
@@ -107,6 +108,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         // §9.2.1.1 tests below are about when.
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        role: None,
     }
 }
 

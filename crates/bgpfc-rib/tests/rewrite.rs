@@ -15,6 +15,7 @@ use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
 use bgpfc_wire::attribute::{Aggregator, Origin};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::NextHop;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
 use proptest::prelude::*;
@@ -92,8 +93,9 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
             list(ext),
             list(large),
             unknown,
-            // RFC 9234 §5: passed on unchanged.
-            proptest::option::of(prop_oneof![Just(Asn(1)), Just(Asn(2))]),
+            // RFC 9234 §5: passed on unchanged, or replaced by ours where
+            // a Role adds it, so ours is among the values.
+            proptest::option::of(prop_oneof![Just(Asn(1)), Just(Asn(2)), Just(LOCAL_AS)]),
         ),
     )
         .prop_map(
@@ -123,7 +125,7 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
 /// External over IPv4, over IPv6 without and with RFC 8950 Extended Next
 /// Hop Encoding for IPv4, or internal.
 fn peer() -> impl Strategy<Value = PeerInfo> {
-    (0u8..4).prop_map(|k| PeerInfo {
+    (0u8..4, proptest::option::of(0u8..6)).prop_map(|(k, role)| PeerInfo {
         addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
         local_addr: if k == 1 || k == 3 {
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xfe))
@@ -148,6 +150,10 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
         },
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        // RFC 9234 §4: every Role, and one no one assigned, on any
+        // session, internal ones included: `same_rewrite` is asked of what
+        // the session says, not of whether the combination is sensible.
+        role: role.map(Role::from_u8),
     })
 }
 
@@ -171,8 +177,8 @@ proptest! {
             AddressFamily::IPV4_UNICAST
         };
         let equal = rewrite(LOCAL_AS, family, &a, &to) == rewrite(LOCAL_AS, family, &b, &to);
-        prop_assert_eq!(same_rewrite(family, &a, &b, &to), equal);
-        prop_assert!(same_rewrite(family, &a, &a, &to));
+        prop_assert_eq!(same_rewrite(LOCAL_AS, family, &a, &b, &to), equal);
+        prop_assert!(same_rewrite(LOCAL_AS, family, &a, &a, &to));
     }
 }
 

@@ -2,7 +2,8 @@
 //! peer and from two that send the same table, as a multi-homed network
 //! has it, churn
 //! under the RFC 4271 §9.2.1.1 advertisement interval, and validating
-//! routes again when the validation source changes (RFC 6811 §4). The
+//! routes again when the validation source changes (RFC 6811 §4), and the
+//! Only to Customer procedures of sessions with BGP Roles (RFC 9234 §5). The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
 
@@ -17,6 +18,7 @@ use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 use criterion::Criterion;
@@ -59,6 +61,7 @@ fn peer(i: u8) -> PeerInfo {
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        role: None,
     }
 }
 
@@ -67,6 +70,7 @@ fn paced_peer(i: u8) -> PeerInfo {
     PeerInfo {
         advertisement_interval: Duration::from_secs(30),
         prefix_limits: Vec::new(),
+        role: None,
         ..peer(i)
     }
 }
@@ -233,7 +237,43 @@ fn bench(c: &mut Criterion) {
         );
     });
     group.finish();
+    roles(c, routes, &v4, &v6);
     revalidation(c, routes, &v4, &v6);
+}
+
+/// RFC 9234 §5 at scale, against the first case above, which is the same
+/// load with no Roles: a table from a provider (ours Customer: every
+/// attribute set gains the attribute on the way in) sent to a customer
+/// (ours Provider: it goes out as it is), and one from a customer sent to a
+/// peer (ours Peer: every set gains ours on the way out).
+fn roles(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let with = |i: u8, role: Role| PeerInfo {
+        role: Some(role),
+        ..peer(i)
+    };
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    for (name, from, to) in [
+        (
+            "from_a_provider_to_a_customer",
+            Role::Customer,
+            Role::Provider,
+        ),
+        ("from_a_customer_to_a_peer", Role::Provider, Role::Peer),
+    ] {
+        group.bench_function(format!("insert_{routes}_{name}"), |b| {
+            b.iter(|| {
+                let now = Instant::now();
+                let mut rib = Rib::new(Asn(65_000));
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(with(1, from), now, o));
+                outputs(|o| rib.peer_up(with(2, to), now, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            });
+        });
+    }
+    group.finish();
 }
 
 /// RFC 6811 §4 at scale. Every route of a table from one peer, exported to

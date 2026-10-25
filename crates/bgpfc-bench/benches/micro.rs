@@ -94,6 +94,7 @@ fn peer() -> PeerInfo {
         // The daemon's default for an external peer (RFC 4271 §10).
         advertisement_interval: default_interval(PeerKind::External),
         prefix_limits: Vec::new(),
+        role: None,
     }
 }
 

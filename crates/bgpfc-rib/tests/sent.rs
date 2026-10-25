@@ -52,6 +52,7 @@ fn peers() -> Vec<PeerInfo> {
             // only delays; tests/pacing.rs is about when.
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
+            role: None,
         })
         .collect()
 }

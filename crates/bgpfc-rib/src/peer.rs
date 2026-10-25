@@ -2,12 +2,14 @@
 //!
 //! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
-//! per-family prefix limit), §6.3 a) (our own address is no next hop).
+//! per-family prefix limit), §6.3 a) (our own address is no next hop);
+//! RFC 9234 §4 (our BGP Role on the session).
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use bgpfc_wire::mp::NextHop;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
 
@@ -53,6 +55,11 @@ pub struct PeerInfo {
     /// session (see [`Output::PrefixLimitExceeded`](crate::Output)).
     /// Families not listed have none.
     pub prefix_limits: Vec<(AddressFamily, u32)>,
+    /// Our BGP Role on the session, when one is configured and the session
+    /// external (RFC 9234 §4): the session takes part in the Only to
+    /// Customer procedures of §5 (see [`otc`](crate::otc)). `None` for a
+    /// session with no Role, which leaves the attribute alone.
+    pub role: Option<Role>,
 }
 
 impl PeerInfo {
