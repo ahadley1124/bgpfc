@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
@@ -39,7 +39,7 @@ pub use attrs::{Interner, PathAttrs};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-use store::{Destination, FamilyMap, PeerId, Route};
+use store::{Destination, FamilyMap, PeerId, Route, Table};
 
 /// What a policy decided about a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,7 +172,7 @@ pub struct PeerStats {
 pub struct Rib {
     /// Adj-RIBs-In and Loc-RIB together: every route per destination,
     /// the best first.
-    tables: FamilyMap<BTreeMap<Prefix, Destination>>,
+    tables: FamilyMap<Table>,
     /// Everything else. Kept apart from the tables so that a table can be
     /// walked while Phase 3 updates the peers' Adj-RIBs-Out.
     s: Sessions,
@@ -312,7 +312,7 @@ impl Rib {
         for (family, table) in self.tables.iter_mut() {
             table.retain(|prefix, dest| {
                 self.s
-                    .remove_route(family, *prefix, dest, id, &mut batches, out)
+                    .remove_route(family, prefix, dest, id, &mut batches, out)
             });
         }
         self.s.emit(&mut batches, out);
@@ -333,7 +333,7 @@ impl Rib {
         if let Some(table) = self.tables.get_mut(family) {
             table.retain(|prefix, dest| {
                 self.s
-                    .remove_route(family, *prefix, dest, id, &mut batches, out)
+                    .remove_route(family, prefix, dest, id, &mut batches, out)
             });
         }
         self.s.emit(&mut batches, out);
@@ -358,10 +358,10 @@ impl Rib {
             .unwrap_or_default();
         adj_out.clear();
         if let Some(table) = self.tables.get(family) {
-            for (prefix, dest) in table {
-                if let Some(a) = self.s.exported(family, *prefix, dest.best(), id) {
-                    batch.announce(&a, *prefix);
-                    adj_out.insert(*prefix, a);
+            for (prefix, dest) in table.iter() {
+                if let Some(a) = self.s.exported(family, prefix, dest.best(), id) {
+                    batch.announce(&a, prefix);
+                    adj_out.insert(prefix, a);
                 }
             }
         }
@@ -390,21 +390,21 @@ impl Rib {
         // Phase 3 keeps every Adj-RIB-Out entry on a destination that has
         // a best route, so one pass over the table visits all of them.
         if let Some(table) = self.tables.get(family) {
-            for (prefix, dest) in table {
-                match self.s.exported(family, *prefix, dest.best(), id) {
-                    Some(a) => match adj_out.insert(*prefix, Arc::clone(&a)) {
+            for (prefix, dest) in table.iter() {
+                match self.s.exported(family, prefix, dest.best(), id) {
+                    Some(a) => match adj_out.insert(prefix, Arc::clone(&a)) {
                         Some(old) if Arc::ptr_eq(&old, &a) => {}
                         old => {
                             if let Some(old) = old {
                                 self.s.cx.interner.release(old);
                             }
-                            batch.announce(&a, *prefix);
+                            batch.announce(&a, prefix);
                         }
                     },
                     None => {
-                        if let Some(old) = adj_out.remove(prefix) {
+                        if let Some(old) = adj_out.remove(&prefix) {
                             self.s.cx.interner.release(old);
-                            batch.withdraw.push(*prefix);
+                            batch.withdraw.push(prefix);
                         }
                     }
                 }
@@ -547,8 +547,8 @@ impl Rib {
         self.tables
             .get(family)
             .into_iter()
-            .flat_map(|t| t.iter())
-            .filter_map(|(p, d)| d.best().map(|r| (*p, self.s.route_ref(r))))
+            .flat_map(Table::iter)
+            .filter_map(|(p, d)| d.best().map(|r| (p, self.s.route_ref(r))))
     }
 
     /// Every route to `prefix` in the Adj-RIBs-In, the best first.
@@ -559,7 +559,7 @@ impl Rib {
     ) -> impl Iterator<Item = RouteRef<'_>> {
         self.tables
             .get(family)
-            .and_then(|t| t.get(&prefix))
+            .and_then(|t| t.get(prefix))
             .map_or(&[][..], Destination::routes)
             .iter()
             .map(|r| self.s.route_ref(r))
@@ -857,13 +857,28 @@ fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
 /// destination's best route before and after.
 fn withdraw(
     peers: &[Option<PeerState>],
-    table: &mut BTreeMap<Prefix, Destination>,
+    table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     id: PeerId,
     scratch: &mut Scratch,
 ) {
-    let Slot::Occupied(mut slot) = table.entry(prefix) else {
+    match Ipv4Key::new(prefix) {
+        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, id, scratch),
+        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, id, scratch),
+    }
+}
+
+fn withdraw_in<K: Ord>(
+    peers: &[Option<PeerState>],
+    map: &mut BTreeMap<K, Destination>,
+    key: K,
+    family: AddressFamily,
+    prefix: Prefix,
+    id: PeerId,
+    scratch: &mut Scratch,
+) {
+    let Slot::Occupied(mut slot) = map.entry(key) else {
         return;
     };
     let dest = slot.get_mut();
@@ -891,13 +906,28 @@ fn withdraw(
 /// destination's best route before and after.
 fn announce(
     peers: &[Option<PeerState>],
-    table: &mut BTreeMap<Prefix, Destination>,
+    table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     route: Route,
     scratch: &mut Scratch,
 ) {
-    let (old, new) = match table.entry(prefix) {
+    match Ipv4Key::new(prefix) {
+        Some(k) => announce_in(peers, &mut table.v4, k, family, prefix, route, scratch),
+        None => announce_in(peers, &mut table.v6, prefix, family, prefix, route, scratch),
+    }
+}
+
+fn announce_in<K: Ord>(
+    peers: &[Option<PeerState>],
+    map: &mut BTreeMap<K, Destination>,
+    key: K,
+    family: AddressFamily,
+    prefix: Prefix,
+    route: Route,
+    scratch: &mut Scratch,
+) {
+    let (old, new) = match map.entry(key) {
         Slot::Vacant(slot) => {
             // A new destination: its one route is the best.
             let new = route.clone();

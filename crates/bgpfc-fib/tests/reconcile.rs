@@ -2,16 +2,23 @@
 //! table, for any pair of tables (AGENTS.md §5, `bgpfc-fib` row).
 #![cfg(not(miri))]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bgpfc_fib::reconcile::{Routes, Table, apply, plan};
 use bgpfc_wire::prefix::Prefix;
 use proptest::prelude::*;
 
 fn table() -> impl Strategy<Value = Table> {
+    // Both families: IPv4 and IPv6 routes are kept apart and must come out
+    // in one prefix order.
     proptest::collection::btree_map(
-        (0u8..8, 0u8..3).prop_map(|(i, len)| {
-            Prefix::new(IpAddr::V4(Ipv4Addr::new(10, i, 0, 0)), 16 + len).unwrap()
+        (0u8..8, 0u8..3, any::<bool>()).prop_map(|(i, len, v6)| {
+            if v6 {
+                let addr = Ipv6Addr::new(0x2001, 0xdb8, u16::from(i), 0, 0, 0, 0, 0);
+                Prefix::new(IpAddr::V6(addr), 48 + len).unwrap()
+            } else {
+                Prefix::new(IpAddr::V4(Ipv4Addr::new(10, i, 0, 0)), 16 + len).unwrap()
+            }
         }),
         (1u8..4).prop_map(|g| IpAddr::V4(Ipv4Addr::new(192, 0, 2, g))),
         0..10,

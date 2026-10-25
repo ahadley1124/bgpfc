@@ -408,7 +408,7 @@ pub(crate) fn print_sizes() {
     let mut rows = bgpfc_rib::profiling::type_sizes();
     rows.extend([
         (
-            "Prefix + gateways [FIB route]",
+            "Ipv4Key + gateways [IPv4 FIB route]",
             bgpfc_fib::reconcile::ROUTE_SIZE,
         ),
         (

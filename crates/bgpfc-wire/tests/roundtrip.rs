@@ -20,7 +20,7 @@ use bgpfc_wire::header::{Header, MessageType, frame};
 use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::prefix::{Prefix, decode_prefixes};
+use bgpfc_wire::prefix::{Ipv4Key, Prefix, decode_prefixes};
 use bgpfc_wire::reader::Reader;
 use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
@@ -304,6 +304,14 @@ proptest! {
         prop_assert_eq!(a.cmp(&b), field_order(&a).cmp(&field_order(&b)));
         prop_assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
         prop_assert_eq!(a.cmp(&b) == std::cmp::Ordering::Equal, a == b);
+    }
+
+    #[test]
+    fn ipv4_key_orders_and_converts_like_its_prefix(a in prefix_v4(), b in prefix_v4()) {
+        let (ka, kb) = (Ipv4Key::new(a).unwrap(), Ipv4Key::new(b).unwrap());
+        prop_assert_eq!(ka.prefix(), a);
+        prop_assert_eq!(ka.cmp(&kb), a.cmp(&b));
+        prop_assert_eq!(ka == kb, a == b);
     }
 }
 

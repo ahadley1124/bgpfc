@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 
-use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 
 /// A route: one prefix, one gateway (single best path only).
 pub type Table = BTreeMap<Prefix, IpAddr>;
@@ -148,9 +148,9 @@ struct Entry {
     installed: Option<GwId>,
 }
 
-/// Octets one route takes in a [`Routes`] table node: the prefix and the
+/// Octets one IPv4 route takes in a [`Routes`] table node: the key and the
 /// two gateway indices (for `bgpfcd --print-sizes`).
-pub const ROUTE_SIZE: usize = size_of::<Prefix>() + size_of::<Entry>();
+pub const ROUTE_SIZE: usize = size_of::<Ipv4Key>() + size_of::<Entry>();
 
 /// The desired and the installed routes in one map, so that the routes
 /// the kernel already has the way the RIB wants them are stored once.
@@ -158,7 +158,10 @@ pub const ROUTE_SIZE: usize = size_of::<Prefix>() + size_of::<Entry>();
 /// tables apart.
 #[derive(Debug, Default)]
 pub struct Routes {
-    map: BTreeMap<Prefix, Entry>,
+    /// IPv4 routes, keyed in 5 octets rather than a `Prefix`'s 18: a full
+    /// table is mostly B-tree nodes, eleven keys each.
+    v4: BTreeMap<Ipv4Key, Entry>,
+    v6: BTreeMap<Prefix, Entry>,
     gateways: Gateways,
 }
 
@@ -172,14 +175,14 @@ impl Routes {
     /// The gateway the RIB wants for `prefix`.
     #[must_use]
     pub fn desired(&self, prefix: &Prefix) -> Option<IpAddr> {
-        let id = self.map.get(prefix)?.desired?;
+        let id = self.get(*prefix)?.desired?;
         Some(self.gateways.addr(id))
     }
 
     /// The gateway the kernel has for `prefix`, as far as we know.
     #[must_use]
     pub fn installed(&self, prefix: &Prefix) -> Option<IpAddr> {
-        let id = self.map.get(prefix)?.installed?;
+        let id = self.get(*prefix)?.installed?;
         Some(self.gateways.addr(id))
     }
 
@@ -206,10 +209,9 @@ impl Routes {
     /// Replace what is believed installed with `kernel` (the startup dump).
     pub fn set_installed(&mut self, kernel: &Table) {
         let prefixes: Vec<Prefix> = self
-            .map
             .iter()
             .filter(|(_, e)| e.installed.is_some())
-            .map(|(p, _)| *p)
+            .map(|(p, _)| p)
             .collect();
         for prefix in prefixes {
             self.install(prefix, None);
@@ -222,10 +224,9 @@ impl Routes {
     /// Want no route at all (shutdown).
     pub fn clear_desired(&mut self) {
         let prefixes: Vec<Prefix> = self
-            .map
             .iter()
             .filter(|(_, e)| e.desired.is_some())
-            .map(|(p, _)| *p)
+            .map(|(p, _)| p)
             .collect();
         for prefix in prefixes {
             self.set_desired(prefix, None);
@@ -237,20 +238,20 @@ impl Routes {
     #[must_use]
     pub fn plan(&self) -> Vec<Op> {
         let mut ops = Vec::new();
-        for (prefix, e) in &self.map {
+        for (prefix, e) in self.iter() {
             if let Some(d) = e.desired
                 && e.installed != Some(d)
             {
                 ops.push(Op::Set {
-                    prefix: *prefix,
+                    prefix,
                     gateway: self.gateways.addr(d),
                 });
             }
         }
-        for (prefix, e) in &self.map {
+        for (prefix, e) in self.iter() {
             if let (None, Some(i)) = (e.desired, e.installed) {
                 ops.push(Op::Delete {
-                    prefix: *prefix,
+                    prefix,
                     gateway: self.gateways.addr(i),
                 });
             }
@@ -277,9 +278,8 @@ impl Routes {
     }
 
     fn table(&self, which: impl Fn(&Entry) -> Option<GwId>) -> Table {
-        self.map
-            .iter()
-            .filter_map(|(p, e)| which(e).map(|id| (*p, self.gateways.addr(id))))
+        self.iter()
+            .filter_map(|(p, e)| which(e).map(|id| (p, self.gateways.addr(id))))
             .collect()
     }
 
@@ -291,10 +291,38 @@ impl Routes {
         }
     }
 
+    fn get(&self, prefix: Prefix) -> Option<&Entry> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.get(&k),
+            None => self.v6.get(&prefix),
+        }
+    }
+
+    /// Every entry in prefix order (IPv4 sorts first).
+    fn iter(&self) -> impl Iterator<Item = (Prefix, &Entry)> {
+        self.v4
+            .iter()
+            .map(|(k, e)| (k.prefix(), e))
+            .chain(self.v6.iter().map(|(p, e)| (*p, e)))
+    }
+
     /// Change `prefix`'s entry, dropping it when it holds nothing after;
     /// one lookup either way.
     fn change<T>(&mut self, prefix: Prefix, f: impl FnOnce(&mut Entry) -> T) -> T {
-        match self.map.entry(prefix) {
+        match Ipv4Key::new(prefix) {
+            Some(k) => change_in(&mut self.v4, k, f),
+            None => change_in(&mut self.v6, prefix, f),
+        }
+    }
+}
+
+fn change_in<K: Ord, T>(
+    map: &mut BTreeMap<K, Entry>,
+    key: K,
+    f: impl FnOnce(&mut Entry) -> T,
+) -> T {
+    {
+        match map.entry(key) {
             Slot::Occupied(mut o) => {
                 let out = f(o.get_mut());
                 if *o.get() == Entry::default() {
@@ -366,6 +394,7 @@ mod tests {
     #[test]
     fn routes_store_each_gateway_once() {
         assert_eq!(size_of::<Entry>(), 8);
+        assert_eq!(ROUTE_SIZE, 13);
         let mut r = Routes::new();
         assert_eq!(r.set_desired(p("10.0.0.0/8"), Some(ip("1.1.1.1"))), None);
         assert_eq!(r.set_desired(p("10.1.0.0/16"), Some(ip("1.1.1.1"))), None);
@@ -400,7 +429,7 @@ mod tests {
             r.apply(op);
         }
         assert_eq!(r.gateways(), 0);
-        assert!(r.map.is_empty());
+        assert!(r.v4.is_empty() && r.v6.is_empty());
         // A freed gateway slot is reused.
         r.set_desired(p("10.0.0.0/8"), Some(ip("3.3.3.3")));
         assert_eq!(r.gateways.addrs.len(), 2);

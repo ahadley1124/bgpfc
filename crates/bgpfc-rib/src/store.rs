@@ -3,9 +3,11 @@
 //! octets in its table, with its first route inline and no allocation of
 //! its own until a second peer sends a route to it.
 
+use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::AddressFamily;
 
 use crate::attrs::PathAttrs;
@@ -138,6 +140,49 @@ impl Destination {
 impl Default for Destination {
     fn default() -> Self {
         Destination::Many(Vec::new())
+    }
+}
+
+/// One family's destinations, in prefix order. IPv4 prefixes are keyed by
+/// a 5-octet [`Ipv4Key`] rather than an 18-octet [`Prefix`]: a full table
+/// is mostly B-tree nodes, eleven keys each. A family has one kind of
+/// prefix, so one of the two maps stays empty, which costs nothing.
+#[derive(Debug, Default)]
+pub(crate) struct Table {
+    pub(crate) v4: BTreeMap<Ipv4Key, Destination>,
+    pub(crate) v6: BTreeMap<Prefix, Destination>,
+}
+
+impl Table {
+    #[cfg(feature = "profiling")]
+    pub(crate) fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    pub(crate) fn get(&self, prefix: Prefix) -> Option<&Destination> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.get(&k),
+            None => self.v6.get(&prefix),
+        }
+    }
+
+    /// Every destination, in prefix order (IPv4 sorts first).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Prefix, &Destination)> {
+        self.v4
+            .iter()
+            .map(|(k, d)| (k.prefix(), d))
+            .chain(self.v6.iter().map(|(p, d)| (*p, d)))
+    }
+
+    #[cfg(feature = "profiling")]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Destination> {
+        self.v4.values().chain(self.v6.values())
+    }
+
+    /// Keep the destinations `keep` says to, in prefix order.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prefix, &mut Destination) -> bool) {
+        self.v4.retain(|k, d| keep(k.prefix(), d));
+        self.v6.retain(|p, d| keep(*p, d));
     }
 }
 

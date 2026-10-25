@@ -2,13 +2,13 @@
 //! sizes, how much the attributes repeat, and the size of the structures a
 //! route is made of.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
 
 use bgpfc_wire::as_path::{AsPath, AsPathSegment};
 use bgpfc_wire::mp::NextHop;
-use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::Asn;
 
 use crate::attrs::PathAttrs;
@@ -33,7 +33,7 @@ impl Rib {
     #[must_use]
     pub fn sizes(&self) -> Sizes {
         Sizes {
-            destinations: self.tables.values().map(BTreeMap::len).sum(),
+            destinations: self.tables.values().map(crate::store::Table::len).sum(),
             adj_rib_in: self
                 .s
                 .peers
@@ -139,9 +139,15 @@ fn as_path_heap_bytes(p: &AsPath) -> usize {
 pub fn type_sizes() -> Vec<(&'static str, usize)> {
     vec![
         ("Prefix", size_of::<Prefix>()),
+        // A B-tree node keeps keys and values in separate arrays, so an
+        // entry costs the two sizes added, without padding between.
         (
-            "(Prefix, Destination) [Loc-RIB entry]",
-            size_of::<(Prefix, Destination)>(),
+            "Ipv4Key + Destination [IPv4 Loc-RIB entry]",
+            size_of::<Ipv4Key>() + size_of::<Destination>(),
+        ),
+        (
+            "Prefix + Destination [IPv6 Loc-RIB entry]",
+            size_of::<Prefix>() + size_of::<Destination>(),
         ),
         ("Destination", size_of::<Destination>()),
         ("Route [Adj-RIB-In route]", size_of::<Route>()),
