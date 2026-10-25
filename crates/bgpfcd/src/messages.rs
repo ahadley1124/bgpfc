@@ -75,9 +75,9 @@ pub(crate) enum PeerInput {
         /// Which connection.
         conn: ConnId,
     },
-    /// Framed UPDATE messages from the RIB thread, to write in order while
-    /// Established (RFC 4271 §9.2).
-    Send(Vec<Vec<u8>>),
+    /// UPDATEs from the RIB thread wait in the peer's outbox (a wake-up;
+    /// see `peer::PeerHandle::send_updates`).
+    Updates,
     /// Shut the session down with this Cease subcode (`ManualStop` for
     /// Administrative Shutdown, RFC 4271 §8.1.2 event 2; `AutomaticStop`
     /// with the subcode otherwise, RFC 4486 §4) and end the thread.

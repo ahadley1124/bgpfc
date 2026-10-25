@@ -4,8 +4,7 @@
 //! thread arrives in milestone 7).
 
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
 
 use bgpfc_fsm::Session;
@@ -13,7 +12,8 @@ use bgpfc_rib::{FibChange, Output, PeerInfo, Policies, Rib, Sink};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
-use crate::messages::{FibMsg, PeerInput, RibMsg, RibQuery, RibReply, RouteReport};
+use crate::messages::{FibMsg, RibMsg, RibQuery, RibReply, RouteReport};
+use crate::peer::SendError;
 
 /// Start the RIB thread.
 pub(crate) fn spawn(
@@ -184,15 +184,14 @@ impl Sink for Deliver<'_> {
                     return;
                 };
                 bgpfc_log::debug!("rib: send", peer = peer, messages = messages.len());
-                match handle.tx.try_send(PeerInput::Send(messages)) {
+                match handle.send_updates(messages) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
+                    Err(SendError::Overrun) => {
                         // AGENTS.md §3: never drop updates silently; the
                         // peer thread resets the session.
-                        bgpfc_log::warn!("rib: peer queue full", peer = peer);
-                        handle.overrun.store(true, Ordering::Relaxed);
+                        bgpfc_log::warn!("rib: peer outbox full", peer = peer);
                     }
-                    Err(TrySendError::Disconnected(_)) => {
+                    Err(SendError::Gone) => {
                         bgpfc_log::warn!("rib: peer thread gone", peer = peer);
                     }
                 }

@@ -205,7 +205,8 @@ The criterion benches (`cargo bench -p bgpfc-wire`, `-p bgpfc-rib`,
 
 ```sh
 cargo test --workspace --features profiling
-cargo test -p bgpfcd --features profiling -- --ignored     # loadgen to daemon, 10 000 prefixes
+cargo test -p bgpfcd --features profiling -- --ignored     # loadgen to daemon, 10 000 prefixes;
+                                                            # two peers, 100 000 each
 ```
 
 ## Reading the report line
