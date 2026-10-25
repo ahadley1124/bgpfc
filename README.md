@@ -11,18 +11,24 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five rows
-> open. Two need the host's interfaces and routes, which bgpfc does not track,
-> so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
-> and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
-> a received next hop is checked against our own address on that session, not
-> against every address of the host (§6.3 a). Two are deliberate deviations: a
-> NOTIFICATION received in OpenSent closes the connection without an FSM error
-> in reply, as BIRD and FRR do (§8.2.2), and the MinRouteAdvertisementInterval
-> timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
-> 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
-> link-local next hop, which §3 asks for where it shares a subnet with the next
-> hop and the peer. Nothing else is claimed.
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 6811. RFC 4271 has six
+> rows open. Two need the host's interfaces and routes, which bgpfc does not
+> track, so the kernel's verdict is logged instead: next-hop resolvability
+> (§9.1.2), and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is
+> partial: a received next hop is checked against our own address on that
+> session, not against every address of the host (§6.3 a). Two are deliberate
+> deviations: a NOTIFICATION received in OpenSent closes the connection without
+> an FSM error in reply, as BIRD and FRR do (§8.2.2), and the
+> MinRouteAdvertisementInterval timer paces announcements but never holds back
+> a withdrawal (§9.2.1.1). The sixth applies only under `enforcement
+> prefer-valid`: the validation state ranks routes before LOCAL_PREF, and that
+> rank is not passed on to internal neighbors (§9.1.1). RFC 2545 has one partial
+> row for the same lack of interfaces: bgpfc never sends a link-local next hop,
+> which §3 asks for where it shares a subnet with the next hop and the peer. RFC
+> 8481, which clarifies RFC 6811, has one deliberate deviation: turning
+> validation on with `mode external` also holds Invalid routes back unless
+> `enforcement` says otherwise, the project's chosen default (§5). Nothing else
+> is claimed.
 
 ### What works
 
@@ -44,11 +50,18 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)).
-- An RFC 6811 origin validation state on every route, from VRPs fetched over
-  RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
-  with failover in order of preference; `bgpfcctl show rpki` reports the
-  client, and interop tests run it against StayRTR. Nothing acts on the
-  state yet.
+- RPKI route origin validation (RFC 6811): a validation state on every
+  route, from VRPs fetched over RTR (RFC 8210, falling back to RFC 6810) from
+  the caches of an `rpki` block, with failover in order of preference. The
+  block's `enforcement` acts on it: `drop-invalid`, the default, keeps Invalid
+  routes out of route selection, the kernel and the neighbors, holding them to
+  use again without an UPDATE once they are no longer Invalid; `prefer-valid`
+  ranks Valid over NotFound over Invalid before LOCAL_PREF; `off` leaves the
+  state to policy, which can match it (`match rpki`) and, on import, set the
+  state a route is used with (`set rpki`). A VRP change moves only the routes
+  it concerns, through the same path as an UPDATE; each route that changed
+  state is logged, and `bgpfcctl show rpki transitions` keeps the latest.
+  Interop tests run it against StayRTR and BIRD.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -88,13 +101,13 @@ against.
 
 Only single best path, with no ECMP. Linux only.
 
-### Next: RPKI route origin validation
+### RPKI route origin validation
 
-In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). Every route
-carries its RFC 6811 origin validation state (step 11), which the RIB
-validates again in place when the VRPs change, and which `bgpfcctl show
-routes` and the HTTP API show. With an `rpki { mode external; ... }` block
-the states are real (step 12): each route reads `valid`, `invalid` or
+[`AGENTS.md`](AGENTS.md) §9 steps 11 to 13 are done. Every route carries
+its RFC 6811 origin validation state (step 11), which the RIB validates
+again in place when the VRPs change, and which `bgpfcctl show routes` and
+the HTTP API show. With an `rpki { mode external; ... }` block the states
+are real (step 12): each route reads `valid`, `invalid` or
 `not-found` against the VRPs bgpfcd fetches over RTR, RFC 8210 falling back
 to version 0 (RFC 6810), from the block's external caches, with failover in
 order of preference, a reconnect back-off, and the last VRPs kept while no
@@ -102,11 +115,21 @@ cache answers, until they expire. Without the block, or with `mode
 disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
 8210 §9), so the cache belongs on loopback or a trusted network.
 
-Enforcement comes next. Nothing acts on the state yet; step 13 will drop
-Invalid routes by default, offer a non-enforcing prefer-valid mode, and let
-policy match on the validation state (RFC 6811 §3). Then bgpfcd will be
-able to start and supervise an optional Routinator as a child process.
-Routinator is a separate program; bgpfc neither bundles nor links it.
+bgpfcd acts on the states (step 13) as the block's `enforcement` says
+([`docs/config.md`](docs/config.md), "RPKI"): `drop-invalid`, the default,
+holds Invalid routes in the Adj-RIB-In, neither installed nor advertised;
+`prefer-valid` holds nothing but ranks Valid over NotFound over Invalid
+before LOCAL_PREF; `off` leaves the states to policy. Import policy can
+match the state and set the one a route is used with (RFC 6811 §3), for
+example to fold it into LOCAL_PREF or to use a customer prefix whose ROA is
+known to be wrong. A ROA created, changed or deleted moves installed and
+advertised routes with no UPDATE, paced like any other change; `show
+routes PREFIX` marks held routes, `show neighbor` counts them, and each
+change of state is logged and kept for `show rpki transitions`.
+
+Next is step 14: bgpfcd will be able to start and supervise an optional
+Routinator as a child process. Routinator is a separate program; bgpfc
+neither bundles nor links it.
 
 ### Later
 
@@ -292,8 +315,10 @@ need a restart.
 ```sh
 bgpfcctl show neighbors
 bgpfcctl show neighbor 198.51.100.1
-bgpfcctl show routes [ipv4|ipv6] [prefix]
+bgpfcctl show routes [ipv4|ipv6] [prefix] [held]
 bgpfcctl show fib
+bgpfcctl show rpki
+bgpfcctl show rpki transitions
 bgpfcctl clear neighbor 198.51.100.1 [soft]
 bgpfcctl reload
 bgpfcctl fib mode install
