@@ -485,7 +485,10 @@ fn current(
 
 fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let status = r.status.as_ref();
-    let mut lines = vec![format!("mode {}", r.config.mode)];
+    let mut lines = vec![
+        format!("mode {}", r.config.mode),
+        format!("invalid {}", r.config.invalid),
+    ];
     for c in &r.config.caches {
         lines.push(format!(
             "cache {c} preference {}{}{}",
@@ -575,6 +578,7 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
     let status = r.status.as_ref();
     j.begin_object()
         .field_display("mode", r.config.mode)
+        .field_display("invalid", r.config.invalid)
         .key("caches")
         .begin_array();
     for c in &r.config.caches {
@@ -1072,6 +1076,7 @@ fn route_line(r: &RouteReport) -> String {
         .path_id
         .map_or(String::new(), |id| format!(" id {}", id.0))
         + &a.otc.map_or(String::new(), |asn| format!(" otc {}", asn.0))
+        + if r.held { " held" } else { "" }
 }
 
 fn route_json(j: &mut Json, r: &RouteReport) {
@@ -1090,6 +1095,7 @@ fn route_json(j: &mut Json, r: &RouteReport) {
         j.field_num("path_id", id.0);
     }
     j.field_bool("best", r.best)
+        .field_bool("held", r.held)
         .field_str("rov", r.rov.as_str())
         .key("as_path")
         .begin_array();
@@ -1734,7 +1740,7 @@ mod tests {
         };
         assert!(!json(&plain).contains("path_id"), "{}", json(&plain));
         assert!(
-            json(&with).contains(r#""peer":"198.51.100.2","path_id":7,"best":false"#),
+            json(&with).contains(r#""peer":"198.51.100.2","path_id":7,"best":false,"held":false"#),
             "{}",
             json(&with)
         );
@@ -2044,6 +2050,7 @@ mod tests {
             }),
             path_id: None,
             best: false,
+            held: false,
             rov: RovState::Disabled,
         }
     }
@@ -2222,11 +2229,11 @@ mod tests {
             r.json,
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
-                r#""local_pref":100,"med":null,"otc":null,"peer":"198.51.100.1","best":true,"#,
+                r#""local_pref":100,"med":null,"otc":null,"peer":"198.51.100.1","best":true,"held":false,"#,
                 r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
                 r#""large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
-                r#""local_pref":null,"med":50,"otc":null,"peer":"198.51.100.2","best":false,"#,
+                r#""local_pref":null,"med":50,"otc":null,"peer":"198.51.100.2","best":false,"held":false,"#,
                 r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
                 r#""large_communities":[]}]"#
             )
@@ -2247,6 +2254,37 @@ mod tests {
                 out.json
             );
         }
+    }
+
+    #[test]
+    fn routes_held_for_their_validation_state_are_marked() {
+        // RFC 6811 §2: a route the Adj-RIB-In keeps but the RIB does not
+        // use (`invalid drop`, or import policy that rejects its state)
+        // follows the candidates of `show routes PREFIX`, marked `held`.
+        let mut best = route(
+            "192.0.2.0/24",
+            "198.51.100.1",
+            &[64_511, 64_496],
+            None,
+            None,
+        );
+        best.best = true;
+        best.rov = RovState::Valid;
+        let mut refused = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, None);
+        refused.rov = RovState::Invalid;
+        refused.held = true;
+        let r = render_routes(&[best, refused]);
+        assert!(!r.lines[1].ends_with(" held"), "{}", r.lines[1]);
+        assert!(
+            r.lines[2].ends_with("64497 via 198.51.100.2 held"),
+            "{}",
+            r.lines[2]
+        );
+        assert!(
+            r.json
+                .contains(r#""best":false,"held":true,"rov":"invalid""#)
+        );
+        assert!(r.json.contains(r#""best":true,"held":false,"rov":"valid""#));
     }
 
     #[test]
@@ -2448,6 +2486,7 @@ mod tests {
             r.lines,
             [
                 "mode external",
+                "invalid policy",
                 "cache 127.0.0.1:3323 preference 0",
                 "cache rtr.example.net:323 preference 10, in use, current",
                 "state idle, connected, version 1",
@@ -2461,7 +2500,7 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"external","caches":["#,
+                r#"{"mode":"external","invalid":"policy","caches":["#,
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
                 r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
@@ -2490,7 +2529,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[3..],
+            r.lines[4..],
             [
                 "state connecting, version 1",
                 "session-id - serial -",
@@ -2511,7 +2550,7 @@ mod tests {
             s.running = false;
         }
         assert_eq!(
-            render_rpki(&report, now).lines[3],
+            render_rpki(&report, now).lines[4],
             "state stopped, version 1"
         );
         // Disabled: the configured caches, nothing else, every member there.
@@ -2522,12 +2561,16 @@ mod tests {
         let r = render_rpki(&report, now);
         assert_eq!(
             r.lines,
-            ["mode disabled", "cache 192.0.2.10:323 preference 0"]
+            [
+                "mode disabled",
+                "invalid policy",
+                "cache 192.0.2.10:323 preference 0"
+            ]
         );
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","caches":[{"host":"192.0.2.10","port":323,"#,
+                r#"{"mode":"disabled","invalid":"policy","caches":[{"host":"192.0.2.10","port":323,"#,
                 r#""preference":0,"in_use":false,"current":false}],"#,
                 r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
@@ -2539,7 +2582,10 @@ mod tests {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
         };
-        assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+        assert_eq!(
+            render_rpki(&none, now).lines,
+            ["mode disabled", "invalid policy"]
+        );
     }
 
     #[test]
@@ -2561,7 +2607,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[1..7],
+            r.lines[2..8],
             [
                 "cache 127.0.0.1:3323 preference 0, current",
                 "cache rtr.example.net:323 preference 10, in use",
@@ -2592,7 +2638,7 @@ mod tests {
             r.lines
         );
         assert_eq!(
-            r.lines[6],
+            r.lines[7],
             "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
         );
         assert!(
@@ -2608,7 +2654,7 @@ mod tests {
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(
-            render_rpki(&respelled, now).lines[2],
+            render_rpki(&respelled, now).lines[3],
             "cache RTR.Example.NET.:323 preference 10, in use, current"
         );
         // Held data that expired is no cache's: every route not-found.
@@ -2618,7 +2664,7 @@ mod tests {
             (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
         }
         let r = render_rpki(&report, now);
-        assert_eq!(r.lines[6], "vrps ipv4 0 ipv6 0");
+        assert_eq!(r.lines[7], "vrps ipv4 0 ipv6 0");
         assert!(
             r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
             "{}",

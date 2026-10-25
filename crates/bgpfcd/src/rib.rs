@@ -694,17 +694,23 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .loc_rib(*family)
                     .find(|(p, _)| p == prefix)
                     .map(|(_, b)| (b.peer, b.path_id));
+                // RFC 6811 §2: the routes held for their state follow the
+                // candidates, so that an operator can see what the RIB
+                // keeps but does not use.
+                let report = |c: &bgpfc_rib::RouteRef<'_>, held: bool| RouteReport {
+                    prefix: *prefix,
+                    peer: c.peer,
+                    attrs: std::sync::Arc::clone(c.attrs),
+                    path_id: c.path_id,
+                    best: !held && best == Some((c.peer, c.path_id)),
+                    held,
+                    rov: c.rov,
+                };
                 RibReply::Routes(
                     rib.candidates(*family, *prefix)
                         .iter()
-                        .map(|c| RouteReport {
-                            prefix: *prefix,
-                            peer: c.peer,
-                            attrs: std::sync::Arc::clone(c.attrs),
-                            path_id: c.path_id,
-                            best: best == Some((c.peer, c.path_id)),
-                            rov: c.rov,
-                        })
+                        .map(|c| report(c, false))
+                        .chain(rib.held(*family, *prefix).iter().map(|c| report(c, true)))
                         .collect(),
                 )
             }
@@ -717,6 +723,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         attrs: std::sync::Arc::clone(b.attrs),
                         path_id: b.path_id,
                         best: true,
+                        held: false,
                         rov: b.rov,
                     })
                     .collect(),
@@ -1698,6 +1705,61 @@ mod tests {
                 ("203.0.113.0/24".to_owned(), true),
             ]
         );
+    }
+
+    #[test]
+    fn routes_for_a_prefix_list_the_held_routes_after_the_candidates() {
+        // RFC 6811 §2: what `invalid drop` refuses is kept, and the
+        // control plane can show it.
+        use RovState::{Invalid, Valid};
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        for (addr, asn) in [("192.0.2.1", 65_001), ("192.0.2.2", 65_002)] {
+            handle(
+                &mut rib,
+                &mut settings,
+                up(addr, asn, PeerKind::External),
+                now,
+            );
+        }
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::Validation(all(&[vrp("198.51.100.0/24", 24, 65_001)])),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::SetInvalidAction(InvalidAction::Drop),
+            now,
+        );
+        for (addr, asn) in [("192.0.2.1", 65_001), ("192.0.2.2", 65_002)] {
+            let msg = routes(addr, asn, &["198.51.100.0/24"]);
+            handle(&mut rib, &mut settings, msg, now);
+        }
+        let q = RibQuery::Routes {
+            family: V4,
+            prefix: Some("198.51.100.0/24".parse().unwrap()),
+            after: None,
+        };
+        let RibReply::Routes(listed) = answer(&rib, &q) else {
+            panic!("expected routes");
+        };
+        let seen: Vec<_> = listed
+            .iter()
+            .map(|r| (r.peer.to_string(), r.rov, r.best, r.held))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("192.0.2.1".to_owned(), Valid, true, false),
+                ("192.0.2.2".to_owned(), Invalid, false, true),
+            ]
+        );
+        // The Loc-RIB listing has the candidate alone.
+        assert_eq!(states(&rib), [("198.51.100.0/24".to_owned(), Valid)]);
     }
 
     #[test]
