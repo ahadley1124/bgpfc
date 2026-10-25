@@ -111,7 +111,9 @@ COMPLIANCE.md           RFC requirement matrix (see §6).
 The dependency direction is strictly downward:
 `bgpfcd → {control, rib, policy, fsm, config, fib, log} → wire`, and `fib → sys`.
 Route origin validation adds `rpki → wire`, `rtr → {rpki, wire, log}`,
-`sidecar → {sys, log}`, and `rib → rpki`; `bgpfcd` may depend on all three.
+`sidecar → {sys, log}`, `rib → rpki`, and `config → rpki` (the validation states
+a policy matches and sets, and what is done with Invalid routes); `bgpfcd` may
+depend on all three.
 `wire`, `fsm`, `policy`, `config`, `rpki`, and `rtr` must not depend on
 `sys`. Keep protocol logic pure so it can be tested without sockets or time.
 `bgpfc-prof` is a leaf below `wire`; `wire`, `rib` and `bgpfcd` reach it only

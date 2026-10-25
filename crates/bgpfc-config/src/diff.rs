@@ -292,6 +292,18 @@ mod tests {
             ConfigDiff::between(a, &e).policy_changed,
             vec![addr("192.0.2.2"), addr("192.0.2.3")]
         );
+        // So does the validation state a term matches or sets (RFC 6811
+        // §3), each a different one from the last.
+        let valid = cfg(&BASE.replace("term r {", "term r { match rpki valid;"));
+        let invalid = cfg(&BASE.replace("term r {", "term r { match rpki invalid;"));
+        let set = cfg(&BASE.replace("term r {", "term r { set rpki valid;"));
+        for (x, y) in [(a, &valid), (&valid, &invalid), (a, &set), (&valid, &set)] {
+            assert_eq!(
+                ConfigDiff::between(x, y).policy_changed,
+                vec![addr("192.0.2.2"), addr("192.0.2.3")]
+            );
+        }
+        assert!(ConfigDiff::between(&valid, &valid).is_empty());
     }
 
     #[test]

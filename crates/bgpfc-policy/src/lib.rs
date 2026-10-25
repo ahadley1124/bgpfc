@@ -5,7 +5,9 @@
 //! Implements: RFC 4271 §9.1.1 (local policy sets the degree of
 //! preference), §9.1.3 (export policy); RFC 1997, 4360, 8092 (community
 //! matching and setting); RFC 8950 §5 (`next-hop self` on an IPv6 session
-//! gives IPv4 routes our IPv6 address once negotiated); `docs/config.md`,
+//! gives IPv4 routes our IPv6 address once negotiated); RFC 6811 §3
+//! (policy matches and sets the validation state of a route), §5 (filter
+//! by it, or adjust the degree of preference by it); `docs/config.md`,
 //! "Policies".
 #![forbid(unsafe_code)]
 
@@ -57,6 +59,9 @@ enum Clause {
     LargeCommunity(LargeCommunity),
     Origin(Origin),
     Neighbor(IpAddr),
+    /// RFC 6811 §3: the validation state, as the run of the policy has it
+    /// at this term.
+    Rpki(RovState),
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +104,9 @@ pub struct Route<'a> {
     /// and so did we (RFC 8950 §4): an IPv4 route may take an IPv6
     /// `local_addr` as its next hop.
     pub extended_next_hop: bool,
+    /// The route's RFC 6811 §2 validation state; what `match rpki`
+    /// compares until a `set rpki` changes it.
+    pub rov: RovState,
 }
 
 impl PolicySet {
@@ -157,6 +165,7 @@ impl PolicySet {
                         Match::LargeCommunity(c) => Clause::LargeCommunity(*c),
                         Match::Origin(o) => Clause::Origin(*o),
                         Match::Neighbor(a) => Clause::Neighbor(*a),
+                        Match::Rpki(state) => Clause::Rpki(*state),
                     };
                     clauses.push(clause);
                 }
@@ -200,23 +209,38 @@ impl PolicySet {
             return Verdict::Reject;
         };
         let mut modified: Option<PathAttrs> = None;
+        // RFC 6811 §3: `set rpki` changes the state the terms after it
+        // match, and the route's state once the policy accepts it.
+        let mut rov = route.rov;
         for term in &policy.terms {
             let attrs = modified.as_ref().unwrap_or(route.attrs);
-            if !term.clauses.iter().all(|c| self.holds(c, route, attrs)) {
+            if !term
+                .clauses
+                .iter()
+                .all(|c| self.holds(c, route, attrs, rov))
+            {
                 continue;
             }
-            if !term.sets.is_empty() {
-                let mut a = modified.take().unwrap_or_else(|| route.attrs.clone());
-                for s in &term.sets {
-                    apply(s, &mut a, route);
+            // A term that only sets the validation state leaves the
+            // attributes alone: nothing is copied for it.
+            let mut touched = false;
+            for set in &term.sets {
+                if let SetAction::Rpki(state) = set {
+                    rov = *state;
+                } else {
+                    apply(
+                        set,
+                        modified.get_or_insert_with(|| route.attrs.clone()),
+                        route,
+                    );
+                    touched = true;
                 }
+            }
+            if touched && let Some(a) = modified.as_mut() {
                 a.normalise();
-                modified = Some(a);
             }
             match term.action {
-                Action::Accept => {
-                    return modified.map_or(Verdict::Accept, Verdict::Modified);
-                }
+                Action::Accept => return accepted(modified, route.rov, rov),
                 Action::Reject => return Verdict::Reject,
                 Action::Next => {}
             }
@@ -224,7 +248,7 @@ impl PolicySet {
         Verdict::Reject
     }
 
-    fn holds(&self, clause: &Clause, route: &Route<'_>, attrs: &PathAttrs) -> bool {
+    fn holds(&self, clause: &Clause, route: &Route<'_>, attrs: &PathAttrs, rov: RovState) -> bool {
         match clause {
             Clause::Prefix(r) => r.matches(route.prefix),
             Clause::PrefixList(i) => self.prefix_lists[*i].matches(route.prefix),
@@ -234,7 +258,19 @@ impl PolicySet {
             Clause::LargeCommunity(c) => attrs.large_communities.binary_search(c).is_ok(),
             Clause::Origin(o) => attrs.origin == *o,
             Clause::Neighbor(a) => route.neighbor == *a,
+            Clause::Rpki(state) => rov == *state,
         }
+    }
+}
+
+/// The verdict for a route accepted with `modified` attributes, if any,
+/// and the validation state `now` where it came in with `before`.
+fn accepted(modified: Option<PathAttrs>, before: RovState, now: RovState) -> Verdict {
+    match (modified, (now != before).then_some(now)) {
+        (None, None) => Verdict::Accept,
+        (Some(a), None) => Verdict::Modified(a),
+        (None, Some(state)) => Verdict::Restated(state),
+        (Some(a), Some(state)) => Verdict::ModifiedRestated(a, state),
     }
 }
 
@@ -251,6 +287,8 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
                 a.as_path = a.as_path.prepend(*asn);
             }
         }
+        // A validation state is not an attribute: `evaluate_at` keeps it.
+        SetAction::Rpki(_) => {}
         SetAction::NextHopSelf => {
             a.next_hop = match (route.family, route.local_addr) {
                 (AddressFamily::IPV4_UNICAST, IpAddr::V4(v4)) => NextHop::Ipv4(v4),
@@ -357,8 +395,6 @@ impl Engine {
     }
 }
 
-/// No clause matches on the validation state yet, so `rov` is accepted
-/// and not read: the RFC 6811 §3 row in COMPLIANCE.md says what is left.
 impl Policies for Engine {
     fn import(
         &self,
@@ -366,7 +402,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
-        _rov: RovState,
+        rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -375,6 +411,7 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
             extended_next_hop: peer.extended_next_hop.contains(&family),
+            rov,
         };
         self.run(|n| n.0, peer, &route)
     }
@@ -385,7 +422,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
-        _rov: RovState,
+        rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -394,6 +431,7 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
             extended_next_hop: peer.extended_next_hop.contains(&family),
+            rov,
         };
         self.run(|n| n.1, peer, &route)
     }

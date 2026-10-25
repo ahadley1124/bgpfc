@@ -81,14 +81,17 @@ match        = "prefix" prefix-entry
              | "ext-community" ext-community
              | "large-community" large-community
              | "origin" ( "igp" | "egp" | "incomplete" )
-             | "neighbor" ip ;
+             | "neighbor" ip
+             | "rpki" rov-state ;
 set          = "local-pref" u32
              | "med" u32
              | "community" op community { community }
              | "ext-community" op ext-community { ext-community }
              | "large-community" op large-community { large-community }
              | "as-path" "prepend" asn { asn }
-             | "next-hop" "self" ;
+             | "next-hop" "self"
+             | "rpki" rov-state ;
+rov-state    = "valid" | "invalid" | "not-found" | "disabled" ;
 op           = "add" | "remove" | "replace" ;
 action       = "accept" | "reject" | "next" ;
 
@@ -151,7 +154,8 @@ Match clauses: `prefix` and `prefix-list` compare the route's NLRI;
 `as-path` is a regular expression over AS numbers (below); the three
 community clauses hold when the route carries the value; `origin` compares
 the ORIGIN attribute; `neighbor` compares the peer the route was received
-from (import) or is being sent to (export).
+from (import) or is being sent to (export); `rpki` compares the route's
+origin validation state (below).
 
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
@@ -161,6 +165,51 @@ address on the session, see `extended-next-hop` below for IPv4 routes on an
 IPv6 session). `next-hop self` is therefore only meaningful in export
 policies towards internal peers. A policy cannot advertise a route to the
 peer it came from, nor an internal route to another internal peer.
+
+**Origin validation state in policy.** `match rpki STATE` holds when the
+route's RFC 6811 origin validation state is `valid`, `invalid`,
+`not-found` or `disabled`, the spelling `show routes` uses (RFC 6811 §3:
+"match and set the validation state of routes as part of its route policy
+filtering function"). `disabled` is not an RFC state: it is the state of a
+route nobody validated (`rpki` without a block, with `mode disabled`, or
+before a cache has sent its VRPs), kept apart from `not-found`, which
+means that no VRP covers the route (`docs/control.md`, "Validation
+state"). A policy that treats the two alike matches both, in two terms.
+In an import policy the state is the one the lookup gave the route; in an
+export policy, the one the route holds in the Loc-RIB. A policy can filter
+by the state or set a preference from it (RFC 6811 §5):
+
+```
+policy FROM-TRANSIT {
+    term bad       { match rpki invalid;   action reject; }
+    term good      { match rpki valid;     set local-pref 200; action accept; }
+    term unknown   { match rpki not-found; set local-pref 100; action accept; }
+}
+```
+
+`set rpki STATE` gives the route that state from there on: the terms
+after it match it, and an import policy that accepts the route leaves it
+with that state, in the decision process, in export policy, and in `show
+routes`. It is for a state that did not come from a lookup (RFC 6811
+§5: where a property that is not passed on to internal peers decides which
+route is chosen, "it could be necessary for routing correctness to
+propagate the validation state to the IBGP peer", by a community on the
+sending side that "the receiving side" matches before "setting the
+validation state"):
+
+```
+policy FROM-IBGP {
+    term said-invalid { match community 65000:666; set rpki invalid; action next; }
+    term said-valid   { match community 65000:200; set rpki valid;   action next; }
+    term rest         { action accept; }
+}
+```
+
+When the VRPs change, a route whose lookup changed runs through its import
+policy again from the route as received, so a state a policy set is set
+again or no longer set according to the new lookup. The state is local to
+the speaker: it is never sent, so what an export policy sets only matters
+to its own later terms.
 
 **AS-path regular expressions.** The pattern is matched against the
 route's `AS_PATH` as a sequence of AS numbers; every operator acts on

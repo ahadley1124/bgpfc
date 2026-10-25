@@ -12,13 +12,16 @@
 //! within the Expire
 //! Interval's range; `backoff` within the Retry Interval's), §7
 //! (`version`), §9 (port 323), §10 (`cache` and its `preference`);
-//! RFC 1123 §2.1 (cache host names); RFC 9234 §4 (`role`, `role-strict`).
+//! RFC 1123 §2.1 (cache host names); RFC 9234 §4 (`role`, `role-strict`);
+//! RFC 6811 §3 (`match rpki` and `set rpki`: policy matches and sets the
+//! validation state).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use bgpfc_rpki::RovState;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::role::{LocalRole, Role};
@@ -791,11 +794,31 @@ impl Lowerer {
                 let a = one(self)?;
                 self.parse(a, "an IP address").map(Match::Neighbor)
             }
+            "rpki" => {
+                let a = one(self)?;
+                self.rov_state(a).map(Match::Rpki)
+            }
             _ => {
                 self.err(kind.pos, format!("unknown match clause `{}`", kind.value));
                 None
             }
         }
+    }
+
+    /// An origin validation state: the spelling every log line, control
+    /// reply and `show routes` already uses.
+    fn rov_state(&mut self, a: &Arg) -> Option<RovState> {
+        let state = a.value.parse::<RovState>().ok();
+        if state.is_none() {
+            self.err(
+                a.pos,
+                format!(
+                    "`{}` is not `valid`, `invalid`, `not-found` or `disabled`",
+                    a.value
+                ),
+            );
+        }
+        state
     }
 
     fn community_op(&mut self, a: &Arg) -> Option<CommunityOp> {
@@ -896,6 +919,10 @@ impl Lowerer {
                     self.err(a.pos, "only `set next-hop self` is supported");
                     None
                 }
+            }
+            "rpki" => {
+                let a = one(self)?;
+                self.rov_state(a).map(SetAction::Rpki)
             }
             _ => {
                 self.err(kind.pos, format!("unknown set action `{}`", kind.value));

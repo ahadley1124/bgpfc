@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bgpfc_rpki::RovState;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -380,6 +381,9 @@ pub enum Match {
     Origin(Origin),
     /// `match neighbor ADDR`.
     Neighbor(IpAddr),
+    /// `match rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state (RFC 6811 §3).
+    Rpki(RovState),
 }
 
 /// How a `set ... community` action changes the set.
@@ -410,6 +414,9 @@ pub enum SetAction {
     AsPathPrepend(Vec<Asn>),
     /// `set next-hop self`.
     NextHopSelf,
+    /// `set rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state from here on (RFC 6811 §3).
+    Rpki(RovState),
 }
 
 /// How a term ends.
