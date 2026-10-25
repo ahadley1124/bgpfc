@@ -1103,3 +1103,41 @@ fn interner_gives_its_table_back_when_emptied() {
     assert_eq!(i.len(), 0);
     assert!(i.capacity() < full / 4, "{} of {full}", i.capacity());
 }
+
+#[test]
+fn routes_sharing_attributes_share_one_exported_set_per_peer() {
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i1 = peer("10.0.0.3", LOCAL_AS.0, 3);
+    let mut rib = Rib::new(LOCAL_AS);
+    let _ = outputs(|o| {
+        rib.peer_up(e1.clone(), o);
+        rib.peer_up(e2.clone(), o);
+        rib.peer_up(i1.clone(), o);
+    });
+    let prefixes = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
+    let a = attrs(&[65_001, 64_500], "10.0.0.1");
+    let _ = outputs(|o| rib.update(e1.addr, &announce(&prefixes, &a), o));
+    // RFC 4271 §5.1: the rewrite differs by peer; within a peer, the
+    // three routes share one set.
+    let sent = |to: &PeerInfo| {
+        let out: Vec<Arc<PathAttrs>> = rib
+            .adj_rib_out(to.addr, V4)
+            .map(|(_, a)| Arc::clone(a))
+            .collect();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|x| Arc::ptr_eq(x, &out[0])));
+        Arc::clone(&out[0])
+    };
+    let (external, internal) = (sent(&e2), sent(&i1));
+    assert_eq!(external.as_path.first_asn(), Some(LOCAL_AS));
+    assert_eq!(external.local_pref, None);
+    assert_eq!(internal.as_path.first_asn(), Some(Asn(65_001)));
+    assert_eq!(internal.local_pref, Some(100));
+    drop((external, internal));
+    // Withdrawn, every set goes with its last route: the memo of the
+    // last rewrite holds none of them.
+    let _ = outputs(|o| rib.update(e1.addr, &withdraw(&prefixes), o));
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
+    assert_eq!(rib.s.cx.interner.len(), 0);
+}

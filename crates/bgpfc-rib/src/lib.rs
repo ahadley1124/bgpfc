@@ -29,7 +29,7 @@ mod tests;
 use std::collections::btree_map::Entry as Slot;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Asn};
@@ -157,6 +157,31 @@ struct PeerState {
     adj_out: FamilyMap<AdjOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: FamilyMap<usize>,
+    /// The last rewrite of attributes for this peer.
+    memo: Option<ExportMemo>,
+}
+
+/// The last session rewrite (RFC 4271 §5.1) of attributes an export
+/// policy accepted unchanged, for one peer. It depends on nothing else
+/// that changes during the session, and the routes of one UPDATE share
+/// their attributes, so the next route mostly needs the same: the rewrite
+/// and the interner lookup run once per attribute set, not once per
+/// route. Both sets are held weakly, so the interner's counts (see
+/// `Interner::release`) do not see the memo, and an allocation it points
+/// to cannot be reused for other attributes while it does.
+struct ExportMemo {
+    family: AddressFamily,
+    source: Source,
+    attrs: Weak<PathAttrs>,
+    /// `None` when the route is not advertised to the peer at all.
+    exported: Option<Weak<PathAttrs>>,
+}
+
+impl ExportMemo {
+    /// Whether the memo is about `attrs` from `source`.
+    fn is_for(&self, family: AddressFamily, source: Source, attrs: &Arc<PathAttrs>) -> bool {
+        self.family == family && self.source == source && self.attrs.as_ptr() == Arc::as_ptr(attrs)
+    }
 }
 
 /// Counters about one peer, for the control plane.
@@ -293,6 +318,7 @@ impl Rib {
             disabled: Vec::new(),
             adj_out: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
+            memo: None,
         });
         for family in families {
             self.refresh(addr, family, out);
@@ -792,7 +818,8 @@ impl Sessions {
             peer: from.addr,
             kind: from.kind,
         };
-        let to = &self.peers[to.index()].as_ref()?.info;
+        let state = self.peers[to.index()].as_mut()?;
+        let to = &state.info;
         let cx = &mut self.cx;
         // The route is not offered to the policy at all when §9.2 rules
         // it out, so a policy cannot override those.
@@ -802,7 +829,28 @@ impl Sessions {
         let modified;
         let attrs: &PathAttrs = match cx.policies.export(to, family, prefix, &best.attrs) {
             Verdict::Reject => return None,
-            Verdict::Accept => &best.attrs,
+            Verdict::Accept => {
+                if let Some(m) = &state.memo
+                    && m.is_for(family, source, &best.attrs)
+                {
+                    // Not advertised, or the set: unless it has gone
+                    // (no route uses it any more), then it is worked out
+                    // again.
+                    let w = m.exported.as_ref()?;
+                    if let Some(a) = w.upgrade() {
+                        return Some(a);
+                    }
+                }
+                let exported = export::export(cx.local_as, family, source, &best.attrs, to)
+                    .map(|a| cx.interner.intern(a));
+                state.memo = Some(ExportMemo {
+                    family,
+                    source,
+                    attrs: Arc::downgrade(&best.attrs),
+                    exported: exported.as_ref().map(Arc::downgrade),
+                });
+                return exported;
+            }
             Verdict::Modified(a) => {
                 modified = a;
                 &modified
