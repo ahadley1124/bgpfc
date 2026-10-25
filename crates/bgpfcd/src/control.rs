@@ -2160,6 +2160,28 @@ mod tests {
     }
 
     #[test]
+    fn a_path_with_an_identifier_and_the_attribute_shows_both() {
+        // RFC 7911 §3 and RFC 9234 §5 together, in the order docs/control.md
+        // gives: the identifier after the neighbor, then the attribute.
+        use bgpfc_wire::types::{Asn, PathId};
+        let mut r = route("192.0.2.0/24", "198.51.100.1", &[64_511], Some(100), None);
+        r.path_id = Some(PathId(7));
+        Arc::make_mut(&mut r.attrs).otc = Some(Asn(64_511));
+        assert!(
+            route_line(&r).ends_with("64511 via 198.51.100.1 id 7 otc 64511"),
+            "{}",
+            route_line(&r)
+        );
+        let mut j = Json::new();
+        route_json(&mut j, &r);
+        let json = j.finish();
+        assert!(
+            json.contains(r#""otc":64511,"peer":"198.51.100.1","path_id":7,"best""#),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn routes_render_as_lines_and_json() {
         // Two routes to one destination, from different origin ASes: a
         // VRP for AS 64496 makes one valid and the other invalid. The
