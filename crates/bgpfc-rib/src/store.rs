@@ -3,7 +3,7 @@
 //! octets in its table, with its first route inline and no allocation of
 //! its own until a second peer sends a route to it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map};
 use std::mem;
 use std::sync::Arc;
 
@@ -143,46 +143,145 @@ impl Default for Destination {
     }
 }
 
-/// One family's destinations, in prefix order. IPv4 prefixes are keyed by
-/// a 5-octet [`Ipv4Key`] rather than an 18-octet [`Prefix`]: a full table
-/// is mostly B-tree nodes, eleven keys each. A family has one kind of
-/// prefix, so one of the two maps stays empty, which costs nothing.
-#[derive(Debug, Default)]
-pub(crate) struct Table {
-    pub(crate) v4: BTreeMap<Ipv4Key, Destination>,
-    pub(crate) v6: BTreeMap<Prefix, Destination>,
+/// One family's values by prefix, in prefix order. IPv4 prefixes are
+/// keyed by a 5-octet [`Ipv4Key`] rather than an 18-octet [`Prefix`]: a
+/// full table is mostly B-tree nodes, eleven keys each. A family has one
+/// kind of prefix, so one of the two maps stays empty, which costs
+/// nothing.
+#[derive(Debug)]
+pub(crate) struct PrefixMap<V> {
+    pub(crate) v4: BTreeMap<Ipv4Key, V>,
+    pub(crate) v6: BTreeMap<Prefix, V>,
 }
 
-impl Table {
-    #[cfg(feature = "profiling")]
+/// One family's destinations.
+pub(crate) type Table = PrefixMap<Destination>;
+
+/// What [`PrefixMap::update`] did.
+pub(crate) enum Updated<V> {
+    /// The prefix mapped to the same value already; nothing changed.
+    Same,
+    /// The new value is in; this is what it replaced, if anything.
+    Changed(Option<V>),
+}
+
+/// One family's Adj-RIB-Out for one peer: what it was last sent. A
+/// B-tree rather than a hash table: 13 octets an IPv4 entry plus node
+/// slack, against 32 and a bucket array that doubles (and is held twice
+/// while it does) for a full table.
+pub(crate) type AdjOut = PrefixMap<Arc<PathAttrs>>;
+
+impl<V> Default for PrefixMap<V> {
+    fn default() -> Self {
+        PrefixMap {
+            v4: BTreeMap::new(),
+            v6: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> PrefixMap<V> {
     pub(crate) fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }
 
-    pub(crate) fn get(&self, prefix: Prefix) -> Option<&Destination> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
+    pub(crate) fn get(&self, prefix: Prefix) -> Option<&V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.get(&k),
             None => self.v6.get(&prefix),
         }
     }
 
-    /// Every destination, in prefix order (IPv4 sorts first).
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (Prefix, &Destination)> {
+    pub(crate) fn insert(&mut self, prefix: Prefix, value: V) -> Option<V> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.insert(k, value),
+            None => self.v6.insert(prefix, value),
+        }
+    }
+
+    /// Map `prefix` to `value` unless `same` says it already maps to the
+    /// same thing. One descent of the tree, where a lookup and an insert
+    /// make two.
+    pub(crate) fn update(
+        &mut self,
+        prefix: Prefix,
+        value: V,
+        same: impl FnOnce(&V, &V) -> bool,
+    ) -> Updated<V> {
+        fn update_in<K: Ord, V>(
+            map: &mut BTreeMap<K, V>,
+            key: K,
+            value: V,
+            same: impl FnOnce(&V, &V) -> bool,
+        ) -> Updated<V> {
+            match map.entry(key) {
+                btree_map::Entry::Vacant(e) => {
+                    e.insert(value);
+                    Updated::Changed(None)
+                }
+                btree_map::Entry::Occupied(mut e) => {
+                    if same(e.get(), &value) {
+                        Updated::Same
+                    } else {
+                        Updated::Changed(Some(e.insert(value)))
+                    }
+                }
+            }
+        }
+        match Ipv4Key::new(prefix) {
+            Some(k) => update_in(&mut self.v4, k, value, same),
+            None => update_in(&mut self.v6, prefix, value, same),
+        }
+    }
+
+    pub(crate) fn remove(&mut self, prefix: Prefix) -> Option<V> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.remove(&k),
+            None => self.v6.remove(&prefix),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.v4.clear();
+        self.v6.clear();
+    }
+
+    /// Every entry, in prefix order (IPv4 sorts first).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Prefix, &V)> {
         self.v4
             .iter()
-            .map(|(k, d)| (k.prefix(), d))
-            .chain(self.v6.iter().map(|(p, d)| (*p, d)))
+            .map(|(k, v)| (k.prefix(), v))
+            .chain(self.v6.iter().map(|(p, v)| (*p, v)))
     }
 
     #[cfg(feature = "profiling")]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Destination> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.v4.values().chain(self.v6.values())
     }
 
-    /// Keep the destinations `keep` says to, in prefix order.
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prefix, &mut Destination) -> bool) {
-        self.v4.retain(|k, d| keep(k.prefix(), d));
-        self.v6.retain(|p, d| keep(*p, d));
+    /// Heap octets, estimated: B-tree leaves of eleven keys and values
+    /// behind a 12-octet header, two thirds full (inserting in random
+    /// order averages about that); inner nodes add a few percent.
+    #[cfg(feature = "profiling")]
+    pub(crate) fn approx_bytes(&self) -> usize {
+        fn leaves<K, V>(n: usize) -> usize {
+            n * (12 + 11 * (size_of::<K>() + size_of::<V>())) * 3 / 22
+        }
+        leaves::<Ipv4Key, V>(self.v4.len()) + leaves::<Prefix, V>(self.v6.len())
+    }
+
+    pub(crate) fn into_values(self) -> impl Iterator<Item = V> {
+        self.v4.into_values().chain(self.v6.into_values())
+    }
+
+    /// Keep the entries `keep` says to, in prefix order.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prefix, &mut V) -> bool) {
+        self.v4.retain(|k, v| keep(k.prefix(), v));
+        self.v6.retain(|p, v| keep(*p, v));
     }
 }
 
@@ -333,6 +432,48 @@ mod tests {
         assert!(!a.same(&b));
         // Equal attributes in another allocation are a different set.
         assert!(!a.same(&route(1)));
+    }
+
+    #[test]
+    fn prefix_map_holds_both_kinds_in_prefix_order() {
+        let p = |s: &str| s.parse::<Prefix>().unwrap();
+        let mut m: PrefixMap<u32> = PrefixMap::default();
+        assert!(m.is_empty());
+        assert!(matches!(
+            m.update(p("2001:db8::/32"), 1, |a, b| a == b),
+            Updated::Changed(None)
+        ));
+        assert!(matches!(
+            m.update(p("192.0.2.0/24"), 2, |a, b| a == b),
+            Updated::Changed(None)
+        ));
+        assert!(matches!(
+            m.update(p("10.0.0.0/8"), 3, |a, b| a == b),
+            Updated::Changed(None)
+        ));
+        assert!(matches!(
+            m.update(p("10.0.0.0/8"), 3, |a, b| a == b),
+            Updated::Same
+        ));
+        assert!(matches!(
+            m.update(p("10.0.0.0/8"), 4, |a, b| a == b),
+            Updated::Changed(Some(3))
+        ));
+        assert_eq!(m.insert(p("10.0.0.0/16"), 5), None);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.get(p("192.0.2.0/24")), Some(&2));
+        assert_eq!(m.get(p("192.0.2.0/25")), None);
+        let order: Vec<String> = m.iter().map(|(p, _)| p.to_string()).collect();
+        assert_eq!(
+            order,
+            ["10.0.0.0/8", "10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]
+        );
+        assert_eq!(m.remove(p("2001:db8::/32")), Some(1));
+        m.retain(|p, v| {
+            *v += 1;
+            p.prefix_len() <= 16
+        });
+        assert_eq!(m.into_values().collect::<Vec<_>>(), vec![5, 6]);
     }
 
     #[test]

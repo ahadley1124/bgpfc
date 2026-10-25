@@ -39,7 +39,7 @@ pub use attrs::{Interner, PathAttrs};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-use store::{Destination, FamilyMap, PeerId, Route, Table};
+use store::{AdjOut, Destination, FamilyMap, PeerId, Route, Table, Updated};
 
 /// What a policy decided about a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +154,7 @@ struct PeerState {
     /// (RFC 4760 §7); no more routes are accepted for them.
     disabled: Vec<AddressFamily>,
     /// Adj-RIB-Out: what the peer was last told, per family.
-    adj_out: FamilyMap<HashMap<Prefix, Arc<PathAttrs>>>,
+    adj_out: FamilyMap<AdjOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: FamilyMap<usize>,
 }
@@ -349,7 +349,6 @@ impl Rib {
             return;
         }
         let mut batch = Batch::default();
-        // Refill the map in place: its capacity is the table's already.
         let mut adj_out = self
             .s
             .peer_mut(id)
@@ -402,7 +401,7 @@ impl Rib {
                         }
                     },
                     None => {
-                        if let Some(old) = adj_out.remove(&prefix) {
+                        if let Some(old) = adj_out.remove(prefix) {
                             self.s.cx.interner.release(old);
                             batch.withdraw.push(prefix);
                         }
@@ -575,7 +574,7 @@ impl Rib {
             .id(addr)
             .and_then(|id| self.s.peer(id).adj_out.get(family))
             .into_iter()
-            .flat_map(|m| m.iter().map(|(p, a)| (*p, a)))
+            .flat_map(AdjOut::iter)
     }
 
     /// Route counts for `addr`.
@@ -589,7 +588,7 @@ impl Rib {
                 .push((*family, p.adj_in_count.get(*family).copied().unwrap_or(0)));
             stats
                 .advertised
-                .push((*family, p.adj_out.get(*family).map_or(0, HashMap::len)));
+                .push((*family, p.adj_out.get(*family).map_or(0, AdjOut::len)));
         }
         Some(stats)
     }
@@ -645,7 +644,7 @@ impl Sessions {
     fn remove(&mut self, addr: IpAddr) -> Option<PeerId> {
         let id = self.by_addr.remove(&addr)?;
         if let Some(state) = self.peers[id.index()].take() {
-            for a in state.adj_out.into_values().flat_map(HashMap::into_values) {
+            for a in state.adj_out.into_values().flat_map(AdjOut::into_values) {
                 self.cx.interner.release(a);
             }
         }
@@ -744,7 +743,7 @@ impl Sessions {
             // (export::eligible): with nothing sent to it before, there is
             // nothing to do. With one peer up, that is every route.
             if best.is_some_and(|b| b.peer == id)
-                && to.adj_out.get(family).is_none_or(HashMap::is_empty)
+                && to.adj_out.get(family).is_none_or(AdjOut::is_empty)
             {
                 continue;
             }
@@ -754,9 +753,10 @@ impl Sessions {
             let adj_out = to.adj_out.or_default(family);
             match exported {
                 Some(a) => {
-                    let same = adj_out.get(&prefix).is_some_and(|old| Arc::ptr_eq(old, &a));
-                    if !same {
-                        if let Some(old) = adj_out.insert(prefix, Arc::clone(&a)) {
+                    if let Updated::Changed(old) =
+                        adj_out.update(prefix, Arc::clone(&a), Arc::ptr_eq)
+                    {
+                        if let Some(old) = old {
                             self.cx.interner.release(old);
                         }
                         batches.get(id, family).announce(&a, prefix);
@@ -766,7 +766,7 @@ impl Sessions {
                     // Not even hashed when nothing was sent: the source
                     // peer of every route, with a single peer up.
                     if !adj_out.is_empty()
-                        && let Some(old) = adj_out.remove(&prefix)
+                        && let Some(old) = adj_out.remove(prefix)
                     {
                         self.cx.interner.release(old);
                         batches.get(id, family).withdraw.push(prefix);

@@ -2,7 +2,7 @@
 //! sizes, how much the attributes repeat, and the size of the structures a
 //! route is made of.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ impl Rib {
                 .iter()
                 .flatten()
                 .flat_map(|p| p.adj_out.values())
-                .map(HashMap::len)
+                .map(crate::store::AdjOut::len)
                 .sum(),
         }
     }
@@ -85,8 +85,7 @@ impl Rib {
         for p in self.s.peers.iter().flatten() {
             for out in p.adj_out.values() {
                 d.adj_rib_out += out.len();
-                // hashbrown: one entry and one control octet per bucket.
-                d.adj_rib_out_bytes += out.capacity() * (size_of::<(Prefix, Arc<PathAttrs>)>() + 1);
+                d.adj_rib_out_bytes += out.approx_bytes();
             }
         }
         d
@@ -160,8 +159,8 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
         ("AsPathSegment", size_of::<AsPathSegment>()),
         ("NextHop", size_of::<NextHop>()),
         (
-            "(Prefix, Arc<PathAttrs>) [Adj-RIB-Out entry]",
-            size_of::<(Prefix, Arc<PathAttrs>)>(),
+            "Ipv4Key + Arc<PathAttrs> [IPv4 Adj-RIB-Out entry]",
+            size_of::<Ipv4Key>() + size_of::<Arc<PathAttrs>>(),
         ),
         ("PeerInfo", size_of::<PeerInfo>()),
         ("PeerState", size_of::<PeerState>()),
