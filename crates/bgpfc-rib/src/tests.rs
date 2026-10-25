@@ -16,7 +16,7 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
 use crate::attrs::{PathAttrs, announced};
-use crate::decision::{Candidate, Neighbor, best};
+use crate::decision::{Candidate, Neighbor, ORDER, Step, best};
 use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
@@ -279,8 +279,9 @@ fn med_compares_within_the_neighboring_as_only() {
 fn med_outcome_does_not_depend_on_candidate_order() {
     // Pairwise MED comparison is not transitive here: a beats b on MED
     // (same AS), b beats c on router id (different AS, MED not
-    // compared), c beats a on router id. Ranking each route against all
-    // routes of its AS first makes the winner the same in every order.
+    // compared), c beats a on router id. Removing from consideration, as
+    // §9.1.2.2 c) does, every route another route still under
+    // consideration beats makes the winner the same in every order.
     let e1 = peer("10.0.0.1", 65_001, 3);
     let e2 = peer("10.0.0.2", 65_001, 1);
     let e3 = peer("10.0.0.3", 65_003, 2);
@@ -347,6 +348,115 @@ fn lower_router_id_then_lower_peer_address() {
     ];
     assert_eq!(best_of(&c), Some(1));
     assert_eq!(best_of(&[]), None);
+}
+
+#[test]
+fn med_is_compared_only_among_routes_still_under_consideration() {
+    // RFC 4271 §9.1.2.2 c): "for m = all routes still under consideration
+    // / for n = all routes still under consideration". Three routes from
+    // AS 65001: a) removes 10.0.0.3, whose path is longest, and its MED 0
+    // goes with it; c) then compares 10 with 20 and removes 10.0.0.2. A
+    // MED taken over every candidate would leave .1 and .2 tied on MED and
+    // let the router ID choose .2.
+    let e1 = peer("10.0.0.1", 65_001, 3);
+    let e2 = peer("10.0.0.2", 65_001, 1);
+    let e3 = peer("10.0.0.3", 65_001, 2);
+    let with_med = |path: &[u32], next_hop: &str, med: u32| {
+        let mut a = attrs(path, next_hop);
+        a.med = Some(med);
+        a
+    };
+    let mut c = [
+        (&e1, with_med(&[65_001, 1], "10.0.0.1", 10)),
+        (&e2, with_med(&[65_001, 2], "10.0.0.2", 20)),
+        (&e3, with_med(&[65_001, 3, 4], "10.0.0.3", 0)),
+    ];
+    assert_eq!(best_of(&c), Some(0));
+    // The same through the RIB, as the routes arrive from the peers.
+    let mut rib = Rib::new(LOCAL_AS);
+    for (info, _) in &c {
+        outputs(|o| rib.peer_up((*info).clone(), now(), o));
+    }
+    for (info, a) in &c {
+        outputs(|o| rib.update(info.addr, &announce(&["192.0.2.0/24"], a), now(), o));
+    }
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e1.addr);
+    // A route the degree of preference removes takes its MED with it too.
+    c[2].1 = with_med(&[65_001, 3], "10.0.0.3", 0);
+    c[2].1.local_pref = Some(50);
+    assert_eq!(best_of(&c), Some(0));
+    // Still under consideration, it removes both.
+    c[2].1.local_pref = None;
+    assert_eq!(best_of(&c), Some(2));
+}
+
+/// Make a route `step` prefers, or one it does not, for
+/// [`each_step_decides_what_the_earlier_ones_leave_tied`].
+fn preferred_by(step: Step, preferred: bool, info: &mut PeerInfo, a: &mut PathAttrs) {
+    match step {
+        Step::DegreeOfPreference => a.local_pref = Some(if preferred { 200 } else { 100 }),
+        Step::AsPathLength => {
+            let path: &[u32] = if preferred {
+                &[65_001]
+            } else {
+                &[65_001, 64_496, 64_497]
+            };
+            a.as_path = AsPath::sequence(&path.iter().map(|n| Asn(*n)).collect::<Vec<_>>());
+        }
+        Step::Origin => {
+            a.origin = if preferred {
+                Origin::Igp
+            } else {
+                Origin::Incomplete
+            };
+        }
+        // From the same neighboring AS, 65001, whatever the other steps
+        // make of the route: its path always starts with it.
+        Step::Med => a.med = Some(if preferred { 0 } else { 50 }),
+        Step::External => {
+            (info.kind, info.remote_as) = if preferred {
+                (PeerKind::External, Asn(65_001))
+            } else {
+                (PeerKind::Internal, LOCAL_AS)
+            };
+        }
+        // §9.1.2.2 e): no IGP, so no route is ever preferred by it.
+        Step::InteriorCost => {}
+        Step::RouterId => info.router_id = RouterId::new(if preferred { 1 } else { 9 }).unwrap(),
+        Step::PeerAddress => info.addr = ip(if preferred { "10.0.0.1" } else { "10.0.0.9" }),
+    }
+}
+
+#[test]
+fn each_step_decides_what_the_earlier_ones_leave_tied() {
+    // Issue #47, RFC 4271 §9.1.2.2: "The criteria MUST be applied in the
+    // order specified." For each step, two routes that every earlier step
+    // finds equal: the one the step prefers wins, although every later
+    // step prefers the other.
+    for (k, &step) in ORDER.iter().enumerate() {
+        if step == Step::InteriorCost {
+            continue;
+        }
+        let build = |wins: bool| {
+            let mut info = peer("10.0.0.5", 65_001, 5);
+            let mut a = attrs(&[65_001], "10.0.0.5");
+            for (j, &s) in ORDER.iter().enumerate() {
+                let preferred = match j.cmp(&k) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => wins,
+                    std::cmp::Ordering::Greater => !wins,
+                };
+                preferred_by(s, preferred, &mut info, &mut a);
+            }
+            (info, a)
+        };
+        let (winner, loser) = (build(true), build(false));
+        assert_ne!(winner.0.addr, loser.0.addr);
+        let w = (&winner.0, winner.1.clone());
+        let l = (&loser.0, loser.1.clone());
+        assert_eq!(best_of(&[w.clone(), l.clone()]), Some(0), "{step:?}");
+        assert_eq!(best_of(&[l, w]), Some(1), "{step:?}");
+    }
 }
 
 // --- RFC 4271 §5.1, §9.2 export rules ----------------------------------
