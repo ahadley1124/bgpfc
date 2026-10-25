@@ -20,7 +20,10 @@
 //! negotiation); RFC 8950 §4 (Extended Next Hop Encoding negotiation);
 //! RFC 7607 §2 (never claim AS 0); RFC 7911 §4, §5 (ADD-PATH negotiation,
 //! per family and direction); RFC 9234 §4.1, §4.2 (the BGP Role
-//! capability, the allowed pairs of Roles, strict mode and Role Mismatch).
+//! capability, the allowed pairs of Roles, strict mode and Role Mismatch);
+//! RFC 4724 §3, §4, §4.2, §5 and RFC 8538 §2, §4, §4.1 (the Graceful
+//! Restart capability, and which routes a session that ends leaves as
+//! stale for the Receiving Speaker procedures).
 #![forbid(unsafe_code)]
 
 mod machine;
@@ -34,7 +37,7 @@ use bgpfc_wire::error::DecodeError;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::role::{LocalRole, Role};
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 pub use bgpfc_wire::update::PeerKind;
 
 pub use machine::{Fsm, SEND_HOLD_TIMER_EXPIRED};
@@ -119,9 +122,14 @@ pub enum Event {
     TcpConnectionValid,
     /// 15: an incoming TCP connection request from a wrong address or port.
     TcpCrInvalid,
-    /// 16: our outgoing TCP connection completed.
+    /// 16: our outgoing TCP connection completed. While Established with a
+    /// peer whose Graceful Restart capability listed families, it ends the
+    /// session, keeping the routes (RFC 4724 §4.2, §5).
     TcpCrAcked,
-    /// 17: an incoming TCP connection completed.
+    /// 17: an incoming TCP connection completed. While Established with a
+    /// peer whose Graceful Restart capability listed families, it ends the
+    /// session, keeping the routes (RFC 4724 §4.2, §5); the caller then
+    /// feeds the event again for the new connection, which Connect takes.
     TcpConnectionConfirmed,
     /// 18: the TCP connection failed or closed.
     TcpConnectionFails,
@@ -216,10 +224,15 @@ pub enum Action {
     /// The session reached Established with these negotiated parameters;
     /// tell the RIB (`PeerUp`).
     SessionUp(Session),
-    /// The session left Established; delete every route learned from it
-    /// (RFC 4271 §8.2.2 "deletes all routes associated with this
-    /// connection") and tell the RIB (`PeerDown`).
-    SessionDown,
+    /// The session left Established; tell the RIB (`PeerDown`). Unless
+    /// `retain` says otherwise, delete every route learned from it (RFC
+    /// 4271 §8.2.2 "deletes all routes associated with this connection").
+    SessionDown {
+        /// The routes to keep as stale instead, when the Receiving Speaker
+        /// procedures of RFC 4724 §4.2 and RFC 8538 §4 apply to how the
+        /// session ended.
+        retain: Option<Retain>,
+    },
     /// Log at error level (RFC 9687 §5 requires it for Send Hold Timer
     /// Expired; also used for FSM errors).
     LogError(&'static str),
@@ -230,6 +243,63 @@ pub enum Action {
         /// Consecutive damped failures, this one included.
         failures: u32,
     },
+}
+
+/// The routes of a session that ended and are kept, as stale routing
+/// information, until the peer sends them again (RFC 4724 §4.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retain {
+    /// The families whose routes are kept: those in the peer's Graceful
+    /// Restart capability (RFC 4724 §4.2).
+    pub families: Vec<AddressFamily>,
+    /// The Restart Time the peer advertised: the time the session has to
+    /// come back in, else the stale routes are deleted (RFC 4724 §4.2).
+    pub restart_time: RestartTime,
+    /// The Graceful Notification bit was exchanged (RFC 8538 §2): routes
+    /// still stale from an earlier session are kept too, instead of being
+    /// deleted "to deal with possible consecutive restarts" (RFC 8538
+    /// §4.1).
+    pub notification: bool,
+}
+
+/// Graceful Restart on a session for which we advertised the capability
+/// (RFC 4724 §3). The End-of-RIB marker follows our initial update of each
+/// family then (§4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restart {
+    /// What the peer's capability says, if it advertised one: the
+    /// Receiving Speaker procedures apply to its routes (RFC 4724 §4.2).
+    pub peer: Option<PeerRestart>,
+}
+
+/// What the peer's Graceful Restart capability told us, for a session on
+/// which ours is on too (RFC 4724 §3, RFC 8538 §2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerRestart {
+    /// Its Restart Time.
+    pub restart_time: RestartTime,
+    /// Its Restart State bit: the peer has restarted, and we must not wait
+    /// for its End-of-RIB before advertising to it (RFC 4724 §3, §4.1).
+    pub restarting: bool,
+    /// Both sides set the Graceful Notification bit (RFC 8538 §2, §4): a
+    /// NOTIFICATION, other than a Hard Reset, either way, is graceful.
+    pub notification: bool,
+    /// The families of its capability that we take routes of, each with its
+    /// Forwarding State bit (RFC 4724 §3). Empty when the peer cannot
+    /// preserve forwarding state, though it sends End-of-RIB.
+    pub families: Vec<(AddressFamily, bool)>,
+}
+
+/// What the next OPEN says of a restart (RFC 4724 §3): not part of the
+/// configuration, because it changes while the daemon runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestartAdvert {
+    /// The Restart State bit: we have restarted.
+    pub restarting: bool,
+    /// The families whose Forwarding State bit is set: those whose
+    /// forwarding state has been preserved, which "can be set only if the
+    /// forwarding state has indeed been preserved" (RFC 4724 §4.1).
+    pub forwarding: Vec<AddressFamily>,
 }
 
 /// Parameters agreed in the OPEN exchange, fixed for the session's life.
@@ -288,8 +358,27 @@ pub struct Session {
     /// used for the procedures described in Section 5", whether or not
     /// the peer sent one). What the Only to Customer procedures follow.
     pub role: Option<Role>,
+    /// Graceful Restart, when we advertised the capability: boxed to keep
+    /// the session small, as it is carried in [`Action::SessionUp`].
+    pub restart: Option<Box<Restart>>,
     /// Capabilities the peer advertised, verbatim.
     pub peer_capabilities: Vec<Capability>,
+}
+
+impl Session {
+    /// What the peer's Graceful Restart capability says, when ours is on
+    /// and it sent one.
+    #[must_use]
+    pub fn peer_restart(&self) -> Option<&PeerRestart> {
+        self.restart.as_deref()?.peer.as_ref()
+    }
+
+    /// Whether the End-of-RIB marker follows our initial update of each
+    /// family: we advertised the capability (RFC 4724 §4).
+    #[must_use]
+    pub fn sends_end_of_rib(&self) -> bool {
+        self.restart.is_some()
+    }
 }
 
 /// Peer oscillation damping (RFC 4271 §8.1.1 group 1): how long to hold
@@ -388,6 +477,13 @@ pub struct Config {
     /// for. Roles are for eBGP sessions (§4); on an internal one it is
     /// neither sent nor checked.
     pub role: Option<LocalRole>,
+    /// Graceful Restart (RFC 4724 §3, RFC 8538 §2): advertise the
+    /// capability, with the Graceful Notification bit, and act as a
+    /// Receiving Speaker on a session whose peer advertised it too.
+    /// `None`, the default, advertises nothing and keeps RFC 4271's rules.
+    /// The capability is built from this and [`Fsm::set_restart_advert`];
+    /// it does not belong in `capabilities` as well.
+    pub graceful_restart: Option<GracefulRestart>,
     /// Seed for timer jitter (RFC 4271 §10); zero disables jitter, which
     /// tests rely on.
     pub jitter_seed: u64,
@@ -420,12 +516,21 @@ impl Config {
             send_hold_time: SendHoldTime::Default,
             capabilities: Vec::new(),
             role: None,
+            graceful_restart: None,
             jitter_seed: 0,
             passive: false,
             send_notification_without_open: false,
             collision_detect_established: false,
         }
     }
+}
+
+/// Graceful Restart as configured for a neighbor (RFC 4724 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GracefulRestart {
+    /// The Restart Time to advertise: the time the peer should allow the
+    /// session to come back in after we restart (RFC 4724 §3).
+    pub restart_time: RestartTime,
 }
 
 /// A trait-free hook for the tests and the daemon to turn an elapsed

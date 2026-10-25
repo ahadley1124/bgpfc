@@ -1644,6 +1644,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -1763,6 +1764,7 @@ mod tests {
             add_path_receive: vec![v4],
             add_path_send: vec![v4, v6],
             role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         };
         let report = PeerReport {
@@ -1882,6 +1884,7 @@ mod tests {
                 add_path_receive: Vec::new(),
                 add_path_send: Vec::new(),
                 role: None,
+                restart: None,
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,
@@ -2069,6 +2072,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: Some(Role::Customer),
+            restart: None,
             peer_capabilities: vec![Capability::Role(Role::Provider)],
         };
         let mut report = PeerReport {

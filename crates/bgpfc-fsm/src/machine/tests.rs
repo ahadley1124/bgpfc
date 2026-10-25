@@ -8,7 +8,7 @@ use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, U
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::role::{LocalRole, Role};
-use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RestartTime, RouterId};
 
 use super::*;
 use crate::{Damping, PeerKind};
@@ -114,7 +114,8 @@ fn tags(actions: &[Action]) -> Vec<String> {
             Action::SendKeepalive => "keepalive".to_owned(),
             Action::SendNotification(n) => format!("notif {}/{}", n.code.to_u8(), n.subcode),
             Action::SessionUp(_) => "up".to_owned(),
-            Action::SessionDown => "down".to_owned(),
+            Action::SessionDown { retain: None } => "down".to_owned(),
+            Action::SessionDown { retain: Some(_) } => "down-retain".to_owned(),
             Action::LogError(_) => "log".to_owned(),
             Action::RestartLimitReached { failures } => format!("limit {failures}"),
         })
@@ -1779,4 +1780,452 @@ fn received_ceases_damp_as_rfc4486_recommends() {
         now,
     );
     assert_eq!(f.damped_failures(), 0);
+}
+
+// ------------------------------------------------------ Graceful Restart
+
+fn gr_config() -> Config {
+    let mut c = config();
+    c.graceful_restart = Some(crate::GracefulRestart {
+        restart_time: RestartTime::new(120).unwrap(),
+    });
+    c
+}
+
+fn restart_time(secs: u16) -> RestartTime {
+    RestartTime::new(secs).unwrap()
+}
+
+/// The peer's Graceful Restart capability (RFC 4724 §3, RFC 8538 §2) with
+/// IPv4 unicast listed, unless `families` says otherwise.
+fn peer_gr(
+    restarting: bool,
+    notification: bool,
+    secs: u16,
+    families: &[(AddressFamily, bool)],
+) -> Capability {
+    Capability::GracefulRestart(bgpfc_wire::capability::GracefulRestart {
+        restarting,
+        notification,
+        restart_time: restart_time(secs),
+        families: families
+            .iter()
+            .map(
+                |&(family, forwarding)| bgpfc_wire::capability::GracefulRestartFamily {
+                    family,
+                    forwarding,
+                },
+            )
+            .collect(),
+    })
+}
+
+/// An Established FSM with `cfg` against a peer that advertised `extra`
+/// besides IPv4 unicast.
+fn established_with(cfg: Config, extra: Vec<Capability>) -> (Fsm, Instant) {
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let mut caps = vec![
+        Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+        Capability::RouteRefresh,
+    ];
+    caps.extend(extra);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+        now,
+    );
+    f.handle(Event::KeepAliveMsg, now);
+    assert_eq!(f.state(), State::Established);
+    (f, now)
+}
+
+fn v4() -> AddressFamily {
+    AddressFamily::IPV4_UNICAST
+}
+
+fn v6() -> AddressFamily {
+    AddressFamily::IPV6_UNICAST
+}
+
+fn hard_reset() -> NotificationMessage {
+    NotificationMessage::hard_reset(&NotificationMessage::cease(
+        CeaseSubcode::AdministrativeReset,
+    ))
+}
+
+/// The action that ends the session, among `actions`.
+fn session_end(actions: &[Action]) -> Option<&Option<Retain>> {
+    actions.iter().find_map(|a| match a {
+        Action::SessionDown { retain } => Some(retain),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_capability_is_advertised_only_when_configured() {
+    // RFC 4724 §3: absent from a neighbor that did not ask for it, so that
+    // without it nothing changes.
+    let (mut f, now) = fsm_at(State::Connect, config());
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert!(bgpfc_wire::capability::graceful_restart(&open.capabilities).is_none());
+    // Configured: the Graceful Notification bit, our Restart Time, no
+    // Restart State bit and no Forwarding State bit on a fresh start
+    // (RFC 4724 §4.1: only "if the forwarding state has indeed been
+    // preserved"), and a tuple for each family we advertise.
+    let (mut f, now) = fsm_at(State::Connect, gr_config());
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert!(!gr.restarting && gr.notification);
+    assert_eq!(gr.restart_time, restart_time(120));
+    assert_eq!(
+        gr.families
+            .iter()
+            .map(|t| (t.family, t.forwarding))
+            .collect::<Vec<_>>(),
+        vec![(v4(), false), (v6(), false)]
+    );
+    assert_eq!(
+        open.capabilities
+            .iter()
+            .filter(|c| matches!(c, Capability::GracefulRestart(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn the_restart_state_and_forwarding_bits_follow_what_the_owner_sets() {
+    // RFC 4724 §4.1: the Restarting Speaker "MUST set the Restart State
+    // bit", and the Forwarding State bit of a family "can be set only if
+    // the forwarding state has indeed been preserved for that address
+    // family".
+    let (mut f, now) = fsm_at(State::Connect, gr_config());
+    f.set_restart_advert(RestartAdvert {
+        restarting: true,
+        forwarding: vec![v4()],
+    });
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert!(gr.restarting);
+    assert_eq!(
+        gr.families
+            .iter()
+            .map(|t| (t.family, t.forwarding))
+            .collect::<Vec<_>>(),
+        vec![(v4(), true), (v6(), false)]
+    );
+    // Without the configuration the advert is not sent at all.
+    let (mut f, now) = fsm_at(State::Connect, config());
+    f.set_restart_advert(RestartAdvert {
+        restarting: true,
+        forwarding: vec![v4()],
+    });
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert!(bgpfc_wire::capability::graceful_restart(&open.capabilities).is_none());
+}
+
+#[test]
+fn a_speaker_with_no_multiprotocol_capability_lists_ipv4_unicast() {
+    // RFC 4724 §3: "implicitly associated with <AFI=IPv4, SAFI=Unicast>
+    // if using the encoding of [BGP-4]".
+    let mut cfg = gr_config();
+    cfg.capabilities.clear();
+    let (mut f, now) = fsm_at(State::Connect, cfg);
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert_eq!(gr.families.len(), 1);
+    assert_eq!(gr.families[0].family, v4());
+}
+
+#[test]
+fn the_session_remembers_the_peers_capability() {
+    // Ours off: the peer's capability is not acted on, whatever it says.
+    let theirs = peer_gr(false, true, 90, &[(v4(), true)]);
+    let (f, _) = established_with(config(), vec![theirs.clone()]);
+    let s = f.session().unwrap();
+    assert_eq!(s.peer_restart(), None);
+    assert!(!s.sends_end_of_rib());
+    // Ours on, the peer's absent: End-of-RIB is still sent (RFC 4724 §4),
+    // and nothing is kept for the peer.
+    let (f, _) = established_with(gr_config(), vec![]);
+    let s = f.session().unwrap();
+    assert_eq!(s.peer_restart(), None);
+    assert!(s.sends_end_of_rib());
+    // Both on: its Restart Time, its bits, and the families we take routes
+    // of, each with its Forwarding State bit (RFC 4724 §3).
+    let (f, _) = established_with(gr_config(), vec![theirs]);
+    let s = f.session().unwrap();
+    assert_eq!(
+        s.peer_restart(),
+        Some(&PeerRestart {
+            restart_time: restart_time(90),
+            restarting: false,
+            notification: true,
+            families: vec![(v4(), true)],
+        })
+    );
+    // A family of its capability that we take no routes of is left out;
+    // the Restart State bit is carried (RFC 4724 §3).
+    let odd = AddressFamily {
+        afi: Afi::Unknown(25),
+        safi: bgpfc_wire::types::Safi::Unknown(65),
+    };
+    let theirs = peer_gr(true, false, 5, &[(v6(), false), (odd, true), (v4(), true)]);
+    let (f, _) = established_with(gr_config(), vec![theirs]);
+    let restart = f.session().unwrap().peer_restart().unwrap().clone();
+    assert!(restart.restarting && !restart.notification);
+    assert_eq!(restart.families, vec![(v6(), false), (v4(), true)]);
+    // RFC 4724 §3: "ignore all but the last instance".
+    let (f, _) = established_with(
+        gr_config(),
+        vec![
+            peer_gr(true, true, 10, &[(v4(), true)]),
+            peer_gr(false, false, 20, &[(v6(), false)]),
+        ],
+    );
+    let restart = f.session().unwrap().peer_restart().unwrap().clone();
+    assert_eq!(restart.restart_time, restart_time(20));
+    assert_eq!(restart.families, vec![(v6(), false)]);
+    assert!(!restart.notification && !restart.restarting);
+}
+
+/// How a session may end, for the tables below.
+fn endings() -> Vec<(&'static str, Event)> {
+    vec![
+        ("tcp failure", Event::TcpConnectionFails),
+        ("hold timer", Event::HoldTimerExpires),
+        ("send hold timer", Event::SendHoldTimerExpires),
+        (
+            "notification received",
+            Event::NotifMsg(NotificationMessage::cease(
+                CeaseSubcode::AdministrativeShutdown,
+            )),
+        ),
+        (
+            "other notification received",
+            Event::NotifMsg(NotificationMessage::hold_timer_expired()),
+        ),
+        ("hard reset received", Event::NotifMsg(hard_reset())),
+        ("version error received", Event::NotifMsgVerErr),
+        (
+            "manual stop",
+            Event::ManualStop(NotificationMessage::cease(
+                CeaseSubcode::AdministrativeReset,
+            )),
+        ),
+        (
+            "manual stop with a hard reset",
+            Event::ManualStop(hard_reset()),
+        ),
+        (
+            "automatic stop",
+            Event::AutomaticStop(NotificationMessage::cease(CeaseSubcode::OutOfResources)),
+        ),
+        (
+            "automatic stop with a hard reset",
+            Event::AutomaticStop(NotificationMessage::hard_reset(
+                &NotificationMessage::max_prefixes_reached(v4(), 10),
+            )),
+        ),
+        ("update error", Event::UpdateMsgErr(update_err())),
+        ("header error", Event::BgpHeaderErr(header_err())),
+        ("fsm error", Event::ConnectRetryTimerExpires),
+    ]
+}
+
+#[test]
+fn which_endings_keep_the_routes() {
+    // (ending, kept without the N bit, kept with it)
+    let table = [
+        // RFC 4724 §5: a TCP failure; RFC 8538 §4: a Hold Timer expiry,
+        // and the Send Hold Timer of RFC 9687 as one more failure of the
+        // transport.
+        ("tcp failure", true, true),
+        ("hold timer", true, true),
+        ("send hold timer", true, true),
+        // RFC 4724 §4: "the normal BGP procedures MUST be followed" for a
+        // NOTIFICATION, sent or received; RFC 8538 §4: unless both sides
+        // set the N bit, and then not for a Hard Reset.
+        ("notification received", false, true),
+        ("other notification received", false, true),
+        ("hard reset received", false, false),
+        ("version error received", false, true),
+        ("manual stop", false, true),
+        ("manual stop with a hard reset", false, false),
+        ("automatic stop", false, true),
+        ("automatic stop with a hard reset", false, false),
+        ("update error", false, true),
+        ("header error", false, true),
+        ("fsm error", false, true),
+    ];
+    assert_eq!(table.len(), endings().len());
+    for (n_bit, column) in [(false, 1), (true, 2)] {
+        for (name, event) in endings() {
+            let theirs = peer_gr(false, n_bit, 90, &[(v4(), false)]);
+            let (mut f, now) = established_with(gr_config(), vec![theirs]);
+            let actions = f.handle(event, now);
+            let row = table.iter().find(|r| r.0 == name).unwrap();
+            let kept = [row.1, row.2][column - 1];
+            let end = session_end(&actions).unwrap_or_else(|| panic!("{name}: {actions:?}"));
+            assert_eq!(end.is_some(), kept, "{name}, N bit {n_bit}: {actions:?}");
+            assert_eq!(f.state(), State::Idle, "{name}");
+            if let Some(retain) = end {
+                assert_eq!(retain.families, vec![v4()], "{name}");
+                assert_eq!(retain.restart_time, restart_time(90), "{name}");
+                assert_eq!(retain.notification, n_bit, "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn nothing_is_kept_without_both_capabilities_and_a_family() {
+    // The same endings with a peer that cannot preserve forwarding state
+    // (no family: RFC 4724 §3), a peer that did not advertise the
+    // capability, and a neighbor of ours with Graceful Restart off: the
+    // routes go as RFC 4271 §8.2.2 has it.
+    let none = || vec![peer_gr(false, true, 90, &[])];
+    let absent = Vec::new;
+    let cases: Vec<(&str, Config, Vec<Capability>)> = vec![
+        ("no family", gr_config(), none()),
+        ("peer without the capability", gr_config(), absent()),
+        (
+            "ours off",
+            config(),
+            vec![peer_gr(false, true, 90, &[(v4(), true)])],
+        ),
+        (
+            "family we take nothing of",
+            gr_config(),
+            vec![peer_gr(
+                false,
+                true,
+                90,
+                &[(
+                    AddressFamily {
+                        afi: Afi::Unknown(25),
+                        safi: bgpfc_wire::types::Safi::Unknown(65),
+                    },
+                    true,
+                )],
+            )],
+        ),
+    ];
+    for (label, cfg, theirs) in cases {
+        for (name, event) in endings() {
+            let (mut f, now) = established_with(cfg.clone(), theirs.clone());
+            let actions = f.handle(event, now);
+            assert_eq!(
+                session_end(&actions),
+                Some(&None),
+                "{label}, {name}: {actions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_families_kept_are_those_of_the_peers_capability_that_we_take() {
+    // RFC 4724 §4.2: "all the address families that were previously
+    // received in the Graceful Restart Capability".
+    let theirs = peer_gr(false, false, 300, &[(v4(), true), (v6(), false)]);
+    let (mut f, now) = established_with(gr_config(), vec![theirs]);
+    let actions = f.handle(Event::TcpConnectionFails, now);
+    assert_eq!(
+        session_end(&actions),
+        Some(&Some(Retain {
+            families: vec![v4(), v6()],
+            restart_time: restart_time(300),
+            notification: false,
+        }))
+    );
+    // The retained session's end is no failure to damp, as before.
+    assert_eq!(f.damped_failures(), 0);
+    assert_eq!(f.state(), State::Idle);
+}
+
+#[test]
+fn a_hard_reset_is_damped_as_the_reason_it_carries() {
+    // RFC 8538 §3.1: the NOTIFICATION inside is the one RFC 4486 §4 judges.
+    for (inner, damped) in [
+        (CeaseSubcode::AdministrativeShutdown, true),
+        (CeaseSubcode::PeerDeconfigured, true),
+        (CeaseSubcode::OutOfResources, true),
+        (CeaseSubcode::AdministrativeReset, false),
+        (CeaseSubcode::OtherConfigurationChange, false),
+    ] {
+        let (mut f, now) = fsm_at(State::Established, config());
+        let n = NotificationMessage::hard_reset(&NotificationMessage::cease(inner));
+        f.handle(Event::NotifMsg(n), now);
+        assert_eq!(f.damped_failures(), u32::from(damped), "{inner:?}");
+    }
+}
+
+#[test]
+fn a_new_connection_from_a_restarting_peer_ends_the_old_session() {
+    // RFC 4724 §4.2: with the capability received, "the subsequent open
+    // connection from the peer" is "an indication of the termination of the
+    // old TCP session": it is closed with no NOTIFICATION, the routes are
+    // kept, and §5: the ConnectRetryCounter goes to zero, the
+    // ConnectRetryTimer starts and the state is Connect, whence the new
+    // connection goes on as in Connect (event 17 → OpenSent).
+    for event in [Event::TcpConnectionConfirmed, Event::TcpCrAcked] {
+        let theirs = peer_gr(false, false, 90, &[(v4(), true)]);
+        let (mut f, now) = established_with(gr_config(), vec![theirs]);
+        let actions = f.handle(event, now);
+        assert_eq!(tags(&actions), ["down-retain", "drop"]);
+        assert_eq!(f.state(), State::Connect);
+        assert_eq!(f.connect_retry_counter(), 0);
+        assert!(f.timer(TimerKind::ConnectRetry).is_running());
+        assert!(!f.timer(TimerKind::Hold).is_running());
+        assert!(!f.timer(TimerKind::Keepalive).is_running());
+        assert!(f.session().is_none());
+        // And no automatic restart is armed: the peer is connecting.
+        assert!(!f.timer(TimerKind::IdleHold).is_running());
+        let actions = f.handle(Event::TcpConnectionConfirmed, now);
+        assert_eq!(tags(&actions), ["open"]);
+        assert_eq!(f.state(), State::OpenSent);
+    }
+    // Without a family in the capability, the capability not received, or
+    // ours off, a second connection is the coordinator's to track
+    // (RFC 4271 §6.8): the event is ignored.
+    for (cfg, extra) in [
+        (gr_config(), vec![peer_gr(false, true, 90, &[])]),
+        (gr_config(), vec![]),
+        (config(), vec![peer_gr(false, true, 90, &[(v4(), true)])]),
+    ] {
+        let (mut f, now) = established_with(cfg, extra);
+        let actions = f.handle(Event::TcpConnectionConfirmed, now);
+        assert_eq!(tags(&actions), Vec::<String>::new());
+        assert_eq!(f.state(), State::Established);
+    }
+}
+
+#[test]
+fn the_notification_of_a_graceful_reset_is_still_sent() {
+    // RFC 8538 §4: the sender "MUST also follow the rules for the Receiving
+    // Speaker": it sends the NOTIFICATION as before, and keeps the routes.
+    let theirs = peer_gr(false, true, 90, &[(v4(), true)]);
+    let (mut f, now) = established_with(gr_config(), vec![theirs]);
+    let actions = f.handle(
+        Event::ManualStop(NotificationMessage::cease(
+            CeaseSubcode::AdministrativeReset,
+        )),
+        now,
+    );
+    assert_eq!(tags(&actions), ["notif 6/4", "down-retain", "drop"]);
 }

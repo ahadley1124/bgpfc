@@ -364,7 +364,7 @@ impl Peer {
                         session,
                     });
                 }
-                Action::SessionDown => {
+                Action::SessionDown { .. } => {
                     #[cfg(feature = "profiling")]
                     bgpfc_prof::metrics::SESSIONS_DROPPED.inc();
                     bgpfc_log::info!("session down", peer = self.cfg.addr);
