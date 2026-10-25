@@ -551,7 +551,7 @@ fn announce_withdraw_and_fib_changes() {
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m[0].withdrawn.len(), 2);
     assert_eq!(rib.loc_rib(V4).count(), 0);
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 0);
     assert_eq!(rib.peers().count(), 1);
 }
 
@@ -830,19 +830,32 @@ fn reexport_sends_only_the_difference() {
             o,
         );
     });
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 2);
-    // Nothing changed: nothing sent.
-    assert_eq!(outputs(|o| rib.reexport(e2.addr, V4, o)).len(), 0);
-    rib.set_policies(Box::new(DropOdd));
-    let out = outputs(|o| rib.reexport(e2.addr, V4, o));
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 2);
+    // The same policies again: nothing sent.
+    let out = outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[e2.addr], o));
+    assert_eq!(out.len(), 0);
+    let out = outputs(|o| rib.set_policies(Box::new(DropOdd), &[e2.addr], o));
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m.len(), 1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     assert_eq!(m[0].nlri.len(), 0);
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 1);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 1);
+    assert_eq!(
+        rib.peer_stats(e2.addr).unwrap().advertised,
+        vec![(V4, 1), (V6, 0)]
+    );
+    // And back: the route is announced again.
+    let out = outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[e2.addr], o));
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
+    assert_eq!(
+        rib.peer_stats(e2.addr).unwrap().advertised,
+        vec![(V4, 2), (V6, 0)]
+    );
     assert!(rib.peer(e2.addr).is_some());
     assert!(rib.peer(ip("10.9.9.9")).is_none());
-    assert_eq!(outputs(|o| rib.reexport(ip("10.9.9.9"), V4, o)).len(), 0);
+    let out = outputs(|o| rib.set_policies(Box::new(DropOdd), &[ip("10.9.9.9")], o));
+    assert_eq!(out.len(), 0);
 }
 
 #[test]
@@ -1160,9 +1173,10 @@ fn peers_are_sent_rewritten_sets_without_a_copy_per_peer() {
     assert_eq!(m[0].as_path().unwrap().first_asn(), Some(LOCAL_AS));
     let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
     for to in [&e2, &i1, &e3] {
-        assert_eq!(rib.adj_rib_out(to.addr, V4).count(), 3);
+        assert_eq!(rib.adj_rib_out(to.addr, V4).len(), 3);
         assert!(
             rib.adj_rib_out(to.addr, V4)
+                .iter()
                 .all(|(_, x)| Arc::ptr_eq(x, &held))
         );
     }
@@ -1170,7 +1184,7 @@ fn peers_are_sent_rewritten_sets_without_a_copy_per_peer() {
     drop(held);
     // Withdrawn, the set goes with its last route.
     let _ = outputs(|o| rib.update(e1.addr, &withdraw(&prefixes), o));
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 0);
     assert_eq!(rib.s.cx.interner.len(), 0);
 }
 
@@ -1200,6 +1214,7 @@ fn a_change_the_session_rewrite_hides_is_not_sent() {
     let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
     assert!(
         rib.adj_rib_out(e2.addr, V4)
+            .iter()
             .all(|(_, x)| Arc::ptr_eq(x, &held))
     );
     // A change it does see is sent.

@@ -99,17 +99,10 @@ fn run(
                 let _ = reply.send(answer(&rib, &q));
             }
             RibMsg::SetPolicies { policies, reexport } => {
-                rib.set_policies(policies.0);
-                for peer in reexport {
-                    let families: Vec<_> = rib
-                        .peer(peer)
-                        .map(|p| p.families.clone())
-                        .unwrap_or_default();
-                    for family in families {
-                        bgpfc_log::info!("rib: re-export", peer = peer, family = family);
-                        rib.reexport(peer, family, &mut out);
-                    }
+                for peer in &reexport {
+                    bgpfc_log::info!("rib: re-export", peer = peer);
                 }
+                rib.set_policies(policies.0, &reexport, &mut out);
             }
             RibMsg::Resend { peer } => {
                 let families: Vec<_> = rib

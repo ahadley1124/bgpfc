@@ -158,12 +158,6 @@ pub(crate) struct PrefixMap<V> {
 /// One family's destinations.
 pub(crate) type Table = PrefixMap<Destination>;
 
-/// One family's Adj-RIB-Out for one peer: what it was last sent. A
-/// B-tree rather than a hash table: 13 octets an IPv4 entry plus node
-/// slack, against 32 and a bucket array that doubles (and is held twice
-/// while it does) for a full table.
-pub(crate) type AdjOut = PrefixMap<Arc<PathAttrs>>;
-
 impl<V> Default for PrefixMap<V> {
     fn default() -> Self {
         PrefixMap {
@@ -174,10 +168,12 @@ impl<V> Default for PrefixMap<V> {
 }
 
 impl<V> PrefixMap<V> {
+    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn len(&self) -> usize {
         self.v4.len() + self.v6.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.v4.is_empty() && self.v6.is_empty()
     }
@@ -189,6 +185,7 @@ impl<V> PrefixMap<V> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, prefix: Prefix, value: V) -> Option<V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.insert(k, value),
@@ -196,16 +193,12 @@ impl<V> PrefixMap<V> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, prefix: Prefix) -> Option<V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.remove(&k),
             None => self.v6.remove(&prefix),
         }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.v4.clear();
-        self.v6.clear();
     }
 
     /// Every entry, in prefix order (IPv4 sorts first).
@@ -236,17 +229,7 @@ impl<V> PrefixMap<V> {
         self.v4.values().chain(self.v6.values())
     }
 
-    /// Heap octets, estimated: B-tree leaves of eleven keys and values
-    /// behind a 12-octet header, two thirds full (inserting in random
-    /// order averages about that); inner nodes add a few percent.
-    #[cfg(feature = "profiling")]
-    pub(crate) fn approx_bytes(&self) -> usize {
-        fn leaves<K, V>(n: usize) -> usize {
-            n * (12 + 11 * (size_of::<K>() + size_of::<V>())) * 3 / 22
-        }
-        leaves::<Ipv4Key, V>(self.v4.len()) + leaves::<Prefix, V>(self.v6.len())
-    }
-
+    #[cfg(test)]
     pub(crate) fn into_values(self) -> impl Iterator<Item = V> {
         self.v4.into_values().chain(self.v6.into_values())
     }
@@ -288,6 +271,7 @@ impl<T> FamilyMap<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, family: AddressFamily) -> Option<T> {
         let i = self.0.iter().position(|(f, _)| *f == family)?;
         Some(self.0.swap_remove(i).1)
@@ -305,12 +289,6 @@ impl<T> FamilyMap<T> {
     #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.0.iter().map(|(_, v)| v)
-    }
-}
-
-impl<T> FamilyMap<T> {
-    pub(crate) fn into_values(self) -> impl Iterator<Item = T> {
-        self.0.into_iter().map(|(_, v)| v)
     }
 }
 

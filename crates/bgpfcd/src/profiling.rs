@@ -396,7 +396,6 @@ fn duplication(peer: IpAddr, rib: &Rib) -> Line {
         .field("as_path_bytes_if_interned", d.as_path_bytes_if_interned)
         .field("candidate_bytes", d.candidate_bytes)
         .field("adj_rib_out", d.adj_rib_out)
-        .field("adj_rib_out_bytes", d.adj_rib_out_bytes)
         .field("walk_ms", started.elapsed().as_millis());
     l
 }

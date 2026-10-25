@@ -46,8 +46,7 @@ impl Rib {
                 .peers
                 .iter()
                 .flatten()
-                .flat_map(|p| p.adj_out.values())
-                .map(crate::store::AdjOut::len)
+                .flat_map(|p| p.advertised.values())
                 .sum(),
         }
     }
@@ -82,12 +81,13 @@ impl Rib {
         d.attr_values = by_value.len();
         d.as_paths = paths.len();
         d.as_path_bytes_if_interned = paths.iter().map(|p| as_path_heap_bytes(p)).sum();
-        for p in self.s.peers.iter().flatten() {
-            for out in p.adj_out.values() {
-                d.adj_rib_out += out.len();
-                d.adj_rib_out_bytes += out.approx_bytes();
-            }
-        }
+        d.adj_rib_out = self
+            .s
+            .peers
+            .iter()
+            .flatten()
+            .flat_map(|p| p.advertised.values())
+            .sum();
         d
     }
 }
@@ -118,10 +118,9 @@ pub struct Duplication {
     /// Heap octets of the per-destination route vectors: destinations
     /// with routes from two or more peers (one route is held inline).
     pub candidate_bytes: usize,
-    /// Routes in all Adj-RIBs-Out: a copy of the exported table per peer.
+    /// Routes in all Adj-RIBs-Out, which are counted, not stored: each
+    /// follows from the Loc-RIB and export.
     pub adj_rib_out: usize,
-    /// Estimated heap octets of the Adj-RIB-Out maps.
-    pub adj_rib_out_bytes: usize,
 }
 
 /// Heap octets owned by `p`: its segment vector and their ASN vectors.
@@ -158,10 +157,6 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
         ("AsPath", size_of::<AsPath>()),
         ("AsPathSegment", size_of::<AsPathSegment>()),
         ("NextHop", size_of::<NextHop>()),
-        (
-            "Ipv4Key + Arc<PathAttrs> [IPv4 Adj-RIB-Out entry]",
-            size_of::<Ipv4Key>() + size_of::<Arc<PathAttrs>>(),
-        ),
         ("PeerInfo", size_of::<PeerInfo>()),
         ("PeerState", size_of::<PeerState>()),
         ("Rib", size_of::<Rib>()),
@@ -255,7 +250,6 @@ mod tests {
         // A has the lower BGP Identifier and wins all three destinations
         // (RFC 4271 §9.1.2.2 f), so only B is sent routes.
         assert_eq!(d.adj_rib_out, 3);
-        assert!(d.adj_rib_out_bytes > 0);
 
         let sizes = rib.sizes();
         assert_eq!(sizes.destinations, 3);

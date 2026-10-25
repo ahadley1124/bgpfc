@@ -240,6 +240,13 @@ impl Batch {
         }
     }
 
+    /// Empty the batch, giving back the sets it announced.
+    pub fn take_sets(&mut self) -> impl Iterator<Item = Arc<PathAttrs>> + '_ {
+        self.withdraw.clear();
+        self.index.clear();
+        self.announce.drain(..).map(|(a, _)| a)
+    }
+
     /// Whether nothing is queued.
     #[must_use]
     pub fn is_empty(&self) -> bool {

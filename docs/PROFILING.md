@@ -305,7 +305,7 @@ of microseconds.
 | `as_paths` | distinct `AS_PATH`s among the sets |
 | `as_path_bytes`, `as_path_bytes_if_interned` | `AS_PATH` heap octets as stored (one copy per set) and if each distinct path were stored once: their difference is what interning paths separately would save |
 | `candidate_bytes` | heap octets of the per-destination route vectors: only destinations with routes from two or more peers have one (a single route is held inline) |
-| `adj_rib_out`, `adj_rib_out_bytes` | Adj-RIB-Out entries and an estimate of their octets: a copy of the exported table per peer |
+| `adj_rib_out` | Adj-RIB-Out entries, all peers. They are counted, not stored: what a peer was told follows from the Loc-RIB and export |
 | `walk_ms` | how long the walk took (the RIB thread is busy meanwhile) |
 
 ### Structure sizes
@@ -366,13 +366,11 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   interner leaves no duplicates. `as_path_bytes` against
   `as_path_bytes_if_interned` says whether interning `AS_PATH`s on their
   own would pay off.
-- **Per-peer RIB copies.** Every peer that is sent routes has an
-  Adj-RIB-Out map of the exported table (`adj_rib_out`,
-  `adj_rib_out_bytes`). Its entries point at the sets the export policy
-  produced, usually the Loc-RIB's own, so `interned` does not grow with
-  the peers: the session rewrite is applied when encoding
-  (`adj_rib_out_build`). With one load generator nothing is exported; add
-  a second session to see it grow.
+- **Per-peer cost.** A peer that is sent routes costs no table of its
+  own: its Adj-RIB-Out is what export makes of the Loc-RIB (`adj_rib_out`
+  counts it), and the session rewrite is applied when encoding
+  (`adj_rib_out_build`), so `interned` does not grow with the peers
+  either. What a second session adds is its queues: add one to see.
 - **Live bytes after `withdraw-all` or `flap`** (`residual_bytes`): an
   attribute set goes with its last route, so `interned` drops to zero
   with the routes and what stays is the maps' own capacity, under a

@@ -152,7 +152,11 @@ fn run(steps: &[Step]) -> (Vec<(Prefix, IpAddr)>, Vec<Vec<Prefix>>) {
     let outs = infos
         .iter()
         .map(|i| {
-            let mut v: Vec<Prefix> = rib.adj_rib_out(i.addr, V4).map(|(p, _)| p).collect();
+            let mut v: Vec<Prefix> = rib
+                .adj_rib_out(i.addr, V4)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
             v.sort();
             v
         })
