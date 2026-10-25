@@ -5,11 +5,11 @@
 
 use std::sync::Mutex;
 
-use bgpfc_rpki::{AffectedPrefixes, PrefixSet, ValidationChange, Vrp, VrpSet};
+use bgpfc_rpki::{AffectedPrefixes, InvalidAction, PrefixSet, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::update::EncodeContext;
 
 use super::*;
-use crate::{Policies, Revalidation, Verdict};
+use crate::{Enforcement, Policies, Revalidation, Verdict};
 
 /// What a policy was asked about, and the validation state it was told.
 type Seen = Arc<Mutex<Vec<(&'static str, Prefix, RovState)>>>;
@@ -1367,4 +1367,322 @@ fn restated_attributes_are_interned_like_any_modified_ones() {
     assert!(Arc::ptr_eq(one[0].attrs, two[0].attrs));
     let stored = routes(&rib, V4, p("192.0.2.0/24"));
     assert_eq!(stored[0].1.received().communities.len(), 0);
+}
+
+/// Import policy that gives Invalid routes a degree of preference of 500,
+/// far above the default, so that nothing but the RIB's own treatment of
+/// the Invalid can put one below another route.
+struct FavourInvalid;
+
+impl Policies for FavourInvalid {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        if rov != RovState::Invalid {
+            return Verdict::Accept;
+        }
+        let mut a = a.clone();
+        a.local_pref = Some(500);
+        Verdict::Modified(a)
+    }
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
+    }
+}
+
+/// The peer the best route to `prefix` came from.
+fn best_peer(rib: &Rib, prefix: &str) -> Option<IpAddr> {
+    rib.loc_rib(V4)
+        .find(|(q, _)| *q == p(prefix))
+        .map(|(_, b)| b.peer)
+}
+
+#[test]
+fn prefer_valid_puts_an_invalid_route_below_the_others_whatever_its_preference() {
+    // RFC 6811 §5: the Invalid lose in the decision process. Import policy
+    // gives them a degree of preference of 500, and they still lose; and
+    // their state follows the VRPs, so one that becomes Valid wins.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(FavourInvalid));
+    outputs(|o| {
+        rib.set_invalid_action(InvalidAction::PreferValid, now(), o);
+    });
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let watcher = peer("10.0.0.3", 65_003, 3);
+    for info in [&e1, &e2, &watcher] {
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
+    }
+    let for_e2 = vrps(&[("192.0.2.0/24", 24, 64_497)]);
+    outputs(|o| rib.validation_changed(all(for_e2.clone()), now(), o));
+
+    // e1's route is Invalid, and alone it is used.
+    let out = outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001, 64_496], "10.0.0.1")),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(best_peer(&rib, "192.0.2.0/24"), Some(e1.addr));
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sends(&out, watcher.addr).len(), 1);
+
+    // e2's route is Valid, with a longer path and the default preference:
+    // it is chosen, and the FIB and the watcher follow.
+    let out = outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(
+                &["192.0.2.0/24"],
+                &attrs(&[65_002, 100, 101, 64_497], "10.0.0.2"),
+            ),
+            now(),
+            o,
+        );
+    });
+    assert_eq!(best_peer(&rib, "192.0.2.0/24"), Some(e2.addr));
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("10.0.0.2")),
+            previous: Some(ip("10.0.0.1")),
+        }]
+    );
+    assert_eq!(sends(&out, watcher.addr).len(), 1);
+    // The Invalid route is still a candidate, in second place, with the
+    // state and the preference it was given.
+    let c = rib.candidates(V4, p("192.0.2.0/24"));
+    assert_eq!(
+        c.iter().map(|c| (c.peer, c.rov)).collect::<Vec<_>>(),
+        vec![(e2.addr, RovState::Valid), (e1.addr, RovState::Invalid)]
+    );
+    assert_eq!(c[1].attrs.local_pref, Some(500));
+
+    // The VRPs now name e1's origin: e1 is Valid, e2 Invalid. The choice
+    // follows, with no UPDATE from either.
+    let for_e1 = vrps(&[("192.0.2.0/24", 24, 64_496)]);
+    let out = outputs(|o| rib.validation_changed(delta(&for_e2, for_e1.clone()), now(), o));
+    assert_eq!(best_peer(&rib, "192.0.2.0/24"), Some(e1.addr));
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("10.0.0.1")),
+            previous: Some(ip("10.0.0.2")),
+        }]
+    );
+    assert_eq!(report(&out).map(|r| r.best_changed), Some(1));
+
+    // No VRPs at all: both NotFound, neither demoted, and the shorter
+    // path decides.
+    let out = outputs(|o| rib.validation_changed(delta(&for_e1, VrpSet::new()), now(), o));
+    assert_eq!(best_peer(&rib, "192.0.2.0/24"), Some(e1.addr));
+    assert_eq!(fib(&out), vec![]);
+}
+
+#[test]
+fn prefer_valid_also_puts_the_invalid_below_a_route_not_found() {
+    // The kinds are two: Invalid, and the rest. A policy-set NotFound (or
+    // an unvalidated Disabled) route is not demoted.
+    use RovState::{Invalid, NotFound, Valid};
+    let told = Seen::default();
+    let policy = Restate {
+        from: Valid,
+        to: NotFound,
+        tag: None,
+        export_sets: false,
+        told: Arc::clone(&told),
+    };
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
+    outputs(|o| {
+        rib.set_invalid_action(InvalidAction::PreferValid, now(), o);
+    });
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    for info in [&e1, &e2] {
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
+    }
+    outputs(|o| rib.validation_changed(all(vrps(&[("192.0.2.0/24", 24, 64_497)])), now(), o));
+    // e1's route is Invalid and has the shorter path.
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+            now(),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(
+                &["192.0.2.0/24"],
+                &attrs(&[65_002, 100, 64_497], "10.0.0.2"),
+            ),
+            now(),
+            o,
+        );
+    });
+    let c = rib.candidates(V4, p("192.0.2.0/24"));
+    assert_eq!(
+        c.iter().map(|c| (c.peer, c.rov)).collect::<Vec<_>>(),
+        vec![(e2.addr, NotFound), (e1.addr, Invalid)]
+    );
+}
+
+#[test]
+fn changing_the_action_decides_the_destinations_with_an_invalid_route_again() {
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(FavourInvalid));
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let watcher = peer("10.0.0.3", 65_003, 3);
+    for info in [&e1, &e2, &watcher] {
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
+    }
+    outputs(|o| {
+        rib.validation_changed(
+            all(vrps(&[
+                ("192.0.2.0/24", 24, 64_497),
+                ("198.51.100.0/24", 24, 64_497),
+            ])),
+            now(),
+            o,
+        );
+    });
+    // Two destinations with an Invalid route from e1 and a Valid one from
+    // e2, and one with Valid routes only.
+    let invalid = attrs(&[65_001, 64_496], "10.0.0.1");
+    let valid = attrs(&[65_002, 100, 101, 64_497], "10.0.0.2");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce(&["192.0.2.0/24", "198.51.100.0/24"], &invalid),
+            now(),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e2.addr,
+            &announce(
+                &["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"],
+                &valid,
+            ),
+            now(),
+            o,
+        );
+    });
+    // Nothing demotes them yet: the Invalid routes' preference wins.
+    for prefix in ["192.0.2.0/24", "198.51.100.0/24"] {
+        assert_eq!(best_peer(&rib, prefix), Some(e1.addr), "{prefix}");
+    }
+
+    let mut out = Vec::new();
+    let report = rib.set_invalid_action(InvalidAction::PreferValid, now(), &mut out);
+    assert_eq!(
+        report,
+        Enforcement {
+            invalid: 2,
+            destinations: 2,
+            best_changed: 2,
+        }
+    );
+    for prefix in ["192.0.2.0/24", "198.51.100.0/24"] {
+        assert_eq!(best_peer(&rib, prefix), Some(e2.addr), "{prefix}");
+    }
+    let mut changes = fib(&out);
+    changes.sort_by_key(|c| c.prefix);
+    assert_eq!(
+        changes
+            .iter()
+            .map(|c| (c.prefix, c.next_hop))
+            .collect::<Vec<_>>(),
+        vec![
+            (p("192.0.2.0/24"), Some(ip("10.0.0.2"))),
+            (p("198.51.100.0/24"), Some(ip("10.0.0.2"))),
+        ]
+    );
+    assert_eq!(sends(&out, watcher.addr).len(), 1);
+
+    // The same action again is no change.
+    let mut out = Vec::new();
+    assert_eq!(
+        rib.set_invalid_action(InvalidAction::PreferValid, now(), &mut out),
+        Enforcement::default()
+    );
+    assert_eq!(out, vec![]);
+
+    // And back to leaving it to policy.
+    let mut out = Vec::new();
+    let report = rib.set_invalid_action(InvalidAction::Policy, now(), &mut out);
+    assert_eq!((report.destinations, report.best_changed), (2, 2));
+    for prefix in ["192.0.2.0/24", "198.51.100.0/24"] {
+        assert_eq!(best_peer(&rib, prefix), Some(e1.addr), "{prefix}");
+    }
+    assert_eq!(fib(&out).len(), 2);
+}
+
+#[test]
+fn the_n_best_paths_sent_to_a_peer_leave_out_the_demoted_ones_first() {
+    // RFC 7911 §5 sends the N best by the decision process: a demoted
+    // route is below every route that is not.
+    use crate::PathLimit;
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(FavourInvalid));
+    outputs(|o| {
+        rib.set_invalid_action(InvalidAction::PreferValid, now(), o);
+    });
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let e3 = peer("10.0.0.4", 65_004, 4);
+    let to = PeerInfo {
+        add_path_send: vec![(V4, PathLimit::Best(2))],
+        ..peer("10.0.0.9", 65_009, 9)
+    };
+    for info in [&e1, &e2, &e3, &to] {
+        outputs(|o| rib.peer_up(info.clone(), now(), o));
+    }
+    outputs(|o| rib.validation_changed(all(vrps(&[("192.0.2.0/24", 24, 64_497)])), now(), o));
+    // e1 is Invalid (preference 500, shortest path); e2 and e3 are Valid.
+    for (from, path) in [
+        (&e1, vec![65_001, 64_496]),
+        (&e2, vec![65_002, 100, 64_497]),
+        (&e3, vec![65_004, 100, 101, 64_497]),
+    ] {
+        outputs(|o| {
+            rib.update(
+                from.addr,
+                &announce(&["192.0.2.0/24"], &attrs(&path, &from.addr.to_string())),
+                now(),
+                o,
+            );
+        });
+    }
+    let sent: Vec<Vec<u32>> = rib
+        .sent_paths(to.addr, V4)
+        .iter()
+        .map(|(_, _, a)| a.as_path.asns().map(|a| a.0).collect())
+        .collect();
+    let mut sent = sent;
+    sent.sort();
+    // The two Valid routes, not the Invalid one with the best preference.
+    assert_eq!(
+        sent,
+        vec![vec![65_002, 100, 64_497], vec![65_004, 100, 101, 64_497]]
+    );
 }

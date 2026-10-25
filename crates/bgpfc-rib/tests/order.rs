@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
-use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
+use bgpfc_rpki::{AffectedPrefixes, InvalidAction, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -288,8 +288,43 @@ impl Policies for Setter {
     }
 }
 
-/// How a test builds its RIB's policies.
-type Policy = fn() -> Box<dyn Policies>;
+/// Policy that leaves Invalid routes in the decision process with a degree
+/// of preference far above the others, so that whether the RIB demotes
+/// them decides which route is best; export tags what is Valid.
+struct FavourInvalid;
+
+impl Policies for FavourInvalid {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        if rov != RovState::Invalid {
+            return Verdict::Accept;
+        }
+        let mut a = a.clone();
+        a.local_pref = Some(500);
+        Verdict::Modified(a)
+    }
+
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        prefix: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        ByState.export(peer, family, prefix, a, rov)
+    }
+}
+
+/// How a test builds its RIB: its policies, and what it does with
+/// Invalid routes by itself.
+type Setup = (fn() -> Box<dyn Policies>, InvalidAction);
 
 /// A VRP over the prefixes the steps use: one of them, or 192.0.0.0/16
 /// (index 3) which covers all three, with a maximum length that may be
@@ -360,11 +395,12 @@ fn interleaved(
     sources: &[VrpSet],
     at: &[usize],
     merged: &[bool],
-    policies: Policy,
+    (policies, action): Setup,
 ) -> Outcome {
     let infos = peers();
     let now = Instant::now();
     let mut rib = Rib::with_policies(LOCAL_AS, policies());
+    rib.set_invalid_action(action, now, &mut Vec::new());
     for info in &infos {
         outputs(|o| rib.peer_up(info.clone(), now, o));
     }
@@ -410,10 +446,11 @@ fn interleaved(
 }
 
 /// The final validation source first, then the decisive steps.
-fn source_first(steps: &[Step], source: Option<&VrpSet>, policies: Policy) -> Outcome {
+fn source_first(steps: &[Step], source: Option<&VrpSet>, (policies, action): Setup) -> Outcome {
     let infos = peers();
     let now = Instant::now();
     let mut rib = Rib::with_policies(LOCAL_AS, policies());
+    rib.set_invalid_action(action, now, &mut Vec::new());
     if let Some(source) = source {
         outputs(|o| {
             rib.validation_changed(
@@ -456,7 +493,7 @@ fn follows_the_source(
     at: &[usize],
     merged: &[bool],
     seed: u64,
-    policies: Policy,
+    setup: Setup,
 ) -> Result<(), TestCaseError> {
     let sources: Vec<VrpSet> = sources
         .into_iter()
@@ -464,10 +501,24 @@ fn follows_the_source(
         .collect();
     let mut at = at[..sources.len()].to_vec();
     at.sort_unstable();
-    let got = interleaved(steps, &sources, &at, merged, policies);
+    let got = interleaved(steps, &sources, &at, merged, setup);
+    if setup.1.demotes() {
+        // RFC 6811 §5: an Invalid route is chosen only when no other is.
+        for (i, candidates) in got.0.iter().enumerate() {
+            let best = got
+                .1
+                .iter()
+                .find(|b| b.0 == prefix(u8::try_from(i).unwrap()));
+            let all_invalid = candidates.iter().all(|c| c.1 == RovState::Invalid);
+            prop_assert_eq!(best.is_some(), !candidates.is_empty());
+            if let Some(best) = best {
+                prop_assert!(best.2 != RovState::Invalid || all_invalid, "{best:?}");
+            }
+        }
+    }
     let mut decisive = last_words(steps);
     shuffle(&mut decisive, seed);
-    let expected = source_first(&decisive, sources.last(), policies);
+    let expected = source_first(&decisive, sources.last(), setup);
     prop_assert_eq!(got, expected);
     Ok(())
 }
@@ -486,7 +537,10 @@ proptest! {
         merged in proptest::collection::vec(any::<bool>(), 4),
         seed in any::<u64>(),
     ) {
-        follows_the_source(&steps, sources, &at, &merged, seed, || Box::new(ByState))?;
+        follows_the_source(
+            &steps, sources, &at, &merged, seed,
+            (|| Box::new(ByState), InvalidAction::Policy),
+        )?;
     }
 
     /// The same, with policy that sets the state of the routes it
@@ -504,7 +558,34 @@ proptest! {
         merged in proptest::collection::vec(any::<bool>(), 4),
         seed in any::<u64>(),
     ) {
-        follows_the_source(&steps, sources, &at, &merged, seed, || Box::new(Setter))?;
+        follows_the_source(
+            &steps, sources, &at, &merged, seed,
+            (|| Box::new(Setter), InvalidAction::Policy),
+        )?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The same, with Invalid routes kept as candidates and the RIB
+    /// demoting them (RFC 6811 §5): which route is best depends on the
+    /// states, and so on the source, never on the order things happened.
+    #[test]
+    fn loc_rib_follows_the_validation_source_when_invalid_routes_are_demoted(
+        steps in proptest::collection::vec(step(), 0..12),
+        sources in proptest::collection::vec(
+            proptest::collection::vec(vrp(), 0..4),
+            0..4,
+        ),
+        at in proptest::collection::vec(0usize..13, 4),
+        merged in proptest::collection::vec(any::<bool>(), 4),
+        seed in any::<u64>(),
+    ) {
+        follows_the_source(
+            &steps, sources, &at, &merged, seed,
+            (|| Box::new(FavourInvalid), InvalidAction::PreferValid),
+        )?;
     }
 }
 

@@ -337,6 +337,7 @@ fn expected(
                     from: Neighbor::of(info),
                     attrs: c.attrs,
                     path_id: c.path_id.map_or(0, |i| i.0),
+                    demoted: false,
                 }
             })
             .unwrap();

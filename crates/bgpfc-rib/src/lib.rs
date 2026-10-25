@@ -65,7 +65,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rpki::{NullSource, ValidationSource};
+use bgpfc_rpki::{InvalidAction, NullSource, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Asn, PathId};
@@ -76,7 +76,7 @@ pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::{PathLimit, PeerInfo};
-pub use validation::Revalidation;
+pub use validation::{Enforcement, Revalidation};
 
 use addpath::{Sent, Sync};
 use pacing::{Clock, Held, Jitter, Now, Offer, Pace, Pacing, Tick};
@@ -406,6 +406,9 @@ struct Context {
     /// every route `Disabled`, until [`Rib::validation_changed`] says
     /// otherwise.
     validation: Arc<dyn ValidationSource>,
+    /// What the RIB does with Invalid routes by itself, apart from policy
+    /// ([`Rib::set_invalid_action`]).
+    invalid: InvalidAction,
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -502,6 +505,7 @@ impl Rib {
                     policies,
                     interner: Interner::default(),
                     validation: Arc::new(NullSource),
+                    invalid: InvalidAction::Policy,
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
@@ -644,7 +648,7 @@ impl Rib {
         let addr = self.s.peer(id).info.addr;
         self.s.peer_mut(id).leaving = true;
         for (f, table) in self.tables.iter_mut() {
-            drop_routes(&self.s.peers, table, f, id, scratch);
+            drop_routes(self.s.phase2(), table, f, id, scratch);
         }
         // The peer goes with its counts: what the removals added up to
         // must not carry over to the next UPDATE's peer.
@@ -994,6 +998,7 @@ impl Rib {
             self.disable_family(id, d.family, scratch);
         }
         let Sessions { cx, peers, .. } = &mut self.s;
+        let p2 = Phase2::new(peers, cx.invalid);
         // invariant: ids are only handed out for occupied slots.
         let state = peers[id.index()].as_ref().unwrap();
         let info = &state.info;
@@ -1017,7 +1022,7 @@ impl Rib {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(peers, table, family, prefix, (id, path.0), scratch);
+                withdraw(p2, table, family, prefix, (id, path.0), scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
@@ -1037,7 +1042,7 @@ impl Rib {
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
                 if let Some(table) = self.tables.get_mut(family) {
-                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.ignored.push(Output::InvalidNextHop {
                     peer: info.addr,
@@ -1054,7 +1059,7 @@ impl Rib {
             // ability to modify the procedures").
             if let Err(otc) = otc::receive(info, &mut built) {
                 if let Some(table) = self.tables.get_mut(family) {
-                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
                 }
                 report_leak(scratch, info, family, otc, prefixes);
                 continue;
@@ -1070,7 +1075,7 @@ impl Rib {
                 || attrs.as_path.first_asn() == Some(info.remote_as);
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
                 if let Some(table) = self.tables.get_mut(family) {
-                    withdraw_all(peers, table, family, (prefixes, path_ids), id, scratch);
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.released.push(attrs);
                 continue;
@@ -1105,13 +1110,13 @@ impl Rib {
                 match judged.into_route(&attrs, id, lookup, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
-                        announce(peers, table, family, prefix, route, path, scratch);
+                        announce(p2, table, family, prefix, route, path, scratch);
                     }
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it.
                     None => {
                         if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(peers, table, family, prefix, (id, path), scratch);
+                            withdraw(p2, table, family, prefix, (id, path), scratch);
                         }
                     }
                 }
@@ -1161,7 +1166,7 @@ impl Rib {
         state.disabled.push(family);
         state.adj_in_count.insert(family, 0);
         if let Some(table) = self.tables.get_mut(family) {
-            drop_routes(&self.s.peers, table, family, id, scratch);
+            drop_routes(self.s.phase2(), table, family, id, scratch);
         }
         // The count is zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
@@ -1364,6 +1369,11 @@ impl Rib {
 }
 
 impl Sessions {
+    /// What Phase 2 reads, as the RIB is set up now.
+    fn phase2(&self) -> Phase2<'_> {
+        Phase2::new(&self.peers, self.cx.invalid)
+    }
+
     fn id(&self, addr: IpAddr) -> Option<PeerId> {
         self.by_addr.get(&addr).copied()
     }
@@ -1504,7 +1514,7 @@ impl Sessions {
         {
             more.push(dest.remove(next));
         }
-        decide(&self.peers, dest);
+        decide(self.phase2(), dest);
         self.changed(
             family,
             prefix,
@@ -1950,13 +1960,37 @@ fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
     }
 }
 
+/// What Phase 2 reads besides the routes of a destination.
+#[derive(Clone, Copy)]
+struct Phase2<'a> {
+    peers: &'a [Option<PeerState>],
+    /// Invalid routes lose to the others ([`InvalidAction::PreferValid`]).
+    demote_invalid: bool,
+}
+
+impl<'a> Phase2<'a> {
+    /// Phase 2 over `peers`, with the RIB's `invalid` action in force.
+    fn new(peers: &'a [Option<PeerState>], invalid: InvalidAction) -> Self {
+        Phase2 {
+            peers,
+            demote_invalid: invalid.demotes(),
+        }
+    }
+
+    /// Whether Phase 2 puts `route` below the routes that are not Invalid
+    /// (RFC 6811 §5).
+    fn demotes(self, route: &Route) -> bool {
+        self.demote_invalid && route.rov == RovState::Invalid
+    }
+}
+
 /// Phase 2: put the best of `dest`'s candidates first.
-fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
+fn decide(p2: Phase2<'_>, dest: &mut Destination) {
     let n = dest.candidates();
     let best = match &*dest {
-        Destination::One(r) => pick(peers, std::slice::from_ref(r), n),
-        Destination::Many(v) => pick(peers, v, n),
-        Destination::Paths(v) => pick(peers, v, n),
+        Destination::One(r) => pick(p2, std::slice::from_ref(r), n),
+        Destination::Many(v) => pick(p2, v, n),
+        Destination::Paths(v) => pick(p2, v, n),
     };
     if let Some(i) = best {
         dest.promote(i);
@@ -1964,22 +1998,23 @@ fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
 }
 
 /// The best of the first `n` of `routes`.
-fn pick<T: Member>(peers: &[Option<PeerState>], routes: &[T], n: usize) -> Option<usize> {
+fn pick<T: Member>(p2: Phase2<'_>, routes: &[T], n: usize) -> Option<usize> {
     decision::best(n, |i| Candidate {
         // invariant: a route's peer slot is occupied (Sessions::peer).
-        from: peers[routes[i].route().peer.index()]
+        from: p2.peers[routes[i].route().peer.index()]
             .as_ref()
             .unwrap()
             .neighbor,
         attrs: &routes[i].route().attrs,
         path_id: routes[i].id(),
+        demoted: p2.demotes(routes[i].route()),
     })
 }
 
 /// Remove every route `id` sent from `table`, a table of `family`, noting
 /// each destination's best route before and after.
 fn drop_routes(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     id: PeerId,
@@ -2002,7 +2037,7 @@ fn drop_routes(
                     None => break,
                 }
             }
-            decide(peers, dest);
+            decide(p2, dest);
             scratch.dirty.push(Dirty {
                 family,
                 prefix,
@@ -2026,7 +2061,7 @@ fn path_at(ids: &[PathId], k: usize) -> u32 {
 /// an announcement that is not kept replace the peer's earlier ones for
 /// them (RFC 7911 §5: the same prefix and identifier).
 fn withdraw_all(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     (prefixes, ids): (&[Prefix], &[PathId]),
@@ -2034,7 +2069,7 @@ fn withdraw_all(
     scratch: &mut Scratch,
 ) {
     for (k, &prefix) in prefixes.iter().enumerate() {
-        withdraw(peers, table, family, prefix, (id, path_at(ids, k)), scratch);
+        withdraw(p2, table, family, prefix, (id, path_at(ids, k)), scratch);
     }
 }
 
@@ -2062,7 +2097,7 @@ fn report_leak(
 /// `path` (zero where it sends none), if there is one, and note the
 /// destination's best route before and after.
 fn withdraw(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -2070,13 +2105,13 @@ fn withdraw(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, from, scratch),
-        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, from, scratch),
+        Some(k) => withdraw_in(p2, &mut table.v4, k, family, prefix, from, scratch),
+        None => withdraw_in(p2, &mut table.v6, prefix, family, prefix, from, scratch),
     }
 }
 
 fn withdraw_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -2095,7 +2130,7 @@ fn withdraw_in<K: Ord>(
     let removed = dest.remove(i);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
-    decide(peers, dest);
+    decide(p2, dest);
     let new = dest.best().cloned();
     if dest.is_empty() {
         slot.remove();
@@ -2114,7 +2149,7 @@ fn withdraw_in<K: Ord>(
 /// Identifier `path` (zero where it sends none), and note the destination's
 /// best route before and after.
 fn announce(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -2123,17 +2158,9 @@ fn announce(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(
-            peers,
-            &mut table.v4,
-            k,
-            family,
-            prefix,
-            (route, path),
-            scratch,
-        ),
+        Some(k) => announce_in(p2, &mut table.v4, k, family, prefix, (route, path), scratch),
         None => announce_in(
-            peers,
+            p2,
             &mut table.v6,
             prefix,
             family,
@@ -2145,7 +2172,7 @@ fn announce(
 }
 
 fn announce_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -2183,7 +2210,7 @@ fn announce_in<K: Ord>(
                 dest.push(route, path);
                 *scratch.delta.or_default(family) += 1;
             }
-            decide(peers, dest);
+            decide(p2, dest);
             (old, dest.best().cloned())
         }
     };

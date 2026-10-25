@@ -6,11 +6,15 @@
 //! state changed go through import policy and the decision process again,
 //! the way an UPDATE takes them.
 //!
+//! What the RIB does with the Invalid ones by itself is set here too
+//! ([`Rib::set_invalid_action`]).
+//!
 //! Implements: RFC 6811 §2 ("The validation state of the Route MUST be
 //! set to reflect the result of the lookup"), §4 ("When a mapping is added
 //! or deleted, the implementation MUST re-validate any affected prefixes
 //! and run the BGP decision process if needed"), for the routes that
-//! [`AffectedPrefixes`] names.
+//! [`AffectedPrefixes`] names; RFC 6811 §5 and RFC 8481 §5 (what is done
+//! with Invalid routes is the operator's choice, see [`InvalidAction`]).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -19,14 +23,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bgpfc_rpki::{
-    AffectedPrefixes, PrefixSet, RouteOrigin, RovState, ValidationChange, ValidationSource,
+    AffectedPrefixes, InvalidAction, PrefixSet, RouteOrigin, RovState, ValidationChange,
+    ValidationSource,
 };
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
 use crate::store::{Destination, PeerId};
 use crate::{
-    Dirty, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
+    Dirty, Interner, Judged, Output, PeerState, Phase2, Policies, Rib, Scratch, Sink, decide, judge,
 };
 
 /// A table walks its affected destinations in one pass, rather than one
@@ -71,6 +76,19 @@ impl Revalidation {
     pub fn changed(&self) -> usize {
         self.changes.iter().map(|c| c.2).sum()
     }
+}
+
+/// What a change of the RIB's [`InvalidAction`] did, for the caller to log:
+/// counts, never an entry per route.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Enforcement {
+    /// Routes in the Adj-RIBs-In whose state is Invalid, held or not.
+    pub invalid: usize,
+    /// Destinations with such a route, decided again.
+    pub destinations: usize,
+    /// Destinations where the decision process then chose another route,
+    /// or none: the FIB changes the report comes with.
+    pub best_changed: usize,
 }
 
 /// The counts of a [`Revalidation`] as the pass gathers them.
@@ -174,6 +192,7 @@ impl Rib {
                 family,
                 local_as: cx.local_as,
                 source: &*cx.validation,
+                demote_invalid: cx.invalid.demotes(),
                 peers: &mut self.s.peers,
                 policies: &*cx.policies,
                 interner: &mut cx.interner,
@@ -236,12 +255,94 @@ impl Rib {
     }
 }
 
+impl Rib {
+    /// What the RIB does with Invalid routes by itself from now on, apart
+    /// from the policy an operator wrote: nothing ([`InvalidAction::Policy`],
+    /// the default), or let them lose to the others
+    /// ([`InvalidAction::PreferValid`], RFC 6811 §5). Destinations with an
+    /// Invalid route go through the decision process again, and what
+    /// follows comes out as it does for an UPDATE: FIB changes, and
+    /// UPDATEs sent or held back by the RFC 4271 §9.2.1.1 pacing. The
+    /// report counts what the change reached; it is empty when the action
+    /// is the one already in force.
+    pub fn set_invalid_action(
+        &mut self,
+        action: InvalidAction,
+        now: Instant,
+        out: &mut impl Sink,
+    ) -> Enforcement {
+        if self.s.cx.invalid == action {
+            return Enforcement::default();
+        }
+        self.s.cx.invalid = action;
+        let mut report = Enforcement::default();
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let p2 = self.s.phase2();
+        for (family, table) in self.tables.iter_mut() {
+            let mut visit = |prefix: Prefix, dest: &mut Destination| {
+                redecide(p2, family, prefix, dest, &mut report, &mut scratch);
+            };
+            for (k, d) in &mut table.v4 {
+                visit(k.prefix(), d);
+            }
+            for (p, d) in &mut table.v6 {
+                visit(*p, d);
+            }
+        }
+        report.best_changed = scratch
+            .dirty
+            .iter()
+            .filter(|d| match (&d.old, &d.new) {
+                (None, None) => false,
+                (Some(a), Some(b)) => !a.same(b),
+                _ => true,
+            })
+            .count();
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
+        report
+    }
+}
+
+/// Run the decision process again for `dest`, if it has an Invalid route,
+/// and note its best route before and after.
+fn redecide(
+    p2: Phase2<'_>,
+    family: AddressFamily,
+    prefix: Prefix,
+    dest: &mut Destination,
+    report: &mut Enforcement,
+    scratch: &mut Scratch,
+) {
+    let invalid = (0..dest.len())
+        .filter(|&i| dest.route(i).rov == RovState::Invalid)
+        .count();
+    if invalid == 0 {
+        return;
+    }
+    report.invalid += invalid;
+    report.destinations += 1;
+    if dest.candidates() == 0 {
+        return;
+    }
+    let old = dest.best().cloned();
+    decide(p2, dest);
+    scratch.dirty.push(Dirty {
+        family,
+        prefix,
+        old,
+        new: dest.best().cloned(),
+        merged: false,
+    });
+}
+
 /// What validating routes again needs of the RIB, borrowed apart from
 /// the table being walked.
 struct Pass<'a> {
     family: AddressFamily,
     local_as: Asn,
     source: &'a dyn ValidationSource,
+    demote_invalid: bool,
     peers: &'a mut Vec<Option<PeerState>>,
     policies: &'a dyn Policies,
     interner: &'a mut Interner,
@@ -341,7 +442,13 @@ impl Pass<'_> {
             }
         }
         if changed {
-            decide(self.peers, dest);
+            decide(
+                Phase2 {
+                    peers: self.peers,
+                    demote_invalid: self.demote_invalid,
+                },
+                dest,
+            );
             self.scratch.dirty.push(Dirty {
                 family: self.family,
                 prefix,
