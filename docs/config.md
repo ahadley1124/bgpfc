@@ -82,14 +82,17 @@ match        = "prefix" prefix-entry
              | "ext-community" ext-community
              | "large-community" large-community
              | "origin" ( "igp" | "egp" | "incomplete" )
-             | "neighbor" ip ;
+             | "neighbor" ip
+             | "rpki" rov-state ;
+rov-state    = "valid" | "invalid" | "not-found" | "disabled" ;
 set          = "local-pref" u32
              | "med" u32
              | "community" op community { community }
              | "ext-community" op ext-community { ext-community }
              | "large-community" op large-community { large-community }
              | "as-path" "prepend" asn { asn }
-             | "next-hop" "self" ;
+             | "next-hop" "self"
+             | "rpki" ( "valid" | "invalid" | "not-found" ) ;   (* import policies only *)
 op           = "add" | "remove" | "replace" ;
 action       = "accept" | "reject" | "next" ;
 
@@ -147,7 +150,35 @@ Match clauses: `prefix` and `prefix-list` compare the route's NLRI;
 `as-path` is a regular expression over AS numbers (below); the three
 community clauses hold when the route carries the value; `origin` compares
 the ORIGIN attribute; `neighbor` compares the peer the route was received
-from (import) or is being sent to (export).
+from (import) or is being sent to (export); `rpki` compares the route's
+origin validation state (RFC 6811 §3: "the ability to match and set the
+validation state of routes"; see **RPKI** below).
+
+`match rpki not-found` also holds for a route that is not validated
+(`disabled`): RFC 6811 §2 says such a route SHOULD read as NotFound, so a
+policy written for validation does the same with or without it. `match
+rpki disabled` holds only when validation is off, so a term with it,
+placed first, treats unvalidated routes apart. On import the clause sees
+the state the lookup gave the route, or the one an earlier term of the
+same run set (`action next`), as later terms see an earlier `set
+local-pref`; on export it sees the state the route is used with.
+
+`set rpki valid|invalid|not-found` sets the state the route is used with
+from then on: `enforcement` acts on it, route selection ranks by it under
+`prefer-valid`, and export policies match it. The route keeps the state
+the lookup gave it too, which is what is shown and logged (RFC 6811 §2:
+"The validation state of the Route MUST be set to reflect the result of
+the lookup"). When the VRPs change the route's looked-up state, the import
+policy runs again, and may set a state again or not. `set rpki disabled`
+is an error, since `disabled` says that no lookup was made, and so is `set
+rpki` in a policy that is some neighbor's `export` policy: the state goes
+no further than this router (bgpfcd does not implement RFC 8097, the
+extended community that would carry it), so there it would do nothing. A
+typical use is a customer prefix whose ROA is known to be wrong:
+`match prefix 198.51.100.0/24; match rpki invalid; set rpki valid;`. Another
+is the receiving side of RFC 6811 §5, a state that an internal neighbor
+which validates puts in a community: `match community 65000:666; set rpki
+invalid;`.
 
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
@@ -291,11 +322,13 @@ Adj-RIB-In or from consideration in the decision process as a side effect
 of its validation state, unless explicitly configured to do so." bgpfcd
 keeps every route in the Adj-RIB-In whatever its state, and takes one out
 of route selection for its state only where the file says so: by `mode
-external`, whose meaning includes `enforcement drop-invalid` as above, or
-by an `enforcement` statement. Without an `rpki` block, or with `mode
-disabled`, no route is validated, and `disabled` is never held.
+external`, whose meaning includes `enforcement drop-invalid` as above, by
+an `enforcement` statement, or by an import policy that matches or sets
+the state (`match rpki`, `set rpki`). Without an `rpki` block, or with
+`mode disabled`, no route is validated, and `disabled` is never held.
 `enforcement` is accepted with `mode disabled` too, and then applies only
-to a state set by configuration. RFC 8481 §5 is stricter: "Absent specific
+to a state an import policy sets: `set rpki invalid` holds the route under
+`drop-invalid`. RFC 8481 §5 is stricter: "Absent specific
 operator configuration, policy MUST NOT be applied." bgpfcd's default
 departs from it, as the project chose (issue #61); `enforcement off;` gives
 the RFC 8481 §5 behaviour.
@@ -308,16 +341,26 @@ Each route goes through these steps in order:
 2. The lookup gives the route its state from its AS_PATH as received (RFC
    6811 §2).
 3. The import policy accepts the route, possibly with other attributes,
-   or rejects it.
-4. `enforcement` acts on the route's state: `drop-invalid` holds an Invalid
-   route.
-5. Route selection among the routes not held, ranking by state first under
+   or rejects it. It may match the state, and set the state the route is
+   used with from then on (`set rpki`).
+4. `enforcement` acts on the state the route is used with, the one import
+   policy set or else the one the lookup gave: `drop-invalid` holds an
+   Invalid route. So `set rpki valid` in an import policy wins over
+   `drop-invalid`, and `match rpki invalid; action reject;` rejects in
+   every mode.
+5. The Adj-RIB-In keeps the routes the import policy accepted and the ones
+   held for their state: by `enforcement`, or because the import policy
+   rejects them only in their current state, which it would accept in
+   another. A route the import policy rejects whatever its state is not
+   kept.
+6. Route selection among the routes not held, ranking by state first under
    `prefer-valid`.
-6. The export policy of each neighbor, the rewriting of RFC 4271 §5.1, and
-   the neighbor's `advertisement-interval`.
+7. The export policy of each neighbor, which sees the state the route is
+   used with, the rewriting of RFC 4271 §5.1, and the neighbor's
+   `advertisement-interval`.
 
 When the VRPs change, the routes whose state they change go through steps
-3 to 6 again (RFC 6811 §4: "When a mapping is added or deleted, the
+3 to 7 again (RFC 6811 §4: "When a mapping is added or deleted, the
 implementation MUST re-validate any affected prefixes and run the BGP
 decision process if needed"). Under `drop-invalid`, a used route that
 becomes Invalid is withdrawn from the neighbors and the kernel, and a held
@@ -431,7 +474,8 @@ and reaches 600 seconds by the eleventh failure in a row. `backoff 600
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
-has `remote-as`, `import` and `export`; the HTTP listen address is a
+has `remote-as`, `import` and `export`; no neighbor's `export` policy has
+`set rpki`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` only for a family in
 `families`; an `rpki` block has a `mode`, at least one `cache` with `mode

@@ -1,21 +1,24 @@
 validation-errors.conf:4:5: term `t` in policy `A` uses undefined prefix-list `MISSING`
       term t { match prefix-list MISSING; action accept; }
       ^
-validation-errors.conf:6:1: neighbor 192.0.2.2 exports undefined policy `B`
+validation-errors.conf:7:5: term `s` of policy `S` sets the validation state, which only an import policy can do; `S` is the export policy of neighbor 192.0.2.5
+      term s { match rpki invalid; set rpki valid; action accept; }
+      ^
+validation-errors.conf:9:1: neighbor 192.0.2.2 exports undefined policy `B`
   neighbor 192.0.2.2 { remote-as 65001; import A; export B; }
   ^
-validation-errors.conf:7:1: neighbor 192.0.2.2 is defined twice
+validation-errors.conf:10:1: neighbor 192.0.2.2 is defined twice
   neighbor 192.0.2.2 { remote-as 65001; import A; export A; }
   ^
-validation-errors.conf:8:1: neighbor 192.0.2.3: keepalive-time 30s must be below hold-time 30s
+validation-errors.conf:11:1: neighbor 192.0.2.3: keepalive-time 30s must be below hold-time 30s
   neighbor 192.0.2.3 {
   ^
-validation-errors.conf:8:1: neighbor 192.0.2.3: send-hold-time 30s must exceed hold-time 30s (RFC 9687 §4.4)
+validation-errors.conf:11:1: neighbor 192.0.2.3: send-hold-time 30s must exceed hold-time 30s (RFC 9687 §4.4)
   neighbor 192.0.2.3 {
   ^
-validation-errors.conf:12:1: neighbor 2001:db8::4: extended-next-hop needs the ipv4-unicast family (RFC 8950 §4)
+validation-errors.conf:15:1: neighbor 2001:db8::4: extended-next-hop needs the ipv4-unicast family (RFC 8950 §4)
   neighbor 2001:db8::4 {
   ^
-validation-errors.conf:12:1: neighbor 2001:db8::4: maximum-prefix for ipv4-unicast, which is not in its families
+validation-errors.conf:15:1: neighbor 2001:db8::4: maximum-prefix for ipv4-unicast, which is not in its families
   neighbor 2001:db8::4 {
   ^

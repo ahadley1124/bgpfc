@@ -240,6 +240,26 @@ mod tests {
             ConfigDiff::between(a, &e).policy_changed,
             vec![addr("192.0.2.2"), addr("192.0.2.3")]
         );
+        // So is a term on the validation state (RFC 6811 §3), and a change
+        // of the state it matches or sets.
+        let rpki = |m: &str, s: &str| {
+            cfg(&BASE.replace(
+                "term r { action accept; }",
+                &format!("term r {{ match rpki {m}; set rpki {s}; action accept; }}"),
+            ))
+        };
+        let valid = rpki("invalid", "valid");
+        assert_eq!(
+            ConfigDiff::between(a, &valid).policy_changed,
+            vec![addr("192.0.2.2"), addr("192.0.2.3")]
+        );
+        for other in [rpki("not-found", "valid"), rpki("invalid", "not-found")] {
+            assert_eq!(
+                ConfigDiff::between(&valid, &other).policy_changed,
+                vec![addr("192.0.2.2"), addr("192.0.2.3")]
+            );
+        }
+        assert!(ConfigDiff::between(&valid, &rpki("invalid", "valid")).is_empty());
     }
 
     #[test]

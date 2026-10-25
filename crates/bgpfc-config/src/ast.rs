@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bgpfc_rpki::Enforcement;
+use bgpfc_rpki::{Enforcement, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -402,6 +402,12 @@ pub enum Match {
     Origin(Origin),
     /// `match neighbor ADDR`.
     Neighbor(IpAddr),
+    /// `match rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state (RFC 6811 §3: "the ability to match and set the
+    /// validation state of routes"), as
+    /// [`RovState::satisfies`](bgpfc_rpki::RovState::satisfies) reads it:
+    /// `not-found` holds for a route not validated (`disabled`) too.
+    Rpki(RovState),
 }
 
 /// How a `set ... community` action changes the set.
@@ -432,6 +438,12 @@ pub enum SetAction {
     AsPathPrepend(Vec<Asn>),
     /// `set next-hop self`.
     NextHopSelf,
+    /// `set rpki valid|invalid|not-found`: the validation state the route
+    /// is used with from then on in place of the one the lookup gave it
+    /// (RFC 6811 §3). Never `disabled`, and only in import policies:
+    /// validation rejects a policy that sets it and is some neighbor's
+    /// export policy.
+    Rpki(RovState),
 }
 
 /// How a term ends.

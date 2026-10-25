@@ -227,6 +227,31 @@ fn regex_errors_point_at_the_term() {
 }
 
 #[test]
+fn terms_on_the_validation_state_are_refused() {
+    // The engine does not evaluate them, so a file with them does not load.
+    for clause in ["match rpki valid;", "set rpki invalid;"] {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            &format!(
+                "router-id 192.0.2.1; local-as 65000;
+                 policy P {{ term ok {{ action next; }} term r {{ {clause} action accept; }} }}"
+            ),
+        )
+        .unwrap();
+        let errs = PolicySet::compile(&cfg).unwrap_err();
+        assert_eq!(errs.len(), 1, "{clause}");
+        assert_eq!(errs[0].pos.line, 2, "{clause}");
+        assert!(
+            errs[0]
+                .message
+                .contains("term `r`: the policy engine cannot match or set"),
+            "{}",
+            errs[0]
+        );
+    }
+}
+
+#[test]
 fn engine_applies_each_neighbors_policies() {
     let cfg = bgpfc_config::parse_str(
         "t",

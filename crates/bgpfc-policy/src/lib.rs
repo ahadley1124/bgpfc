@@ -157,8 +157,15 @@ impl PolicySet {
                         Match::LargeCommunity(c) => Clause::LargeCommunity(*c),
                         Match::Origin(o) => Clause::Origin(*o),
                         Match::Neighbor(a) => Clause::Neighbor(*a),
+                        Match::Rpki(_) => {
+                            errors.push(unsupported_rpki(t));
+                            continue;
+                        }
                     };
                     clauses.push(clause);
+                }
+                if t.sets.iter().any(|s| matches!(s, SetAction::Rpki(_))) {
+                    errors.push(unsupported_rpki(t));
                 }
                 terms.push(Term {
                     clauses,
@@ -238,8 +245,22 @@ impl PolicySet {
     }
 }
 
+/// A term on the validation state, which this engine does not evaluate:
+/// refused, so that no file means something the daemon does not do.
+fn unsupported_rpki(t: &bgpfc_config::ast::Term) -> PolicyError {
+    PolicyError {
+        pos: t.pos,
+        message: format!(
+            "term `{}`: the policy engine cannot match or set the validation state",
+            t.name
+        ),
+    }
+}
+
 fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
     match set {
+        // invariant: `PolicySet::compile` refuses every term with it.
+        SetAction::Rpki(_) => {}
         SetAction::LocalPref(v) => a.local_pref = Some(*v),
         SetAction::Med(v) => a.med = Some(*v),
         SetAction::Community(op, vals) => edit(&mut a.communities, *op, vals),

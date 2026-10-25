@@ -6,12 +6,13 @@
 //! Implements: RFC 9687 §4.4 (a fixed `SendHoldTime` exceeds the Hold
 //! Time); RFC 4271 §10 (`KeepaliveTime` below the Hold Time); RFC 8950 §4
 //! (`extended-next-hop` qualifies a configured family); RFC 4271 §6.7
-//! (`maximum-prefix` bounds a configured family).
+//! (`maximum-prefix` bounds a configured family); RFC 6811 §3 (`set rpki`
+//! only where the state is used: import).
 
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::ast::{Config, Match, SendHoldTime};
+use crate::ast::{Config, Match, SendHoldTime, SetAction};
 use crate::error::ConfigError;
 
 /// Every problem found, or nothing.
@@ -33,6 +34,28 @@ pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
                         ),
                     );
                 }
+            }
+        }
+    }
+
+    // The state a route is used with is set on import (RFC 6811 §3) and
+    // travels no further: without RFC 8097, which is not implemented, no
+    // attribute carries it to the neighbor. In an export policy `set rpki`
+    // would do nothing, so say so rather than let it mislead.
+    for policy in &cfg.policies {
+        let Some(n) = cfg.neighbors.iter().find(|n| n.export == policy.name) else {
+            continue;
+        };
+        for term in &policy.terms {
+            if term.sets.iter().any(|s| matches!(s, SetAction::Rpki(_))) {
+                err(
+                    term.pos,
+                    format!(
+                        "term `{}` of policy `{}` sets the validation state, which only an \
+                         import policy can do; `{}` is the export policy of neighbor {}",
+                        term.name, policy.name, policy.name, n.addr
+                    ),
+                );
             }
         }
     }
