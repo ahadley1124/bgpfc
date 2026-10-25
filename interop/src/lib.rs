@@ -601,6 +601,16 @@ impl Bird {
     /// If the config cannot be written or `bird` cannot be spawned.
     #[must_use]
     pub fn three_paths(lab: &Lab, ns: &str, local_as: u32) -> Bird {
+        Bird::three_paths_with(lab, ns, local_as, "")
+    }
+
+    /// [`Bird::three_paths`] with `protocol` added to the BGP protocol,
+    /// such as `local role provider;` (RFC 9234).
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn three_paths_with(lab: &Lab, ns: &str, local_as: u32, protocol: &str) -> Bird {
         const THREE: &str = "\
             protocol static short {\n    ipv4 { import all; };\n    route 192.0.2.0/24 blackhole;\n}\n\
             protocol static long {\n    ipv4 { import filter { bgp_path.prepend(64999); accept; }; };\n\
@@ -622,7 +632,7 @@ impl Bird {
                 passive: true,
                 statics: Vec::new(),
                 channel: "add paths tx;".to_owned(),
-                protocol: String::new(),
+                protocol: protocol.to_owned(),
             },
             THREE,
         )

@@ -446,3 +446,118 @@ fn leaks_are_dropped_and_the_rest_is_marked() {
     // The session goes on.
     assert!(n.contains("Established"), "{n}");
 }
+
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn every_path_of_an_add_path_session_follows_the_procedures() {
+    // RFC 9234 §5 with RFC 7911 on both sessions: BIRD in C, bgpfcd's
+    // provider, sends three paths of one prefix (`add paths tx`), each
+    // with the attribute BIRD's egress procedure adds; bgpfcd keeps each
+    // under its Path Identifier and sends all three on to BIRD in B, its
+    // customer (`add paths rx`), the attribute unchanged on each.
+    let mut lab = Lab::new("ra", 26);
+    let ns_c = lab.add_c();
+    let bird_c = Bird::three_paths_with(&lab, &ns_c, C_AS, "local role provider;");
+    let bird_b = Bird::start(
+        &lab,
+        &lab.b.clone(),
+        &BirdOpts {
+            local_as: B_AS,
+            local: lab.b_addr,
+            local_port: 179,
+            neighbor: lab.a_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: Vec::new(),
+            channel: "add paths rx;".to_owned(),
+            protocol: "local role customer;".to_owned(),
+        },
+    );
+    let socket = lab.dir.join("ctl.sock");
+    let bgpfcd = start_bgpfcd(
+        &lab,
+        &lab.a.clone(),
+        &BgpfcdOpts {
+            local_as: BGPFC_AS,
+            router_id: lab.a_addr,
+            listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
+            neighbors: vec![
+                NeighborOpts {
+                    advertisement_interval: Some(1),
+                    extra: "role provider; add-path send ipv4-unicast all;".to_owned(),
+                    ..NeighborOpts::new(lab.b_addr, B_AS)
+                },
+                NeighborOpts {
+                    extra: "role customer; add-path receive ipv4-unicast yes;".to_owned(),
+                    ..NeighborOpts::new(lab.c_addr, C_AS)
+                },
+            ],
+            extra: format!("control {{ socket {}; }}", socket.display()),
+        },
+    );
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args).0;
+    let report = || {
+        format!(
+            "--- bgpfcd ---\n{}\n--- bird b ---\n{}\n--- bird c ---\n{}",
+            bgpfcd.log_text(),
+            bird_b.peer_status(&lab),
+            bird_c.peer_status(&lab)
+        )
+    };
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().matches("session established").count() == 2
+    });
+    assert!(ok, "{}", report());
+
+    // RFC 9234 §4.1 and RFC 7911 §4: each OPEN had both capabilities.
+    let c = ctl(&["show", "neighbor", &lab.c_addr.to_string()]);
+    assert!(c.contains("role customer (neighbor sent provider)"), "{c}");
+    assert!(c.contains("add-path receive ipv4-unicast send none"), "{c}");
+    let b = ctl(&["show", "neighbor", &lab.b_addr.to_string()]);
+    assert!(b.contains("role provider (neighbor sent customer)"), "{b}");
+    assert!(
+        b.contains("add-path receive none send ipv4-unicast=all"),
+        "{b}"
+    );
+
+    // Three paths, each under BIRD's identifier and with BIRD's AS in the
+    // attribute.
+    let candidates = || ctl(&["show", "routes", "192.0.2.0/24"]);
+    let ok = wait_for(Duration::from_secs(20), || {
+        candidates().matches(" otc 65002").count() == 3
+    });
+    let routes = candidates();
+    assert!(ok, "{routes}\n{}", report());
+    for l in routes.lines().filter(|l| l.contains("192.0.2.0/24")) {
+        assert!(l.contains(" id ") && l.ends_with(" otc 65002"), "{routes}");
+    }
+
+    // All three reach the customer, each with the attribute as it was set.
+    let at_b = || bird_route(&bird_b, &lab, "192.0.2.0/24");
+    let ok = wait_for(Duration::from_secs(30), || {
+        at_b().matches("BGP.otc: 65002").count() == 3
+    });
+    assert!(ok, "{}\n{}", at_b(), report());
+    assert_eq!(at_b().matches("BGP.as_path: 65000 65002").count(), 3);
+
+    // One path goes at C: B loses that one and keeps the other two.
+    let _ = bird_c.birdc(&lab, &["disable", "long"]);
+    let ok = wait_for(Duration::from_secs(30), || {
+        at_b().matches("BGP.otc: 65002").count() == 2
+    });
+    assert!(ok, "{}\n{}", at_b(), report());
+    let mut paths: Vec<String> = at_b()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("BGP.as_path: "))
+        .map(str::to_owned)
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["65000 65002", "65000 65002 64999 64998"],
+        "{}",
+        at_b()
+    );
+}
