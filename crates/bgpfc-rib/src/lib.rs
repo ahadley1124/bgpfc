@@ -1238,6 +1238,22 @@ impl Rib {
             .collect()
     }
 
+    /// The routes to `prefix` that the Adj-RIBs-In hold and that are no
+    /// candidates: import policy rejects them with the state they have and
+    /// would accept them with another, or the RIB refuses them for being
+    /// Invalid ([`InvalidAction::Drop`]) (RFC 6811 §2). Attributes as
+    /// received.
+    #[must_use]
+    pub fn held(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
+        let Some(dest) = self.tables.get(family).and_then(|t| t.get(prefix)) else {
+            return Vec::new();
+        };
+        dest.iter()
+            .skip(dest.candidates())
+            .map(|(r, id)| self.s.route_ref(family, r, id))
+            .collect()
+    }
+
     /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
     /// then IPv6 unicast, each in prefix order, so in one prefix order
     /// throughout (what `bgpfc_fib::Routes::merge` takes).

@@ -107,6 +107,14 @@ fn an_invalid_route_is_held_and_no_candidate() {
         rib.peer_stats(e1.addr).unwrap().received,
         vec![(V4, 3), (V6, 0)]
     );
+    // They are listed apart from the candidates, as received.
+    let h = rib.held(V4, p("198.51.100.0/24"));
+    assert_eq!(h.len(), 1);
+    assert_eq!((h[0].peer, h[0].rov), (e1.addr, Invalid));
+    assert_eq!(*h[0].attrs.as_ref(), invalid_path());
+    assert_eq!(rib.held(V4, p("192.0.2.0/24")).len(), 1);
+    assert!(rib.held(V4, p("203.0.113.0/24")).is_empty());
+    assert!(rib.held(V4, p("10.0.0.0/8")).is_empty());
     // Nothing of them is advertised.
     assert_eq!(
         rib.adj_rib_out(watcher.addr, V4)
