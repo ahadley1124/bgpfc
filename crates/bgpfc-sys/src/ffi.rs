@@ -59,6 +59,7 @@ pub(crate) const PR_CAP_AMBIENT_CLEAR_ALL: c_ulong = 4;
 // <asm-generic/fcntl.h>
 pub(crate) const F_SETFD: c_int = 2;
 pub(crate) const FD_CLOEXEC: c_int = 1;
+pub(crate) const O_CLOEXEC: c_int = 0o2_000_000;
 // `_SC_OPEN_MAX`: <bits/confname.h> in glibc, <unistd.h> in musl.
 pub(crate) const SC_OPEN_MAX: c_int = 4;
 // <linux/wait.h>
@@ -115,7 +116,7 @@ unsafe extern "C" {
         len: socklen_t,
     ) -> c_int;
     // <unistd.h>
-    pub(crate) fn pipe(fds: *mut c_int) -> c_int;
+    pub(crate) fn pipe2(fds: *mut c_int, flags: c_int) -> c_int; // pipe(2)
     pub(crate) fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
     pub(crate) fn getuid() -> uid_t;
     pub(crate) fn setuid(uid: uid_t) -> c_int;
