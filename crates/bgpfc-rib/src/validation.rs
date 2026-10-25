@@ -17,7 +17,7 @@
 //! runs the decision process again for every route).
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,7 +29,7 @@ use bgpfc_rpki::{
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::store::{Destination, PeerId, Route};
+use crate::store::{Destination, PeerId, Route, Table};
 use crate::{
     Decide, Dirty, Held, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, judge,
 };
@@ -42,11 +42,46 @@ use crate::{
 /// (`benches/rib.rs`, `revalidate_*`).
 const DENSE: usize = 16;
 
+/// What became of a route a change of validation state moved, once the
+/// decision process ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteStatus {
+    /// The best route to its destination.
+    Best,
+    /// A candidate, not the best.
+    Candidate,
+    /// Held in the Adj-RIB-In and no candidate, for this reason.
+    Held(Held),
+}
+
+/// One route whose RFC 6811 validation state a change of the validation
+/// source moved (issue #59: "An operator needs to see that a prefix went
+/// Valid → Invalid at a specific time"; the caller adds the time).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transition {
+    /// The route's family.
+    pub family: AddressFamily,
+    /// Its destination.
+    pub prefix: Prefix,
+    /// The peer it came from.
+    pub peer: IpAddr,
+    /// Its Route Origin ASN (RFC 6811 §2).
+    pub origin: RouteOrigin,
+    /// The state the lookup gave it before the change: valid, invalid or
+    /// not-found.
+    pub from: RovState,
+    /// The state the lookup gives it now: valid, invalid or not-found.
+    pub to: RovState,
+    /// What it is after the decision process.
+    pub route: RouteStatus,
+}
+
 /// What validating routes again after a change of the validation source
 /// did (RFC 6811 §4), for the caller to log: counts and a short sample,
-/// never an entry per route, so that a change that moves every route of
-/// a full table, as turning validation on or off does, costs one small
-/// report.
+/// and the routes that moved among valid, invalid and not-found, at most
+/// [`Revalidation::LISTED`] of them, so that a change that moves every
+/// route of a full table, as turning validation on or off or the expiry
+/// of the VRPs does, costs one bounded report.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Revalidation {
     /// Routes held in the Adj-RIBs-In that the change affected, each
@@ -70,6 +105,16 @@ pub struct Revalidation {
     /// Routes the change put back into use: held before it, candidates
     /// after it.
     pub released: usize,
+    /// The routes whose state moved from one RFC 6811 state to another,
+    /// at most [`Revalidation::LISTED`], IPv4 before IPv6 and each in
+    /// prefix order, with what became of each. A move to or from
+    /// `disabled` is validation being switched on or off: counted in
+    /// `changes`, never listed. A route that no state lets import policy
+    /// accept any more leaves the Adj-RIB-In and is not listed either.
+    pub transitions: Vec<Transition>,
+    /// The moves among valid, invalid and not-found that `transitions`
+    /// does not list.
+    pub unlisted: usize,
 }
 
 /// What judging every route again under a new enforcement mode did (see
@@ -97,6 +142,11 @@ impl Revalidation {
     /// The most destinations [`Revalidation::sample`] names.
     pub const SAMPLE: usize = 8;
 
+    /// The most routes [`Revalidation::transitions`] lists: enough for an
+    /// ordinary delta, which moves few routes, and a bound on the report
+    /// (about 60 KB) when a change moves a whole table.
+    pub const LISTED: usize = 1024;
+
     /// Routes whose state changed.
     #[must_use]
     pub fn changed(&self) -> usize {
@@ -115,6 +165,8 @@ struct Tally {
     sample: Vec<Prefix>,
     held: usize,
     released: usize,
+    transitions: Vec<Transition>,
+    unlisted: usize,
 }
 
 impl Tally {
@@ -141,6 +193,8 @@ impl Tally {
             best_changed,
             held: self.held,
             released: self.released,
+            transitions: self.transitions,
+            unlisted: self.unlisted,
         })
     }
 }
@@ -256,7 +310,12 @@ impl Rib {
         let mut tally = Tally::default();
         // Empty destinations to remove once a table's walk is done.
         let mut empty: Vec<Prefix> = Vec::new();
-        for (family, table) in self.tables.iter_mut() {
+        let mut moves: Vec<Move> = Vec::new();
+        // IPv4 before IPv6, whichever table came first, for the order of
+        // the sample and the transitions.
+        let mut tables: Vec<(AddressFamily, &mut Table)> = self.tables.iter_mut().collect();
+        tables.sort_by_key(|(family, _)| *family);
+        for (family, table) in tables {
             let cx = &mut self.s.cx;
             let mut pass = Pass {
                 family,
@@ -270,6 +329,7 @@ impl Rib {
                 tally: &mut tally,
                 scratch: &mut *scratch,
                 empty: &mut empty,
+                moves: &mut moves,
             };
             match ranges {
                 None => {
@@ -348,6 +408,20 @@ struct Pass<'a> {
     scratch: &'a mut Scratch,
     /// Destinations left with no route, for the caller to remove.
     empty: &'a mut Vec<Prefix>,
+    /// The routes of the destination being validated again whose state
+    /// moved among valid, invalid and not-found.
+    moves: &'a mut Vec<Move>,
+}
+
+/// A route whose state moved among valid, invalid and not-found, until
+/// its destination has been decided and its [`Transition`] can say what
+/// became of it.
+struct Move {
+    peer: PeerId,
+    addr: IpAddr,
+    origin: RouteOrigin,
+    from: RovState,
+    to: RovState,
 }
 
 /// What validating one route again did, for its destination.
@@ -422,8 +496,42 @@ impl Pass<'_> {
                 });
             }
         }
+        self.list(prefix, dest);
         if dest.is_empty() {
             self.empty.push(prefix);
+        }
+    }
+
+    /// List the moves among valid, invalid and not-found of `dest`'s
+    /// routes (issue #59), with what each route is now that the
+    /// destination is decided, up to [`Revalidation::LISTED`] in all, and
+    /// count the rest.
+    fn list(&mut self, prefix: Prefix, dest: &Destination) {
+        for m in self.moves.drain(..) {
+            // Not found: no state admits it any more, and it is gone.
+            let Some(i) = dest.position(m.peer) else {
+                self.tally.unlisted += 1;
+                continue;
+            };
+            let route = match dest.routes()[i].held {
+                Some(by) => RouteStatus::Held(by),
+                // The candidates come first, the best first of all.
+                None if i == 0 => RouteStatus::Best,
+                None => RouteStatus::Candidate,
+            };
+            if self.tally.transitions.len() < Revalidation::LISTED {
+                self.tally.transitions.push(Transition {
+                    family: self.family,
+                    prefix,
+                    peer: m.addr,
+                    origin: m.origin,
+                    from: m.from,
+                    to: m.to,
+                    route,
+                });
+            } else {
+                self.tally.unlisted += 1;
+            }
         }
     }
 
@@ -435,21 +543,21 @@ impl Pass<'_> {
         // RFC 6811 §2, on the route as received, as on its arrival. A
         // forced pass keeps the states: the source is the same.
         let received = Arc::clone(route.received());
-        let (rov, aspa) = if self.force {
-            (route.rov, route.aspa)
-        } else {
-            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
-            (
+        let origin =
+            (!self.force).then(|| RouteOrigin::from_as_path(&received.as_path, self.local_as));
+        let (rov, aspa) = match origin {
+            Some(origin) => (
                 self.source.rov(prefix, origin),
                 self.source.aspa(&received.as_path),
-            )
+            ),
+            None => (route.rov, route.aspa),
         };
         if rov == route.rov && aspa == route.aspa && !self.force {
             return Redone::default();
         }
-        let restated = rov != route.rov;
+        let (from, restated) = (route.rov, rov != route.rov);
         if restated {
-            self.tally.moved[slot(route.rov)][slot(rov)] += 1;
+            self.tally.moved[slot(from)][slot(rov)] += 1;
         }
         route.rov = rov;
         route.aspa = aspa;
@@ -461,6 +569,22 @@ impl Pass<'_> {
                 ..Redone::default()
             };
         };
+        // Issue #59: a move among the RFC 6811 states is listed. One to or
+        // from `disabled` is validation being switched on or off, which
+        // moves every route: counted, not listed.
+        if let Some(origin) = origin
+            && restated
+            && from != RovState::Disabled
+            && rov != RovState::Disabled
+        {
+            self.moves.push(Move {
+                peer: route.peer,
+                addr: peer.info.addr,
+                origin,
+                from,
+                to: rov,
+            });
+        }
         let was_held = route.held.is_some();
         let judged = judge(
             self.policies,

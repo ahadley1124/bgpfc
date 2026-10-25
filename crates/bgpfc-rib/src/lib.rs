@@ -70,7 +70,7 @@ pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-pub use validation::{Rejudged, Revalidation};
+pub use validation::{Rejudged, Revalidation, RouteStatus, Transition};
 
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
@@ -262,7 +262,8 @@ pub enum Output {
     },
     /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
     /// the validation source (see [`Rib::validation_changed`]): one report
-    /// per change of the source, counted rather than listed, however many
+    /// per change of the source, counted, with the routes that moved among
+    /// valid, invalid and not-found listed up to a bound, however many
     /// routes it moved. The caller logs it. The state a route gets on
     /// arrival is its first, not a change, and is not reported.
     Revalidated(Revalidation),

@@ -162,15 +162,19 @@ fn a_held_invalid_route_returns_when_it_becomes_valid_without_an_update() {
     });
     assert_eq!(
         report(&out),
-        Some(&Revalidation {
-            released: 1,
-            ..revalidation(
-                1,
-                &[(RovState::Invalid, RovState::Valid, 1)],
-                &["192.0.2.0/24"],
-                1
-            )
-        })
+        Some(&one_moved(
+            Revalidation {
+                released: 1,
+                ..revalidation(
+                    1,
+                    &[(RovState::Invalid, RovState::Valid, 1)],
+                    &["192.0.2.0/24"],
+                    1
+                )
+            },
+            e1.addr,
+            RouteStatus::Best
+        ))
     );
     assert_eq!(
         fib(&out),
@@ -204,15 +208,19 @@ fn a_used_route_that_turns_invalid_is_withdrawn_from_peers_and_the_fib() {
     });
     assert_eq!(
         report(&out),
-        Some(&Revalidation {
-            held: 1,
-            ..revalidation(
-                1,
-                &[(RovState::Valid, RovState::Invalid, 1)],
-                &["192.0.2.0/24"],
-                1
-            )
-        })
+        Some(&one_moved(
+            Revalidation {
+                held: 1,
+                ..revalidation(
+                    1,
+                    &[(RovState::Valid, RovState::Invalid, 1)],
+                    &["192.0.2.0/24"],
+                    1
+                )
+            },
+            e1.addr,
+            RouteStatus::Held(Held::Enforcement)
+        ))
     );
     assert_eq!(
         fib(&out),
