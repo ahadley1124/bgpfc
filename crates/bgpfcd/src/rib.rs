@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{FibChange, Output, PeerInfo, Revalidation, Rib, Sink};
+use bgpfc_rib::{FibChange, Output, PathLimit, PeerInfo, Revalidation, Rib, Sink};
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -146,6 +146,15 @@ fn handle(
             );
             let mut info = peer_info(peer, local_addr, &session, interval);
             info.prefix_limits = limits;
+            info.add_path_send = add_path_send(settings, peer, &session.add_path_send);
+            if !info.add_path_receive.is_empty() || !info.add_path_send.is_empty() {
+                bgpfc_log::info!(
+                    "rib: add-path",
+                    peer = peer,
+                    receive = families(&info.add_path_receive),
+                    send = describe_path_limits(&info.add_path_send)
+                );
+            }
             rib.peer_up(info, now, out);
         }
         RibMsg::Update { peer, update, .. } => {
@@ -181,6 +190,10 @@ fn handle(
         RibMsg::SetPrefixLimits(new) => {
             settings.prefix_limits = new;
             follow_prefix_limits(rib, settings, now, out);
+        }
+        RibMsg::SetAddPathLimits(new) => {
+            settings.add_path_send = new;
+            follow_add_path_limits(rib, settings, now, out);
         }
         RibMsg::Resend { peer } => {
             let families: Vec<_> = rib
@@ -282,6 +295,84 @@ fn follow_prefix_limits(rib: &mut Rib, settings: &RibSettings, now: Instant, out
     }
 }
 
+/// After a reload: running sessions send the number of paths the new file
+/// says (RFC 7911 §5) without a reset. The families a session sends paths
+/// for were negotiated in its OPEN, and a change to them reset it, so only
+/// the number can differ here.
+fn follow_add_path_limits(
+    rib: &mut Rib,
+    settings: &RibSettings,
+    now: Instant,
+    out: &mut impl Sink,
+) {
+    let up: Vec<(IpAddr, Vec<_>)> = rib
+        .peers()
+        .filter(|p| !p.add_path_send.is_empty())
+        .map(|p| (p.addr, p.add_path_send.clone()))
+        .collect();
+    for (peer, old) in up {
+        let families: Vec<_> = old.iter().map(|(f, _)| *f).collect();
+        let limits = add_path_send(settings, peer, &families);
+        if limits != old {
+            bgpfc_log::info!(
+                "rib: add-path send",
+                peer = peer,
+                limits = describe_path_limits(&limits)
+            );
+            rib.set_add_path_limits(peer, &limits, now, out);
+        }
+    }
+}
+
+/// How many paths `peer` is sent for each of `negotiated`, the families
+/// both sides agreed to exchange Path Identifiers for in the OPEN (RFC 7911
+/// §5). A family the file no longer configures, which only a reload racing
+/// the reset of the session can leave, still has to be encoded with
+/// identifiers, so it sends its best path alone.
+fn add_path_send(
+    settings: &RibSettings,
+    peer: IpAddr,
+    negotiated: &[AddressFamily],
+) -> Vec<(AddressFamily, PathLimit)> {
+    let configured = settings.add_path_send.get(&peer);
+    negotiated
+        .iter()
+        .map(|family| {
+            let limit = configured
+                .and_then(|l| l.iter().find(|(f, _)| f == family))
+                .map_or(PathLimit::Best(1), |(_, l)| *l);
+            (*family, limit)
+        })
+        .collect()
+}
+
+/// `ipv4-unicast,ipv6-unicast` for a log line; `none` if empty.
+fn families(families: &[AddressFamily]) -> String {
+    if families.is_empty() {
+        return "none".to_owned();
+    }
+    families
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `ipv4-unicast=all,ipv6-unicast=2` for a log line; `none` if empty.
+fn describe_path_limits(limits: &[(AddressFamily, PathLimit)]) -> String {
+    if limits.is_empty() {
+        return "none".to_owned();
+    }
+    limits
+        .iter()
+        .map(|(f, l)| match l {
+            PathLimit::All => format!("{f}=all"),
+            PathLimit::Best(n) => format!("{f}={n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The `maximum-prefix` limits configured for `peer` (RFC 4271 §6.7).
 fn prefix_limits(settings: &RibSettings, peer: IpAddr) -> Vec<(AddressFamily, u32)> {
     settings
@@ -330,7 +421,9 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         extended_next_hop: s.extended_next_hop_send.clone(),
         advertisement_interval: interval,
         prefix_limits: Vec::new(),
-        add_path_receive: Vec::new(),
+        // RFC 7911 §5: the families the peer sends several paths for. What
+        // we send it is configured (`add_path_send`).
+        add_path_receive: s.add_path_receive.clone(),
         add_path_send: Vec::new(),
     }
 }
@@ -548,10 +641,12 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
             after,
         } => match prefix {
             Some(prefix) => {
+                // With ADD-PATH one peer can have several candidates: the
+                // best is one path of one peer (RFC 7911 §2).
                 let best = rib
                     .loc_rib(*family)
                     .find(|(p, _)| p == prefix)
-                    .map(|(_, b)| b.peer);
+                    .map(|(_, b)| (b.peer, b.path_id));
                 RibReply::Routes(
                     rib.candidates(*family, *prefix)
                         .iter()
@@ -559,7 +654,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                             prefix: *prefix,
                             peer: c.peer,
                             attrs: std::sync::Arc::clone(c.attrs),
-                            best: best == Some(c.peer),
+                            path_id: c.path_id,
+                            best: best == Some((c.peer, c.path_id)),
                             rov: c.rov,
                         })
                         .collect(),
@@ -572,6 +668,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         prefix,
                         peer: b.peer,
                         attrs: std::sync::Arc::clone(b.attrs),
+                        path_id: b.path_id,
                         best: true,
                         rov: b.rov,
                     })
@@ -591,6 +688,8 @@ mod tests {
 
     use bgpfc_rib::RovState;
     use bgpfc_rpki::ValidationChange;
+
+    use crate::messages::AddPathLimits;
 
     use bgpfc_wire::types::{Asn, HoldTime, RouterId};
 
@@ -831,6 +930,179 @@ mod tests {
             "ipv4-unicast=1,ipv6-unicast=2"
         );
         assert_eq!(describe_limits(&[]), "none");
+    }
+
+    /// An UPDATE from `peer` (AS `peer_as`) with a path for each of
+    /// `prefix`'s Path Identifiers (RFC 7911 §3), one NLRI entry each.
+    fn paths(peer: &str, peer_as: u32, prefix: &str, ids: &[u32]) -> Vec<RibMsg> {
+        use bgpfc_wire::types::PathId;
+        use bgpfc_wire::update::PathIds;
+        ids.iter()
+            .map(|id| {
+                let mut msg = routes(peer, peer_as, &[prefix]);
+                if let RibMsg::Update { update, .. } = &mut msg {
+                    // A longer path for the higher identifiers, so that
+                    // the decision process has something to choose by.
+                    let hops: Vec<Asn> = std::iter::repeat_n(Asn(peer_as), *id as usize).collect();
+                    update.message.attributes[1] = bgpfc_wire::attribute::PathAttribute::AsPath(
+                        bgpfc_wire::as_path::AsPath::sequence(&hops),
+                    );
+                    update.message.path_ids = Some(Box::new(PathIds {
+                        nlri: vec![PathId(*id)],
+                        ..PathIds::default()
+                    }));
+                }
+                msg
+            })
+            .collect()
+    }
+
+    /// A RIB with peer 1 (sends several paths, we receive them), peer 2
+    /// (is sent all of them, with no MRAI so that each change goes out at
+    /// once, RFC 4271 §9.2.1.1) and plain peer 3 up, as RFC 7911 §5 has
+    /// the three negotiate.
+    fn add_path_rib(now: Instant) -> (Rib, RibSettings) {
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        settings
+            .add_path_send
+            .insert(ip("192.0.2.2"), vec![(V4, PathLimit::All)]);
+        settings
+            .intervals
+            .insert(ip("192.0.2.2"), Some(Duration::ZERO));
+        let mut receiving = session(65_001, PeerKind::External);
+        receiving.add_path_receive = vec![V4];
+        let mut sending = session(65_002, PeerKind::External);
+        sending.add_path_send = vec![V4];
+        for (peer, s) in [("192.0.2.1", receiving), ("192.0.2.2", sending)] {
+            let msg = RibMsg::PeerUp {
+                peer: ip(peer),
+                local_addr: ip("192.0.2.254"),
+                session: s,
+            };
+            handle(&mut rib, &mut settings, msg, now);
+        }
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.3", 65_003, PeerKind::External),
+            now,
+        );
+        (rib, settings)
+    }
+
+    #[test]
+    fn add_path_sessions_start_with_and_follow_the_configured_limits() {
+        // RFC 7911 §5: paths in from peer 1 (it sends, we receive) and
+        // from plain peer 3, paths out to peer 2 (we send, it receives).
+        use bgpfc_wire::types::PathId;
+        let now = Instant::now();
+        let (mut rib, mut settings) = add_path_rib(now);
+        let info = |rib: &Rib, a: &str| {
+            let p = rib.peer(ip(a)).unwrap();
+            (p.add_path_receive.clone(), p.add_path_send.clone())
+        };
+        assert_eq!(info(&rib, "192.0.2.1"), (vec![V4], vec![]));
+        assert_eq!(
+            info(&rib, "192.0.2.2"),
+            (vec![], vec![(V4, PathLimit::All)])
+        );
+        assert_eq!(info(&rib, "192.0.2.3"), (vec![], vec![]));
+        for msg in paths("192.0.2.1", 65_001, "198.51.100.0/24", &[7, 9]) {
+            handle(&mut rib, &mut settings, msg, now);
+        }
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.3", 65_003, &["198.51.100.0/24"]),
+            now,
+        );
+        // Peer 2 gets every path, under identifiers of ours.
+        let ids = |rib: &Rib| {
+            rib.sent_paths(ip("192.0.2.2"), V4)
+                .into_iter()
+                .map(|(_, id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&rib), vec![PathId(1), PathId(2), PathId(3)]);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Send { peer, .. } if *peer == ip("192.0.2.2")))
+        );
+        // The control plane sees them all, the best flagged once, with
+        // the identifiers the peers sent where they sent any.
+        let prefix = "198.51.100.0/24".parse().unwrap();
+        let RibReply::Routes(reports) = answer(
+            &rib,
+            &RibQuery::Routes {
+                family: V4,
+                prefix: Some(prefix),
+                after: None,
+            },
+        ) else {
+            panic!("routes expected");
+        };
+        let mut seen: Vec<_> = reports
+            .iter()
+            .map(|r| (r.peer, r.path_id.map(|p| p.0), r.best))
+            .collect();
+        seen.sort();
+        assert_eq!(seen.iter().filter(|r| r.2).count(), 1, "{seen:?}");
+        assert_eq!(
+            seen.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+            vec![
+                (ip("192.0.2.1"), Some(7)),
+                (ip("192.0.2.1"), Some(9)),
+                (ip("192.0.2.3"), None)
+            ]
+        );
+        // A reload that sends the best path alone: the others are
+        // withdrawn from peer 2 without a reset.
+        let mut new = AddPathLimits::new();
+        new.insert(ip("192.0.2.2"), vec![(V4, PathLimit::Best(1))]);
+        let out = handle(&mut rib, &mut settings, RibMsg::SetAddPathLimits(new), now);
+        assert_eq!(
+            rib.peer(ip("192.0.2.2")).unwrap().add_path_send,
+            vec![(V4, PathLimit::Best(1))]
+        );
+        assert_eq!(ids(&rib).len(), 1);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Send { peer, .. } if *peer == ip("192.0.2.2")))
+        );
+        // The same again changes nothing; a session that sends no paths is
+        // left alone whatever the file says.
+        let mut same = AddPathLimits::new();
+        same.insert(ip("192.0.2.2"), vec![(V4, PathLimit::Best(1))]);
+        same.insert(ip("192.0.2.3"), vec![(V4, PathLimit::All)]);
+        let out = handle(&mut rib, &mut settings, RibMsg::SetAddPathLimits(same), now);
+        assert_eq!(out, vec![]);
+        assert_eq!(info(&rib, "192.0.2.3"), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_negotiated_family_the_file_no_longer_configures_sends_its_best_path() {
+        // Only a reload racing the reset of the session can leave it: the
+        // encoding still has identifiers (RFC 7911 §5), one path goes.
+        let settings = RibSettings::default();
+        assert_eq!(
+            add_path_send(&settings, ip("192.0.2.2"), &[V4]),
+            vec![(V4, PathLimit::Best(1))]
+        );
+        assert_eq!(add_path_send(&settings, ip("192.0.2.2"), &[]), vec![]);
+        assert_eq!(
+            describe_path_limits(&[
+                (V4, PathLimit::All),
+                (AddressFamily::IPV6_UNICAST, PathLimit::Best(2))
+            ]),
+            "ipv4-unicast=all,ipv6-unicast=2"
+        );
+        assert_eq!(describe_path_limits(&[]), "none");
+        assert_eq!(
+            families(&[V4, AddressFamily::IPV6_UNICAST]),
+            "ipv4-unicast,ipv6-unicast"
+        );
+        assert_eq!(families(&[]), "none");
     }
 
     /// A peer handle on a queue of one, for watching what the RIB thread
