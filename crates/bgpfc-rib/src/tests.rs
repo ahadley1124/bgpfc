@@ -1318,6 +1318,34 @@ fn as_loop_routes_are_excluded() {
 }
 
 #[test]
+fn every_next_hop_counts_as_resolvable() {
+    // RFC 4271 §9.1.2: "If the NEXT_HOP attribute of a BGP route depicts
+    // an address that is not resolvable ... the BGP route MUST be excluded
+    // from the Phase 2 decision function." bgpfcd runs no IGP and reads no
+    // route from the kernel, so it cannot tell (COMPLIANCE.md, RFC 4271
+    // §9.1.2; docs/config.md, "Route selection"): a next hop on no
+    // network the router is attached to is chosen, installed and
+    // advertised like any other.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    let far = attrs(&[65_001], "203.0.113.99");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &far), now(), o));
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("203.0.113.99")),
+            previous: None,
+        }]
+    );
+    assert_eq!(sends(&out, e2.addr).len(), 1);
+}
+
+#[test]
 fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);

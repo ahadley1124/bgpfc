@@ -525,6 +525,17 @@ routes from consideration in this order until one is left (RFC 4271
 8. f): the lowest BGP Identifier of the neighbor.
 9. g): the lowest neighbor address.
 
+RFC 4271 §9.1.2 also takes out of route selection a route whose NEXT_HOP
+cannot be resolved ("the BGP route MUST be excluded from the Phase 2
+decision function"), and issue #47 makes routes with an unreachable next
+hop ineligible. bgpfcd does not apply this rule: it runs no IGP and reads
+no routes from the kernel, so every next hop counts as resolvable, as
+every interior cost counts as equal in step 7. A route whose next hop is
+unreachable can therefore be chosen and advertised. With `fib { mode
+install; }` the kernel refuses to install a route whose gateway it cannot
+reach directly, and the failure is logged at error as `fib: failed`, but
+the route stays chosen.
+
 Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
 first, as the most significant part of the degree of preference that RFC
 4271 §9.1.1 lets local policy compute: below LOCAL_PREF, a forged origin
