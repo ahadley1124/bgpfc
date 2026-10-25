@@ -238,7 +238,8 @@ change was, `origin` is `null` for none, and `held_by` is `null` unless
 `route` is `held`. The memory is the RIB thread's and starts empty with
 the daemon. Three bounds keep a change that moves a whole table, such as
 VRPs that expire or validation switched on with a full table, from
-holding the RIB thread or flooding the log, and none is configurable:
+holding the RIB thread or flooding the log with the RIB's lines, and none
+is configurable:
 
 | Bound | Value | Why |
 |---|---|---|
@@ -249,6 +250,15 @@ holding the RIB thread or flooding the log, and none is configurable:
 Nothing is uncounted: the first line counts every move per pair of
 states, and `show routes` gives every route's current state. A knob
 would change no outcome, only how much is written.
+
+The bounds are on the RIB's lines only. The FIB thread logs each route it
+installs or removes at info (`fib: dry-run` or `fib: applied`), whatever
+made the change, as it does for an UPDATE. So a change of state or of
+`enforcement` adds up to one such line for each destination it counts in
+`best_changed`: under `drop-invalid`, one for each destination whose only
+route it holds or releases. The example above, `best_changed=4800`, comes
+with about 4800 of them. At `log { level warn; }` the FIB thread writes
+only its failures.
 
 ## RPKI
 

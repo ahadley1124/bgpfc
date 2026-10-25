@@ -515,6 +515,48 @@ fn expiry_releases_every_route_held_by_enforcement() {
 }
 
 #[test]
+fn holding_many_destinations_is_one_report_and_a_fib_change_each() {
+    // docs/control.md, "Changes of state": what the RIB says about a
+    // change is one report, however many routes it moved, but each
+    // destination whose best route it changes is a FIB change of its own,
+    // which the FIB thread logs on a line of its own. Under drop-invalid,
+    // a change that holds or releases the only route of N destinations
+    // makes N of them, whether VRPs or the enforcement changed.
+    let mut rib = Rib::new(LOCAL_AS);
+    outputs(|o| rib.set_enforcement(DropInvalid, now(), o));
+    let (e1, e2) = two_peers(&mut rib);
+    let prefixes: Vec<String> = (0..600u32)
+        .map(|i| format!("10.{}.{}.0/24", i >> 8, i & 0xff))
+        .collect();
+    let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    let out = send(&mut rib, &e1, &refs);
+    assert_eq!(fib(&out).len(), 600);
+    // A ROA that makes every one of them Invalid.
+    let out = outputs(|o| {
+        rib.validation_changed(all(vrps(&[("10.0.0.0/8", 24, 64_497)])), now(), o);
+    });
+    let reports = out
+        .iter()
+        .filter(|o| matches!(o, Output::Revalidated(_)))
+        .count();
+    assert_eq!(reports, 1);
+    let r = report(&out).unwrap();
+    assert_eq!((r.held, r.best_changed), (600, 600));
+    let changes = fib(&out);
+    assert_eq!(changes.len(), 600);
+    assert!(changes.iter().all(|c| c.next_hop.is_none()));
+    assert_eq!(sent(&out, &e2).1.len(), 600);
+    // Enforcement switched off by a reload: one report, and the 600
+    // destinations back in the FIB.
+    let out = outputs(|o| rib.set_enforcement(Off, now(), o));
+    let r = rejudged(&out);
+    assert_eq!((r.released, r.best_changed), (600, 600));
+    let changes = fib(&out);
+    assert_eq!(changes.len(), 600);
+    assert!(changes.iter().all(|c| c.next_hop == Some(ip("10.0.0.1"))));
+}
+
+#[test]
 fn a_flapping_vrp_set_sends_at_most_one_announcement_and_one_withdrawal_per_interval() {
     // Issue #59, design §D5: validation-driven changes go through the RFC
     // 4271 §9.2.1.1 pacing. A ROA flapping every second moves a route in
