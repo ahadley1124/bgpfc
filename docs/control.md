@@ -168,7 +168,10 @@ lists it after the candidates, marked `!`, followed by `held by
 enforcement` (the `enforcement` rules out the state it is used with) or
 `held by policy` (the import policy rejects it in its state and would
 accept it in another); the JSON has `held` (`enforcement`, `policy` or
-`null`). `show routes held` lists every held route of a family, and `show
+`null`). A held route keeps the attributes its neighbor sent, and is shown
+with them: the import policy runs on them again when the route is used
+again, so what the policy sets, such as a `set local-pref`, shows only
+then. `show routes held` lists every held route of a family, and `show
 neighbor` counts them per family.
 
 ```
