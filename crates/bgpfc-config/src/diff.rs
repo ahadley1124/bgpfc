@@ -50,11 +50,12 @@ pub enum GlobalChange {
     Log,
     /// The `control` block.
     Control,
-    /// The `rpki` block, an absent one counting as `mode disabled` with
-    /// the defaults: the RTR client starts, stops or restarts. A block
-    /// that only spells something differently, such as a default written
-    /// out or a cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)),
-    /// is no change.
+    /// The `rpki` block's RTR client settings, an absent block counting
+    /// as `mode disabled` with the defaults: the RTR client starts, stops
+    /// or restarts. A block that only spells something differently, such
+    /// as a default written out or a cache's host, is no change, and nor
+    /// is its `enforcement`, which the client does not use (see
+    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)).
     Rpki,
 }
 
@@ -399,5 +400,51 @@ mod tests {
             ConfigDiff::between(&two, &swapped).global,
             vec![GlobalChange::Rpki]
         );
+    }
+
+    #[test]
+    fn an_enforcement_change_is_not_an_rpki_client_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let modes = ["drop-invalid", "prefer-valid", "off"];
+        for from in modes {
+            for to in modes {
+                let a = with(&format!(
+                    "rpki {{ mode external; enforcement {from}; cache 192.0.2.10; }}"
+                ));
+                let b = with(&format!(
+                    "rpki {{ mode external; enforcement {to}; cache 192.0.2.10; }}"
+                ));
+                // The client keeps its sessions and its VRPs.
+                assert!(a.rpki.same_as(&b.rpki), "{from} -> {to}");
+                let d = ConfigDiff::between(&a, &b);
+                assert!(!d.global.contains(&GlobalChange::Rpki), "{from} -> {to}");
+                assert_eq!(a.rpki == b.rpki, from == to);
+                // No neighbor is touched either.
+                assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+            }
+        }
+        // With another change to the block, it is still one client change.
+        let a = with("rpki { mode external; enforcement off; cache 192.0.2.10; }");
+        let b = with("rpki { mode external; cache 192.0.2.11; }");
+        assert_eq!(ConfigDiff::between(&a, &b).global, vec![GlobalChange::Rpki]);
+    }
+
+    #[test]
+    fn writing_the_default_enforcement_is_no_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let implied = with("rpki { mode external; cache 192.0.2.10; }");
+        let written = with("rpki { mode external; enforcement drop-invalid; cache 192.0.2.10; }");
+        assert_eq!(
+            implied.rpki.enforcement,
+            crate::ast::Rpki::DEFAULT_ENFORCEMENT
+        );
+        assert_eq!(implied.rpki, written.rpki);
+        assert!(ConfigDiff::between(&implied, &written).is_empty());
+        // No block at all has the default too, and `mode disabled` with it
+        // written out is the same.
+        let none = cfg(BASE);
+        let disabled = with("rpki { mode disabled; enforcement drop-invalid; }");
+        assert_eq!(none.rpki, disabled.rpki);
+        assert!(ConfigDiff::between(&none, &disabled).is_empty());
     }
 }

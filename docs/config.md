@@ -58,6 +58,7 @@ control-item = "socket" path ";"
                        [ "token-file" path ";" ] "}" ;
 
 rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
+             | "enforcement" ( "drop-invalid" | "prefer-valid" | "off" ) ";"   (* default drop-invalid *)
              | "cache" host { cache-option } ";"       (* repeatable; options once each *)
              | "version" ( "0" | "1" ) ";"             (* default 1 *)
              | "connect-timeout" u32 ";"              (* default 10 *)
@@ -224,10 +225,12 @@ more than 1000 IPv4 unicast routes in the RIB (RFC 4271 §6.7): bgpfcd
 sends Cease / Maximum Number of Prefixes Reached with the family and the
 limit in its data (RFC 4486 §4), drops every route the neighbor sent
 (none of the UPDATE that crossed the limit is passed on), and logs an
-error. Counted are the routes accepted: those that passed the AS loop
+error. Counted are the routes the RIB keeps: those that passed the AS loop
 check and the import policy, which is what `show neighbor` reports as
-received. Routes the import policy rejects are not kept and not counted,
-as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
+received, and the routes it holds for their validation state (see
+**RPKI** below), so that a change of state never moves the count. Routes
+the import policy rejects whatever their state are not kept and not
+counted, as with FRR's `maximum-prefix` and BIRD's `import limit`. The limit must
 be at least 1 and its family one of the neighbor's `families`. The
 neighbor then restarts like after any other damped failure, so a peer
 that keeps sending too many routes is retried `restart-limit` times and
@@ -255,13 +258,90 @@ restarts after a damped failure; `off` always does.
 
 **RPKI.** The `rpki` block says where the Validated ROA Payloads (VRPs)
 come from that give every route its RFC 6811 origin validation state
-(`docs/control.md`, "Validation state"). Without the block, or with `mode
-disabled`, there are none and every route is `disabled`. The block must
-state its `mode`; nothing else implies one. `mode external` takes the VRPs
-over the RPKI-to-Router protocol (RTR) from the caches listed with `cache`,
-of which there must be at least one; `mode disabled` keeps the cache list
-but uses none of it. The state is not yet acted on: it does not decide
-whether a route is accepted or which one is chosen.
+(`docs/control.md`, "Validation state"), and what that state does.
+Without the block, or with `mode disabled`, there are none and every route
+is `disabled`. The block must state its `mode`; nothing else implies one.
+`mode external` takes the VRPs over the RPKI-to-Router protocol (RTR) from
+the caches listed with `cache`, of which there must be at least one; `mode
+disabled` keeps the cache list but uses none of it.
+
+`mode external` is the statement that turns origin validation on, and it
+means: validate every route against the caches' VRPs, and act on the
+result as `enforcement` says, `drop-invalid` unless the block says
+otherwise. `enforcement` is one of:
+
+- `drop-invalid`, the default. A route whose state is Invalid is *held*:
+  it stays in the Adj-RIB-In, counted as received, but it is no candidate
+  for route selection, so it is neither installed nor advertised. As soon
+  as its state is no longer Invalid it is used again, without an UPDATE or
+  a route refresh. This is RFC 6811 §5's "rejecting all "invalid" routes",
+  the default the project ships with (issue #61).
+- `prefer-valid`. No route is held for its state. Route selection prefers
+  Valid routes to `not-found` (and `disabled`) ones, and those to Invalid
+  ones, before anything else, LOCAL_PREF included: RFC 6811 §5's
+  "adjusting a route's degree of preference in the selection algorithm
+  based on its validation state". An Invalid route is used only when the
+  destination has no other.
+- `off`. Nothing acts on the state: it is shown, but neither whether a
+  route is used nor which route is chosen depends on it (RFC 8481 §5,
+  "Set State, Don't Act").
+
+RFC 6811 §2: "An implementation MUST NOT exclude a route from the
+Adj-RIB-In or from consideration in the decision process as a side effect
+of its validation state, unless explicitly configured to do so." bgpfcd
+keeps every route in the Adj-RIB-In whatever its state, and takes one out
+of route selection for its state only where the file says so: by `mode
+external`, whose meaning includes `enforcement drop-invalid` as above, or
+by an `enforcement` statement. Without an `rpki` block, or with `mode
+disabled`, no route is validated, and `disabled` is never held.
+`enforcement` is accepted with `mode disabled` too, and then applies only
+to a state set by configuration. RFC 8481 §5 is stricter: "Absent specific
+operator configuration, policy MUST NOT be applied." bgpfcd's default
+departs from it, as the project chose (issue #61); `enforcement off;` gives
+the RFC 8481 §5 behaviour.
+
+Each route goes through these steps in order:
+
+1. The checks that make a route unusable whatever the policy, such as an
+   AS_PATH holding our own AS (RFC 4271 §9.1.2). A route that fails them is
+   not kept.
+2. The lookup gives the route its state from its AS_PATH as received (RFC
+   6811 §2).
+3. The import policy accepts the route, possibly with other attributes,
+   or rejects it.
+4. `enforcement` acts on the route's state: `drop-invalid` holds an Invalid
+   route.
+5. Route selection among the routes not held, ranking by state first under
+   `prefer-valid`.
+6. The export policy of each neighbor, the rewriting of RFC 4271 §5.1, and
+   the neighbor's `advertisement-interval`.
+
+When the VRPs change, the routes whose state they change go through steps
+3 to 6 again (RFC 6811 §4: "When a mapping is added or deleted, the
+implementation MUST re-validate any affected prefixes and run the BGP
+decision process if needed"). Under `drop-invalid`, a used route that
+becomes Invalid is withdrawn from the neighbors and the kernel, and a held
+route that is no longer Invalid is used again, installed and advertised
+when it is the best route, with no UPDATE from its neighbor.
+
+A change of state reaches the neighbors through the same pacing as a
+change an UPDATE brings (`advertisement-interval` above), and no other
+limit applies. A destination is advertised again to a neighbor at most
+once per interval, a withdrawal goes out at once and does not end the
+interval, and a first advertisement is never held. So VRPs that keep
+changing, such as two caches with different data taking turns, send a
+neighbor at most one announcement and one withdrawal of a destination per
+interval. A route that becomes Invalid under `drop-invalid` is withdrawn
+at once: holding the withdrawal back would keep propagating what
+enforcement exists to stop. A large change, such as expiry releasing every
+held route, goes out at once, many prefixes to an UPDATE; its size is that
+of the change, and RFC 6811 §4 asks for it.
+
+VRPs that expire (`max-expire` below) leave no data, so every route
+becomes `not-found` and every route `drop-invalid` held is used again:
+validation fails open. RFC 8210 §6 forbids keeping them ("The router MUST
+NOT retain the data past the time indicated by this parameter"), and the
+expiry is logged as an error.
 
 > **Keep the cache on the router or on a trusted network.** RTR runs over
 > plain TCP to port 323: nothing authenticates the cache to bgpfcd or
@@ -327,7 +407,11 @@ looks nothing up; it judges the file alone, wherever it runs. The client
 looks a name up again at every connection attempt, so a cache whose address
 changes is followed. It starts before the neighbors, and every route is
 `disabled` until a cache has sent its VRPs; from then on the states follow
-the cache's data. The client logs with the rest of the daemon, at the `log`
+the cache's data. A route that arrives before then is therefore used, as
+`disabled` is never held, and withdrawn once the VRPs make it Invalid. A
+cache on the router or near it answers well before a BGP session comes up,
+so this window is normally empty; BIRD and FRR behave the same way. The
+client logs with the rest of the daemon, at the `log`
 level: losing a cache is a warning, its return an info line, and VRPs that
 expire before a cache could refresh them an error.
 
@@ -378,8 +462,9 @@ differently, or until they expire (RFC 8210 §10, §6). A change to `mode
 disabled` stops the client and makes every route `disabled` again. A block
 that differs only in spelling, such as a default written out or a cache
 written another way that names the same cache (see `cache` above), leaves
-the running client alone, and a new cache whose name does not resolve fails
-the reload as it fails the start.
+the running client alone, and so does a change to `enforcement` alone,
+which the client does not use. A new cache whose name does not resolve
+fails the reload as it fails the start.
 
 ## Command line
 
