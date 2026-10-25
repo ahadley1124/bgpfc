@@ -87,8 +87,8 @@ fn sent(out: &[Output], to: &PeerInfo) -> Vec<Sent> {
                 // invariant: the session rewrite prepends our AS to a
                 // path the neighbor's AS starts.
                 let from = a.as_path.asns().nth(1).unwrap().0;
-                for k in 0..prefixes.len() {
-                    v.push(Sent::Announce(ids[k].0, from, a.otc));
+                for id in ids.iter().take(prefixes.len()) {
+                    v.push(Sent::Announce(id.0, from, a.otc));
                 }
             }
         }
