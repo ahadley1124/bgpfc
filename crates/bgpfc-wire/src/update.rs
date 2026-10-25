@@ -55,6 +55,12 @@ pub enum PeerKind {
 /// each prefix, in one direction (RFC 7911 §3, §5). Only IPv4 and IPv6
 /// unicast, the families this implementation parses; the NLRI field and
 /// `MP_REACH_NLRI` of IPv4 unicast alike follow the IPv4 entry.
+///
+/// NOTE(interop): RFC 7911 §3 extends "the NLRI encoding" of RFC 4271,
+/// which RFC 4760 §5 reuses in both multiprotocol attributes, and §5 does
+/// not list the fields. BIRD and FRR extend them all for a family with
+/// ADD-PATH and none for any other (`tests/captures.rs` has BIRD's NLRI
+/// and Withdrawn Routes fields and `MP_UNREACH_NLRI`), and so does this.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AddPathFamilies {
     ipv4_unicast: bool,
