@@ -1,11 +1,13 @@
 //! Loc-RIB is a function of the Adj-RIBs-In alone: whatever order the
 //! same announcements and withdrawals arrive in, the best routes and the
-//! final Adj-RIBs-Out are the same (AGENTS.md §5, `bgpfc-rib` row).
+//! final Adj-RIBs-Out are the same (AGENTS.md §5, `bgpfc-rib` row). The
+//! FIB changes on the way chain up to the same routes.
 #![cfg(not(miri))]
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
-use bgpfc_rib::{PeerInfo, Rib};
+use bgpfc_rib::{Output, PeerInfo, Rib};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::prefix::Prefix;
@@ -121,21 +123,40 @@ fn step() -> impl Strategy<Value = Step> {
 }
 
 /// The final state: best route per prefix and each peer's Adj-RIB-Out.
+/// On the way, checks that the FIB changes chain: each names as previous
+/// the next hop the one before gave the prefix, and together they end at
+/// the routes a full reconcile gets.
 fn run(steps: &[Step]) -> (Vec<(Prefix, IpAddr)>, Vec<Vec<Prefix>>) {
     let infos = peers();
     let mut rib = Rib::new(LOCAL_AS);
     for info in &infos {
         rib.peer_up(info.clone(), &mut Vec::new());
     }
+    let mut fib = BTreeMap::new();
     for s in steps {
         let info = &infos[usize::from(s.peer)];
-        rib.update(info.addr, &update(s, info), &mut Vec::new());
+        let mut out = Vec::new();
+        rib.update(info.addr, &update(s, info), &mut out);
+        for o in out {
+            if let Output::Fib(c) = o {
+                assert_eq!(c.previous, fib.get(&c.prefix).copied(), "{c:?}");
+                match c.next_hop {
+                    Some(n) => fib.insert(c.prefix, n),
+                    None => fib.remove(&c.prefix),
+                };
+            }
+        }
     }
+    assert_eq!(rib.fib_routes().collect::<BTreeMap<_, _>>(), fib);
     let best = rib.loc_rib(V4).map(|(p, b)| (p, b.peer)).collect();
     let outs = infos
         .iter()
         .map(|i| {
-            let mut v: Vec<Prefix> = rib.adj_rib_out(i.addr, V4).map(|(p, _)| p).collect();
+            let mut v: Vec<Prefix> = rib
+                .adj_rib_out(i.addr, V4)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
             v.sort();
             v
         })

@@ -15,7 +15,7 @@ use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
 use crate::attrs::PathAttrs;
 use crate::decision::{Candidate, Neighbor, best};
-use crate::export::{Source, export, prepend};
+use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
@@ -54,10 +54,10 @@ fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
         local_pref: None,
         atomic_aggregate: false,
         aggregator: None,
-        communities: Vec::new(),
-        ext_communities: Vec::new(),
-        large_communities: Vec::new(),
-        unknown: Vec::new(),
+        communities: Box::default(),
+        ext_communities: Box::default(),
+        large_communities: Box::default(),
+        unknown: Box::default(),
     }
 }
 
@@ -185,10 +185,16 @@ fn as_set_counts_as_one_hop() {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     let mut a = attrs(&[65_001], "10.0.0.1");
-    a.as_path.segments.push(AsPathSegment {
-        kind: SegmentType::Set,
-        asns: vec![Asn(1), Asn(2), Asn(3)],
-    });
+    a.as_path = AsPath::from_segments(&[
+        AsPathSegment {
+            kind: SegmentType::Sequence,
+            asns: vec![Asn(65_001)],
+        },
+        AsPathSegment {
+            kind: SegmentType::Set,
+            asns: vec![Asn(1), Asn(2), Asn(3)],
+        },
+    ]);
     let b = attrs(&[65_002, 9, 9], "10.0.0.2");
     // a: 1 + 1 (the set) = 2 hops; b: 3 hops.
     let c = [(&e1, a), (&e2, b)];
@@ -376,10 +382,10 @@ fn non_transitive_extended_communities_stay_in_the_as() {
     let mut a = attrs(&[65_001], "10.0.0.1");
     let transitive = ExtendedCommunity::two_octet_as(2, true, 1, 1);
     let local_only = ExtendedCommunity::two_octet_as(2, false, 1, 2);
-    a.ext_communities = vec![transitive, local_only];
+    a.ext_communities = vec![transitive, local_only].into();
     a.normalise();
     let e = export(LOCAL_AS, V4, src, &a, &ext).unwrap();
-    assert_eq!(e.ext_communities, vec![transitive]);
+    assert_eq!(*e.ext_communities, [transitive]);
     let i = export(LOCAL_AS, V4, src, &a, &int).unwrap();
     assert_eq!(i.ext_communities.len(), 2);
 }
@@ -394,11 +400,11 @@ fn well_known_communities_limit_export() {
         kind: from.kind,
     };
     let mut a = attrs(&[65_001], "10.0.0.1");
-    a.communities = vec![Community::NO_EXPORT];
+    a.communities = vec![Community::NO_EXPORT].into();
     a.normalise();
     assert!(export(LOCAL_AS, V4, src, &a, &ext).is_none());
     assert!(export(LOCAL_AS, V4, src, &a, &int).is_some());
-    a.communities = vec![Community::NO_ADVERTISE];
+    a.communities = vec![Community::NO_ADVERTISE].into();
     assert!(export(LOCAL_AS, V4, src, &a, &ext).is_none());
     assert!(export(LOCAL_AS, V4, src, &a, &int).is_none());
 }
@@ -426,29 +432,6 @@ fn ipv6_next_hop_self_and_v4_over_v6_session() {
     assert_eq!(e.next_hop, a4.next_hop);
 }
 
-#[test]
-fn prepend_respects_segment_limit_and_sets() {
-    use bgpfc_wire::as_path::{AsPathSegment, SegmentType};
-    let p1 = prepend(&AsPath::empty(), Asn(1));
-    assert_eq!(p1.asns().collect::<Vec<_>>(), vec![Asn(1)]);
-    let p2 = prepend(&p1, Asn(2));
-    assert_eq!(p2.segments.len(), 1);
-    assert_eq!(p2.asns().collect::<Vec<_>>(), vec![Asn(2), Asn(1)]);
-    let full = AsPath::sequence(&vec![Asn(9); 255]);
-    let p3 = prepend(&full, Asn(1));
-    assert_eq!(p3.segments.len(), 2);
-    assert_eq!(p3.segments[0].asns, vec![Asn(1)]);
-    let set = AsPath {
-        segments: vec![AsPathSegment {
-            kind: SegmentType::Set,
-            asns: vec![Asn(5)],
-        }],
-    };
-    let p4 = prepend(&set, Asn(1));
-    assert_eq!(p4.segments[0].kind, SegmentType::Sequence);
-    assert_eq!(p4.segments.len(), 2);
-}
-
 // --- The RIB end to end --------------------------------------------------
 
 #[test]
@@ -472,12 +455,14 @@ fn announce_withdraw_and_fib_changes() {
             FibChange {
                 family: V4,
                 prefix: p("192.0.2.0/24"),
-                next_hop: Some(ip("10.0.0.1"))
+                next_hop: Some(ip("10.0.0.1")),
+                previous: None,
             },
             FibChange {
                 family: V4,
                 prefix: p("198.51.100.0/24"),
-                next_hop: Some(ip("10.0.0.1"))
+                next_hop: Some(ip("10.0.0.1")),
+                previous: None,
             },
         ]
     );
@@ -509,6 +494,7 @@ fn announce_withdraw_and_fib_changes() {
     let b = attrs(&[65_002], "10.0.0.2");
     let out = outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.2")));
+    assert_eq!(fib(&out)[0].previous, Some(ip("10.0.0.1")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
     // e2 had e1's route; its own is not sent back, so it is withdrawn.
@@ -521,6 +507,15 @@ fn announce_withdraw_and_fib_changes() {
     // Withdraw from e2: back to e1's route; e2 gets it, e1 gets a withdraw.
     let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), o));
     assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+    assert_eq!(fib(&out)[0].previous, Some(ip("10.0.0.2")));
+    // What the FIB is given when it reconciles in full, in prefix order.
+    assert_eq!(
+        rib.fib_routes().collect::<Vec<_>>(),
+        vec![
+            (p("192.0.2.0/24"), ip("10.0.0.1")),
+            (p("198.51.100.0/24"), ip("10.0.0.1"))
+        ]
+    );
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
@@ -531,10 +526,12 @@ fn announce_withdraw_and_fib_changes() {
     let f = fib(&out);
     assert_eq!(f.len(), 2);
     assert!(f.iter().all(|c| c.next_hop.is_none()));
+    assert!(f.iter().all(|c| c.previous == Some(ip("10.0.0.1"))));
+    assert_eq!(rib.fib_routes().count(), 0);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m[0].withdrawn.len(), 2);
     assert_eq!(rib.loc_rib(V4).count(), 0);
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 0);
     assert_eq!(rib.peers().count(), 1);
 }
 
@@ -739,23 +736,25 @@ fn attributes_round_trip_through_an_update() {
         asn: Asn(65_001),
         address: Ipv4Addr::new(1, 1, 1, 1),
     });
-    a.communities = vec![Community::new(65_001, 2), Community::new(65_001, 1)];
+    a.communities = vec![Community::new(65_001, 2), Community::new(65_001, 1)].into();
     a.large_communities = vec![bgpfc_wire::community::LargeCommunity {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     a.unknown = vec![crate::attrs::UnknownAttribute {
         flags: 0xc0,
         code: 200,
         value: vec![1, 2],
-    }];
+    }]
+    .into();
     a.normalise();
     let m = a.to_update(V4, vec![p("192.0.2.0/24")]);
     let back = PathAttrs::from_update(&m, V4).unwrap();
     assert_eq!(
-        back.communities,
-        vec![Community::new(65_001, 1), Community::new(65_001, 2)]
+        *back.communities,
+        [Community::new(65_001, 1), Community::new(65_001, 2)]
     );
     // The Partial bit is set on the forwarded unknown attribute.
     assert_eq!(back.unknown[0].flags, 0xe0);
@@ -811,19 +810,32 @@ fn reexport_sends_only_the_difference() {
             o,
         );
     });
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 2);
-    // Nothing changed: nothing sent.
-    assert_eq!(outputs(|o| rib.reexport(e2.addr, V4, o)).len(), 0);
-    rib.set_policies(Box::new(DropOdd));
-    let out = outputs(|o| rib.reexport(e2.addr, V4, o));
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 2);
+    // The same policies again: nothing sent.
+    let out = outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[e2.addr], o));
+    assert_eq!(out.len(), 0);
+    let out = outputs(|o| rib.set_policies(Box::new(DropOdd), &[e2.addr], o));
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(m.len(), 1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     assert_eq!(m[0].nlri.len(), 0);
-    assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 1);
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 1);
+    assert_eq!(
+        rib.peer_stats(e2.addr).unwrap().advertised,
+        vec![(V4, 1), (V6, 0)]
+    );
+    // And back: the route is announced again.
+    let out = outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[e2.addr], o));
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
+    assert_eq!(
+        rib.peer_stats(e2.addr).unwrap().advertised,
+        vec![(V4, 2), (V6, 0)]
+    );
     assert!(rib.peer(e2.addr).is_some());
     assert!(rib.peer(ip("10.9.9.9")).is_none());
-    assert_eq!(outputs(|o| rib.reexport(ip("10.9.9.9"), V4, o)).len(), 0);
+    let out = outputs(|o| rib.set_policies(Box::new(DropOdd), &[ip("10.9.9.9")], o));
+    assert_eq!(out.len(), 0);
 }
 
 #[test]
@@ -963,8 +975,9 @@ fn attribute_sets_go_with_their_last_route() {
         );
     });
     outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
-    // Received sets a and b, and what each is exported as to the others.
-    assert!(rib.attribute_sets() >= 4, "{}", rib.attribute_sets());
+    // Received sets a and b; the peers they are sent to get them
+    // rewritten when encoded, not as sets of their own.
+    assert_eq!(rib.attribute_sets(), 2);
     // Replacing a route lets its old set go once nothing uses it.
     let a2 = attrs(&[65_001, 8], "10.0.0.1");
     outputs(|o| {
@@ -1044,18 +1057,20 @@ fn attribute_hash_follows_every_field() {
         asn: Asn(65_001),
         address: Ipv4Addr::new(1, 1, 1, 1),
     });
-    base.communities = vec![Community::new(65_001, 1)];
-    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)];
+    base.communities = vec![Community::new(65_001, 1)].into();
+    base.ext_communities = vec![ExtendedCommunity::two_octet_as(2, true, 1, 1)].into();
     base.large_communities = vec![LargeCommunity {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     base.unknown = vec![crate::attrs::UnknownAttribute {
         flags: 0xc0,
         code: 200,
         value: vec![1, 2],
-    }];
+    }]
+    .into();
     assert_eq!(hasher.hash_one(&base), hasher.hash_one(base.clone()));
     let changes: Vec<fn(&mut PathAttrs)> = vec![
         |a| a.origin = Origin::Egp,
@@ -1066,8 +1081,12 @@ fn attribute_hash_follows_every_field() {
         |a| a.local_pref = Some(5),
         |a| a.atomic_aggregate = true,
         |a| a.aggregator = None,
-        |a| a.communities.push(Community::new(65_001, 2)),
-        |a| a.ext_communities.clear(),
+        |a| {
+            a.communities = [&a.communities[..], &[Community::new(65_001, 2)]]
+                .concat()
+                .into();
+        },
+        |a| a.ext_communities = Box::default(),
         |a| a.large_communities[0].local2 = 4,
         |a| a.unknown[0].value.push(3),
         |a| {
@@ -1087,4 +1106,129 @@ fn attribute_hash_follows_every_field() {
             "change {i}"
         );
     }
+}
+
+#[test]
+fn interner_gives_its_table_back_when_emptied() {
+    let mut i = crate::attrs::Interner::default();
+    let held: Vec<_> = (0..1000u32)
+        .map(|n| i.intern(attrs(&[n + 1], "10.0.0.1")))
+        .collect();
+    let full = i.capacity();
+    assert!(full >= 1000);
+    for a in held {
+        i.release(a);
+    }
+    assert_eq!(i.len(), 0);
+    assert!(i.capacity() < full / 4, "{} of {full}", i.capacity());
+}
+
+#[test]
+fn peers_are_sent_rewritten_sets_without_a_copy_per_peer() {
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i1 = peer("10.0.0.3", LOCAL_AS.0, 3);
+    let mut rib = Rib::new(LOCAL_AS);
+    let _ = outputs(|o| {
+        rib.peer_up(e1.clone(), o);
+        rib.peer_up(e2.clone(), o);
+        rib.peer_up(i1.clone(), o);
+    });
+    let prefixes = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
+    let a = attrs(&[65_001, 64_500], "10.0.0.1");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&prefixes, &a), o));
+    // RFC 4271 §5.1: what each peer is sent is rewritten for its session.
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m[0].nlri.len(), 3);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(LOCAL_AS));
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 254)));
+    let m = decode_sent(sends(&out, i1.addr)[0], &i1);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(Asn(65_001)));
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+    // The Adj-RIBs-Out hold the Loc-RIB's own set, not a copy per peer;
+    // so does that of a peer that comes up later and is sent the table.
+    let e3 = peer("10.0.0.4", 65_003, 4);
+    let out = outputs(|o| rib.peer_up(e3.clone(), o));
+    let m = decode_sent(sends(&out, e3.addr)[0], &e3);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(LOCAL_AS));
+    let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
+    for to in [&e2, &i1, &e3] {
+        assert_eq!(rib.adj_rib_out(to.addr, V4).len(), 3);
+        assert!(
+            rib.adj_rib_out(to.addr, V4)
+                .iter()
+                .all(|(_, x)| Arc::ptr_eq(x, &held))
+        );
+    }
+    assert_eq!(rib.s.cx.interner.len(), 1);
+    drop(held);
+    // Withdrawn, the set goes with its last route.
+    let _ = outputs(|o| rib.update(e1.addr, &withdraw(&prefixes), o));
+    assert_eq!(rib.adj_rib_out(e2.addr, V4).len(), 0);
+    assert_eq!(rib.s.cx.interner.len(), 0);
+}
+
+#[test]
+fn a_change_the_session_rewrite_hides_is_not_sent() {
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i1 = peer("10.0.0.3", LOCAL_AS.0, 3);
+    let mut rib = Rib::new(LOCAL_AS);
+    let _ = outputs(|o| {
+        rib.peer_up(e1.clone(), o);
+        rib.peer_up(e2.clone(), o);
+        rib.peer_up(i1.clone(), o);
+    });
+    let a = attrs(&[65_001], "10.0.0.1");
+    let _ = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
+    // Another next hop and MED: an external peer gets ours and no MED
+    // (RFC 4271 §5.1.3, §5.1.4), so nothing it would see changed; an
+    // internal peer gets both as received.
+    let mut b = attrs(&[65_001], "10.0.0.9");
+    b.med = Some(5);
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &b), o));
+    assert!(sends(&out, e2.addr).is_empty(), "{out:?}");
+    let m = decode_sent(sends(&out, i1.addr)[0], &i1);
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 9)));
+    // The Adj-RIB-Out follows the new set all the same.
+    let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
+    assert!(
+        rib.adj_rib_out(e2.addr, V4)
+            .iter()
+            .all(|(_, x)| Arc::ptr_eq(x, &held))
+    );
+    // A change it does see is sent.
+    let c = attrs(&[65_001, 7], "10.0.0.9");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &c), o));
+    assert_eq!(sends(&out, e2.addr).len(), 1);
+}
+
+#[test]
+fn colliding_sets_are_not_shared_and_nothing_is_lost() {
+    use std::hash::{BuildHasherDefault, Hasher};
+    // Every set hashes alike: only the first is kept in the table.
+    #[derive(Default)]
+    struct Zero;
+    impl Hasher for Zero {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, _: &[u8]) {}
+    }
+    let mut i = crate::attrs::Interner::with_hasher(BuildHasherDefault::<Zero>::default());
+    let a1 = i.intern(attrs(&[1], "10.0.0.1"));
+    let b1 = i.intern(attrs(&[2], "10.0.0.1"));
+    let a2 = i.intern(attrs(&[1], "10.0.0.1"));
+    let b2 = i.intern(attrs(&[2], "10.0.0.1"));
+    assert!(Arc::ptr_eq(&a1, &a2));
+    assert!(!Arc::ptr_eq(&b1, &b2), "a colliding set is not shared");
+    assert_eq!(*b1, *b2);
+    assert_eq!(i.len(), 1);
+    // Releasing a set that is not the table's leaves the table's alone.
+    i.release(b1);
+    i.release(b2);
+    assert_eq!(i.len(), 1);
+    i.release(a1);
+    i.release(a2);
+    assert_eq!(i.len(), 0);
 }

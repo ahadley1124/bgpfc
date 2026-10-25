@@ -4,8 +4,7 @@
 //! thread arrives in milestone 7).
 
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
 
 use bgpfc_fsm::Session;
@@ -13,7 +12,8 @@ use bgpfc_rib::{FibChange, Output, PeerInfo, Policies, Rib, Sink};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
-use crate::messages::{FibMsg, PeerInput, RibMsg, RibQuery, RibReply, RouteReport};
+use crate::messages::{FibMsg, PAGE, RibMsg, RibQuery, RibReply, RouteReport};
+use crate::peer::SendError;
 
 /// Start the RIB thread.
 pub(crate) fn spawn(
@@ -99,17 +99,10 @@ fn run(
                 let _ = reply.send(answer(&rib, &q));
             }
             RibMsg::SetPolicies { policies, reexport } => {
-                rib.set_policies(policies.0);
-                for peer in reexport {
-                    let families: Vec<_> = rib
-                        .peer(peer)
-                        .map(|p| p.families.clone())
-                        .unwrap_or_default();
-                    for family in families {
-                        bgpfc_log::info!("rib: re-export", peer = peer, family = family);
-                        rib.reexport(peer, family, &mut out);
-                    }
+                for peer in &reexport {
+                    bgpfc_log::info!("rib: re-export", peer = peer);
                 }
+                rib.set_policies(policies.0, &reexport, &mut out);
             }
             RibMsg::Resend { peer } => {
                 let families: Vec<_> = rib
@@ -121,10 +114,42 @@ fn run(
                     rib.refresh(peer, family, &mut out);
                 }
             }
+            RibMsg::FibMode(mode, reply) => {
+                // Changes already made go first.
+                out.flush();
+                fib_mode(&rib, fib, mode, reply);
+            }
         }
         out.flush();
         #[cfg(feature = "profiling")]
         loads.after(seen, &rib);
+    }
+}
+
+/// Routes in one `FibMsg::Reconcile`.
+const RECONCILE_BATCH: usize = 4096;
+
+/// Switch the FIB's mode. Going to install, the FIB reconciles what is
+/// installed against every route the RIB has (README, "FIB dry-run"),
+/// which go to it in batches through the bounded queue rather than as one
+/// table-sized list.
+fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: SyncSender<usize>) {
+    let send = |msg| fib.send(msg).is_ok();
+    let mut ok = send(FibMsg::SetMode(mode));
+    if mode == bgpfc_fib::Mode::Install {
+        let mut batch = Vec::with_capacity(RECONCILE_BATCH);
+        for route in rib.fib_routes() {
+            batch.push(route);
+            if batch.len() == RECONCILE_BATCH {
+                ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
+                batch.reserve(RECONCILE_BATCH);
+            }
+        }
+        ok &= send(FibMsg::Reconcile(batch));
+    }
+    ok &= send(FibMsg::ReconcileEnd(reply));
+    if !ok {
+        bgpfc_log::error!("fib thread gone");
     }
 }
 
@@ -184,15 +209,14 @@ impl Sink for Deliver<'_> {
                     return;
                 };
                 bgpfc_log::debug!("rib: send", peer = peer, messages = messages.len());
-                match handle.tx.try_send(PeerInput::Send(messages)) {
+                match handle.send_updates(messages) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
+                    Err(SendError::Overrun) => {
                         // AGENTS.md §3: never drop updates silently; the
                         // peer thread resets the session.
-                        bgpfc_log::warn!("rib: peer queue full", peer = peer);
-                        handle.overrun.store(true, Ordering::Relaxed);
+                        bgpfc_log::warn!("rib: peer outbox full", peer = peer);
                     }
-                    Err(TrySendError::Disconnected(_)) => {
+                    Err(SendError::Gone) => {
                         bgpfc_log::warn!("rib: peer thread gone", peer = peer);
                     }
                 }
@@ -205,6 +229,10 @@ impl Sink for Deliver<'_> {
 }
 
 fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
+    // Counting the prefixes costs more than the test.
+    if !bgpfc_log::enabled(bgpfc_log::Level::Debug) {
+        return;
+    }
     let announced = update.announcements().count();
     let withdrawn = update.withdrawals().count();
     bgpfc_log::debug!(
@@ -240,7 +268,11 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
                 .collect(),
         ),
-        RibQuery::Routes { family, prefix } => match prefix {
+        RibQuery::Routes {
+            family,
+            prefix,
+            after,
+        } => match prefix {
             Some(prefix) => {
                 let best = rib
                     .loc_rib(*family)
@@ -258,7 +290,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 )
             }
             None => RibReply::Routes(
-                rib.loc_rib(*family)
+                rib.loc_rib_after(*family, *after)
+                    .take(PAGE)
                     .map(|(prefix, b)| RouteReport {
                         prefix,
                         peer: b.peer,
@@ -268,5 +301,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .collect(),
             ),
         },
+        RibQuery::FibRoutes { after } => {
+            RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
+        }
     }
 }

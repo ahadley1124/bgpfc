@@ -12,8 +12,8 @@
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Inputs a peer thread will queue before its producers block.
 const INPUT_QUEUE: usize = 256;
 
+/// Octets of UPDATEs that may wait for a peer thread to write them. More
+/// means the peer has fallen too far behind, and its session is reset
+/// (AGENTS.md §3, backpressure). Room for a few full tables of UPDATEs
+/// (7.4 MB for a million IPv4 prefixes), which another peer's table load
+/// can produce faster than a slow peer reads.
+const OUTBOX_BYTES: usize = 32 << 20;
+
 /// What the daemon knows about one neighbour.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerConfig {
@@ -60,10 +67,63 @@ pub(crate) struct PeerHandle {
     pub(crate) addr: IpAddr,
     /// Its input queue.
     pub(crate) tx: SyncSender<PeerInput>,
-    /// Set by the RIB thread when the queue was full and UPDATEs had to be
-    /// dropped: the peer thread resets the session rather than leave the
-    /// peer with a partial view (AGENTS.md §3, backpressure).
-    pub(crate) overrun: Arc<AtomicBool>,
+    /// UPDATEs for the peer, from the RIB thread: see [`Outbox`].
+    outbox: Sender<Vec<Vec<u8>>>,
+    /// Shared with the peer thread.
+    state: Arc<Outbox>,
+}
+
+/// UPDATEs the RIB thread has encoded and the peer thread has not written
+/// yet travel apart from the input queue. That queue is full whenever the
+/// peer sends a table (its reader fills it), and a route the RIB sends
+/// the peer meanwhile must not find it full. They are bounded by octets
+/// rather than by messages: one entry can be a whole table (the initial
+/// Adj-RIB-Out, RFC 2918 refresh).
+#[derive(Debug, Default)]
+struct Outbox {
+    /// Octets queued.
+    queued: AtomicUsize,
+    /// Set when UPDATEs had to be dropped: the peer thread resets the
+    /// session rather than leave the peer with a partial view (AGENTS.md
+    /// §3, backpressure).
+    overrun: AtomicBool,
+}
+
+/// Why UPDATEs were not queued.
+#[derive(Debug)]
+pub(crate) enum SendError {
+    /// The peer is too far behind; its session will be reset.
+    Overrun,
+    /// The peer thread has ended.
+    Gone,
+}
+
+impl PeerHandle {
+    /// Queue UPDATEs for the peer thread to write, in order. Never blocks
+    /// the caller (the RIB thread).
+    ///
+    /// # Errors
+    /// [`SendError::Overrun`] when more than [`OUTBOX_BYTES`] already
+    /// wait: the UPDATEs are dropped and the session is reset. Whatever
+    /// its size, a batch is taken when nothing waits.
+    pub(crate) fn send_updates(&self, messages: Vec<Vec<u8>>) -> Result<(), SendError> {
+        let octets: usize = messages.iter().map(Vec::len).sum();
+        // Only this thread adds and only the peer thread subtracts, so
+        // the figure can only have dropped by the time it is added to.
+        let queued = self.state.queued.load(Ordering::Relaxed);
+        let result = if queued > 0 && queued + octets > OUTBOX_BYTES {
+            self.state.overrun.store(true, Ordering::Relaxed);
+            Err(SendError::Overrun)
+        } else {
+            self.state.queued.fetch_add(octets, Ordering::Relaxed);
+            self.outbox.send(messages).map_err(|_| SendError::Gone)
+        };
+        // A wake-up for a thread waiting on its input queue. When the
+        // queue is full the thread is busy, and it looks at the outbox
+        // after every input.
+        let _ = self.tx.try_send(PeerInput::Updates);
+        result
+    }
 }
 
 struct Conn {
@@ -89,7 +149,8 @@ pub(crate) struct Peer {
     attempt: u64,
     session: Option<Session>,
     write_failed: bool,
-    overrun: Arc<AtomicBool>,
+    outbox: Receiver<Vec<Vec<u8>>>,
+    outbox_state: Arc<Outbox>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -102,11 +163,14 @@ pub(crate) struct Peer {
 /// thread runs (listeners bind and privileges drop in between).
 pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
-    let overrun = Arc::new(AtomicBool::new(false));
+    // Unbounded in entries: send_updates bounds it by octets.
+    let (outbox_tx, outbox) = channel();
+    let state = Arc::new(Outbox::default());
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
-        overrun: Arc::clone(&overrun),
+        outbox: outbox_tx,
+        state: Arc::clone(&state),
     };
     let fsm = Fsm::new(cfg.fsm.clone());
     let peer = Peer {
@@ -121,7 +185,8 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         attempt: 0,
         session: None,
         write_failed: false,
-        overrun,
+        outbox,
+        outbox_state: state,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -324,17 +389,8 @@ impl Peer {
                     self.pending = None;
                 }
             }
-            PeerInput::Send(messages) => {
-                if self.fsm.state() == State::Established {
-                    #[cfg(feature = "profiling")]
-                    bgpfc_prof::metrics::UPDATES_SENT.add(messages.len());
-                    for m in &messages {
-                        self.write_raw(m);
-                    }
-                    self.updates_out += 1;
-                    self.fsm.message_sent(now);
-                }
-            }
+            // The outbox is written below, after every input.
+            PeerInput::Updates => {}
             PeerInput::Stop(subcode) => {
                 // RFC 4271 §8.2.2 ManualStop: a Cease goes out (RFC 4486
                 // §4 Administrative Shutdown) and the FSM returns to Idle;
@@ -387,7 +443,10 @@ impl Peer {
                 });
             }
         }
-        if self.overrun.swap(false, Ordering::Relaxed) && self.fsm.state() == State::Established {
+        self.write_outbox(now);
+        if self.outbox_state.overrun.swap(false, Ordering::Relaxed)
+            && self.fsm.state() == State::Established
+        {
             // RFC 4486 §4: Out of Resources. The peer restarts and gets a
             // complete Adj-RIB-Out again.
             bgpfc_log::error!(
@@ -537,6 +596,27 @@ impl Peer {
         self.open_timer.reset();
         if let Some(c) = self.conn.take() {
             let _ = c.stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Write the UPDATEs waiting in the outbox, or drop them outside
+    /// Established (RFC 4271 §9.2: UPDATEs go out only then; a new
+    /// session starts from a full Adj-RIB-Out).
+    fn write_outbox(&mut self, now: Instant) {
+        while let Ok(messages) = self.outbox.try_recv() {
+            if self.fsm.state() == State::Established {
+                #[cfg(feature = "profiling")]
+                bgpfc_prof::metrics::UPDATES_SENT.add(messages.len());
+                for m in &messages {
+                    self.write_raw(m);
+                }
+                self.updates_out += 1;
+                self.fsm.message_sent(now);
+            }
+            let octets: usize = messages.iter().map(Vec::len).sum();
+            self.outbox_state
+                .queued
+                .fetch_sub(octets, Ordering::Relaxed);
         }
     }
 

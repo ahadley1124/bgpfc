@@ -1135,12 +1135,10 @@ mod tests {
             UpdateSubcode::MalformedAsPath as u8
         );
         // RFC 9774 §3: AS_SET, unless allowed.
-        let set = AsPath {
-            segments: vec![crate::as_path::AsPathSegment {
-                kind: crate::as_path::SegmentType::Set,
-                asns: vec![Asn(65_001)],
-            }],
-        };
+        let set = AsPath::from_segments(&[crate::as_path::AsPathSegment {
+            kind: crate::as_path::SegmentType::Set,
+            asns: vec![Asn(65_001)],
+        }]);
         m.attributes[1] = PathAttribute::AsPath(set.clone());
         let wire = m.encode(&ENC4).unwrap();
         let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();

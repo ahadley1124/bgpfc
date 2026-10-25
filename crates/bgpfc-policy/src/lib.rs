@@ -17,7 +17,6 @@ use std::net::IpAddr;
 
 use bgpfc_config::ast::{Action, CommunityOp, Config, Match, SetAction};
 use bgpfc_config::error::Pos;
-use bgpfc_rib::export::prepend;
 use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Verdict};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
@@ -222,10 +221,7 @@ impl PolicySet {
         match clause {
             Clause::Prefix(r) => r.matches(route.prefix),
             Clause::PrefixList(i) => self.prefix_lists[*i].matches(route.prefix),
-            Clause::AsPath(re) => {
-                let asns: Vec<_> = attrs.as_path.asns().collect();
-                re.is_match(&asns)
-            }
+            Clause::AsPath(re) => re.matches(attrs.as_path.asns(), attrs.as_path.asns().count()),
             Clause::Community(c) => attrs.has_community(*c),
             Clause::ExtCommunity(c) => attrs.ext_communities.binary_search(c).is_ok(),
             Clause::LargeCommunity(c) => attrs.large_communities.binary_search(c).is_ok(),
@@ -245,7 +241,7 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
         SetAction::AsPathPrepend(asns) => {
             // `prepend 1 2` yields `1 2 <path>`: prepend from the right.
             for asn in asns.iter().rev() {
-                a.as_path = prepend(&a.as_path, *asn);
+                a.as_path = a.as_path.prepend(*asn);
             }
         }
         SetAction::NextHopSelf => {
@@ -263,15 +259,17 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
     }
 }
 
-fn edit<T: Copy + Ord>(set: &mut Vec<T>, op: CommunityOp, vals: &[T]) {
+fn edit<T: Copy + Ord>(set: &mut Box<[T]>, op: CommunityOp, vals: &[T]) {
+    let mut v = std::mem::take(set).into_vec();
     match op {
-        CommunityOp::Add => set.extend_from_slice(vals),
-        CommunityOp::Remove => set.retain(|c| !vals.contains(c)),
+        CommunityOp::Add => v.extend_from_slice(vals),
+        CommunityOp::Remove => v.retain(|c| !vals.contains(c)),
         CommunityOp::Replace => {
-            set.clear();
-            set.extend_from_slice(vals);
+            v.clear();
+            v.extend_from_slice(vals);
         }
     }
+    *set = v.into_boxed_slice();
 }
 
 /// The policies of a configuration, applied per neighbor.
