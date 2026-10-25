@@ -451,6 +451,19 @@ impl Sink for Deliver<'_> {
                     .collect();
                 bgpfc_log::log(bgpfc_log::Level::Info, REVALIDATED, &fields);
             }
+            Output::Enforcement(r) => {
+                // RFC 6811 §5: every route judged again under the
+                // operator's new enforcement mode, counted in one line.
+                bgpfc_log::info!(
+                    "rib: rpki enforcement changed",
+                    from = r.from,
+                    to = r.to,
+                    routes = r.routes,
+                    held = r.held,
+                    released = r.released,
+                    best_changed = r.best_changed
+                );
+            }
         }
     }
 }
@@ -1320,6 +1333,7 @@ mod tests {
             destinations: 1_000_000,
             sample,
             best_changed: 2,
+            ..Default::default()
         };
         assert_eq!(
             line(&on),
@@ -1337,6 +1351,7 @@ mod tests {
             destinations: 1,
             sample: vec![p("2001:db8::/32")],
             best_changed: 0,
+            ..Default::default()
         };
         assert_eq!(
             line(&delta),

@@ -1621,6 +1621,7 @@ mod tests {
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
             advertised: vec![(v4, 4), (v6, 0)],
+            ..Default::default()
         };
         let report = PeerReport {
             addr,

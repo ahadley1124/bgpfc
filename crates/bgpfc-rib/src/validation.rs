@@ -6,11 +6,15 @@
 //! state changed go through import policy and the decision process again,
 //! the way an UPDATE takes them.
 //!
+//! The same walk judges every route again when the operator's
+//! enforcement mode changes ([`Rib::set_enforcement`]).
+//!
 //! Implements: RFC 6811 §2 ("The validation state of the Route MUST be
 //! set to reflect the result of the lookup"), §4 ("When a mapping is added
 //! or deleted, the implementation MUST re-validate any affected prefixes
 //! and run the BGP decision process if needed"), for the routes that
-//! [`AffectedPrefixes`] names.
+//! [`AffectedPrefixes`] names; §5 (a change of what acts on the state
+//! runs the decision process again for every route).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -19,14 +23,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bgpfc_rpki::{
-    AffectedPrefixes, PrefixSet, RouteOrigin, RovState, ValidationChange, ValidationSource,
+    AffectedPrefixes, Enforcement, PrefixSet, RouteOrigin, RovState, ValidationChange,
+    ValidationSource,
 };
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::store::{Destination, PeerId};
+use crate::store::{Destination, PeerId, Route};
 use crate::{
-    Dirty, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
+    Dirty, Held, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
 };
 
 /// A table walks its affected destinations in one pass, rather than one
@@ -59,6 +64,33 @@ pub struct Revalidation {
     /// Destinations where the decision process then chose another route,
     /// or none: the FIB changes the report comes with.
     pub best_changed: usize,
+    /// Routes the change took out of use: candidates before it, held
+    /// after it ([`Held`]).
+    pub held: usize,
+    /// Routes the change put back into use: held before it, candidates
+    /// after it.
+    pub released: usize,
+}
+
+/// What judging every route again under a new enforcement mode did (see
+/// [`Rib::set_enforcement`]), for the caller to log: counts, as for a
+/// [`Revalidation`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejudged {
+    /// The mode before.
+    pub from: Enforcement,
+    /// The mode now.
+    pub to: Enforcement,
+    /// Routes held in the Adj-RIBs-In, each judged again.
+    pub routes: usize,
+    /// Routes the new mode took out of use: candidates before, held after.
+    pub held: usize,
+    /// Routes the new mode put back into use: held before, candidates
+    /// after.
+    pub released: usize,
+    /// Destinations where the decision process then chose another route,
+    /// or none.
+    pub best_changed: usize,
 }
 
 impl Revalidation {
@@ -72,7 +104,8 @@ impl Revalidation {
     }
 }
 
-/// The counts of a [`Revalidation`] as the pass gathers them.
+/// The counts of a [`Revalidation`] or a [`Rejudged`] as the pass gathers
+/// them.
 #[derive(Default)]
 struct Tally {
     routes: usize,
@@ -80,6 +113,8 @@ struct Tally {
     moved: [[usize; 4]; 4],
     destinations: usize,
     sample: Vec<Prefix>,
+    held: usize,
+    released: usize,
 }
 
 impl Tally {
@@ -104,6 +139,8 @@ impl Tally {
             destinations: self.destinations,
             sample: self.sample,
             best_changed,
+            held: self.held,
+            released: self.released,
         })
     }
 }
@@ -163,8 +200,60 @@ impl Rib {
             AffectedPrefixes::All => None,
             AffectedPrefixes::CoveredBy(changed) => Some(covered_ranges(changed)),
         };
-        let mut tally = Tally::default();
         let mut scratch = std::mem::take(&mut self.scratch);
+        let tally = self.walk(ranges.as_deref(), false, &mut scratch);
+        if let Some(report) = tally.finish(best_changed(&scratch.dirty)) {
+            out.put(Output::Revalidated(report));
+        }
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
+    }
+
+    /// Use `enforcement` from now on (RFC 6811 §5: "rejecting all
+    /// "invalid" routes", or preferring by state, as the operator
+    /// configured): judge every route held in an Adj-RIB-In again under
+    /// it, with the validation state it has, and run the decision process
+    /// for every destination, since the ranking may have changed too. A
+    /// route the new mode rules out is held, and one it admits again is
+    /// used again, with no UPDATE and no ROUTE-REFRESH. What follows comes
+    /// out after one [`Output::Enforcement`] that counts it: FIB changes,
+    /// and UPDATEs sent or held back by the RFC 4271 §9.2.1.1 pacing, as
+    /// for an UPDATE. Nothing happens when the mode is the current one.
+    ///
+    /// It is the walk [`Rib::validation_changed`] makes for
+    /// [`AffectedPrefixes::All`], made on a reload that changes the mode.
+    pub fn set_enforcement(&mut self, enforcement: Enforcement, now: Instant, out: &mut impl Sink) {
+        let from = self.s.cx.enforcement;
+        if from == enforcement {
+            return;
+        }
+        self.s.cx.enforcement = enforcement;
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let tally = self.walk(None, true, &mut scratch);
+        out.put(Output::Enforcement(Rejudged {
+            from,
+            to: enforcement,
+            routes: tally.routes,
+            held: tally.held,
+            released: tally.released,
+            best_changed: best_changed(&scratch.dirty),
+        }));
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
+    }
+
+    /// Visit the destinations of every table that `ranges` (from
+    /// [`covered_ranges`]) cover, or all of them for `None`, with a
+    /// [`Pass`]: validate their routes again and, for those whose state
+    /// changed, or every route when `force` is set, judge them again. The
+    /// scratch gets the destinations to run Phase 3 for.
+    fn walk(
+        &mut self,
+        ranges: Option<&[RangeInclusive<Prefix>]>,
+        force: bool,
+        scratch: &mut Scratch,
+    ) -> Tally {
+        let mut tally = Tally::default();
         // Empty destinations to remove once a table's walk is done.
         let mut empty: Vec<Prefix> = Vec::new();
         for (family, table) in self.tables.iter_mut() {
@@ -175,12 +264,14 @@ impl Rib {
                 source: &*cx.validation,
                 peers: &mut self.s.peers,
                 policies: &*cx.policies,
+                enforcement: cx.enforcement,
+                force,
                 interner: &mut cx.interner,
                 tally: &mut tally,
-                scratch: &mut scratch,
+                scratch: &mut *scratch,
                 empty: &mut empty,
             };
-            match &ranges {
+            match ranges {
                 None => {
                     for (k, d) in &mut table.v4 {
                         pass.destination(k.prefix(), d);
@@ -218,20 +309,25 @@ impl Rib {
                 };
             }
         }
-        let best_changed = scratch
-            .dirty
-            .iter()
-            .filter(|d| match (&d.old, &d.new) {
-                (None, None) => false,
-                (Some(a), Some(b)) => !a.same(b),
-                _ => true,
-            })
-            .count();
-        if let Some(report) = tally.finish(best_changed) {
-            out.put(Output::Revalidated(report));
-        }
-        self.finish(&mut scratch, now, out);
-        self.scratch = scratch;
+        tally
+    }
+}
+
+/// Destinations among `dirty` where the decision process chose another
+/// route, or none.
+fn best_changed(dirty: &[Dirty]) -> usize {
+    dirty
+        .iter()
+        .filter(|d| !same_best(d.old.as_ref(), d.new.as_ref()))
+        .count()
+}
+
+/// Whether `a` and `b` are the same best route, or both none.
+fn same_best(a: Option<&Route>, b: Option<&Route>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same(b),
+        _ => false,
     }
 }
 
@@ -243,6 +339,10 @@ struct Pass<'a> {
     source: &'a dyn ValidationSource,
     peers: &'a mut Vec<Option<PeerState>>,
     policies: &'a dyn Policies,
+    enforcement: Enforcement,
+    /// Judge every route again, its state changed or not, with the state
+    /// it has: the enforcement mode changed.
+    force: bool,
     interner: &'a mut Interner,
     tally: &'a mut Tally,
     scratch: &'a mut Scratch,
@@ -250,76 +350,38 @@ struct Pass<'a> {
     empty: &'a mut Vec<Prefix>,
 }
 
+/// What validating one route again did, for its destination.
+#[derive(Clone, Copy, Default)]
+struct Redone {
+    /// Its RFC 6811 state changed.
+    restated: bool,
+    /// It is a candidate with a new state or new attributes, or one that
+    /// came or went: the decision process must run.
+    changed: bool,
+    /// It moved between the candidates and the held routes.
+    moved: bool,
+}
+
 impl Pass<'_> {
     /// Validate again the routes held for `prefix`, in place, and run
-    /// import policy again on those whose state changed; the scratch gets
-    /// the destination with its best route before and after if its
-    /// candidates changed.
+    /// import policy and enforcement again on those whose state changed,
+    /// or on all of them when forced; the scratch gets the destination
+    /// with its best route before and after if its candidates, or its
+    /// best route, changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let old = dest.best().cloned();
-        let mut changed = false;
-        let mut restated = false;
-        // Whether a route moved between the candidates and the held
-        // routes, and which ones no state admits any more.
-        let mut moved = false;
+        let mut done = Redone::default();
+        // The routes no state admits any more.
         let mut dropped: Vec<PeerId> = Vec::new();
         for route in dest.routes_mut() {
-            self.tally.routes += 1;
-            // RFC 6811 §2, on the route as received, as on its arrival.
-            let received = Arc::clone(route.received());
-            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
-            let rov = self.source.rov(prefix, origin);
-            let aspa = self.source.aspa(&received.as_path);
-            if rov == route.rov && aspa == route.aspa {
-                continue;
-            }
-            if rov != route.rov {
-                self.tally.moved[slot(route.rov)][slot(rov)] += 1;
-                restated = true;
-            }
-            route.rov = rov;
-            route.aspa = aspa;
-            // Always found: the Adj-RIBs-In hold routes only of peers
-            // that are up, as a peer's routes go with it.
-            let Some(peer) = self.peers[route.peer.index()].as_mut() else {
-                continue;
-            };
-            let was_held = route.held;
-            let judged = judge(
-                self.policies,
-                self.interner,
-                &peer.info,
-                (self.family, prefix),
-                &received,
-                rov,
-            );
-            let (attrs, rov_set, held) = match judged {
-                Judged::Accepted { attrs, rov_set } => (attrs, rov_set, false),
-                Judged::Held => (Arc::clone(&received), None, true),
-                // Policy accepted the route with some state when it was
-                // last judged, so only a change of policy since, before
-                // the ROUTE-REFRESH that follows one, can leave none.
-                Judged::Dropped => {
-                    let n = peer.adj_in_count.or_default(self.family);
-                    *n = n.saturating_sub(1);
-                    dropped.push(route.peer);
-                    (Arc::clone(&received), None, true)
-                }
-            };
-            let replaced = std::mem::replace(&mut route.attrs, attrs);
-            let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
-            self.scratch.released.push(replaced);
-            route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
-            route.rov_set = rov_set;
-            route.held = held;
-            // A candidate with a new state or new attributes, or one that
-            // came or went.
-            changed |= !(was_held && held && unchanged);
-            moved |= was_held != held;
+            let r = self.route(prefix, route, &mut dropped);
+            done.restated |= r.restated;
+            done.changed |= r.changed;
+            done.moved |= r.moved;
         }
-        if moved {
+        if done.moved {
             // Candidates first; a stable sort keeps their order.
-            dest.routes_mut().sort_by_key(|r| r.held);
+            dest.routes_mut().sort_by_key(|r| r.held.is_some());
         }
         for peer in dropped {
             if let Some(i) = dest.position(peer) {
@@ -328,24 +390,123 @@ impl Pass<'_> {
                 self.scratch.released.extend(r.received);
             }
         }
-        if restated {
+        if done.restated {
             self.tally.destinations += 1;
             if self.tally.sample.len() < Revalidation::SAMPLE {
                 self.tally.sample.push(prefix);
             }
         }
-        if changed {
+        if done.changed {
             decide(self.peers, dest);
-            self.scratch.dirty.push(Dirty {
-                family: self.family,
-                prefix,
-                old,
-                new: dest.best().cloned(),
-                merged: false,
-            });
+            let new = dest.best();
+            // A forced pass judges every route again, and most come out
+            // as they were: only a destination whose best route is
+            // another, or is used otherwise, is noted, so that a pass
+            // over a full table does not note every destination.
+            let same = match (&old, new) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same(b) && a.same_state(b),
+                _ => false,
+            };
+            if !self.force || !same {
+                self.scratch.dirty.push(Dirty {
+                    family: self.family,
+                    prefix,
+                    old,
+                    new: new.cloned(),
+                    merged: false,
+                });
+            }
         }
         if dest.is_empty() {
             self.empty.push(prefix);
+        }
+    }
+
+    /// Validate `route` to `prefix` again and, if its state changed or
+    /// the pass is forced, judge it again; `dropped` gets its peer if no
+    /// state admits it any more.
+    fn route(&mut self, prefix: Prefix, route: &mut Route, dropped: &mut Vec<PeerId>) -> Redone {
+        self.tally.routes += 1;
+        // RFC 6811 §2, on the route as received, as on its arrival. A
+        // forced pass keeps the states: the source is the same.
+        let received = Arc::clone(route.received());
+        let (rov, aspa) = if self.force {
+            (route.rov, route.aspa)
+        } else {
+            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
+            (
+                self.source.rov(prefix, origin),
+                self.source.aspa(&received.as_path),
+            )
+        };
+        if rov == route.rov && aspa == route.aspa && !self.force {
+            return Redone::default();
+        }
+        let restated = rov != route.rov;
+        if restated {
+            self.tally.moved[slot(route.rov)][slot(rov)] += 1;
+        }
+        route.rov = rov;
+        route.aspa = aspa;
+        // Always found: the Adj-RIBs-In hold routes only of peers that
+        // are up, as a peer's routes go with it.
+        let Some(peer) = self.peers[route.peer.index()].as_mut() else {
+            return Redone {
+                restated,
+                ..Redone::default()
+            };
+        };
+        let was_held = route.held.is_some();
+        let judged = judge(
+            self.policies,
+            self.enforcement,
+            self.interner,
+            &peer.info,
+            (self.family, prefix),
+            &received,
+            rov,
+        );
+        let (attrs, rov_set, held, gone) = match judged {
+            Judged::Accepted { attrs, rov_set } => (attrs, rov_set, None, false),
+            Judged::Held { by, rov_set } => (Arc::clone(&received), rov_set, Some(by), false),
+            // Policy accepted the route with some state when it was last
+            // judged, so only a change of policy since, before the
+            // ROUTE-REFRESH that follows one, can leave none. Kept behind
+            // the candidates until the destination removes it, and no
+            // longer counted.
+            Judged::Dropped => {
+                let n = peer.adj_in_count.or_default(self.family);
+                *n = n.saturating_sub(1);
+                if was_held {
+                    let n = peer.adj_in_held.or_default(self.family);
+                    *n = n.saturating_sub(1);
+                }
+                dropped.push(route.peer);
+                (Arc::clone(&received), None, Some(Held::Policy), true)
+            }
+        };
+        let is_held = held.is_some();
+        if !gone && was_held != is_held {
+            let n = peer.adj_in_held.or_default(self.family);
+            if is_held {
+                *n += 1;
+                self.tally.held += 1;
+            } else {
+                *n = n.saturating_sub(1);
+                self.tally.released += 1;
+            }
+        }
+        let replaced = std::mem::replace(&mut route.attrs, attrs);
+        let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
+        self.scratch.released.push(replaced);
+        route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
+        route.rov_set = rov_set;
+        route.held = held;
+        Redone {
+            restated,
+            changed: !(was_held && is_held && unchanged),
+            moved: was_held != is_held,
         }
     }
 }

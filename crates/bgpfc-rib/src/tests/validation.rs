@@ -9,7 +9,9 @@ use bgpfc_rpki::{AffectedPrefixes, PrefixSet, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::update::EncodeContext;
 
 use super::*;
-use crate::{Imported, Policies, Revalidation, Verdict};
+use crate::{Held, Imported, Policies, Rejudged, Revalidation, Verdict};
+
+mod enforcement;
 
 /// What a policy was asked about, and the validation state it was told.
 type Seen = Arc<Mutex<Vec<(&'static str, Prefix, RovState)>>>;
@@ -184,6 +186,7 @@ fn revalidation(
         destinations: destinations.len(),
         sample: destinations.iter().map(|d| p(d)).collect(),
         best_changed,
+        ..Revalidation::default()
     }
 }
 
@@ -570,9 +573,13 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
     let ours = vrps(&[("192.0.2.0/24", 24, 64_496)]);
     let out = outputs(|o| rib.validation_changed(delta(&other_as, ours.clone()), now(), o));
     let invalid_valid = [(RovState::Invalid, RovState::Valid, 1)];
+    // Put back into use.
     assert_eq!(
         report(&out),
-        Some(&revalidation(1, &invalid_valid, &["192.0.2.0/24"], 1))
+        Some(&Revalidation {
+            released: 1,
+            ..revalidation(1, &invalid_valid, &["192.0.2.0/24"], 1)
+        })
     );
     assert!(matches!(out[0], Output::Revalidated(_)));
     assert_eq!(
@@ -596,7 +603,10 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
     let valid_invalid = [(RovState::Valid, RovState::Invalid, 1)];
     assert_eq!(
         report(&out),
-        Some(&revalidation(1, &valid_invalid, &["192.0.2.0/24"], 1))
+        Some(&Revalidation {
+            held: 1,
+            ..revalidation(1, &valid_invalid, &["192.0.2.0/24"], 1)
+        })
     );
     assert_eq!(
         fib(&out),
@@ -726,7 +736,10 @@ fn withdrawn_routes_and_those_of_a_peer_gone_are_not_validated_again() {
     let invalid_disabled = [(RovState::Invalid, RovState::Disabled, 1)];
     assert_eq!(
         report(&out),
-        Some(&revalidation(1, &invalid_disabled, &["192.0.3.0/24"], 1))
+        Some(&Revalidation {
+            released: 1,
+            ..revalidation(1, &invalid_disabled, &["192.0.3.0/24"], 1)
+        })
     );
     // Taken now that it is no longer Invalid.
     assert_eq!(fib(&out).len(), 1);
@@ -968,21 +981,22 @@ fn routes_change_places_between_candidates_and_held_routes() {
             o,
         );
     });
-    let order = |rib: &Rib| -> Vec<(IpAddr, RovState, bool)> {
+    let order = |rib: &Rib| -> Vec<(IpAddr, RovState, Option<Held>)> {
         routes(rib, V4, p("192.0.2.0/24"))
             .into_iter()
             .map(|(peer, r)| (peer, r.rov, r.held))
             .collect()
     };
+    let policy = Some(Held::Policy);
     assert_eq!(
         order(&rib),
-        vec![(e1.addr, Valid, false), (e2.addr, Invalid, true)]
+        vec![(e1.addr, Valid, None), (e2.addr, Invalid, policy)]
     );
     let second = vrps(&[("192.0.2.0/24", 24, 64_497)]);
     let out = outputs(|o| rib.validation_changed(delta(&first, second), now(), o));
     assert_eq!(
         order(&rib),
-        vec![(e2.addr, Valid, false), (e1.addr, Invalid, true)]
+        vec![(e2.addr, Valid, None), (e1.addr, Invalid, policy)]
     );
     let c = rib.candidates(V4, p("192.0.2.0/24"));
     assert_eq!((c.len(), c[0].peer), (1, e2.addr));

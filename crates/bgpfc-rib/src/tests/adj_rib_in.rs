@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::{AcceptAll, Imported, Policies, Verdict};
+use crate::{AcceptAll, Held, Imported, Policies, Verdict};
 
 /// Import policy that rejects one prefix and gives every other route a
 /// `LOCAL_PREF` of 200.
@@ -353,7 +353,7 @@ fn each_route_is_held_once_with_what_policy_made_of_it() {
         assert_eq!(routes(&rib, V4, p("192.0.2.0/24")).len(), n + 1);
     }
     for (_, r) in routes(&rib, V4, p("192.0.2.0/24")) {
-        assert!(!r.held);
+        assert_eq!(r.held, None);
         assert_eq!(r.received().local_pref, None);
         assert_eq!(r.attrs.local_pref, Some(200));
         assert_eq!(r.attrs.as_path, r.received().as_path);
@@ -390,15 +390,16 @@ fn held_routes_follow_the_candidates() {
         &mut Vec::new(),
     );
     send(&mut rib, 2, "198.51.100.0/24");
-    let order = |rib: &Rib| -> Vec<(IpAddr, bool)> {
+    let order = |rib: &Rib| -> Vec<(IpAddr, Option<Held>)> {
         routes(rib, V4, prefix)
             .into_iter()
             .map(|(peer, r)| (peer, r.held))
             .collect()
     };
+    let policy = Some(Held::Policy);
     assert_eq!(
         order(&rib),
-        vec![(e[1].addr, false), (e[0].addr, true), (e[2].addr, true)]
+        vec![(e[1].addr, None), (e[0].addr, policy), (e[2].addr, policy)]
     );
     let c = rib.candidates(V4, prefix);
     assert_eq!(c.len(), 1);
@@ -416,7 +417,7 @@ fn held_routes_follow_the_candidates() {
             previous: Some(e[1].addr),
         }]
     );
-    assert!(order(&rib).iter().all(|r| r.1));
+    assert!(order(&rib).iter().all(|r| r.1 == policy));
     assert!(rib.candidates(V4, prefix).is_empty());
     assert_eq!(rib.peer_stats(e[1].addr).unwrap().received[0], (V4, 1));
 }
