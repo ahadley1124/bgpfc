@@ -416,11 +416,15 @@ profiling builds with profiling builds. In another run the same way,
 interleaved with 24ae7d9's default build: 1.95 s and 130 MB of RSS
 against 3.38 s and 360 MB.
 
-Install mode, 1M routes into the kernel of a scratch network namespace
-(`unshare -n`, `lo` up with an address in 192.0.2.0/24 so the load
-generator's next hops resolve), default build: 5.8–6.0 s and 130 MB RSS,
-against 9.9–11.5 s and 416 MB at 24ae7d9, which held the desired and the
-installed routes as two tables.
+Install mode, 1M routes into the kernel of a network namespace of their
+own (a veth pair, one end 192.0.2.10/24, so the load generator's next
+hops resolve), default build, three runs each, timed until the FIB
+thread goes idle with every route in the kernel: 5.2–5.6 s and 131 MB
+RSS, against 9.4–9.6 s and 416 MB at 24ae7d9, which held the desired and
+the installed routes as two tables. The FIB thread bounds it: 4.7 s of
+CPU (8.7 s at 24ae7d9), two thirds of it in the kernel, for one netlink
+request and acknowledgement per route. Listing the kernel table while it
+fills (`ip route | wc -l`) slows the inserts; count it once, at the end.
 
 ## Caveats
 
