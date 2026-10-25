@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 18 are `done`, 7 `partial`,
+Of the 154 RFCs below, 20 are `done`, 5 `partial`,
 21 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2545, 2918, 4360, 4486, 5396, 5492, 5668, 6608, 6793, 7607, 8092, 8212, 8654, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2545, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 8092, 8212, 8654, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -39,9 +39,6 @@ Of the 154 RFCs below, 18 are `done`, 7 `partial`,
 - RFC 6286: §2.2 (our own identifier from an internal peer is Bad BGP
   Identifier) and §2.3 (equal identifiers in a collision: the larger AS
   keeps its connection).
-- RFC 4760 and RFC 7606: one open row each in COMPLIANCE.md, and both
-  look finished in code (see the notes); the rows need checking and, for
-  7606 §5.1, a test.
 - RFC 7454 (BCP 194): maximum-prefix limits and GTSM.
 - RFC 8326: an option to tag our announcements with `GRACEFUL_SHUTDOWN`.
 
@@ -113,7 +110,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [9687](https://datatracker.ietf.org/doc/html/rfc9687) | Border Gateway Protocol 4 (BGP-4) Send Hold Timer | PS | `done` |  |
 | [9072](https://datatracker.ietf.org/doc/html/rfc9072) | Extended Optional Parameters Length for BGP OPEN Message | PS | `done` |  |
 | [8654](https://datatracker.ietf.org/doc/html/rfc8654) | Extended Message Support for BGP | PS | `done` |  |
-| [7606](https://datatracker.ietf.org/doc/html/rfc7606) | Revised Error Handling for BGP UPDATE Messages | PS | `partial` | Open in COMPLIANCE.md: §5.1, at most one of withdrawn routes, NLRI, `MP_REACH_NLRI` and `MP_UNREACH_NLRI` per UPDATE. The RIB's `Batch::encode` already sends one kind per UPDATE, but no test pins it. |
+| [7606](https://datatracker.ietf.org/doc/html/rfc7606) | Revised Error Handling for BGP UPDATE Messages | PS | `done` |  |
 | [6286](https://datatracker.ietf.org/doc/html/rfc6286) | Autonomous-System-Wide Unique BGP Identifier for BGP-4 | PS | `partial` | §2.1 (any non-zero identifier) is done. Missing: §2.2, an OPEN from an internal peer carrying our own identifier is Bad BGP Identifier; §2.3, on a collision between equal identifiers the speaker with the larger AS keeps the connection it initiated (`resolve_collision` closes the new connection either way). |
 | [4893](https://datatracker.ietf.org/doc/html/rfc4893) | BGP Support for Four-octet AS Number Space | PS; obsoleted by 6793 | `n/a` |  |
 | [6793](https://datatracker.ietf.org/doc/html/rfc6793) | BGP Support for Four-Octet Autonomous System (AS) Number Space | PS | `done` |  |
@@ -153,7 +150,7 @@ RFC 4360 is being replaced by rfc4360-bis, which is in the RFC Editor queue.
 |---|---|---|---|---|
 | [2283](https://datatracker.ietf.org/doc/html/rfc2283) | Multiprotocol Extensions for BGP-4 | PS; obsoleted by 2858 | `n/a` |  |
 | [2858](https://datatracker.ietf.org/doc/html/rfc2858) | Multiprotocol Extensions for BGP-4 | PS; obsoleted by 4760 | `n/a` |  |
-| [4760](https://datatracker.ietf.org/doc/html/rfc4760) | Multiprotocol Extensions for BGP-4 | DS; updated by 7606 | `partial` | COMPLIANCE.md's one open row (§7, drop a family after a bad MP attribute) looks stale: `Rib::family_disabled` does it and `family_disable_drops_that_family_only` tests it. |
+| [4760](https://datatracker.ietf.org/doc/html/rfc4760) | Multiprotocol Extensions for BGP-4 | DS; updated by 7606 | `done` |  |
 | [2545](https://datatracker.ietf.org/doc/html/rfc2545) | Use of BGP-4 Multiprotocol Extensions for IPv6 Inter-Domain Routing | PS | `done` |  |
 | [4798](https://datatracker.ietf.org/doc/html/rfc4798) | Connecting IPv6 Islands over IPv4 MPLS Using IPv6 Provider Edge Routers (6PE) | PS | `no` | MPLS. |
 | [9012](https://datatracker.ietf.org/doc/html/rfc9012) | The BGP Tunnel Encapsulation Attribute | PS; updated by 9830 | `no` |  |

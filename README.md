@@ -10,12 +10,11 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > **Status:** v1 feature-complete on the `rewrite` branch and exercised against
 > BIRD, FRR and GoBGP in CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
-> row is `done` for RFC 5492, 6793, 2918, 8654, 1997, 4360, 8092, 4486, 6608,
-> 9003, 7607, 9072, 9687 and 9774. RFC 4271 is complete except next-hop
-> resolvability (there is no IGP; the kernel's verdict is logged) and the
-> MinRouteAdvertisementInterval timer; RFC 4760 and 7606 each have one `partial`
-> row; the RFC 8950 extended next hop capability is not advertised yet. Nothing
-> else is claimed.
+> row is `done` for RFC 5492, 6793, 4760, 2918, 7606, 8654, 1997, 4360, 8092,
+> 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 is complete except
+> next-hop resolvability (there is no IGP; the kernel's verdict is logged) and
+> the MinRouteAdvertisementInterval timer; the RFC 8950 extended next hop
+> capability is not advertised yet. Nothing else is claimed.
 
 ### What works
 

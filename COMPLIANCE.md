@@ -94,7 +94,7 @@ is `done`.
 | 6.3 | Missing Well-known Attribute, Data = type code | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `check_mandatory` | update.rs `missing_mandatory_attributes` |
 | 6.3 | Unrecognized Well-known Attribute, Data = the attribute; session reset | MUST | done | wire/update.rs `unknown_attribute` | update.rs `unknown_attributes_per_rfc4271_section_5` |
 | 6.3 | Invalid ORIGIN Attribute, Data = the attribute | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_one` | update.rs `bad_origin_is_treat_as_withdraw` |
-| 6.3 | Invalid `NEXT_HOP`: semantic errors logged and route ignored, no NOTIFICATION | SHOULD | todo (next hop validation arrives with the FIB in milestone 7) | | |
+| 6.3 | Invalid `NEXT_HOP`: semantic errors logged and route ignored, no NOTIFICATION | SHOULD | todo (no semantic next hop checks yet) | | |
 | 6.3 | Malformed `AS_PATH` | MUST | done (treat-as-withdraw per RFC 7606) | wire/update.rs `decode_as_path` | update.rs `as_path_rules` |
 | 6.3 | Leftmost AS equals the external peer's AS | MAY | done (treat-as-withdraw per RFC 7606 §7.2) | rib/lib.rs `Rib::update` | rib tests `leftmost_as_must_be_the_external_peer` |
 | 6.3 | Optional Attribute Error, Data = the attribute | MUST | done | wire/update.rs `discard_malformed`, `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
@@ -182,7 +182,7 @@ is `done`.
 
 | RFC § | Requirement (short) | Level | Status | Code | Test |
 |---|---|---|---|---|---|
-| 8 | Use capability advertisement to negotiate | SHOULD | done (codec; FSM uses it later) | wire/capability.rs | capability.rs |
+| 8 | Use capability advertisement to negotiate | SHOULD | done | wire/capability.rs, fsm/machine.rs `negotiate_families` | capability.rs, fsm tests `open_negotiation` |
 | 8 | Capability 1, length 4: AFI, reserved, SAFI | MUST | done | wire/capability.rs | capability.rs `known_capabilities_round_trip` |
 | 8 | Reserved octet zero on send, ignored on receipt | SHOULD | done | wire/capability.rs | capability.rs `multiprotocol_ignores_the_reserved_octet` |
 | 8 | Both sides must advertise an `<AFI, SAFI>` to exchange it | MUST | done (no Multiprotocol capability means IPv4 unicast only) | fsm/machine.rs `negotiate_families` | fsm tests `open_negotiation`, `internal_session_and_old_speaker` |
@@ -193,7 +193,7 @@ is `done`.
 | 4 | `MP_UNREACH_NLRI` type 15: AFI, SAFI, withdrawn routes; no other attributes required | MUST | done | wire/mp.rs `MpUnreach` | mp.rs `unreach_round_trip_and_errors` |
 | 5 | NLRI `<length, prefix>` encoding | MUST | done | wire/prefix.rs | prefix.rs |
 | 6 | SAFI 1 unicast, 2 multicast | MAY | done (unicast only is parsed) | wire/types.rs `Safi`, wire/mp.rs `supported` | mp.rs `reach_errors` |
-| 7 | Incorrect MP attribute → drop that family's routes from the peer, ignore the family for the session | MUST / SHOULD | partial (reported to the RIB as `FamilyDisabled`; the RIB acts in milestone 5) | wire/update.rs `mp_failure`, bgpfcd/peer.rs `update` | update.rs `mp_attribute_errors_disable_the_family` |
+| 7 | Incorrect MP attribute → drop that family's routes from the peer, ignore the family for the session | MUST / SHOULD | done (the RIB drops the family's routes and ignores later ones; the session stays up) | wire/update.rs `mp_failure`, bgpfcd/peer.rs `update`, rib/lib.rs `Rib::family_disabled` | update.rs `mp_attribute_errors_disable_the_family`, rib tests `family_disable_drops_that_family_only` |
 | 7 | May reset with Optional Attribute Error | MAY | done (NOTIFICATION supplied) | wire/update.rs `mp_failure` | update.rs `mp_attribute_errors_disable_the_family` |
 
 ## RFC 2918 — Route Refresh
