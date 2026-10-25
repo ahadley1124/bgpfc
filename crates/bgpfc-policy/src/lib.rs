@@ -222,10 +222,7 @@ impl PolicySet {
         match clause {
             Clause::Prefix(r) => r.matches(route.prefix),
             Clause::PrefixList(i) => self.prefix_lists[*i].matches(route.prefix),
-            Clause::AsPath(re) => {
-                let asns: Vec<_> = attrs.as_path.asns().collect();
-                re.is_match(&asns)
-            }
+            Clause::AsPath(re) => re.matches(attrs.as_path.asns(), attrs.as_path.asns().count()),
             Clause::Community(c) => attrs.has_community(*c),
             Clause::ExtCommunity(c) => attrs.ext_communities.binary_search(c).is_ok(),
             Clause::LargeCommunity(c) => attrs.large_communities.binary_search(c).is_ok(),
