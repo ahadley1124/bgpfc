@@ -349,7 +349,10 @@ impl Batch {
         for range in chunks(&self.withdraw, max_body - WITHDRAW_OVERHEAD, extra) {
             let withdrawn = self.withdraw[range.clone()].to_vec();
             let ids = if with_ids {
-                self.withdraw_ids[range].to_vec()
+                self.withdraw_ids
+                    .get(range)
+                    .ok_or(EncodeError::PathIdsMissing(family))?
+                    .to_vec()
             } else {
                 Vec::new()
             };
@@ -392,7 +395,11 @@ impl Batch {
             for range in chunks(prefixes, room, extra) {
                 let chunk = prefixes[range.clone()].to_vec();
                 let m = if with_ids {
-                    let ids = self.announce_ids.get(n).map_or(&[][..], |v| &v[range]);
+                    let ids = self
+                        .announce_ids
+                        .get(n)
+                        .and_then(|v| v.get(range))
+                        .ok_or(EncodeError::PathIdsMissing(family))?;
                     attrs.to_update_paths(family, chunk, ids.to_vec())
                 } else {
                     attrs.to_update(family, chunk)

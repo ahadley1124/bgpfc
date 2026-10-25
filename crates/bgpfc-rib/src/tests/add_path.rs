@@ -1239,3 +1239,32 @@ fn pacing_holds_the_announcements_of_a_destination_and_the_paths_it_displaces() 
     let out = outputs(|o| rib.flush(secs(t0, 60), o));
     assert_eq!(wire(&out, &to), vec![Wire::Announce(dst, 1, vec![65_002])]);
 }
+
+#[test]
+fn a_batch_without_identifiers_for_a_peer_sent_paths_is_an_error_not_a_panic() {
+    // RFC 7911 §5: every prefix sent to such a peer has a Path Identifier.
+    // The RIB gives them all, so this is an internal fault; it must not
+    // take the RIB thread down.
+    use crate::export::Batch;
+    use bgpfc_wire::error::EncodeError;
+    let to = path_sender("192.0.2.9", 65_009, 9, PathLimit::All);
+    let dst: Prefix = "192.0.2.0/24".parse().unwrap();
+    let mut batch = Batch::default();
+    batch.withdraw.push(dst);
+    assert_eq!(
+        batch.encode(Asn(65_000), V4, &to),
+        Err(EncodeError::PathIdsMissing(V4))
+    );
+    let a = Arc::new(attrs(&[65_001], "192.0.2.1"));
+    let mut batch = Batch::default();
+    batch.announce(&a, dst);
+    assert_eq!(
+        batch.encode(Asn(65_000), V4, &to),
+        Err(EncodeError::PathIdsMissing(V4))
+    );
+    // With identifiers it encodes.
+    let mut batch = Batch::default();
+    batch.withdraw_path(dst, PathId(3));
+    batch.announce_path(&a, dst, PathId(4));
+    assert_eq!(batch.encode(Asn(65_000), V4, &to).unwrap().len(), 2);
+}
