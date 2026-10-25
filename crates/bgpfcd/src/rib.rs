@@ -10,6 +10,13 @@
 //! 6811 states, in one line per change, and what a change of the `rpki`
 //! block's `enforcement` did to their use (RFC 6811 §5), in one line too.
 //!
+//! Issue #59: "An operator needs to see that a prefix went Valid → Invalid
+//! at a specific time." After the line of a change of the validation
+//! source come the routes it moved among valid, invalid and not-found, a
+//! line each: the first [`LOGGED`] at info, the rest the RIB lists at
+//! debug. Moves to and from `disabled`, validation being switched on or
+//! off, are only counted, as is what the RIB does not list.
+//!
 //! Changes of the validation source arrive on the same channel, as
 //! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
 //! the RIB validates the affected routes again, and what follows is
@@ -22,7 +29,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, Sink};
+use bgpfc_log::Level;
+use bgpfc_rib::{
+    FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, RouteStatus, Sink, Transition,
+};
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -445,23 +455,28 @@ impl Sink for Deliver<'_> {
             }
             Output::Revalidated(r) => {
                 // RFC 6811 §4: the routes a change of the validation source
-                // moved, counted. One line per change, however many routes
-                // it moved: turning validation on or off moves every route
-                // of the table, and a line per route would hold the RIB
-                // thread and flood the log.
-                log_line(bgpfc_log::Level::Info, REVALIDATED, &revalidated(&r));
+                // moved, counted in one line however many routes it moved:
+                // turning validation on or off, or the expiry of the VRPs,
+                // moves every route of the table, and a line per route
+                // would hold the RIB thread and flood the log. Then a line
+                // per route it moved among valid, invalid and not-found
+                // (issue #59), as many as `LOGGED` at info.
+                let debug = bgpfc_log::enabled(Level::Debug);
+                for line in revalidation_lines(&r, debug) {
+                    log_line(line.level, line.msg, &line.fields);
+                }
             }
             Output::Enforcement(r) => {
                 // RFC 6811 §5: every route judged again under the
                 // operator's new enforcement mode, counted in one line.
-                log_line(bgpfc_log::Level::Info, ENFORCEMENT_CHANGED, &rejudged(&r));
+                log_line(Level::Info, ENFORCEMENT_CHANGED, &rejudged(&r));
             }
         }
     }
 }
 
 /// Log a line whose field values are already text.
-fn log_line(level: bgpfc_log::Level, msg: &str, values: &[(&'static str, String)]) {
+fn log_line(level: Level, msg: &str, values: &[(&'static str, String)]) {
     let fields: Vec<bgpfc_log::Field<'_>> = values
         .iter()
         .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
@@ -476,17 +491,21 @@ const REVALIDATED: &str = "rib: validation states changed";
 /// The fields of that line: the routes validated again, how many of them
 /// changed state, those per change of state (`disabled->valid:1000,...`),
 /// the destinations they are for with the first few of them, the
-/// destinations whose best route changed, and the routes the change took
-/// out of use (`held`) and put back into use (`released`) under the
-/// `enforcement` and import policy (RFC 6811 §2, §5). The first six are
-/// m11's, in m11's order, which scripts may read.
-fn revalidated(r: &Revalidation) -> [(&'static str, String); 8] {
+/// destinations whose best route changed, the routes the change took out
+/// of use (`held`) and put back into use (`released`) under the
+/// `enforcement` and import policy (RFC 6811 §2, §5), and of the routes
+/// it moved among valid, invalid and not-found, those with a line of
+/// their own at info (`logged`) and those without (`unlogged`). The first
+/// six are m11's, in m11's order, which scripts may read.
+fn revalidated(r: &Revalidation) -> [(&'static str, String); 10] {
     let changes = r
         .changes
         .iter()
         .map(|(from, to, n)| format!("{from}->{to}:{n}"))
         .collect::<Vec<_>>()
         .join(",");
+    let logged = r.transitions.len().min(LOGGED);
+    let unlogged = r.transitions.len() - logged + r.unlisted;
     [
         ("routes", r.routes.to_string()),
         ("changed", r.changed().to_string()),
@@ -496,7 +515,94 @@ fn revalidated(r: &Revalidation) -> [(&'static str, String); 8] {
         ("best_changed", r.best_changed.to_string()),
         ("held", r.held.to_string()),
         ("released", r.released.to_string()),
+        ("logged", logged.to_string()),
+        ("unlogged", unlogged.to_string()),
     ]
+}
+
+/// Routes a change of the validation source moved among valid, invalid
+/// and not-found that get a line of their own at info: the first this
+/// many the RIB lists, in prefix order. Ordinary RTR deltas move few
+/// routes, as most VRP churn re-issues ROAs that are already Valid, so a
+/// hundred logs a typical delta whole, line by line. The changes that move
+/// many routes (VRPs that expire, failover to a cache with other data, a
+/// bulk ROA operation) then cost about 15 KB of log, not a line per route
+/// of a table of a million or more. The rest the RIB lists, at most
+/// [`Revalidation::LISTED`] in all, go out at debug; every move is
+/// counted on the summary line. Not configurable: no value of it is more
+/// correct than another, and `show routes` gives every route's state.
+pub(crate) const LOGGED: usize = 100;
+
+/// The message of the line per route a change of the validation source
+/// moved (issue #59).
+const TRANSITION: &str = "rib: route validation state changed";
+
+/// One line to log, its field values already text.
+#[derive(Debug, PartialEq, Eq)]
+struct Line {
+    level: Level,
+    msg: &'static str,
+    fields: Vec<(&'static str, String)>,
+}
+
+/// What a change of the validation source is logged with: the summary
+/// line first, then a line per route it moved among valid, invalid and
+/// not-found that the RIB lists: the first [`LOGGED`] at info, and with
+/// `debug` the others at debug, which are not built otherwise.
+fn revalidation_lines(r: &Revalidation, debug: bool) -> Vec<Line> {
+    let shown = if debug {
+        r.transitions.len()
+    } else {
+        r.transitions.len().min(LOGGED)
+    };
+    let mut lines = Vec::with_capacity(1 + shown);
+    lines.push(Line {
+        level: Level::Info,
+        msg: REVALIDATED,
+        fields: revalidated(r).into(),
+    });
+    for (i, t) in r.transitions[..shown].iter().enumerate() {
+        lines.push(Line {
+            level: if i < LOGGED {
+                Level::Info
+            } else {
+                Level::Debug
+            },
+            msg: TRANSITION,
+            fields: transition(t),
+        });
+    }
+    lines
+}
+
+/// The fields of the line for one route a change moved: its destination,
+/// the peer it came from, its Route Origin ASN (RFC 6811 §2), the states
+/// the lookup gave it before and after, and what it is now: `best`,
+/// `candidate`, or `held` with `by` the reason (`enforcement` or
+/// `policy`).
+fn transition(t: &Transition) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("prefix", t.prefix.to_string()),
+        ("peer", t.peer.to_string()),
+        ("origin", t.origin.to_string()),
+        ("from", t.from.to_string()),
+        ("to", t.to.to_string()),
+        ("route", status_name(t.route).to_owned()),
+    ];
+    if let RouteStatus::Held(by) = t.route {
+        fields.push(("by", by.to_string()));
+    }
+    fields
+}
+
+/// What a route is after the decision process, as logs and the control
+/// plane name it: `best`, `candidate` or `held`.
+pub(crate) const fn status_name(s: RouteStatus) -> &'static str {
+    match s {
+        RouteStatus::Best => "best",
+        RouteStatus::Candidate => "candidate",
+        RouteStatus::Held(_) => "held",
+    }
 }
 
 /// The message of the line logged when the `enforcement` changes.
@@ -1366,7 +1472,8 @@ mod tests {
              changes=disabled->valid:600000,disabled->invalid:50000,disabled->not-found:600000 \
              destinations=1000000 \
              prefixes=1.0.0.0/24,1.0.1.0/24,1.0.2.0/24,1.0.3.0/24,1.0.4.0/24,1.0.5.0/24,\
-             1.0.6.0/24,1.0.7.0/24,... best_changed=2 held=0 released=0\n"
+             1.0.6.0/24,1.0.7.0/24,... best_changed=2 held=0 released=0 \
+             logged=0 unlogged=0\n"
         );
         // A small delta: every destination named.
         let delta = Revalidation {
@@ -1381,7 +1488,7 @@ mod tests {
             line(&delta),
             "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
              routes=3 changed=2 changes=not-found->invalid:2 destinations=1 \
-             prefixes=2001:db8::/32 best_changed=0 held=0 released=0\n"
+             prefixes=2001:db8::/32 best_changed=0 held=0 released=0 logged=0 unlogged=0\n"
         );
         // Under drop-invalid the two invalid routes were taken out of use
         // and a third put back (RFC 6811 §5): the same line, counted.
@@ -1399,7 +1506,7 @@ mod tests {
             line(&enforced),
             "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
              routes=3 changed=3 changes=not-found->invalid:2,invalid->valid:1 destinations=1 \
-             prefixes=2001:db8::/32 best_changed=1 held=2 released=1\n"
+             prefixes=2001:db8::/32 best_changed=1 held=2 released=1 logged=0 unlogged=0\n"
         );
         assert_eq!(listed(&[], 0), "");
     }
@@ -1518,5 +1625,169 @@ mod tests {
             ["drop-invalid", "off", "2", "0", "1", "1"].map(str::to_owned)
         );
         assert_eq!(states(&rib).len(), 2);
+    }
+
+    /// The lines of `lines` as the log writes them, at the epoch.
+    fn written(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| formatted(l.level, l.msg, &l.fields))
+            .collect()
+    }
+
+    #[test]
+    fn a_small_change_logs_a_line_per_route_after_the_summary() {
+        // Issue #59: each route a VRP change moved among valid, invalid
+        // and not-found, with its time, after the summary of the change.
+        // Under drop-invalid one route becomes Invalid and is held, the
+        // other leaves Invalid and is used again.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let mut apply =
+            |rib: &mut Rib, change| handle(rib, &mut settings, RibMsg::Validation(change), now);
+        // Validation switched on: disabled->X, counted and not listed.
+        let theirs = vrp("203.0.113.0/24", 24, 64_496);
+        let ours = vrp("198.51.100.0/24", 24, 65_001);
+        let out = apply(&mut rib, all(&[ours, theirs]));
+        let Some(Output::Revalidated(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(written(&revalidation_lines(r, true)).len(), 1);
+        // The VRPs trade places.
+        let change = ValidationChange {
+            source: std::sync::Arc::new(
+                [
+                    vrp("198.51.100.0/24", 24, 64_496),
+                    vrp("203.0.113.0/24", 24, 65_001),
+                ]
+                .into_iter()
+                .collect::<bgpfc_rpki::VrpSet>(),
+            ),
+            affected: AffectedPrefixes::from_vrps([ours, theirs]),
+        };
+        let out = apply(&mut rib, change);
+        let Some(Output::Revalidated(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            written(&revalidation_lines(r, false)),
+            [
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
+                 routes=2 changed=2 changes=valid->invalid:1,invalid->valid:1 \
+                 destinations=2 prefixes=198.51.100.0/24,203.0.113.0/24 best_changed=2 \
+                 held=1 released=1 logged=2 unlogged=0\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: route validation state changed\" \
+                 prefix=198.51.100.0/24 peer=192.0.2.1 origin=AS65001 from=valid to=invalid \
+                 route=held by=enforcement\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: route validation state changed\" \
+                 prefix=203.0.113.0/24 peer=192.0.2.1 origin=AS65001 from=invalid to=valid \
+                 route=best\n",
+            ]
+        );
+        // Nothing more at debug: every listed move has its info line.
+        assert_eq!(revalidation_lines(r, true), revalidation_lines(r, false));
+        // What became of each route is what the RIB now has.
+        let now_held: Vec<_> = rib.held(V4).map(|(p, r)| (p.to_string(), r.held)).collect();
+        assert_eq!(
+            now_held,
+            [(
+                "198.51.100.0/24".to_owned(),
+                Some(bgpfc_rib::Held::Enforcement)
+            )]
+        );
+        assert_eq!(
+            states(&rib),
+            [("203.0.113.0/24".to_owned(), RovState::Valid)]
+        );
+    }
+
+    /// `n` routes of AS 65001 from 192.0.2.1 moved from valid to invalid,
+    /// the i-th to 10.x.y.0/24 for i = 256 x + y, starting at `first`.
+    fn moved(first: usize, n: usize) -> Vec<Transition> {
+        (first..first + n)
+            .map(|i| {
+                let [_, _, x, y] = u32::try_from(i).unwrap().to_be_bytes();
+                Transition {
+                    family: V4,
+                    prefix: format!("10.{x}.{y}.0/24").parse().unwrap(),
+                    peer: ip("192.0.2.1"),
+                    origin: bgpfc_rpki::RouteOrigin::As(Asn(65_001)),
+                    from: RovState::Valid,
+                    to: RovState::Invalid,
+                    route: RouteStatus::Candidate,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_large_change_logs_a_hundred_lines_and_counts_the_rest() {
+        // A change that moves more routes than the RIB lists: the first
+        // LOGGED at info, the rest listed at debug, the others counted.
+        let r = Revalidation {
+            routes: 2000,
+            changes: vec![(RovState::Valid, RovState::Invalid, 2000)],
+            destinations: 2000,
+            transitions: moved(0, Revalidation::LISTED),
+            unlisted: 2000 - Revalidation::LISTED,
+            ..Default::default()
+        };
+        let info = revalidation_lines(&r, false);
+        assert_eq!(info.len(), 1 + LOGGED);
+        assert!(info.iter().all(|l| l.level == Level::Info));
+        let summary = &written(&info)[0];
+        assert!(
+            summary.ends_with(" logged=100 unlogged=1900\n"),
+            "{summary}"
+        );
+        assert!(
+            written(&info)[LOGGED].contains(" prefix=10.0.99.0/24 "),
+            "{:?}",
+            info[LOGGED]
+        );
+        // At debug, the rest of those listed, after them.
+        let all = revalidation_lines(&r, true);
+        assert_eq!(all.len(), 1 + Revalidation::LISTED);
+        assert_eq!(all[..=LOGGED], info[..]);
+        assert!(all[LOGGED + 1..].iter().all(|l| l.level == Level::Debug));
+        assert_eq!(
+            written(&all).last().map(String::as_str),
+            Some(
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: route validation state changed\" \
+                 prefix=10.3.255.0/24 peer=192.0.2.1 origin=AS65001 from=valid to=invalid \
+                 route=candidate\n"
+            )
+        );
+        // A route dropped by the change, which import policy rejects in
+        // every state, is not listed but counted.
+        let dropped = Revalidation {
+            transitions: moved(0, 3),
+            unlisted: 1,
+            ..Default::default()
+        };
+        assert!(
+            written(&revalidation_lines(&dropped, true))[0].ends_with(" logged=3 unlogged=1\n")
+        );
+        // A route without an origin, as RFC 6811 §2 has NONE.
+        let mut none = moved(0, 1);
+        none[0].origin = bgpfc_rpki::RouteOrigin::None;
+        none[0].route = RouteStatus::Held(bgpfc_rib::Held::Policy);
+        let fields = transition(&none[0]);
+        assert_eq!(fields[2], ("origin", "none".to_owned()));
+        assert_eq!(
+            fields[5..],
+            [("route", "held".to_owned()), ("by", "policy".to_owned())]
+        );
     }
 }
