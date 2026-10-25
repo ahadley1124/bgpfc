@@ -577,8 +577,11 @@ parameters changed (anything but `description`, `import`, `export`,
 reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
-supports it. A changed `advertisement-interval` applies to the running
-session at once, also without a reset. So does a changed `maximum-prefix`:
+supports it. A route held for its validation state (see **RPKI**) meets
+the new import policy the same way, when its neighbor sends it again, or
+at once when the same reload also changes `enforcement`. A changed
+`advertisement-interval` applies to the running session at once, also
+without a reset. So does a changed `maximum-prefix`:
 a session that already holds more routes than its new limit ends as if it
 had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
