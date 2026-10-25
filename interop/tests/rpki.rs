@@ -8,7 +8,8 @@
 //! §5): the default, `drop-invalid`, which holds the Invalid routes back
 //! from the decision process, the relay and the kernel (issues #61, #59),
 //! and `prefer-valid`, which ranks the routes by state, and a reload from
-//! one to another (#47).
+//! one to another (#47); and import policy that matches and sets the state
+//! (RFC 6811 §3).
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
@@ -304,7 +305,8 @@ impl Setup {
         states
     }
 
-    /// What `GET /v1/routes` says about each route, as [`Setup::states`].
+    /// What `GET /v1/routes` says about each route, as [`Setup::states`]:
+    /// `rov`, and after `>` the `rov_set` import policy gave it, if any.
     fn http_states(&self) -> Vec<(String, String)> {
         let body = self.http("/v1/routes");
         let mut states: Vec<(String, String)> = body
@@ -312,8 +314,11 @@ impl Setup {
             .skip(1)
             .filter_map(|route| {
                 let prefix = route.split('"').next()?;
-                let (_, rov) = route.split_once("\"rov\":\"")?;
-                Some((prefix.to_owned(), rov.split('"').next()?.to_owned()))
+                let rov = match json_value(route, "rov_set").as_str() {
+                    "null" | "" => json_value(route, "rov"),
+                    set => format!("{}>{set}", json_value(route, "rov")),
+                };
+                Some((prefix.to_owned(), rov))
             })
             .collect();
         states.sort();
@@ -1652,4 +1657,137 @@ fn prefer_valid_takes_the_valid_path_over_a_higher_local_pref() {
     // None of the reloads touched the RTR client or a BGP session.
     assert_eq!(s.rtr_starts(), starts, "{}", s.report());
     assert_eq!(s.count("session established"), 2, "{}", s.report());
+}
+
+/// An import policy on the validation state (RFC 6811 §3): a customer
+/// prefix whose ROA is known to be wrong is used as Valid, Valid routes
+/// get `LOCAL_PREF` 200 and `NotFound` ones 120, and the rest is accepted
+/// as it is.
+const ROV_IN: &str = "policy ROV-IN {
+    term allow { match prefix 198.51.100.0/24; match rpki invalid; set rpki valid; action accept; }
+    term valid { match rpki valid; set local-pref 200; action accept; }
+    term nf { match rpki not-found; set local-pref 120; action accept; }
+    term rest { action accept; }
+}";
+
+impl Setup {
+    /// What `show routes` says about each route's `LOCAL_PREF`: its prefix
+    /// and the value, `-` for none, in the order of the prefixes as text.
+    fn local_prefs(&self) -> Vec<(String, String)> {
+        let (out, _) = self.ctl(&["show", "routes"]);
+        let mut prefs: Vec<(String, String)> = out
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    words.first()?.trim_start_matches('*').to_owned(),
+                    (*words.get(3)?).to_owned(),
+                ))
+            })
+            .collect();
+        prefs.sort();
+        prefs
+    }
+}
+
+/// Owned pairs, as [`Setup::states`] and [`Setup::local_prefs`] give them.
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect()
+}
+
+/// RFC 6811 §3: "An implementation MUST provide the ability to match and
+/// set the validation state of routes as part of its route policy
+/// filtering function." BIRD's routes go through [`ROV_IN`] under the
+/// default `drop-invalid`. `match rpki` sets their `LOCAL_PREF` by state,
+/// and `set rpki valid` lets the Invalid 198.51.100.0/24 be used and
+/// relayed, shown as `invalid>valid`, while the other Invalid route is
+/// held. New VRPs move every route, with no UPDATE from BIRD: the import
+/// policy runs again on each (m11's path, RFC 6811 §4), so the
+/// `LOCAL_PREF`s follow the new states, the override no longer applies to
+/// the now `not-found` 198.51.100.0/24, and the newly Invalid
+/// 192.0.2.0/24 is held.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn policy_matches_the_state_and_overrides_it() {
+    let opts = Opts {
+        import: Some(ROV_IN),
+        ..Opts::enforcing(None)
+    };
+    let s = Setup::start("y", 24, &opts, &FIRST);
+    s.wait_for_states(
+        ESTABLISH,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("198.51.100.0/24", "invalid>valid"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    assert_eq!(
+        s.local_prefs(),
+        pairs(&[
+            ("192.0.2.0/24", "200"),
+            ("198.51.100.0/24", "-"),
+            ("203.0.113.0/24", "120"),
+        ]),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.held(),
+        held_by(&[("192.0.2.128/25", "invalid")], "enforcement"),
+        "{}",
+        s.report()
+    );
+    let body = s.http("/v1/routes?family=ipv4&prefix=198.51.100.0/24");
+    assert!(
+        body.contains("\"rov\":\"invalid\",\"rov_set\":\"valid\",\"held\":null"),
+        "{body}"
+    );
+    // The overridden route is used like a Valid one: relayed.
+    let used = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
+    assert!(
+        wait_for(Duration::from_secs(20), || s.relay_routes() == used),
+        "{:?}\n{}",
+        s.relay_routes(),
+        s.report()
+    );
+
+    let updates = s.updates_from_bird();
+    s.caches[0].set_vrps(&SECOND);
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    assert_eq!(
+        s.local_prefs(),
+        pairs(&[
+            ("192.0.2.128/25", "200"),
+            ("198.51.100.0/24", "120"),
+            ("203.0.113.0/24", "200"),
+        ]),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.held(),
+        held_by(&[("192.0.2.0/24", "invalid")], "enforcement"),
+        "{}",
+        s.report()
+    );
+    let used = ["192.0.2.128/25", "198.51.100.0/24", "203.0.113.0/24"];
+    assert!(
+        wait_for(Duration::from_secs(20), || s.relay_routes() == used),
+        "{:?}\n{}",
+        s.relay_routes(),
+        s.report()
+    );
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
 }
