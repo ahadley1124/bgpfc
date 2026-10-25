@@ -730,6 +730,19 @@ proptest! {
     }
 
     #[test]
+    fn hard_reset_carries_any_notification(m in notification()) {
+        // RFC 8538 §3.1: a Hard Reset encapsulates another NOTIFICATION in
+        // its data portion, whatever that is, and gives it back.
+        let outer = NotificationMessage::hard_reset(&m);
+        prop_assert!(outer.is_hard_reset());
+        prop_assert_eq!(outer.hard_reset_inner(), Some(m.clone()));
+        let wire = outer.encode(true).unwrap();
+        prop_assert_eq!(NotificationMessage::decode(&wire).unwrap(), outer);
+        // And no other NOTIFICATION is one.
+        prop_assert_eq!(m.is_hard_reset(), m.code == ErrorCode::Cease && m.subcode == 9);
+    }
+
+    #[test]
     fn route_refresh_round_trip(f in address_family()) {
         let m = RouteRefreshMessage { family: f };
         prop_assert_eq!(RouteRefreshMessage::decode(&m.encode()).unwrap(), m);
