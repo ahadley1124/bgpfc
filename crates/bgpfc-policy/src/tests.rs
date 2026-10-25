@@ -576,6 +576,75 @@ fn export_sees_the_state_it_is_given() {
 }
 
 #[test]
+fn rejecting_not_found_without_validation_holds_every_route() {
+    // docs/config.md, `match rpki`: without an `rpki` block every route
+    // is `disabled`, which `match rpki not-found` matches (RFC 6811 §2:
+    // "SHOULD initialize the validation state of such a route to
+    // "NotFound""). A policy that rejects it there and accepts another
+    // state holds the route for policy, whatever the `enforcement`, so
+    // nothing is used; `match rpki disabled` placed first takes
+    // unvalidated routes apart.
+    use std::time::Instant;
+
+    use bgpfc_rib::{Held, Output, Rib};
+    use bgpfc_wire::attribute::PathAttribute;
+    use bgpfc_wire::update::{DecodedUpdate, UpdateMessage};
+
+    let prefix: Prefix = "192.0.2.0/24".parse().unwrap();
+    let update = DecodedUpdate {
+        message: UpdateMessage {
+            nlri: vec![prefix],
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+                PathAttribute::NextHop("10.0.0.1".parse().unwrap()),
+            ],
+            ..UpdateMessage::default()
+        },
+        ..DecodedUpdate::default()
+    };
+    // The state and hold of the route the RIB keeps, and the Loc-RIB's
+    // size, with `terms` as the import policy.
+    let run = |terms: &str| -> (Vec<(RovState, Option<Held>)>, usize) {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            &format!(
+                "router-id 192.0.2.1; local-as 65000;
+                 policy IN {{ {terms} }}
+                 policy OUT {{ term t {{ action accept; }} }}
+                 neighbor 10.0.0.1 {{ remote-as 65001; import IN; export OUT; }}"
+            ),
+        )
+        .unwrap();
+        let mut rib = Rib::with_policies(Asn(65_000), Box::new(Engine::new(&cfg).unwrap()));
+        let mut out: Vec<Output> = Vec::new();
+        let now = Instant::now();
+        // As bgpfcd starts it: the block's `enforcement`, here the
+        // default.
+        rib.set_enforcement(cfg.rpki.enforcement, now, &mut out);
+        let peer = peer_at("10.0.0.1");
+        rib.peer_up(peer.clone(), now, &mut out);
+        rib.update(peer.addr, &update, now, &mut out);
+        let kept = rib
+            .routes(V4, prefix)
+            .iter()
+            .map(|r| (r.rov, r.held))
+            .collect();
+        (kept, rib.loc_rib(V4).count())
+    };
+    assert_eq!(
+        run("term nf { match rpki not-found; action reject; } term rest { action accept; }"),
+        (vec![(RovState::Disabled, Some(Held::Policy))], 0)
+    );
+    assert_eq!(
+        run("term off { match rpki disabled; action accept; }
+             term nf { match rpki not-found; action reject; }
+             term rest { action accept; }"),
+        (vec![(RovState::Disabled, None)], 1)
+    );
+}
+
+#[test]
 fn engine_tells_next_hop_self_what_the_session_negotiated() {
     // RFC 8950 §5 through the Engine: the peer's negotiated families
     // decide whether an IPv4 route may take our IPv6 session address.

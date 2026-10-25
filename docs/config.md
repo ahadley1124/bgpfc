@@ -158,7 +158,13 @@ validation state of routes"; see **RPKI** below).
 (`disabled`): RFC 6811 §2 says such a route SHOULD read as NotFound, so a
 policy written for validation does the same with or without it. `match
 rpki disabled` holds only when validation is off, so a term with it,
-placed first, treats unvalidated routes apart. On import the clause sees
+placed first, treats unvalidated routes apart. That matters for a policy
+that rejects on `not-found` and accepts some other state, such as one
+that takes Valid routes only: while validation is off it holds every
+route, `held by policy` (see **RPKI** below), and uses none, until
+validation gives them a state it accepts. A term `match rpki disabled;
+action accept;` placed before it takes unvalidated routes as they are.
+On import the clause sees
 the state the lookup gave the route, or the one an earlier term of the
 same run set (`action next`), as later terms see an earlier `set
 local-pref`; on export it sees the state the route is used with.
@@ -325,7 +331,10 @@ of route selection for its state only where the file says so: by `mode
 external`, whose meaning includes `enforcement drop-invalid` as above, by
 an `enforcement` statement, or by an import policy that matches or sets
 the state (`match rpki`, `set rpki`). Without an `rpki` block, or with
-`mode disabled`, no route is validated, and `disabled` is never held.
+`mode disabled`, no route is validated, and no `enforcement` holds a
+`disabled` route; only an import policy that matches or sets the state
+can, such as one that rejects on `match rpki not-found` (see `match rpki`
+above).
 `enforcement` is accepted with `mode disabled` too, and then applies only
 to a state an import policy sets: `set rpki invalid` holds the route under
 `drop-invalid`. RFC 8481 §5 is stricter: "Absent specific operator
@@ -471,7 +480,9 @@ looks a name up again at every connection attempt, so a cache whose address
 changes is followed. It starts before the neighbors, and every route is
 `disabled` until a cache has sent its VRPs; from then on the states follow
 the cache's data. A route that arrives before then is therefore used, as
-`disabled` is never held, and withdrawn once the VRPs make it Invalid. A
+no `enforcement` holds a `disabled` route, and withdrawn once the VRPs
+make it Invalid; an import policy that rejects on `match rpki not-found`
+holds it instead until they give it a state it accepts. A
 cache on the router or near it answers well before a BGP session comes up,
 so this window is normally empty; BIRD and FRR behave the same way. The
 client logs with the rest of the daemon, at the `log` level: losing a cache
