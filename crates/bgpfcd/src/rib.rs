@@ -200,6 +200,10 @@ fn handle(
             );
             rib.validation_changed(change, now, out);
         }
+        RibMsg::SetEnforcement(mode) => {
+            bgpfc_log::debug!("rib: rpki enforcement", mode = mode);
+            rib.set_enforcement(mode, now, out);
+        }
         // The changes of earlier messages went to the FIB first: the loop
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
@@ -1398,6 +1402,63 @@ mod tests {
              prefixes=2001:db8::/32 best_changed=1 held=2 released=1\n"
         );
         assert_eq!(listed(&[], 0), "");
+    }
+
+    #[test]
+    fn set_enforcement_message_rejudges_and_logs_one_line() {
+        // A reload's new mode through the channel (RFC 6811 §5): every
+        // route judged again, one report first, then what changed.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let on = all(&[vrp("203.0.113.0/24", 24, 64_496)]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        let (tx, rx) = sync_channel(4);
+        let mut send = |rib: &mut Rib, mode| {
+            tx.send(RibMsg::SetEnforcement(mode)).unwrap();
+            handle(rib, &mut settings, rx.try_recv().unwrap(), now)
+        };
+        let out = send(&mut rib, Enforcement::DropInvalid);
+        let reports: Vec<&bgpfc_rib::Rejudged> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Enforcement(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "{out:?}");
+        assert!(matches!(out[0], Output::Enforcement(_)), "{out:?}");
+        assert_eq!(
+            formatted(
+                bgpfc_log::Level::Info,
+                ENFORCEMENT_CHANGED,
+                &rejudged(reports[0])
+            ),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: rpki enforcement changed\" \
+             from=off to=drop-invalid routes=2 held=1 released=0 best_changed=1\n"
+        );
+        assert!(
+            matches!(&out[1..], [Output::Fib(c)] if c.prefix.to_string() == "203.0.113.0/24"),
+            "{out:?}"
+        );
+        assert_eq!(rib.enforcement(), Enforcement::DropInvalid);
+        // The same mode again: nothing to do, nothing logged.
+        assert_eq!(send(&mut rib, Enforcement::DropInvalid), vec![]);
+        // prefer-valid uses the invalid route again, last in rank.
+        let out = send(&mut rib, Enforcement::PreferValid);
+        assert!(
+            matches!(&out[..], [Output::Enforcement(r), Output::Fib(_)] if r.released == 1),
+            "{out:?}"
+        );
     }
 
     #[test]

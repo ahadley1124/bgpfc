@@ -192,6 +192,9 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again. `router-id` and `local-as` changes are refused, and `listen`,
+again; a changed `enforcement` alone leaves the client alone and judges
+every route again under the new mode at once (the summary says `rpki
+enforcement MODE`, the log `rib: rpki enforcement changed`).
+`router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.

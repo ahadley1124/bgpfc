@@ -358,6 +358,10 @@ impl Coordinator<'_> {
                     let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
                     notes.push(done.map_or_else(|e| e, str::to_owned));
                 }
+                // Sent to the RIB thread below, after the policies.
+                GlobalChange::RpkiEnforcement => {
+                    notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
+                }
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
                 GlobalChange::Fib => {
                     if new.fib.table != self.config.fib.table
@@ -395,6 +399,13 @@ impl Coordinator<'_> {
             policies: messages::NewPolicies(Box::new(engine)),
             reexport: diff.policy_changed.clone(),
         });
+        // RFC 6811 §5: a new `enforcement` judges every route again, under
+        // the new import policies, with no restart of the RTR client.
+        if diff.global.contains(&GlobalChange::RpkiEnforcement) {
+            let _ = self
+                .rib_tx
+                .send(RibMsg::SetEnforcement(new.rpki.enforcement));
+        }
         // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
         // file without a reset. Sent before new peers start, so their
         // sessions come up with the new values.

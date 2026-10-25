@@ -581,8 +581,13 @@ disabled` stops the client and makes every route `disabled` again. A block
 that differs only in spelling, such as a default written out or a cache
 written another way that names the same cache (see `cache` above), leaves
 the running client alone, and so does a change to `enforcement` alone,
-which the client does not use. A new cache whose name does not resolve
-fails the reload as it fails the start.
+which the client does not use. A changed `enforcement` instead judges every
+route again at once under the new mode, with the new import policies: the
+routes it rules out are held, those it admits again are used, and route
+selection runs for every destination, so that what changes is installed
+and advertised, or withdrawn, with no UPDATE or route refresh (RFC 6811
+§5). The reload summary then says `rpki enforcement MODE`. A new cache
+whose name does not resolve fails the reload as it fails the start.
 
 ## Command line
 

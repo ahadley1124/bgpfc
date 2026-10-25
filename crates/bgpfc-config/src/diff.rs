@@ -55,8 +55,14 @@ pub enum GlobalChange {
     /// or restarts. A block that only spells something differently, such
     /// as a default written out or a cache's host, is no change, and nor
     /// is its `enforcement`, which the client does not use (see
-    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)).
+    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); that is
+    /// [`GlobalChange::RpkiEnforcement`].
     Rpki,
+    /// The `rpki` block's `enforcement`, an absent block or statement
+    /// counting as the default: every route is judged again under the new
+    /// mode (RFC 6811 §5), with no restart of the RTR client. It may come
+    /// with [`GlobalChange::Rpki`] in one reload.
+    RpkiEnforcement,
 }
 
 impl ConfigDiff {
@@ -72,6 +78,10 @@ impl ConfigDiff {
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
             (!old.rpki.same_as(&new.rpki), GlobalChange::Rpki),
+            (
+                old.rpki.enforcement != new.rpki.enforcement,
+                GlobalChange::RpkiEnforcement,
+            ),
         ] {
             if changed {
                 d.global.push(what);
@@ -434,19 +444,32 @@ mod tests {
                 let b = with(&format!(
                     "rpki {{ mode external; enforcement {to}; cache 192.0.2.10; }}"
                 ));
-                // The client keeps its sessions and its VRPs.
+                // The client keeps its sessions and its VRPs; the routes
+                // are judged again under the new mode, and that is all.
                 assert!(a.rpki.same_as(&b.rpki), "{from} -> {to}");
                 let d = ConfigDiff::between(&a, &b);
-                assert!(!d.global.contains(&GlobalChange::Rpki), "{from} -> {to}");
+                let expected = if from == to {
+                    vec![]
+                } else {
+                    vec![GlobalChange::RpkiEnforcement]
+                };
+                assert_eq!(d.global, expected, "{from} -> {to}");
+                assert_eq!(d.is_empty(), from == to);
                 assert_eq!(a.rpki == b.rpki, from == to);
                 // No neighbor is touched either.
                 assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
             }
         }
-        // With another change to the block, it is still one client change.
+        // With another change to the block, it is one client change, and
+        // the enforcement change beside it.
         let a = with("rpki { mode external; enforcement off; cache 192.0.2.10; }");
         let b = with("rpki { mode external; cache 192.0.2.11; }");
-        assert_eq!(ConfigDiff::between(&a, &b).global, vec![GlobalChange::Rpki]);
+        assert_eq!(
+            ConfigDiff::between(&a, &b).global,
+            vec![GlobalChange::Rpki, GlobalChange::RpkiEnforcement]
+        );
+        let c = with("rpki { mode external; enforcement off; cache 192.0.2.11; }");
+        assert_eq!(ConfigDiff::between(&a, &c).global, vec![GlobalChange::Rpki]);
     }
 
     #[test]
@@ -466,5 +489,16 @@ mod tests {
         let disabled = with("rpki { mode disabled; enforcement drop-invalid; }");
         assert_eq!(none.rpki, disabled.rpki);
         assert!(ConfigDiff::between(&none, &disabled).is_empty());
+        // Another mode written there is an enforcement change, which a
+        // state import policy sets can feel, and still no client change.
+        let off = with("rpki { mode disabled; enforcement off; }");
+        assert_eq!(
+            ConfigDiff::between(&none, &off).global,
+            vec![GlobalChange::RpkiEnforcement]
+        );
+        assert_eq!(
+            ConfigDiff::between(&off, &implied).global,
+            vec![GlobalChange::Rpki, GlobalChange::RpkiEnforcement]
+        );
     }
 }
