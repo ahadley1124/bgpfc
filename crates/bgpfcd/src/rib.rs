@@ -628,7 +628,9 @@ pub(crate) const fn status_name(s: RouteStatus) -> &'static str {
 /// Changes of state kept for `show rpki transitions`: the most recent of
 /// those the RIB lists, as many as one change of the validation source
 /// lists at most ([`Revalidation::LISTED`]), so that the last large one
-/// shows whole. About 64 KB. Not configurable, as [`LOGGED`] is not.
+/// shows whole. About 90 KB: 88 bytes an entry on a 64-bit target, the
+/// [`Transition`] and its two times. Not configurable, as [`LOGGED`] is
+/// not.
 pub(crate) const KEPT: usize = 1024;
 
 /// The RIB thread's memory of the routes changes of the validation source
@@ -2195,5 +2197,17 @@ mod tests {
             Ok(RibReply::Transitions(answer)) => assert_eq!(answer, r),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_transition_ring_holds_about_90_kb() {
+        // docs/control.md and `KEPT`: the ring is "about 90 KB", and a
+        // `show rpki transitions` clones as much into its reply. Entries
+        // have a fixed size, so the bound is the capacity times it.
+        let entry = std::mem::size_of::<Recorded>();
+        assert_eq!(entry, 88);
+        let bytes = KEPT * entry;
+        assert!((85_000..=95_000).contains(&bytes), "{bytes}");
     }
 }

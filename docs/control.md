@@ -244,8 +244,8 @@ is configurable:
 | Bound | Value | Why |
 |---|---|---|
 | per-route lines at info per change | 100 | Ordinary RTR deltas move few routes, since most VRP churn re-issues ROAs that are already Valid, so a hundred logs a typical change whole. A change that moves many routes (expiry, a move to a cache with other data, a bulk ROA operation) then costs about 15 KB of log rather than a line per route of a table of a million. |
-| routes listed per change | 1024 | The RIB names at most this many routes per change (`Revalidation::LISTED`): those after the first hundred go out at `debug`, and routes beyond the 1024 are only counted (`unlogged`, `not recorded`). It bounds the report (about 60 KB) and the debug output, which would otherwise be a line per route of the table. |
-| changes kept for `show rpki transitions` | 1024 | The latest, about 64 KB: as many as one change lists, so that the last large one shows whole. |
+| routes listed per change | 1024 | The RIB names at most this many routes per change (`Revalidation::LISTED`): those after the first hundred go out at `debug`, and routes beyond the 1024 are only counted (`unlogged`, `not recorded`). It bounds the report (about 55 KB) and the debug output, which would otherwise be a line per route of the table. |
+| changes kept for `show rpki transitions` | 1024 | The latest, about 90 KB: as many as one change lists, so that the last large one shows whole. |
 
 Nothing is uncounted: the first line counts every move per pair of
 states, and `show routes` gives every route's current state. A knob

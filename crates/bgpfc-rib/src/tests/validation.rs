@@ -1269,6 +1269,18 @@ fn moves(r: &Revalidation) -> Vec<(Prefix, IpAddr, RovState, RovState, RouteStat
         .collect()
 }
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn the_routes_a_report_lists_take_about_55_kb() {
+    // `Revalidation::LISTED` and docs/control.md: the routes one report
+    // lists, at most, take "about 55 KB", each listed route having a
+    // fixed size.
+    let route = std::mem::size_of::<crate::Transition>();
+    assert_eq!(route, 52);
+    let bytes = Revalidation::LISTED * route;
+    assert!((50_000..=60_000).contains(&bytes), "{bytes}");
+}
+
 #[test]
 fn transitions_list_rfc_state_moves_with_what_became_of_each_route() {
     use RouteStatus::{Best, Candidate};

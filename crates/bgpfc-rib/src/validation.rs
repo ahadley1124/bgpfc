@@ -144,7 +144,8 @@ impl Revalidation {
 
     /// The most routes [`Revalidation::transitions`] lists: enough for an
     /// ordinary delta, which moves few routes, and a bound on the report
-    /// (about 60 KB) when a change moves a whole table.
+    /// (about 55 KB, 52 bytes a route on a 64-bit target) when a change
+    /// moves a whole table.
     pub const LISTED: usize = 1024;
 
     /// Routes whose state changed.
