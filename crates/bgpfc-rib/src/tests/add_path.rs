@@ -1117,6 +1117,97 @@ fn ipv6_paths_are_sent_in_mp_reach_with_identifiers() {
 }
 
 #[test]
+fn each_update_to_a_peer_sent_paths_carries_one_kind_of_route_with_mp_attributes_first() {
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = add_path_peer("2001:db8::1", 65_001, 1);
+    let e2 = path_sender("2001:db8::2", 65_002, 2, PathLimit::All);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    let v4 = attrs(&[65_001], "10.0.0.1");
+    let v6 = attrs(&[65_001], "2001:db8::1");
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce_paths(&[("192.0.2.0/24", 1)], &v4),
+            now(),
+            o,
+        );
+    });
+    outputs(|o| {
+        rib.update(
+            e1.addr,
+            &announce_paths(&[("2001:db8:1::/48", 1)], &v6),
+            now(),
+            o,
+        );
+    });
+    // One UPDATE with all four fields, each prefix with its Path
+    // Identifier (RFC 7911 §3), as RFC 7606 §5.1 says we must accept.
+    let mut message = v4.to_update(V4, vec![p("198.51.100.0/24")]);
+    message.withdrawn = vec![p("192.0.2.0/24")];
+    message.mp_reach = v6.to_update(V6, vec![p("2001:db8:2::/48")]).mp_reach;
+    message.mp_unreach = Some(bgpfc_wire::mp::MpUnreach {
+        family: V6,
+        withdrawn: vec![p("2001:db8:1::/48")],
+    });
+    message.path_ids = Some(Box::new(PathIds {
+        withdrawn: vec![PathId(1)],
+        nlri: vec![PathId(1)],
+        mp_reach: vec![PathId(1)],
+        mp_unreach: vec![PathId(1)],
+    }));
+    let update = DecodedUpdate {
+        message,
+        treated_as_withdraw: None,
+        discarded: Vec::new(),
+        disabled: Vec::new(),
+    };
+    let out = outputs(|o| rib.update(e1.addr, &update, now(), o));
+    // RFC 7606 §5.1 holds for the extended encoding too: each UPDATE sent
+    // carries one of withdrawn routes, NLRI, MP_REACH_NLRI and
+    // MP_UNREACH_NLRI, an MP attribute first, and every prefix in it has a
+    // Path Identifier (RFC 7911 §5).
+    let ctx = DecodeContext {
+        four_octet_as: true,
+        peer: e2.kind,
+        allow_as_set: false,
+        extended_next_hop: false,
+        add_path: bgpfc_wire::update::AddPathFamilies::of(&[V4, V6]),
+    };
+    let mut kinds = Vec::new();
+    for messages in sends(&out, e2.addr) {
+        for raw in messages {
+            let m = UpdateMessage::decode(&raw[HEADER_LEN..], &ctx)
+                .unwrap()
+                .message;
+            let lists = [
+                (m.withdrawn.len(), m.withdrawn_ids().len()),
+                (m.nlri.len(), m.nlri_ids().len()),
+                (
+                    m.mp_reach.as_ref().map_or(0, |r| r.nlri.len()),
+                    m.mp_reach_ids().len(),
+                ),
+                (
+                    m.mp_unreach.as_ref().map_or(0, |u| u.withdrawn.len()),
+                    m.mp_unreach_ids().len(),
+                ),
+            ];
+            let present: Vec<usize> = (0..4).filter(|&k| lists[k].0 > 0).collect();
+            assert_eq!(present.len(), 1, "{m:?}");
+            let kind = present[0];
+            assert_eq!(lists[kind].0, lists[kind].1, "{m:?}");
+            // MP_REACH_NLRI is type 14, MP_UNREACH_NLRI 15 (RFC 4760 §3, §4).
+            if let Some(mp_type) = [None, None, Some(14), Some(15)][kind] {
+                assert_eq!(first_attribute_type(raw), Some(mp_type));
+            }
+            kinds.push(kind);
+        }
+    }
+    kinds.sort_unstable();
+    assert_eq!(kinds, vec![0, 1, 2, 3]);
+}
+
+#[test]
 fn many_paths_are_packed_to_the_message_size_with_their_identifiers() {
     let mut rib = Rib::new(LOCAL_AS);
     let e = three_sources(&mut rib);
