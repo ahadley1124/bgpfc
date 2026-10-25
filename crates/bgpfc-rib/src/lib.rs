@@ -740,6 +740,14 @@ impl Sessions {
             }
             // invariant: fewer than 2^32 peers.
             let id = PeerId(u32::try_from(i).unwrap());
+            // The peer the best route came from is never sent it back
+            // (export::eligible): with nothing sent to it before, there is
+            // nothing to do. With one peer up, that is every route.
+            if best.is_some_and(|b| b.peer == id)
+                && to.adj_out.get(family).is_none_or(HashMap::is_empty)
+            {
+                continue;
+            }
             let exported = self.exported(family, prefix, best, id);
             // invariant: the slot was occupied above.
             let to = self.peers[i].as_mut().unwrap();
