@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 20 are `done`, 6 `partial`,
-20 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 21 are `done`, 6 `partial`,
+19 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 7911, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -56,7 +56,7 @@ Of the 154 RFCs below, 20 are `done`, 6 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7911, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
 `bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
@@ -174,7 +174,7 @@ RFC 4360 is being replaced by rfc4360-bis, which is in the RFC Editor queue.
 | [5065](https://datatracker.ietf.org/doc/html/rfc5065) | Autonomous System Confederations for BGP | DS; updated by 9774 | `later` | AGENTS.md §9. The codec already knows the confederation segment types and counts them as §5.3 says. |
 | [5291](https://datatracker.ietf.org/doc/html/rfc5291) | Outbound Route Filtering Capability for BGP-4 | PS | `no` |  |
 | [5292](https://datatracker.ietf.org/doc/html/rfc5292) | Address-Prefix-Based Outbound Route Filter for BGP-4 | PS | `no` |  |
-| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `later` | AGENTS.md §9. |
+| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `done` | Send and receive, per neighbor and family, for IPv4 and IPv6 unicast (AGENTS.md §9 step 15); every path received takes part in the decision process and the FIB still gets the one best path. Open in [COMPLIANCE.md](../COMPLIANCE.md): §5, keeping a receiver's forwarding plane steady across a graceful restart (SHOULD, todo until graceful restart, step 16). |
 | [5004](https://datatracker.ietf.org/doc/html/rfc5004) | Avoid BGP Best Path Transitions from One External to Another | PS | `no` | Would make the Loc-RIB depend on arrival order, against the RIB invariant in AGENTS.md §5. |
 | [7947](https://datatracker.ietf.org/doc/html/rfc7947) | Internet Exchange BGP Route Server | PS | `later` | RESOURCES.md, "Later: features". |
 | [1863](https://datatracker.ietf.org/doc/html/rfc1863) | A BGP/IDRP Route Server alternative to a full mesh routing | Historic; obsoleted by 4223 | `n/a` |  |
