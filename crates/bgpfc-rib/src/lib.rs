@@ -385,6 +385,27 @@ struct Scratch {
     batches: Batches,
 }
 
+impl Scratch {
+    /// Entries a buffer keeps room for between inputs: more than the
+    /// largest UPDATE needs (a 65535-octet message holds about 16 000
+    /// IPv4 prefixes), far fewer than an input that touches a whole
+    /// table, such as a change of validation source, whose room would
+    /// otherwise stay allocated (about 80 octets a destination).
+    const KEEP: usize = 1 << 14;
+
+    /// Give back the room an unusually large input left.
+    fn trim(&mut self) {
+        fn trim<T>(v: &mut Vec<T>) {
+            if v.capacity() > Scratch::KEEP {
+                v.shrink_to(Scratch::KEEP);
+            }
+        }
+        trim(&mut self.dirty);
+        trim(&mut self.order);
+        trim(&mut self.released);
+    }
+}
+
 impl Rib {
     /// An empty RIB for a speaker in `local_as` that accepts every route.
     #[must_use]
@@ -995,6 +1016,7 @@ impl Rib {
         for a in scratch.released.drain(..) {
             self.s.cx.interner.release(a);
         }
+        scratch.trim();
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.

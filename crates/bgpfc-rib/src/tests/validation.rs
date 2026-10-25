@@ -1003,3 +1003,28 @@ fn routes_change_places_between_candidates_and_held_routes() {
         assert_eq!(rib.peer_stats(e.addr).unwrap().received[0], (V4, 1));
     }
 }
+
+#[test]
+fn a_change_for_the_whole_table_gives_its_room_back() {
+    // Turning validation on changes the state of every route at once.
+    // The buffers each UPDATE reuses grow to the table for it, and must
+    // not keep that room afterwards.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    let n = 2 * crate::Scratch::KEEP;
+    let prefixes: Vec<String> = (0..n)
+        .map(|i| format!("10.{}.{}.0/24", i >> 8, i & 0xff))
+        .collect();
+    let a = attrs(&[65_001], "10.0.0.1");
+    for chunk in prefixes.chunks(1000) {
+        let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        outputs(|o| rib.update(e1.addr, &announce(&refs, &a), now(), o));
+    }
+    let out = outputs(|o| {
+        rib.validation_changed(all(vrps(&[("10.0.0.0/8", 24, 65_001)])), now(), o);
+    });
+    assert_eq!(report(&out).map(Revalidation::changed), Some(n));
+    assert!(rib.scratch.dirty.capacity() <= crate::Scratch::KEEP);
+    assert!(rib.scratch.released.capacity() <= crate::Scratch::KEEP);
+}
