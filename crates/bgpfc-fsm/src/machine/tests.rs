@@ -2186,8 +2186,10 @@ fn a_new_connection_from_a_restarting_peer_ends_the_old_session() {
     for event in [Event::TcpConnectionConfirmed, Event::TcpCrAcked] {
         let theirs = peer_gr(false, false, 90, &[(v4(), true)]);
         let (mut f, now) = established_with(gr_config(), vec![theirs]);
+        assert!(f.takes_over_on_connection());
         let actions = f.handle(event, now);
         assert_eq!(tags(&actions), ["down-retain", "drop"]);
+        assert!(!f.takes_over_on_connection());
         assert_eq!(f.state(), State::Connect);
         assert_eq!(f.connect_retry_counter(), 0);
         assert!(f.timer(TimerKind::ConnectRetry).is_running());
@@ -2209,6 +2211,7 @@ fn a_new_connection_from_a_restarting_peer_ends_the_old_session() {
         (config(), vec![peer_gr(false, true, 90, &[(v4(), true)])]),
     ] {
         let (mut f, now) = established_with(cfg, extra);
+        assert!(!f.takes_over_on_connection());
         let actions = f.handle(Event::TcpConnectionConfirmed, now);
         assert_eq!(tags(&actions), Vec::<String>::new());
         assert_eq!(f.state(), State::Established);

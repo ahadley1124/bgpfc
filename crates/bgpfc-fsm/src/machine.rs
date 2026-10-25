@@ -1187,6 +1187,16 @@ impl Fsm {
         })
     }
 
+    /// Whether a TCP connection from the peer, while the session is
+    /// Established, ends it and keeps its routes (RFC 4724 §4.2, §5): the
+    /// peer has restarted without our knowing. The FSM then drops the old
+    /// connection and goes to Connect, and the caller gives it the event of
+    /// the new connection again, which Connect takes.
+    #[must_use]
+    pub fn takes_over_on_connection(&self) -> bool {
+        self.state == State::Established && self.restart_session()
+    }
+
     /// Whether the session was set up with a peer whose Graceful Restart
     /// capability listed a family (RFC 4724 §5).
     fn restart_session(&self) -> bool {
