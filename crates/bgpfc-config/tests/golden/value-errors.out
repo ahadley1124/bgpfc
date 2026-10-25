@@ -190,3 +190,24 @@ value-errors.conf:65:1: `rpki` needs a `mode` (`disabled` or `external`)
 value-errors.conf:65:1: `rpki` is given more than once
   rpki { cache 192.0.2.9; }
   ^
+value-errors.conf:66:65: `boss` is not a BGP role: expected provider, rs, rs-client, customer or peer
+  neighbor 192.0.2.40 { remote-as 65040; import A; export A; role boss; }
+                                                                  ^
+value-errors.conf:67:75: `role` is given more than once
+  neighbor 192.0.2.41 { remote-as 65041; import A; export A; role provider; role peer; }
+                                                                            ^
+value-errors.conf:68:72: `maybe` is not `yes` or `no`
+  neighbor 192.0.2.42 { remote-as 65042; import A; export A; role-strict maybe; role; }
+                                                                         ^
+value-errors.conf:68:79: `role` takes one argument, found 0
+  neighbor 192.0.2.42 { remote-as 65042; import A; export A; role-strict maybe; role; }
+                                                                                ^
+value-errors.conf:69:60: neighbor 192.0.2.43: `role-strict yes` needs a `role` (RFC 9234 §4.2)
+  neighbor 192.0.2.43 { remote-as 65043; import A; export A; role-strict yes; }
+                                                             ^
+value-errors.conf:71:77: `role-strict` is given more than once
+  neighbor 192.0.2.45 { remote-as 65045; import A; export A; role-strict yes; role-strict yes; role Customer; }
+                                                                              ^
+value-errors.conf:71:99: `Customer` is not a BGP role: expected provider, rs, rs-client, customer or peer
+  neighbor 192.0.2.45 { remote-as 65045; import A; export A; role-strict yes; role-strict yes; role Customer; }
+                                                                                                    ^

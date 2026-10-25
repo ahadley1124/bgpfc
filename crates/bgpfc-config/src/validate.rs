@@ -6,7 +6,8 @@
 //! Implements: RFC 9687 §4.4 (a fixed `SendHoldTime` exceeds the Hold
 //! Time); RFC 4271 §10 (`KeepaliveTime` below the Hold Time); RFC 8950 §4
 //! (`extended-next-hop` qualifies a configured family); RFC 4271 §6.7
-//! (`maximum-prefix` bounds a configured family).
+//! (`maximum-prefix` bounds a configured family); RFC 9234 §4 (a BGP Role
+//! is for an external session).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -93,6 +94,21 @@ pub(crate) fn validate(cfg: &Config) -> Vec<ConfigError> {
                     ),
                 );
             }
+        }
+        // RFC 9234 §4: "The BGP Role characterizes the relationship between
+        // the eBGP speakers forming a session"; §5 asks that the OTC
+        // procedures not be used inside an AS. A session to our own AS is
+        // internal, so a Role there is a mistake worth naming.
+        if let Some(local) = n.role
+            && n.remote_as == cfg.local_as
+        {
+            err(
+                n.pos,
+                format!(
+                    "neighbor {}: role {} needs an external session, but remote-as {} is our own AS (RFC 9234 §4)",
+                    n.addr, local.role, n.remote_as.0
+                ),
+            );
         }
         // RFC 4760 §8: a family not configured is never negotiated, so a
         // limit on it could never apply; say so rather than ignore it.

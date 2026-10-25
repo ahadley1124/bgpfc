@@ -11,6 +11,7 @@ use std::time::Duration;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::role::LocalRole;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::error::Pos;
@@ -487,6 +488,11 @@ pub struct Neighbor {
     /// exceeding it ends the session with Cease / Maximum Number of
     /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
     pub maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `role` and `role-strict`: our BGP Role on the session (RFC 9234
+    /// §4), with strict mode (§4.2) if asked for. `None` by default: no
+    /// Role is advertised and the Only to Customer procedures (§5) do not
+    /// apply. Validation allows it only on an external session.
+    pub role: Option<LocalRole>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -514,5 +520,8 @@ impl Neighbor {
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
+            // RFC 9234 §4.1: the Role is in the OPEN, and the OTC
+            // procedures of §5 follow it for routes already held.
+            && self.role == other.role
     }
 }

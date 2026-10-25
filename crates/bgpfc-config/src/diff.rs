@@ -214,6 +214,47 @@ mod tests {
     }
 
     #[test]
+    fn a_role_or_strict_mode_is_a_session_parameter() {
+        // RFC 9234 §4.1, §4.2: the Role is in the OPEN and strict mode
+        // decides whether the OPEN is acceptable, and the Only to Customer
+        // procedures of §5 follow the Role, so a change resets the session.
+        let a = cfg(BASE);
+        let with = |text: &str| cfg(&BASE.replace("remote-as 65002;", text));
+        let customer = with("remote-as 65002; role customer;");
+        assert_eq!(
+            ConfigDiff::between(&a, &customer).reset,
+            vec![addr("192.0.2.3")]
+        );
+        let provider = with("remote-as 65002; role provider;");
+        assert_eq!(
+            ConfigDiff::between(&customer, &provider).reset,
+            vec![addr("192.0.2.3")]
+        );
+        let strict = with("remote-as 65002; role customer; role-strict yes;");
+        assert_eq!(
+            ConfigDiff::between(&customer, &strict).reset,
+            vec![addr("192.0.2.3")]
+        );
+        assert_eq!(
+            ConfigDiff::between(&strict, &a).reset,
+            vec![addr("192.0.2.3")]
+        );
+        // Spelling out the defaults is no change.
+        let explicit = with("remote-as 65002; role customer; role-strict no;");
+        assert!(ConfigDiff::between(&customer, &explicit).is_empty());
+        // Strict mode with no Role is no setting at all, and an error.
+        assert!(
+            crate::parse_str(
+                "t",
+                &BASE.replace("remote-as 65002;", "remote-as 65002; role-strict yes;")
+            )
+            .is_err()
+        );
+        let off = with("remote-as 65002; role-strict no;");
+        assert!(ConfigDiff::between(&a, &off).is_empty());
+    }
+
+    #[test]
     fn policy_and_prefix_list_edits_are_policy_changes() {
         let base = cfg(BASE);
         let a = &base;

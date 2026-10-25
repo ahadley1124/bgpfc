@@ -253,10 +253,16 @@ Config {
                     1000,
                 ),
             ],
+            role: Some(
+                LocalRole {
+                    role: Customer,
+                    strict: true,
+                },
+            ),
         },
         Neighbor {
             pos: Pos {
-                line: 56,
+                line: 58,
                 col: 1,
             },
             addr: 2001:db8::2,
@@ -312,6 +318,57 @@ Config {
                     1200000,
                 ),
             ],
+            role: Some(
+                LocalRole {
+                    role: RouteServerClient,
+                    strict: false,
+                },
+            ),
+        },
+        Neighbor {
+            pos: Pos {
+                line: 72,
+                col: 1,
+            },
+            addr: 2001:db8::3,
+            remote_as: Asn(
+                65003,
+            ),
+            description: None,
+            port: 179,
+            hold_time: HoldTime(
+                90,
+            ),
+            keepalive_time: None,
+            connect_retry_time: 120s,
+            send_hold_time: Default,
+            families: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+                AddressFamily {
+                    afi: Ipv6,
+                    safi: Unicast,
+                },
+            ],
+            import: "IN",
+            export: "OUT",
+            passive: false,
+            allow_as_set: false,
+            collision_detect_established: false,
+            advertisement_interval: None,
+            extended_next_hop: [],
+            restart_limit: Some(
+                10,
+            ),
+            maximum_prefix: [],
+            role: Some(
+                LocalRole {
+                    role: Peer,
+                    strict: false,
+                },
+            ),
         },
     ],
 }

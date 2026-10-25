@@ -180,6 +180,7 @@ Config {
                 10,
             ),
             maximum_prefix: [],
+            role: None,
         },
     ],
 }
