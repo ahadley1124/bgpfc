@@ -3,7 +3,7 @@
 //! octets in its table, with its first route inline and no allocation of
 //! its own until a second peer sends a route to it.
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::BTreeMap;
 use std::mem;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
@@ -158,14 +158,6 @@ pub(crate) struct PrefixMap<V> {
 /// One family's destinations.
 pub(crate) type Table = PrefixMap<Destination>;
 
-/// What [`PrefixMap::update`] did.
-pub(crate) enum Updated<V> {
-    /// The prefix mapped to the same value already; nothing changed.
-    Same,
-    /// The new value is in; this is what it replaced, if anything.
-    Changed(Option<V>),
-}
-
 /// One family's Adj-RIB-Out for one peer: what it was last sent. A
 /// B-tree rather than a hash table: 13 octets an IPv4 entry plus node
 /// slack, against 32 and a bucket array that doubles (and is held twice
@@ -201,41 +193,6 @@ impl<V> PrefixMap<V> {
         match Ipv4Key::new(prefix) {
             Some(k) => self.v4.insert(k, value),
             None => self.v6.insert(prefix, value),
-        }
-    }
-
-    /// Map `prefix` to `value` unless `same` says it already maps to the
-    /// same thing. One descent of the tree, where a lookup and an insert
-    /// make two.
-    pub(crate) fn update(
-        &mut self,
-        prefix: Prefix,
-        value: V,
-        same: impl FnOnce(&V, &V) -> bool,
-    ) -> Updated<V> {
-        fn update_in<K: Ord, V>(
-            map: &mut BTreeMap<K, V>,
-            key: K,
-            value: V,
-            same: impl FnOnce(&V, &V) -> bool,
-        ) -> Updated<V> {
-            match map.entry(key) {
-                btree_map::Entry::Vacant(e) => {
-                    e.insert(value);
-                    Updated::Changed(None)
-                }
-                btree_map::Entry::Occupied(mut e) => {
-                    if same(e.get(), &value) {
-                        Updated::Same
-                    } else {
-                        Updated::Changed(Some(e.insert(value)))
-                    }
-                }
-            }
-        }
-        match Ipv4Key::new(prefix) {
-            Some(k) => update_in(&mut self.v4, k, value, same),
-            None => update_in(&mut self.v6, prefix, value, same),
         }
     }
 
@@ -455,26 +412,10 @@ mod tests {
         let p = |s: &str| s.parse::<Prefix>().unwrap();
         let mut m: PrefixMap<u32> = PrefixMap::default();
         assert!(m.is_empty());
-        assert!(matches!(
-            m.update(p("2001:db8::/32"), 1, |a, b| a == b),
-            Updated::Changed(None)
-        ));
-        assert!(matches!(
-            m.update(p("192.0.2.0/24"), 2, |a, b| a == b),
-            Updated::Changed(None)
-        ));
-        assert!(matches!(
-            m.update(p("10.0.0.0/8"), 3, |a, b| a == b),
-            Updated::Changed(None)
-        ));
-        assert!(matches!(
-            m.update(p("10.0.0.0/8"), 3, |a, b| a == b),
-            Updated::Same
-        ));
-        assert!(matches!(
-            m.update(p("10.0.0.0/8"), 4, |a, b| a == b),
-            Updated::Changed(Some(3))
-        ));
+        assert_eq!(m.insert(p("2001:db8::/32"), 1), None);
+        assert_eq!(m.insert(p("192.0.2.0/24"), 2), None);
+        assert_eq!(m.insert(p("10.0.0.0/8"), 3), None);
+        assert_eq!(m.insert(p("10.0.0.0/8"), 4), Some(3));
         assert_eq!(m.insert(p("10.0.0.0/16"), 5), None);
         assert_eq!(m.len(), 4);
         assert_eq!(m.get(p("192.0.2.0/24")), Some(&2));

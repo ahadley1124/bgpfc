@@ -284,7 +284,7 @@ The histograms count from daemon start, not per event.
 | `rib_insert` | one announced route into the Adj-RIB-In, import policy and the decision process for its destination included |
 | `rib_remove` | one withdrawn route out of the Adj-RIB-In |
 | `best_path` | one decision process run for one destination (see `best_path_runs`) |
-| `adj_rib_out_build` | packing one peer's batch of changes into UPDATEs |
+| `adj_rib_out_build` | packing one peer's batch of changes into UPDATEs, the session rewrite of each attribute set included |
 | `rib_peer_down` | removing every route of a peer that went down |
 | `rib_update` | the RIB thread on one UPDATE: Adj-RIB-In, decision process, Adj-RIB-Out, outputs handed to the FIB and peer threads |
 | `update_total` | one UPDATE from the start of its decode on the peer thread to the RIB thread finishing it, the wait in the RIB queue included |
@@ -368,8 +368,11 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   own would pay off.
 - **Per-peer RIB copies.** Every peer that is sent routes has an
   Adj-RIB-Out map of the exported table (`adj_rib_out`,
-  `adj_rib_out_bytes`). With one load generator nothing is exported; add a
-  second session to see it grow.
+  `adj_rib_out_bytes`). Its entries point at the sets the export policy
+  produced, usually the Loc-RIB's own, so `interned` does not grow with
+  the peers: the session rewrite is applied when encoding
+  (`adj_rib_out_build`). With one load generator nothing is exported; add
+  a second session to see it grow.
 - **Live bytes after `withdraw-all` or `flap`** (`residual_bytes`): an
   attribute set goes with its last route, so `interned` drops to zero
   with the routes and what stays is the maps' own capacity, under a

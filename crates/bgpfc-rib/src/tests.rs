@@ -982,8 +982,9 @@ fn attribute_sets_go_with_their_last_route() {
         );
     });
     outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), o));
-    // Received sets a and b, and what each is exported as to the others.
-    assert!(rib.attribute_sets() >= 4, "{}", rib.attribute_sets());
+    // Received sets a and b; the peers they are sent to get them
+    // rewritten when encoded, not as sets of their own.
+    assert_eq!(rib.attribute_sets(), 2);
     // Replacing a route lets its old set go once nothing uses it.
     let a2 = attrs(&[65_001, 8], "10.0.0.1");
     outputs(|o| {
@@ -1130,7 +1131,7 @@ fn interner_gives_its_table_back_when_emptied() {
 }
 
 #[test]
-fn routes_sharing_attributes_share_one_exported_set_per_peer() {
+fn peers_are_sent_rewritten_sets_without_a_copy_per_peer() {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     let i1 = peer("10.0.0.3", LOCAL_AS.0, 3);
@@ -1142,37 +1143,69 @@ fn routes_sharing_attributes_share_one_exported_set_per_peer() {
     });
     let prefixes = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
     let a = attrs(&[65_001, 64_500], "10.0.0.1");
-    let _ = outputs(|o| rib.update(e1.addr, &announce(&prefixes, &a), o));
-    // RFC 4271 §5.1: the rewrite differs by peer; within a peer, the
-    // three routes share one set.
-    let sent = |rib: &Rib, to: &PeerInfo| {
-        let out: Vec<Arc<PathAttrs>> = rib
-            .adj_rib_out(to.addr, V4)
-            .map(|(_, a)| Arc::clone(a))
-            .collect();
-        assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|x| Arc::ptr_eq(x, &out[0])));
-        Arc::clone(&out[0])
-    };
-    let (external, internal) = (sent(&rib, &e2), sent(&rib, &i1));
-    assert_eq!(external.as_path.first_asn(), Some(LOCAL_AS));
-    assert_eq!(external.local_pref, None);
-    assert_eq!(internal.as_path.first_asn(), Some(Asn(65_001)));
-    assert_eq!(internal.local_pref, Some(100));
-    // The same for a peer sent the whole table when it comes up, and the
-    // rewrites kept for that pass are dropped after it.
+    let out = outputs(|o| rib.update(e1.addr, &announce(&prefixes, &a), o));
+    // RFC 4271 §5.1: what each peer is sent is rewritten for its session.
+    let m = decode_sent(sends(&out, e2.addr)[0], &e2);
+    assert_eq!(m[0].nlri.len(), 3);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(LOCAL_AS));
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 254)));
+    let m = decode_sent(sends(&out, i1.addr)[0], &i1);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(Asn(65_001)));
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 1)));
+    // The Adj-RIBs-Out hold the Loc-RIB's own set, not a copy per peer;
+    // so does that of a peer that comes up later and is sent the table.
     let e3 = peer("10.0.0.4", 65_003, 4);
-    let _ = outputs(|o| rib.peer_up(e3.clone(), o));
-    let late = sent(&rib, &e3);
-    assert_eq!(late.as_path.first_asn(), Some(LOCAL_AS));
-    let id = rib.s.id(e3.addr).unwrap();
-    assert!(rib.s.peer(id).memo.pass.is_none());
-    drop((external, internal, late));
-    // Withdrawn, every set goes with its last route: the memo of the
-    // last rewrite holds none of them.
+    let out = outputs(|o| rib.peer_up(e3.clone(), o));
+    let m = decode_sent(sends(&out, e3.addr)[0], &e3);
+    assert_eq!(m[0].as_path().unwrap().first_asn(), Some(LOCAL_AS));
+    let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
+    for to in [&e2, &i1, &e3] {
+        assert_eq!(rib.adj_rib_out(to.addr, V4).count(), 3);
+        assert!(
+            rib.adj_rib_out(to.addr, V4)
+                .all(|(_, x)| Arc::ptr_eq(x, &held))
+        );
+    }
+    assert_eq!(rib.s.cx.interner.len(), 1);
+    drop(held);
+    // Withdrawn, the set goes with its last route.
     let _ = outputs(|o| rib.update(e1.addr, &withdraw(&prefixes), o));
     assert_eq!(rib.adj_rib_out(e2.addr, V4).count(), 0);
     assert_eq!(rib.s.cx.interner.len(), 0);
+}
+
+#[test]
+fn a_change_the_session_rewrite_hides_is_not_sent() {
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let i1 = peer("10.0.0.3", LOCAL_AS.0, 3);
+    let mut rib = Rib::new(LOCAL_AS);
+    let _ = outputs(|o| {
+        rib.peer_up(e1.clone(), o);
+        rib.peer_up(e2.clone(), o);
+        rib.peer_up(i1.clone(), o);
+    });
+    let a = attrs(&[65_001], "10.0.0.1");
+    let _ = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), o));
+    // Another next hop and MED: an external peer gets ours and no MED
+    // (RFC 4271 §5.1.3, §5.1.4), so nothing it would see changed; an
+    // internal peer gets both as received.
+    let mut b = attrs(&[65_001], "10.0.0.9");
+    b.med = Some(5);
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &b), o));
+    assert!(sends(&out, e2.addr).is_empty(), "{out:?}");
+    let m = decode_sent(sends(&out, i1.addr)[0], &i1);
+    assert_eq!(m[0].next_hop(), Some(Ipv4Addr::new(10, 0, 0, 9)));
+    // The Adj-RIB-Out follows the new set all the same.
+    let held = Arc::clone(rib.loc_rib(V4).next().unwrap().1.attrs);
+    assert!(
+        rib.adj_rib_out(e2.addr, V4)
+            .all(|(_, x)| Arc::ptr_eq(x, &held))
+    );
+    // A change it does see is sent.
+    let c = attrs(&[65_001, 7], "10.0.0.9");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &c), o));
+    assert_eq!(sends(&out, e2.addr).len(), 1);
 }
 
 #[test]

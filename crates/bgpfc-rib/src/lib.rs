@@ -29,7 +29,7 @@ mod tests;
 use std::collections::btree_map::Entry as Slot;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Asn};
@@ -39,7 +39,7 @@ pub use attrs::{Interner, PathAttrs};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-use store::{AdjOut, Destination, FamilyMap, PeerId, Route, Table, Updated};
+use store::{AdjOut, Destination, FamilyMap, PeerId, Route, Table};
 
 /// What a policy decided about a route.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,70 +155,13 @@ struct PeerState {
     /// Families disabled after a malformed multiprotocol attribute
     /// (RFC 4760 §7); no more routes are accepted for them.
     disabled: Vec<AddressFamily>,
-    /// Adj-RIB-Out: what the peer was last told, per family.
+    /// Adj-RIB-Out: what the peer was last told, per family, as the
+    /// export policy left it. The session rewrite (RFC 4271 §5.1) is
+    /// applied when encoding, so a route the policy accepts unchanged is
+    /// held as the Loc-RIB's own set, not as a per-peer copy.
     adj_out: FamilyMap<AdjOut>,
     /// Routes held in the Adj-RIB-In per family (for statistics).
     adj_in_count: FamilyMap<usize>,
-    /// Recent rewrites of attributes for this peer.
-    memo: ExportMemo,
-}
-
-/// Session rewrites (RFC 4271 §5.1) of attributes an export policy
-/// accepted unchanged, for one peer. They depend on nothing else that
-/// changes during the session, and routes share attribute sets, so the
-/// rewrite and the interner lookup can run once per set rather than once
-/// per route. The routes of one UPDATE share their set, so the last
-/// rewrite is kept. A full pass over the table (initial Adj-RIB-Out,
-/// refresh) meets the sets in prefix order instead, so for its duration
-/// every rewrite is kept, by the address of the source set. The sets are
-/// held weakly, so the interner's counts (see `Interner::release`) do not
-/// see the memo, and an allocation it points to cannot be reused for
-/// other attributes while it does.
-#[derive(Default)]
-struct ExportMemo {
-    last: Option<Rewrite>,
-    pass: Option<HashMap<usize, Rewrite>>,
-}
-
-#[derive(Clone)]
-struct Rewrite {
-    family: AddressFamily,
-    source: Source,
-    attrs: Weak<PathAttrs>,
-    /// `None` when the route is not advertised to the peer at all.
-    exported: Option<Weak<PathAttrs>>,
-}
-
-impl Rewrite {
-    fn is_for(&self, family: AddressFamily, source: Source, attrs: &Arc<PathAttrs>) -> bool {
-        self.family == family && self.source == source && self.attrs.as_ptr() == Arc::as_ptr(attrs)
-    }
-}
-
-impl ExportMemo {
-    fn find(
-        &self,
-        family: AddressFamily,
-        source: Source,
-        attrs: &Arc<PathAttrs>,
-    ) -> Option<&Rewrite> {
-        if let Some(r) = &self.last
-            && r.is_for(family, source, attrs)
-        {
-            return Some(r);
-        }
-        self.pass
-            .as_ref()?
-            .get(&Arc::as_ptr(attrs).addr())
-            .filter(|r| r.is_for(family, source, attrs))
-    }
-
-    fn keep(&mut self, r: Rewrite) {
-        if let Some(pass) = &mut self.pass {
-            pass.insert(r.attrs.as_ptr().addr(), r.clone());
-        }
-        self.last = Some(r);
-    }
 }
 
 /// Counters about one peer, for the control plane.
@@ -255,6 +198,31 @@ struct Context {
     local_as: Asn,
     policies: Box<dyn Policies>,
     interner: Interner,
+}
+
+impl Context {
+    /// An Adj-RIB-Out entry now holds `new` instead of `old`: give `old`
+    /// back, and say whether the peer must be sent the route. Not when
+    /// the sets are the same, nor when the session rewrite makes them the
+    /// same (RFC 4271 §5.1: a next hop that only changed behind an
+    /// external session, say), which the peer cannot tell apart.
+    fn record_replaced(
+        &mut self,
+        family: AddressFamily,
+        old: Option<Arc<PathAttrs>>,
+        new: &Arc<PathAttrs>,
+        to: &PeerInfo,
+    ) -> bool {
+        let Some(old) = old else {
+            return true;
+        };
+        if Arc::ptr_eq(&old, new) {
+            return false;
+        }
+        let changed = !export::same_rewrite(family, &old, new, to);
+        self.interner.release(old);
+        changed
+    }
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -355,7 +323,6 @@ impl Rib {
             disabled: Vec::new(),
             adj_out: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
-            memo: ExportMemo::default(),
         });
         for family in families {
             self.refresh(addr, family, out);
@@ -415,7 +382,6 @@ impl Rib {
         let state = self.s.peer_mut(id);
         let mut adj_out = state.adj_out.remove(family).unwrap_or_default();
         adj_out.clear();
-        state.memo.pass = Some(HashMap::new());
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
                 if let Some(a) = self.s.exported(family, prefix, dest.best(), id) {
@@ -424,10 +390,10 @@ impl Rib {
                 }
             }
         }
+        let local_as = self.s.cx.local_as;
         let state = self.s.peer_mut(id);
-        state.memo.pass = None;
         state.adj_out.insert(family, adj_out);
-        Sessions::encode(&state.info, family, &batch, out);
+        Sessions::encode(local_as, &state.info, family, &batch, out);
     }
 
     /// Re-run export for `addr` and `family` after a policy change: only
@@ -442,22 +408,19 @@ impl Rib {
         }
         let mut batch = Batch::default();
         let state = self.s.peer_mut(id);
+        let info = state.info.clone();
         let mut adj_out = state.adj_out.remove(family).unwrap_or_default();
-        state.memo.pass = Some(HashMap::new());
         // Phase 3 keeps every Adj-RIB-Out entry on a destination that has
         // a best route, so one pass over the table visits all of them.
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
                 match self.s.exported(family, prefix, dest.best(), id) {
-                    Some(a) => match adj_out.insert(prefix, Arc::clone(&a)) {
-                        Some(old) if Arc::ptr_eq(&old, &a) => {}
-                        old => {
-                            if let Some(old) = old {
-                                self.s.cx.interner.release(old);
-                            }
+                    Some(a) => {
+                        let old = adj_out.insert(prefix, Arc::clone(&a));
+                        if self.s.cx.record_replaced(family, old, &a, &info) {
                             batch.announce(&a, prefix);
                         }
-                    },
+                    }
                     None => {
                         if let Some(old) = adj_out.remove(prefix) {
                             self.s.cx.interner.release(old);
@@ -467,10 +430,10 @@ impl Rib {
                 }
             }
         }
+        let local_as = self.s.cx.local_as;
         let state = self.s.peer_mut(id);
-        state.memo.pass = None;
         state.adj_out.insert(family, adj_out);
-        Sessions::encode(&state.info, family, &batch, out);
+        Sessions::encode(local_as, &state.info, family, &batch, out);
     }
 
     /// What the RIB knows about peer `addr`, if it is up.
@@ -835,16 +798,12 @@ impl Sessions {
             }
             let exported = self.exported(family, prefix, best, id);
             // invariant: the slot was occupied above.
-            let to = self.peers[i].as_mut().unwrap();
-            let adj_out = to.adj_out.or_default(family);
+            let PeerState { info, adj_out, .. } = self.peers[i].as_mut().unwrap();
+            let adj_out = adj_out.or_default(family);
             match exported {
                 Some(a) => {
-                    if let Updated::Changed(old) =
-                        adj_out.update(prefix, Arc::clone(&a), Arc::ptr_eq)
-                    {
-                        if let Some(old) = old {
-                            self.cx.interner.release(old);
-                        }
+                    let old = adj_out.insert(prefix, Arc::clone(&a));
+                    if self.cx.record_replaced(family, old, &a, info) {
                         batches.get(id, family).announce(&a, prefix);
                     }
                 }
@@ -862,9 +821,11 @@ impl Sessions {
         }
     }
 
-    /// The interned attributes `best` is advertised with to peer `to`, if
-    /// any: export policy first (RFC 4271 §9.1.3), then the session
-    /// rewriting of §5.1.
+    /// The attributes `best` is advertised to peer `to` with, as the
+    /// export policy (RFC 4271 §9.1.3) leaves them: the route's own set
+    /// when the policy accepts it unchanged, else its changed set,
+    /// interned. `None` when the route is not advertised to `to`. The
+    /// session rewrite of §5.1 is the encoder's (`Batch::encode`).
     fn exported(
         &mut self,
         family: AddressFamily,
@@ -878,43 +839,18 @@ impl Sessions {
             peer: from.addr,
             kind: from.kind,
         };
-        let state = self.peers[to.index()].as_mut()?;
-        let to = &state.info;
+        let to = &self.peers[to.index()].as_ref()?.info;
         let cx = &mut self.cx;
         // The route is not offered to the policy at all when §9.2 rules
         // it out, so a policy cannot override those.
         if !export::eligible(family, source, to) {
             return None;
         }
-        let modified;
-        let attrs: &PathAttrs = match cx.policies.export(to, family, prefix, &best.attrs) {
-            Verdict::Reject => return None,
-            Verdict::Accept => {
-                if let Some(m) = state.memo.find(family, source, &best.attrs) {
-                    // Not advertised, or the set: unless it has gone
-                    // (no route uses it any more), then it is worked out
-                    // again.
-                    let w = m.exported.as_ref()?;
-                    if let Some(a) = w.upgrade() {
-                        return Some(a);
-                    }
-                }
-                let exported = export::export(cx.local_as, family, source, &best.attrs, to)
-                    .map(|a| cx.interner.intern(a));
-                state.memo.keep(Rewrite {
-                    family,
-                    source,
-                    attrs: Arc::downgrade(&best.attrs),
-                    exported: exported.as_ref().map(Arc::downgrade),
-                });
-                return exported;
-            }
-            Verdict::Modified(a) => {
-                modified = a;
-                &modified
-            }
-        };
-        export::export(cx.local_as, family, source, attrs, to).map(|a| cx.interner.intern(a))
+        match cx.policies.export(to, family, prefix, &best.attrs) {
+            Verdict::Reject => None,
+            Verdict::Accept => export::permitted(&best.attrs, to).then(|| Arc::clone(&best.attrs)),
+            Verdict::Modified(a) => export::permitted(&a, to).then(|| cx.interner.intern(a)),
+        }
     }
 
     /// Encode the batches, in peer address and family order, and empty
@@ -924,16 +860,22 @@ impl Sessions {
             .0
             .sort_by_key(|(id, family, _)| (self.peer(*id).info.addr, *family));
         for (id, family, batch) in &batches.0 {
-            Sessions::encode(&self.peer(*id).info, *family, batch, out);
+            Sessions::encode(self.cx.local_as, &self.peer(*id).info, *family, batch, out);
         }
         batches.0.clear();
     }
 
-    fn encode(to: &PeerInfo, family: AddressFamily, batch: &Batch, out: &mut impl Sink) {
+    fn encode(
+        local_as: Asn,
+        to: &PeerInfo,
+        family: AddressFamily,
+        batch: &Batch,
+        out: &mut impl Sink,
+    ) {
         if batch.is_empty() {
             return;
         }
-        out.put(match batch.encode(family, to) {
+        out.put(match batch.encode(local_as, family, to) {
             Ok(messages) => Output::Send {
                 peer: to.addr,
                 messages,
