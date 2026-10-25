@@ -812,9 +812,9 @@ fn write_neighbor(
                 .field_num("keepalive_time", s.keepalive_time.as_secs())
                 .field_bool("four_octet_as", s.four_octet_as)
                 .field_bool("extended_messages", s.extended_messages)
-                .field_bool("route_refresh", s.route_refresh)
-                .key("families")
-                .begin_array();
+                .field_bool("route_refresh", s.route_refresh);
+            write_role(j, s);
+            j.key("families").begin_array();
             for f in &s.families {
                 j.display(f);
             }
@@ -839,6 +839,29 @@ fn write_neighbor(
         }
     }
     j.end_object();
+}
+
+/// The `role` member of a session: our BGP Role and the one the neighbor
+/// sent (RFC 9234 §4.1), `null` without a Role of ours.
+fn write_role(j: &mut Json, s: &bgpfc_fsm::Session) {
+    j.key("role");
+    let Some(local) = s.role else {
+        j.null();
+        return;
+    };
+    j.begin_object().field_display("local", local).key("remote");
+    match peer_role(s) {
+        Some(r) => j.display(r),
+        None => j.null(),
+    };
+    j.end_object();
+}
+
+/// The Role the neighbor advertised, if it did (RFC 9234 §4.1). Several,
+/// which the session would not have come up with unless they agree, are
+/// the first.
+fn peer_role(s: &bgpfc_fsm::Session) -> Option<bgpfc_wire::role::Role> {
+    bgpfc_wire::capability::roles(&s.peer_capabilities).next()
 }
 
 fn render_neighbors(
@@ -905,6 +928,12 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
             "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
             s.four_octet_as, s.extended_messages, s.route_refresh
         ));
+        if let Some(local) = s.role {
+            lines.push(format!(
+                "  role {local} (neighbor sent {})",
+                peer_role(s).map_or("none".to_owned(), |r| r.to_string())
+            ));
+        }
         if !s.extended_next_hop_receive.is_empty() || !s.extended_next_hop_send.is_empty() {
             let list = |families: &[AddressFamily]| {
                 if families.is_empty() {
@@ -978,7 +1007,7 @@ fn route_line(r: &RouteReport) -> String {
             path.join(" ")
         },
         r.peer
-    )
+    ) + &a.otc.map_or(String::new(), |asn| format!(" otc {}", asn.0))
 }
 
 fn route_json(j: &mut Json, r: &RouteReport) {
@@ -989,6 +1018,7 @@ fn route_json(j: &mut Json, r: &RouteReport) {
         .field_display("origin", a.origin)
         .field_opt_num("local_pref", a.local_pref)
         .field_opt_num("med", a.med)
+        .field_opt_num("otc", a.otc.map(|asn| asn.0))
         .field_display("peer", r.peer)
         .field_bool("best", r.best)
         .field_str("rov", r.rov.as_str())
@@ -1809,6 +1839,115 @@ mod tests {
     }
 
     #[test]
+    fn neighbor_detail_shows_the_roles() {
+        use bgpfc_wire::capability::Capability;
+        use bgpfc_wire::role::Role;
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: false,
+            route_refresh: true,
+            families: vec![AddressFamily::IPV4_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            role: Some(Role::Customer),
+            peer_capabilities: vec![Capability::Role(Role::Provider)],
+        };
+        let mut report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session.clone()),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        // RFC 9234 §4.1: our Role and the one the neighbor sent.
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  role customer (neighbor sent provider)".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""role":{"local":"customer","remote":"provider"}"#),
+            "{}",
+            r.json
+        );
+        // A neighbor that sent none (RFC 9234 §4.2 lets the session go on).
+        report.session = Some(bgpfc_fsm::Session {
+            peer_capabilities: Vec::new(),
+            ..session.clone()
+        });
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines
+                .contains(&"  role customer (neighbor sent none)".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""role":{"local":"customer","remote":null}"#),
+            "{}",
+            r.json
+        );
+        // No Role of ours: no line, and `null`.
+        report.session = Some(bgpfc_fsm::Session {
+            role: None,
+            ..session
+        });
+        let r = render_neighbor(&report, &[]);
+        assert!(!r.lines.iter().any(|l| l.contains("role")));
+        assert!(r.json.contains(r#""role":null"#), "{}", r.json);
+    }
+
+    #[test]
+    fn routes_show_the_only_to_customer_attribute() {
+        use bgpfc_wire::types::Asn;
+        let mut with = route("192.0.2.0/24", "198.51.100.1", &[64_511], Some(100), None);
+        Arc::make_mut(&mut with.attrs).otc = Some(Asn(64_511));
+        let without = route(
+            "198.51.100.0/24",
+            "198.51.100.1",
+            &[64_511],
+            Some(100),
+            None,
+        );
+        let r = render_routes(&[with, without]);
+        assert!(
+            r.lines[1].ends_with("64511 via 198.51.100.1 otc 64511"),
+            "{}",
+            r.lines[1]
+        );
+        assert!(
+            r.lines[2].ends_with("64511 via 198.51.100.1"),
+            "{}",
+            r.lines[2]
+        );
+        assert!(
+            r.json.contains(r#""med":null,"otc":64511,"peer""#),
+            "{}",
+            r.json
+        );
+        assert!(
+            r.json.contains(r#""med":null,"otc":null,"peer""#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
     fn routes_render_as_lines_and_json() {
         // Two routes to one destination, from different origin ASes: a
         // VRP for AS 64496 makes one valid and the other invalid. The
@@ -1843,17 +1982,17 @@ mod tests {
                 ),
             ]
         );
-        // docs/control.md: `local_pref` and `med` are numbers, or null;
-        // `rov` is the state's name.
+        // docs/control.md: `local_pref`, `med` and `otc` are numbers, or
+        // null; `rov` is the state's name.
         assert_eq!(
             r.json,
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
-                r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
+                r#""local_pref":100,"med":null,"otc":null,"peer":"198.51.100.1","best":true,"#,
                 r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
                 r#""large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
-                r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
+                r#""local_pref":null,"med":50,"otc":null,"peer":"198.51.100.2","best":false,"#,
                 r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
                 r#""large_communities":[]}]"#
             )
