@@ -7,7 +7,8 @@
 //! route refresh); RFC 9003 §3 (a shutdown communication of at most 128
 //! octets); RFC 4486 §4 (Administrative Reset).
 
-use std::io::{BufRead as _, BufReader};
+use std::collections::VecDeque;
+use std::io::{BufRead as _, BufReader, BufWriter, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -26,13 +27,15 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, FibReport, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
+    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a thread may take to answer a query.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Octets of a listing gathered before a write to the client.
+const LISTING_BUFFER: usize = 64 << 10;
 /// HTTP connections served at once; the rest are refused with 503.
 const MAX_HTTP_CONNECTIONS: usize = 16;
 /// RFC 9003 §3: a communication longer than this may not reach a peer
@@ -227,8 +230,27 @@ pub(crate) struct Reply {
     pub(crate) json: String,
 }
 
+/// What a command answers.
+pub(crate) enum Answer<'a> {
+    /// Everything at once.
+    Reply(Reply),
+    /// A long listing, taken and written a page at a time.
+    Listing(Listing<'a>),
+}
+
 /// Run a command. The error is a message for the operator.
-pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
+pub(crate) fn execute<'a>(ctx: &'a Ctx, cmd: &Command) -> Result<Answer<'a>, String> {
+    match cmd {
+        Command::ShowRoutes {
+            family,
+            prefix: None,
+        } => Listing::routes(ctx, *family).map(Answer::Listing),
+        Command::ShowFib => Listing::fib(ctx).map(Answer::Listing),
+        _ => reply(ctx, cmd).map(Answer::Reply),
+    }
+}
+
+fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
     match cmd {
         Command::ShowNeighbors => {
             let reports = peer_reports(ctx, None)?;
@@ -243,43 +265,25 @@ pub(crate) fn execute(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
             let stats = rib_peers(ctx)?;
             Ok(render_neighbor(&reports[0], &stats))
         }
+        // One destination and every candidate route to it. Without one,
+        // execute answers with a listing.
         Command::ShowRoutes { family, prefix } => {
-            let (tx, rx) = sync_channel(1);
-            ctx.rib
-                .send(RibMsg::Query(
-                    RibQuery::Routes {
-                        family: *family,
-                        prefix: *prefix,
-                    },
-                    tx,
-                ))
-                .map_err(|_| "rib thread gone".to_owned())?;
-            match rx.recv_timeout(QUERY_TIMEOUT) {
-                Ok(RibReply::Routes(routes)) => Ok(render_routes(&routes)),
-                Ok(_) => Err("unexpected reply".to_owned()),
-                Err(_) => Err("rib did not answer".to_owned()),
+            let routes = rib_routes(ctx, *family, *prefix, None)?;
+            let mut lines = vec![ROUTES_HEADER.to_owned()];
+            lines.extend(routes.iter().map(route_line));
+            let mut j = Json::new();
+            j.begin_array();
+            for r in &routes {
+                route_json(&mut j, r);
             }
+            j.end_array();
+            Ok(Reply {
+                lines,
+                json: j.finish(),
+            })
         }
-        Command::ShowFib => {
-            // What is installed first: a route the RIB adds meanwhile
-            // shows as pending rather than as stale.
-            let (tx, rx) = sync_channel(1);
-            ctx.fib
-                .send(FibMsg::Query(tx))
-                .map_err(|_| "fib thread gone".to_owned())?;
-            let report = rx
-                .recv_timeout(QUERY_TIMEOUT)
-                .map_err(|_| "fib did not answer".to_owned())?;
-            let (tx, rx) = sync_channel(1);
-            ctx.rib
-                .send(RibMsg::Query(RibQuery::FibRoutes, tx))
-                .map_err(|_| "rib thread gone".to_owned())?;
-            match rx.recv_timeout(QUERY_TIMEOUT) {
-                Ok(RibReply::FibRoutes(desired)) => Ok(render_fib(&report, &desired)),
-                Ok(_) => Err("unexpected reply".to_owned()),
-                Err(_) => Err("rib did not answer".to_owned()),
-            }
-        }
+        // invariant: execute answers it with a listing.
+        Command::ShowFib => unreachable!("show fib is a listing"),
         Command::ShowStatus => status(ctx),
         Command::ClearNeighbor {
             addr,
@@ -559,97 +563,328 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
     }
 }
 
-fn render_routes(routes: &[RouteReport]) -> Reply {
-    let mut lines = vec![format!(
-        "{:<44} {:<40} {:<8} {:>5} {:>7} path",
-        "prefix", "next-hop", "origin", "lpref", "med"
-    )];
-    let mut j = Json::new();
-    j.begin_array();
-    for r in routes {
-        let a = &r.attrs;
-        let path: Vec<String> = a.as_path.asns().map(|x| x.0.to_string()).collect();
-        lines.push(format!(
-            "{}{:<43} {:<40} {:<8} {:>5} {:>7} {} via {}",
-            if r.best { "*" } else { " " },
-            r.prefix,
-            a.next_hop_addr(),
-            a.origin,
-            a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
-            a.med.map_or("-".to_owned(), |v| v.to_string()),
-            if path.is_empty() {
-                "-".to_owned()
-            } else {
-                path.join(" ")
-            },
-            r.peer
-        ));
-        j.begin_object()
-            .field_display("prefix", r.prefix)
-            .field_display("next_hop", a.next_hop_addr())
-            .field_display("origin", a.origin)
-            .field_opt("local_pref", a.local_pref)
-            .field_opt("med", a.med)
-            .field_display("peer", r.peer)
-            .field_bool("best", r.best)
-            .key("as_path")
-            .begin_array();
-        for asn in a.as_path.asns() {
-            j.number(asn.0);
-        }
-        j.end_array().key("communities").begin_array();
-        for c in &a.communities {
-            j.display(c);
-        }
-        j.end_array().key("large_communities").begin_array();
-        for c in &a.large_communities {
-            j.display(c);
-        }
-        j.end_array().end_object();
+const ROUTES_HEADER: &str = "prefix                                       next-hop                                 origin   lpref     med path";
+
+fn route_line(r: &RouteReport) -> String {
+    let a = &r.attrs;
+    let path: Vec<String> = a.as_path.asns().map(|x| x.0.to_string()).collect();
+    format!(
+        "{}{:<43} {:<40} {:<8} {:>5} {:>7} {} via {}",
+        if r.best { "*" } else { " " },
+        r.prefix,
+        a.next_hop_addr(),
+        a.origin,
+        a.local_pref.map_or("-".to_owned(), |v| v.to_string()),
+        a.med.map_or("-".to_owned(), |v| v.to_string()),
+        if path.is_empty() {
+            "-".to_owned()
+        } else {
+            path.join(" ")
+        },
+        r.peer
+    )
+}
+
+fn route_json(j: &mut Json, r: &RouteReport) {
+    let a = &r.attrs;
+    j.begin_object()
+        .field_display("prefix", r.prefix)
+        .field_display("next_hop", a.next_hop_addr())
+        .field_display("origin", a.origin)
+        .field_opt("local_pref", a.local_pref)
+        .field_opt("med", a.med)
+        .field_display("peer", r.peer)
+        .field_bool("best", r.best)
+        .key("as_path")
+        .begin_array();
+    for asn in a.as_path.asns() {
+        j.number(asn.0);
     }
-    j.end_array();
-    Reply {
-        lines,
-        json: j.finish(),
+    j.end_array().key("communities").begin_array();
+    for c in &a.communities {
+        j.display(c);
+    }
+    j.end_array().key("large_communities").begin_array();
+    for c in &a.large_communities {
+        j.display(c);
+    }
+    j.end_array().end_object();
+}
+
+/// A page of the Loc-RIB of `family` after `after`, or every candidate
+/// route to `prefix`.
+fn rib_routes(
+    ctx: &Ctx,
+    family: AddressFamily,
+    prefix: Option<Prefix>,
+    after: Option<Prefix>,
+) -> Result<Vec<RouteReport>, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(
+            RibQuery::Routes {
+                family,
+                prefix,
+                after,
+            },
+            tx,
+        ))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::Routes(routes)) => Ok(routes),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
     }
 }
 
-fn render_fib(f: &FibReport, desired: &bgpfc_fib::Table) -> Reply {
-    let mut lines = vec![format!("mode {}", f.mode)];
-    let mut j = Json::new();
-    j.begin_object()
-        .field_display("mode", f.mode)
-        .key("routes")
-        .begin_array();
-    for (prefix, gateway) in desired {
-        let installed = f.installed.get(prefix) == Some(gateway);
-        lines.push(format!(
-            "{:<44} via {:<40} {}",
-            prefix,
-            gateway,
-            if installed { "installed" } else { "pending" }
-        ));
-        j.begin_object()
-            .field_display("prefix", prefix)
-            .field_display("gateway", gateway)
-            .field_bool("installed", installed)
-            .end_object();
+/// A page of the routes the RIB wants in the FIB.
+fn rib_fib_routes(ctx: &Ctx, after: Option<Prefix>) -> Result<Vec<(Prefix, IpAddr)>, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(RibQuery::FibRoutes { after }, tx))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::FibRoutes(routes)) => Ok(routes),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
     }
-    for (prefix, gateway) in &f.installed {
-        if !desired.contains_key(prefix) {
-            lines.push(format!("{prefix:<44} via {gateway:<40} stale"));
-            j.begin_object()
-                .field_display("prefix", prefix)
-                .field_display("gateway", gateway)
-                .field_bool("installed", true)
-                .field_bool("stale", true)
-                .end_object();
+}
+
+/// The FIB's mode and a page of its installed routes.
+fn fib_report(ctx: &Ctx, after: Option<Prefix>) -> Result<FibReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.fib
+        .send(FibMsg::Query { after, reply: tx })
+        .map_err(|_| "fib thread gone".to_owned())?;
+    rx.recv_timeout(QUERY_TIMEOUT)
+        .map_err(|_| "fib did not answer".to_owned())
+}
+
+/// Gets the page of a listing after an item (from the start for `None`).
+type Fetch<'a, T> = dyn FnMut(Option<Prefix>) -> Result<Vec<T>, String> + 'a;
+
+/// A listing's items, fetched a page ([`PAGE`]) at a time, in prefix
+/// order: each page continues after the last item of the one before.
+/// Pages are taken at different times, so a listing is not a snapshot.
+pub(crate) struct Pages<'a, T> {
+    fetch: Box<Fetch<'a, T>>,
+    key: fn(&T) -> Prefix,
+    page: VecDeque<T>,
+    /// The page held is the last.
+    last: bool,
+    /// The key of the last item taken.
+    taken: Option<Prefix>,
+}
+
+impl<'a, T> Pages<'a, T> {
+    fn starting(
+        first: Vec<T>,
+        fetch: impl FnMut(Option<Prefix>) -> Result<Vec<T>, String> + 'a,
+        key: fn(&T) -> Prefix,
+    ) -> Pages<'a, T> {
+        Pages {
+            last: first.len() < PAGE,
+            page: first.into(),
+            fetch: Box::new(fetch),
+            key,
+            taken: None,
         }
     }
-    j.end_array().end_object();
-    Reply {
-        lines,
-        json: j.finish(),
+
+    fn open(
+        mut fetch: impl FnMut(Option<Prefix>) -> Result<Vec<T>, String> + 'a,
+        key: fn(&T) -> Prefix,
+    ) -> Result<Pages<'a, T>, String> {
+        let first = fetch(None)?;
+        Ok(Pages::starting(first, fetch, key))
+    }
+
+    /// The next item, left in place.
+    fn peek(&mut self) -> Result<Option<&T>, String> {
+        if self.page.is_empty() && !self.last {
+            let page = (self.fetch)(self.taken)?;
+            self.last = page.len() < PAGE;
+            self.page = page.into();
+        }
+        Ok(self.page.front())
+    }
+
+    fn take(&mut self) -> Result<Option<T>, String> {
+        self.peek()?;
+        let item = self.page.pop_front();
+        if let Some(i) = &item {
+            self.taken = Some((self.key)(i));
+        }
+        Ok(item)
+    }
+}
+
+/// A long listing: `show routes` of a whole family, `show fib`. A full
+/// table has a million routes or more, so it is taken from the RIB and the
+/// FIB a page at a time and written as it comes, rather than copied,
+/// rendered in both forms and written whole (which took several hundred
+/// megabytes for a million routes).
+pub(crate) enum Listing<'a> {
+    Routes(Pages<'a, RouteReport>),
+    /// The routes the RIB wants merged with those installed, in prefix
+    /// order: each wanted route is installed or pending, and an installed
+    /// route not wanted is stale.
+    Fib {
+        mode: Mode,
+        desired: Pages<'a, (Prefix, IpAddr)>,
+        installed: Pages<'a, (Prefix, IpAddr)>,
+    },
+}
+
+/// One `show fib` row.
+struct FibRow {
+    prefix: Prefix,
+    gateway: IpAddr,
+    installed: bool,
+    stale: bool,
+}
+
+impl<'a> Listing<'a> {
+    fn routes(ctx: &'a Ctx, family: AddressFamily) -> Result<Listing<'a>, String> {
+        let pages = Pages::open(
+            move |after| rib_routes(ctx, family, None, after),
+            |r: &RouteReport| r.prefix,
+        )?;
+        Ok(Listing::Routes(pages))
+    }
+
+    fn fib(ctx: &'a Ctx) -> Result<Listing<'a>, String> {
+        // What is installed first: a route the RIB adds meanwhile shows as
+        // pending rather than as stale.
+        let first = fib_report(ctx, None)?;
+        let installed = Pages::starting(
+            first.installed,
+            move |after| fib_report(ctx, after).map(|r| r.installed),
+            |r: &(Prefix, IpAddr)| r.0,
+        );
+        let desired = Pages::open(move |after| rib_fib_routes(ctx, after), |r| r.0)?;
+        Ok(Listing::Fib {
+            mode: first.mode,
+            desired,
+            installed,
+        })
+    }
+
+    /// The next `show fib` row.
+    fn next_fib_row(
+        desired: &mut Pages<'_, (Prefix, IpAddr)>,
+        installed: &mut Pages<'_, (Prefix, IpAddr)>,
+    ) -> Result<Option<FibRow>, String> {
+        let d = desired.peek()?.copied();
+        let i = installed.peek()?.copied();
+        let wanted = |(prefix, gateway): (Prefix, IpAddr), installed| FibRow {
+            prefix,
+            gateway,
+            installed,
+            stale: false,
+        };
+        Ok(match (d, i) {
+            (None, None) => None,
+            (Some(d), i) if i.is_none_or(|i| d.0 < i.0) => {
+                desired.take()?;
+                Some(wanted(d, false))
+            }
+            (Some(d), Some(i)) if d.0 == i.0 => {
+                desired.take()?;
+                installed.take()?;
+                Some(wanted(d, d.1 == i.1))
+            }
+            (_, Some(i)) => {
+                installed.take()?;
+                Some(FibRow {
+                    prefix: i.0,
+                    gateway: i.1,
+                    installed: true,
+                    stale: true,
+                })
+            }
+            // invariant: the first arm takes (Some, None).
+            (Some(_), None) => unreachable!(),
+        })
+    }
+
+    /// Write as protocol lines. Stops at the first error, leaving the
+    /// response unterminated.
+    fn write_lines(self, out: &mut proto::Lines<'_, impl Write>) -> Result<(), String> {
+        let io = |e: std::io::Error| e.to_string();
+        match self {
+            Listing::Routes(mut pages) => {
+                out.line(ROUTES_HEADER).map_err(io)?;
+                while let Some(r) = pages.take()? {
+                    out.line(&route_line(&r)).map_err(io)?;
+                }
+            }
+            Listing::Fib {
+                mode,
+                mut desired,
+                mut installed,
+            } => {
+                out.line(&format!("mode {mode}")).map_err(io)?;
+                while let Some(r) = Listing::next_fib_row(&mut desired, &mut installed)? {
+                    let state = match (r.stale, r.installed) {
+                        (true, _) => "stale",
+                        (false, true) => "installed",
+                        (false, false) => "pending",
+                    };
+                    out.line(&format!("{:<44} via {:<40} {state}", r.prefix, r.gateway))
+                        .map_err(io)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write as a JSON document. Stops at the first error, leaving the
+    /// document incomplete.
+    fn write_json(self, out: &mut impl Write) -> Result<(), String> {
+        let io = |e: std::io::Error| e.to_string();
+        let mut first = true;
+        let mut item = |out: &mut dyn Write, j: Json| -> Result<(), String> {
+            if !std::mem::take(&mut first) {
+                out.write_all(b",").map_err(io)?;
+            }
+            out.write_all(j.finish().as_bytes()).map_err(io)
+        };
+        match self {
+            Listing::Routes(mut pages) => {
+                out.write_all(b"[").map_err(io)?;
+                while let Some(r) = pages.take()? {
+                    let mut j = Json::new();
+                    route_json(&mut j, &r);
+                    item(out, j)?;
+                }
+                out.write_all(b"]").map_err(io)?;
+            }
+            Listing::Fib {
+                mode,
+                mut desired,
+                mut installed,
+            } => {
+                let mut j = Json::new();
+                j.begin_object().field_display("mode", mode).key("routes");
+                out.write_all(j.finish().as_bytes()).map_err(io)?;
+                out.write_all(b"[").map_err(io)?;
+                while let Some(r) = Listing::next_fib_row(&mut desired, &mut installed)? {
+                    let mut j = Json::new();
+                    j.begin_object()
+                        .field_display("prefix", r.prefix)
+                        .field_display("gateway", r.gateway)
+                        .field_bool("installed", r.installed);
+                    if r.stale {
+                        j.field_bool("stale", true);
+                    }
+                    j.end_object();
+                    item(out, j)?;
+                }
+                out.write_all(b"]}").map_err(io)?;
+            }
+        }
+        out.flush().map_err(io)
     }
 }
 
@@ -684,15 +919,29 @@ fn unix_connection(stream: &UnixStream, ctx: &Ctx) {
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    let response = match proto::Request::parse(line.trim_end_matches(['\r', '\n'])) {
-        Err(e) => proto::Response::error(e.to_string()),
-        Ok(req) => match Command::parse(&req.words).and_then(|c| execute(ctx, &c)) {
-            Ok(reply) => proto::Response::ok(reply.lines),
-            Err(e) => proto::Response::error(e),
-        },
-    };
     let mut w = stream;
-    let _ = response.write_to(&mut w);
+    let answer = proto::Request::parse(line.trim_end_matches(['\r', '\n']))
+        .map_err(|e| e.to_string())
+        .and_then(|req| Command::parse(&req.words))
+        .and_then(|c| execute(ctx, &c));
+    let _ = match answer {
+        Ok(Answer::Reply(reply)) => proto::Response::ok(reply.lines).write_to(&mut w),
+        Ok(Answer::Listing(listing)) => {
+            // A write per line would be several million system calls.
+            let mut b = BufWriter::with_capacity(LISTING_BUFFER, &mut w);
+            proto::Lines::begin(&mut b).and_then(|mut lines| {
+                match listing.write_lines(&mut lines) {
+                    Ok(()) => lines.end(),
+                    // The client sees the response cut short.
+                    Err(e) => {
+                        bgpfc_log::warn!("control: listing cut short", error = e);
+                        Ok(())
+                    }
+                }
+            })
+        }
+        Err(e) => proto::Response::error(e).write_to(&mut w),
+    };
 }
 
 /// Listen for HTTP on a loopback address (config validation guarantees
@@ -734,16 +983,37 @@ fn http_connection(stream: &TcpStream, ctx: &Ctx) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut reader = BufReader::new(stream);
+    let mut w = stream;
     let response = match http::Request::read_from(&mut reader) {
         Err(http::HttpError::TooLarge) => http::Response::error(413, "request too large"),
         Err(e) => http::Response::error(400, &e.to_string()),
-        Ok(req) => http_respond(ctx, &req),
+        Ok(req) => match http_respond(ctx, &req) {
+            HttpAnswer::Response(response) => response,
+            HttpAnswer::Listing(listing) => {
+                // The body runs until the connection closes, as it is
+                // produced.
+                let head = http::Response::json(200, String::new());
+                let mut b = BufWriter::with_capacity(LISTING_BUFFER, &mut w);
+                if head.write_head_until_close(&mut b).is_ok()
+                    && let Err(e) = listing.write_json(&mut b)
+                {
+                    bgpfc_log::warn!("control: listing cut short", error = e);
+                }
+                return;
+            }
+        },
     };
-    let mut w = stream;
     let _ = response.write_to(&mut w);
 }
 
-fn http_respond(ctx: &Ctx, req: &http::Request) -> http::Response {
+/// What an HTTP request is answered with.
+enum HttpAnswer<'a> {
+    Response(http::Response),
+    /// A listing, the body of a 200 response.
+    Listing(Listing<'a>),
+}
+
+fn http_respond<'a>(ctx: &'a Ctx, req: &http::Request) -> HttpAnswer<'a> {
     // RFC 6750 §2.1: the token, when configured, is required on every
     // request, before the resource is even looked at.
     if let Some(token) = &ctx.token
@@ -752,28 +1022,29 @@ fn http_respond(ctx: &Ctx, req: &http::Request) -> http::Response {
         let mut r = http::Response::error(401, "bearer token required");
         r.extra
             .push(("WWW-Authenticate".to_owned(), "Bearer".to_owned()));
-        return r;
+        return HttpAnswer::Response(r);
     }
     let cmd = match Command::from_http(req) {
         Ok(c) => c,
-        Err((status, m)) => return http::Response::error(status, &m),
+        Err((status, m)) => return HttpAnswer::Response(http::Response::error(status, &m)),
     };
     if cmd.is_write() && !ctx.writes {
-        return http::Response::error(
+        return HttpAnswer::Response(http::Response::error(
             403,
             "write endpoints are disabled (control { http { writes yes; } })",
-        );
+        ));
     }
     match execute(ctx, &cmd) {
-        Ok(reply) => http::Response::json(200, reply.json),
-        Err(e) => http::Response::error(
+        Ok(Answer::Reply(reply)) => HttpAnswer::Response(http::Response::json(200, reply.json)),
+        Ok(Answer::Listing(listing)) => HttpAnswer::Listing(listing),
+        Err(e) => HttpAnswer::Response(http::Response::error(
             if e.starts_with("no neighbor") {
                 404
             } else {
                 500
             },
             &e,
-        ),
+        )),
     }
 }
 
@@ -783,6 +1054,75 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn route(prefix: &str, gateway: &str) -> (Prefix, IpAddr) {
+        (prefix.parse().unwrap(), gateway.parse().unwrap())
+    }
+
+    #[test]
+    fn fib_rows_merge_wanted_and_installed_in_prefix_order() {
+        let none = |_| Ok(Vec::new());
+        let mut desired = Pages::starting(
+            vec![
+                route("10.0.0.0/8", "192.0.2.1"),
+                route("10.2.0.0/16", "192.0.2.2"),
+                route("2001:db8::/32", "fe80::1"),
+            ],
+            none,
+            |r| r.0,
+        );
+        let mut installed = Pages::starting(
+            vec![
+                route("10.0.0.0/8", "192.0.2.1"),
+                route("10.1.0.0/16", "192.0.2.9"),
+                route("10.2.0.0/16", "192.0.2.3"),
+            ],
+            none,
+            |r| r.0,
+        );
+        let mut rows = Vec::new();
+        while let Some(r) = Listing::next_fib_row(&mut desired, &mut installed).unwrap() {
+            rows.push((r.prefix.to_string(), r.installed, r.stale));
+        }
+        let row = |p: &str, installed, stale| (p.to_owned(), installed, stale);
+        assert_eq!(
+            rows,
+            vec![
+                row("10.0.0.0/8", true, false),
+                row("10.1.0.0/16", true, true),
+                row("10.2.0.0/16", false, false),
+                row("2001:db8::/32", false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn pages_continue_after_the_last_item_of_a_full_page() {
+        let all: Vec<(Prefix, IpAddr)> = (0..=PAGE)
+            .map(|i| {
+                let [a, b] = u16::try_from(i).unwrap().to_be_bytes();
+                let p = Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap();
+                (p, "192.0.2.1".parse().unwrap())
+            })
+            .collect();
+        let mut fetches = Vec::new();
+        let mut pages = Pages::open(
+            |after| {
+                fetches.push(after);
+                let from = after.map_or(0, |a| all.iter().position(|r| r.0 == a).unwrap() + 1);
+                Ok(all[from..].iter().take(PAGE).copied().collect())
+            },
+            |r| r.0,
+        )
+        .unwrap();
+        let mut n = 0;
+        while pages.take().unwrap().is_some() {
+            n += 1;
+        }
+        drop(pages);
+        assert_eq!(n, PAGE + 1);
+        assert_eq!(fetches, vec![None, Some(all[PAGE - 1].0)]);
     }
 
     #[test]

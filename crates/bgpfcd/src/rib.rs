@@ -12,7 +12,7 @@ use bgpfc_rib::{FibChange, Output, PeerInfo, Policies, Rib, Sink};
 use bgpfc_wire::types::Asn;
 
 use crate::coordinator::PeerTable;
-use crate::messages::{FibMsg, RibMsg, RibQuery, RibReply, RouteReport};
+use crate::messages::{FibMsg, PAGE, RibMsg, RibQuery, RibReply, RouteReport};
 use crate::peer::SendError;
 
 /// Start the RIB thread.
@@ -271,7 +271,11 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
                 .collect(),
         ),
-        RibQuery::Routes { family, prefix } => match prefix {
+        RibQuery::Routes {
+            family,
+            prefix,
+            after,
+        } => match prefix {
             Some(prefix) => {
                 let best = rib
                     .loc_rib(*family)
@@ -289,7 +293,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                 )
             }
             None => RibReply::Routes(
-                rib.loc_rib(*family)
+                rib.loc_rib_after(*family, *after)
+                    .take(PAGE)
                     .map(|(prefix, b)| RouteReport {
                         prefix,
                         peer: b.peer,
@@ -299,6 +304,8 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .collect(),
             ),
         },
-        RibQuery::FibRoutes => RibReply::FibRoutes(rib.fib_routes().collect()),
+        RibQuery::FibRoutes { after } => {
+            RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
+        }
     }
 }

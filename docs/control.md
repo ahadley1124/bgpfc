@@ -32,7 +32,7 @@ failure, 2 on a usage error.
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with the negotiated session (router ID, timers, capabilities, families) |
 | `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*` |
-| `show fib` | FIB mode and every desired route with `installed`, `pending` or `stale` |
+| `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
@@ -50,9 +50,19 @@ A body line that starts with `.` is sent as `..`. One request per
 connection; the daemon closes after the response. Requests over 4096
 bytes are refused.
 
+`show routes` of a whole family and `show fib` can list millions of
+routes. The daemon takes them from the RIB and the FIB 4096 at a time and
+writes each part as it comes, so the listing is not one snapshot: a
+route that changes meanwhile may show either way. If the daemon cannot
+finish a listing, the response ends without its `.` line, which the client
+reports as an error.
+
 ## HTTP API
 
-Every response is JSON with `Connection: close`. Errors are
+Every response is JSON with `Connection: close`. `GET /v1/routes` without
+a prefix and `GET /v1/fib` are written as they are produced, as above,
+without `Content-Length`: the body ends when the connection closes (RFC
+9112 §6.3), and a body cut short is not valid JSON. Errors are
 `{"error": "..."}` with the status below. When a `token-file` is
 configured, every request must carry `Authorization: Bearer TOKEN` (the
 file's content, trimmed), else `401` with `WWW-Authenticate: Bearer`.

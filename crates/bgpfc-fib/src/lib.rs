@@ -168,6 +168,13 @@ impl Fib {
         self.routes.installed_table()
     }
 
+    /// At most `limit` of the routes believed installed, after `from`, in
+    /// prefix order.
+    #[must_use]
+    pub fn installed_after(&self, from: Option<Prefix>, limit: usize) -> Vec<(Prefix, IpAddr)> {
+        self.routes.installed_after(from).take(limit).collect()
+    }
+
     /// Open the netlink socket. Needs no privilege; install mode needs
     /// `CAP_NET_ADMIN` on top. Call before dropping privileges only if
     /// the socket should keep them (it does: netlink checks the opener).

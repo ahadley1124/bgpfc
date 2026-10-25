@@ -7,7 +7,7 @@ use std::thread;
 
 use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
 
-use crate::messages::{FibMsg, FibReport};
+use crate::messages::{FibMsg, FibReport, PAGE};
 
 /// Batches of changes the RIB thread may queue before it blocks. A batch
 /// is one RIB input's changes, or [`crate::rib::FIB_BATCH`] of a long one.
@@ -68,10 +68,10 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
             FibMsg::Mode(reply) => {
                 let _ = reply.send(fib.mode());
             }
-            FibMsg::Query(reply) => {
+            FibMsg::Query { after, reply } => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    installed: fib.installed(),
+                    installed: fib.installed_after(after, PAGE),
                 });
             }
             FibMsg::Shutdown(done) => {

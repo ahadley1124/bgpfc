@@ -272,6 +272,12 @@ impl Routes {
     }
 
     /// The installed routes after `from` (all of them for `None`), in
+    /// prefix order: a long listing taken a part at a time.
+    pub fn installed_after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, IpAddr)> {
+        self.after(from).map(|(p, id)| (p, self.gateways.addr(id)))
+    }
+
+    /// The installed routes after `from` (all of them for `None`), in
     /// prefix order: IPv4 sorts first.
     fn after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, GwId)> + '_ {
         let (v4, v6) = match from {

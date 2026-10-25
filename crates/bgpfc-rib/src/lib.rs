@@ -602,10 +602,20 @@ impl Rib {
 
     /// The Loc-RIB of `family`, best routes in prefix order.
     pub fn loc_rib(&self, family: AddressFamily) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
+        self.loc_rib_after(family, None)
+    }
+
+    /// The Loc-RIB of `family` after `from`, in prefix order: a long
+    /// listing taken a part at a time.
+    pub fn loc_rib_after(
+        &self,
+        family: AddressFamily,
+        from: Option<Prefix>,
+    ) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
         self.tables
             .get(family)
             .into_iter()
-            .flat_map(Table::iter)
+            .flat_map(move |t| t.after(from))
             .filter_map(|(p, d)| d.best().map(|r| (p, self.s.route_ref(r))))
     }
 
@@ -627,10 +637,15 @@ impl Rib {
     /// then IPv6 unicast, each in prefix order, so in one prefix order
     /// throughout (what `bgpfc_fib::Routes::merge` takes).
     pub fn fib_routes(&self) -> impl Iterator<Item = (Prefix, IpAddr)> {
+        self.fib_routes_after(None)
+    }
+
+    /// [`Rib::fib_routes`] after `from`.
+    pub fn fib_routes_after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, IpAddr)> {
         [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
             .into_iter()
             .filter_map(|f| self.tables.get(f))
-            .flat_map(Table::iter)
+            .flat_map(move |t| t.after(from))
             .filter_map(|(p, d)| d.best().map(|r| (p, r.attrs.next_hop_addr())))
     }
 

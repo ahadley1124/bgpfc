@@ -134,20 +134,31 @@ pub(crate) enum FibMsg {
     ReconcileEnd(SyncSender<usize>),
     /// Report the mode on the sender.
     Mode(SyncSender<bgpfc_fib::Mode>),
-    /// Report the installed routes on the sender.
-    Query(SyncSender<FibReport>),
+    /// Report the mode and a page of the installed routes: at most
+    /// [`PAGE`], after `after`, in prefix order.
+    Query {
+        /// The last route of the page before, if any.
+        after: Option<Prefix>,
+        /// Where the report goes.
+        reply: SyncSender<FibReport>,
+    },
     /// Remove every installed route and reply on the sender.
     Shutdown(SyncSender<()>),
 }
 
-/// A snapshot of the FIB manager. What the RIB wants is the RIB's to say
-/// (`RibQuery::FibRoutes`).
+/// Routes in one page of a long listing (`show routes`, `show fib`): the
+/// control plane takes a full table a page at a time, so that answering
+/// costs a page of memory rather than copies of the table.
+pub(crate) const PAGE: usize = 4096;
+
+/// The FIB manager's mode and a page of its installed routes. What the
+/// RIB wants is the RIB's to say (`RibQuery::FibRoutes`).
 #[derive(Clone, Debug)]
 pub(crate) struct FibReport {
     /// The mode.
     pub(crate) mode: bgpfc_fib::Mode,
-    /// Routes believed installed.
-    pub(crate) installed: bgpfc_fib::Table,
+    /// Routes believed installed: a page.
+    pub(crate) installed: Vec<(Prefix, IpAddr)>,
 }
 
 /// A question for the RIB thread.
@@ -155,16 +166,22 @@ pub(crate) struct FibReport {
 pub(crate) enum RibQuery {
     /// Per-peer route counts and session facts.
     Peers,
-    /// Loc-RIB routes of a family, optionally one prefix with all its
-    /// candidates.
+    /// Loc-RIB routes of a family, a page after `after`; or one prefix
+    /// with all its candidates.
     Routes {
         /// The family.
         family: AddressFamily,
         /// Only this destination.
-        prefix: Option<bgpfc_wire::prefix::Prefix>,
+        prefix: Option<Prefix>,
+        /// Without `prefix`: the last route of the page before, if any.
+        after: Option<Prefix>,
     },
-    /// The next hop of every destination, as the FIB is to install it.
-    FibRoutes,
+    /// The next hop of the destinations after `after`, as the FIB is to
+    /// install them: a page.
+    FibRoutes {
+        /// The last route of the page before, if any.
+        after: Option<Prefix>,
+    },
 }
 
 /// One Loc-RIB route or candidate in a reply.
@@ -188,7 +205,7 @@ pub(crate) enum RibReply {
     /// Answer to [`RibQuery::Routes`].
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
-    FibRoutes(bgpfc_fib::Table),
+    FibRoutes(Vec<(Prefix, IpAddr)>),
 }
 
 /// What peer threads tell the RIB thread.

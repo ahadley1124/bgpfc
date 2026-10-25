@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, btree_map};
 use std::mem;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
@@ -252,10 +253,25 @@ impl<V> PrefixMap<V> {
 
     /// Every entry, in prefix order (IPv4 sorts first).
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Prefix, &V)> {
-        self.v4
-            .iter()
+        self.after(None)
+    }
+
+    /// The entries after `from` (all of them for `None`), in prefix order.
+    pub(crate) fn after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, &V)> {
+        let (v4, v6) = match from {
+            None => (Some(self.v4.range(..)), self.v6.range(..)),
+            Some(p) => match Ipv4Key::new(p) {
+                Some(k) => (
+                    Some(self.v4.range((Excluded(k), Unbounded))),
+                    self.v6.range(..),
+                ),
+                None => (None, self.v6.range((Excluded(p), Unbounded))),
+            },
+        };
+        v4.into_iter()
+            .flatten()
             .map(|(k, v)| (k.prefix(), v))
-            .chain(self.v6.iter().map(|(p, v)| (*p, v)))
+            .chain(v6.map(|(p, v)| (*p, v)))
     }
 
     #[cfg(feature = "profiling")]
@@ -468,6 +484,16 @@ mod tests {
             order,
             ["10.0.0.0/8", "10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]
         );
+        let after = |from: &str| -> Vec<String> {
+            m.after(Some(p(from))).map(|(p, _)| p.to_string()).collect()
+        };
+        assert_eq!(
+            after("10.0.0.0/8"),
+            ["10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]
+        );
+        assert_eq!(after("192.0.2.0/24"), ["2001:db8::/32"]);
+        assert_eq!(after("::/0"), ["2001:db8::/32"]);
+        assert_eq!(after("2001:db8::/32"), Vec::<String>::new());
         assert_eq!(m.remove(p("2001:db8::/32")), Some(1));
         m.retain(|p, v| {
             *v += 1;
