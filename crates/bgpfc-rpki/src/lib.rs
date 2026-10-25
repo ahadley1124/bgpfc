@@ -12,15 +12,20 @@
 //! they change; a producer sends those through a [`ValidationSink`].
 //! [`NullSource`] is the source when validation is off.
 //!
+//! [`InvalidAction`] names what the speaker itself does with the Invalid
+//! ones, which the RIB applies.
+//!
 //! Implements: RFC 6811 §2 (VRPs, the Route Origin ASN, Covered, Matched,
 //! the three validation states), §4 (re-validate the affected prefixes
-//! when VRPs change); RFC 6483 §2 (validation outcome),
+//! when VRPs change), §5 (what may be done with Invalid routes); RFC 8481
+//! §5 (the operator decides what is done); RFC 6483 §2 (validation outcome),
 //! §4 (an AS 0 ROA disavows origination); RFC 7607 §2 (AS 0 is never a
 //! valid origin); RFC 9319 §3 (a VRP authorises nothing longer than its
 //! maxLength); RFC 8210 §5.1, §5.6, §5.7 (bounds of Max Length; one VRP
 //! per {Prefix, Len, Max-Len, ASN}).
 #![forbid(unsafe_code)]
 
+pub mod action;
 pub mod affected;
 mod index;
 pub mod origin;
@@ -33,6 +38,7 @@ use std::fmt;
 
 use bgpfc_wire::prefix::Prefix;
 
+pub use action::InvalidAction;
 pub use affected::{AffectedPrefixes, PrefixSet};
 pub use origin::RouteOrigin;
 pub use set::VrpSet;
@@ -62,6 +68,8 @@ pub enum RpkiError {
     },
     /// Text that names no validation state.
     UnknownState(String),
+    /// Text that names no action for Invalid routes.
+    UnknownAction(String),
     /// The consumer of validation changes has gone away.
     SinkClosed,
 }
@@ -82,6 +90,9 @@ impl fmt::Display for RpkiError {
                 )
             }
             RpkiError::UnknownState(s) => write!(f, "unknown validation state {s:?}"),
+            RpkiError::UnknownAction(s) => {
+                write!(f, "unknown action {s:?} for Invalid routes")
+            }
             RpkiError::SinkClosed => {
                 f.write_str("the consumer of validation changes has gone away")
             }
