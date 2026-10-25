@@ -1,8 +1,10 @@
 //! The load generator against the daemon over localhost
 //! (`docs/PROFILING.md`): a 10 000-prefix synthetic table must end up in
-//! the RIB exactly, and the report lines must parse.
+//! the RIB exactly, and the report lines must parse; with two peers, the
+//! table one sends reaches the other and no session resets.
 //!
-//! Needs a profiling build and a free localhost port:
+//! Needs a profiling build and free localhost ports (127.0.0.1 and
+//! 127.0.0.2):
 //!
 //! ```sh
 //! cargo test -p bgpfcd --features profiling -- --ignored
@@ -26,6 +28,10 @@ use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 const PREFIXES: usize = 10_000;
 
+/// Prefixes, twenty to an attribute set and so about to an UPDATE: enough
+/// UPDATEs to fill the RIB's queue (1024) and a peer's (256).
+const TWO_PEER_PREFIXES: usize = 100_000;
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -43,9 +49,25 @@ fn ask(socket: &Path, command: &str) -> Vec<String> {
     r.lines
 }
 
+/// `ask`, retried until `done` holds of the answer (the socket may not be
+/// there yet).
+fn wait_for(socket: &Path, command: &str, done: impl Fn(&str) -> bool) -> String {
+    for _ in 0..600 {
+        if UnixStream::connect(socket).is_ok() {
+            let answer = ask(socket, command).join("\n");
+            if done(&answer) {
+                return answer;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{command}: no answer as expected");
+}
+
 /// Start bgpfcd in `dir`, listening on `port` with 127.0.0.1 as a passive
-/// neighbor; its report lines arrive on the receiver.
-fn start_daemon(dir: &Path, port: u16) -> (Child, Receiver<String>) {
+/// neighbor and `more` appended to the configuration; its report lines
+/// arrive on the receiver.
+fn start_daemon(dir: &Path, port: u16, more: &str) -> (Child, Receiver<String>) {
     let conf = dir.join("bgpfcd.conf");
     std::fs::write(
         &conf,
@@ -53,7 +75,8 @@ fn start_daemon(dir: &Path, port: u16) -> (Child, Receiver<String>) {
             "router-id 192.0.2.1;\nlocal-as 65000;\nlog {{ level warn; }}\n\
              listen {{ address 127.0.0.1; port {port}; }}\nfib {{ mode dry-run; }}\n\
              control {{ socket {}; }}\npolicy ANY {{ term all {{ action accept; }} }}\n\
-             neighbor 127.0.0.1 {{ remote-as 65001; passive yes; import ANY; export ANY; }}\n",
+             neighbor 127.0.0.1 {{ remote-as 65001; passive yes; import ANY; export ANY; }}\n\
+             {more}",
             dir.join("ctl.sock").display()
         ),
     )
@@ -122,7 +145,7 @@ fn a_synthetic_table_fills_the_rib_exactly() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let port = free_port();
-    let (mut daemon, rx) = start_daemon(&dir, port);
+    let (mut daemon, rx) = start_daemon(&dir, port, "");
     let loadgen = thread::spawn(move || {
         let mut out = Vec::new();
         run(&plan(port), &mut out).map(|()| String::from_utf8(out).unwrap())
@@ -181,5 +204,80 @@ fn a_synthetic_table_fills_the_rib_exactly() {
     let out = loadgen.join().unwrap().unwrap();
     assert!(out.contains("phase=load"), "{out}");
     assert!(out.contains("event=closed by=peer"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two peers send the same table, the second first. Each route of the
+/// first replaces the second's as the best (lower peer address, RFC 4271
+/// §9.1.2.2 g), so the RIB withdraws it from the first peer while that
+/// peer is still sending. Enough UPDATEs to fill the RIB's queue and then
+/// the peer's: the withdrawals must not wait in the input queue the
+/// peer's own UPDATEs fill, where they found no room and reset the
+/// session (Cease, Out of Resources).
+#[test]
+#[ignore = "starts bgpfcd on localhost ports; run with --features profiling -- --ignored"]
+fn a_table_reaches_a_second_peer_and_no_session_resets() {
+    let dir = std::env::temp_dir().join(format!("bgpfcd-two-peers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = free_port();
+    let listener = TcpListener::bind("127.0.0.2:0").unwrap();
+    let second = format!(
+        "neighbor 127.0.0.2 {{ remote-as 65001; port {}; connect-retry-time 1; \
+         import ANY; export ANY; }}\n",
+        listener.local_addr().unwrap().port()
+    );
+    let (mut daemon, rx) = start_daemon(&dir, port, &second);
+    let table = |mut p: Plan| {
+        if let Source::Synthetic {
+            prefixes,
+            attr_sets,
+            ..
+        } = &mut p.source
+        {
+            *prefixes = TWO_PEER_PREFIXES;
+            *attr_sets = TWO_PEER_PREFIXES / 20;
+        }
+        p
+    };
+    let mut b = table(plan(port));
+    b.endpoint = Endpoint::Listen(listener);
+    b.hold = None;
+    let b = thread::spawn(move || {
+        let mut out = Vec::new();
+        run(&b, &mut out).map(|()| String::from_utf8(out).unwrap())
+    });
+    let load = next(&rx, "table_load");
+    assert_eq!(get(&load, "peer"), Some("127.0.0.2"), "{load}");
+    let a = thread::spawn(move || {
+        let mut out = Vec::new();
+        run(&table(plan(port)), &mut out).map(|()| String::from_utf8(out).unwrap())
+    });
+
+    let load = next(&rx, "table_load");
+    assert_eq!(get(&load, "peer"), Some("127.0.0.1"), "{load}");
+    assert_eq!(get_u64(&load, "prefixes"), Some(TWO_PEER_PREFIXES as u64));
+    let socket = dir.join("ctl.sock");
+    wait_for(&socket, "show neighbor 127.0.0.2", |a| {
+        a.contains(&format!("advertised {TWO_PEER_PREFIXES}"))
+    });
+    wait_for(&socket, "show neighbor 127.0.0.1", |a| {
+        a.contains("advertised 0")
+    });
+    let neighbors = ask(&socket, "show neighbors").join("\n");
+    assert_eq!(neighbors.matches("Established").count(), 2, "{neighbors}");
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(daemon.wait().unwrap().success());
+    for out in [a.join().unwrap().unwrap(), b.join().unwrap().unwrap()] {
+        assert!(
+            out.contains("notification=Cease/Administrative_Shutdown"),
+            "{out}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

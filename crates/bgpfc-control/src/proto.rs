@@ -155,15 +155,11 @@ impl Response {
                 w.write_all(b"\n")?;
             }
         }
+        let mut lines = Lines { w };
         for l in &self.lines {
-            if l.starts_with('.') {
-                w.write_all(b".")?;
-            }
-            w.write_all(l.as_bytes())?;
-            w.write_all(b"\n")?;
+            lines.line(l)?;
         }
-        w.write_all(b".\n")?;
-        w.flush()
+        lines.end()
     }
 
     /// Read a response in wire form, for the client.
@@ -206,6 +202,46 @@ impl Response {
     }
 }
 
+/// A successful response written a line at a time, for answers too long
+/// to hold whole (a full routing table). A writer dropped before
+/// [`Lines::end`] leaves the response unterminated, which the client
+/// reports as an error.
+pub struct Lines<'a, W: Write> {
+    w: &'a mut W,
+}
+
+impl<'a, W: Write> Lines<'a, W> {
+    /// Write the status line.
+    ///
+    /// # Errors
+    /// The write failure.
+    pub fn begin(w: &'a mut W) -> io::Result<Lines<'a, W>> {
+        w.write_all(b"+ok\n")?;
+        Ok(Lines { w })
+    }
+
+    /// Write one body line, without its newline.
+    ///
+    /// # Errors
+    /// The write failure.
+    pub fn line(&mut self, l: &str) -> io::Result<()> {
+        if l.starts_with('.') {
+            self.w.write_all(b".")?;
+        }
+        self.w.write_all(l.as_bytes())?;
+        self.w.write_all(b"\n")
+    }
+
+    /// Terminate the response.
+    ///
+    /// # Errors
+    /// The write failure.
+    pub fn end(self) -> io::Result<()> {
+        self.w.write_all(b".\n")?;
+        self.w.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +264,23 @@ mod tests {
         let back = Request::parse(line.trim_end()).unwrap();
         assert_eq!(back.words, ["clear", "a b", "", "q"]);
         assert_eq!(RequestError::Empty.to_string(), "empty request");
+    }
+
+    #[test]
+    fn a_response_written_line_by_line_is_the_same() {
+        let r = Response::ok(vec!["a".into(), ".b".into()]);
+        let mut whole = Vec::new();
+        r.write_to(&mut whole).unwrap();
+        let mut parts = Vec::new();
+        let mut lines = Lines::begin(&mut parts).unwrap();
+        lines.line("a").unwrap();
+        lines.line(".b").unwrap();
+        lines.end().unwrap();
+        assert_eq!(parts, whole);
+        // Unterminated: the client sees an error, not a short answer.
+        let mut cut = Vec::new();
+        Lines::begin(&mut cut).unwrap().line("a").unwrap();
+        assert!(Response::read_from(&mut &cut[..]).is_err());
     }
 
     #[test]

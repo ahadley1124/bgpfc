@@ -19,6 +19,7 @@
 //! proportional to the pattern size times the path length whatever the
 //! pattern looks like.
 
+use std::cell::RefCell;
 use std::fmt;
 
 use bgpfc_wire::types::Asn;
@@ -58,6 +59,22 @@ enum Inst {
     Split(usize, usize),
     Jmp(usize),
     Match,
+}
+
+/// The matcher's working lists, kept per thread so that matching, which
+/// runs for every route a policy with an `as-path` clause sees, allocates
+/// nothing once they have grown.
+#[derive(Default)]
+struct Scratch {
+    current: Vec<usize>,
+    next: Vec<usize>,
+    /// The generation each instruction was last added in.
+    mark: Vec<usize>,
+    stack: Vec<usize>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
 /// A compiled AS-path regular expression.
@@ -411,40 +428,53 @@ impl AsPathRegex {
     /// anchored).
     #[must_use]
     pub fn is_match(&self, path: &[Asn]) -> bool {
-        let n = self.insts.len();
-        let mut current: Vec<usize> = Vec::with_capacity(n);
-        let mut next: Vec<usize> = Vec::with_capacity(n);
-        let mut mark = vec![usize::MAX; n];
+        self.matches(path.iter().copied(), path.len())
+    }
+
+    /// [`AsPathRegex::is_match`] on the `len` ASes `path` yields, without
+    /// collecting them: policy evaluation runs this for every route.
+    #[must_use]
+    pub fn matches(&self, path: impl Iterator<Item = Asn>, len: usize) -> bool {
+        SCRATCH.with_borrow_mut(|s| self.run(path, len, s))
+    }
+
+    fn run(&self, mut path: impl Iterator<Item = Asn>, len: usize, s: &mut Scratch) -> bool {
+        let Scratch {
+            current,
+            next,
+            mark,
+            stack,
+        } = s;
+        current.clear();
+        mark.clear();
+        mark.resize(self.insts.len(), usize::MAX);
         let mut generation = 0usize;
-        for pos in 0..=path.len() {
+        for pos in 0..=len {
             if pos == 0 || !self.anchored_start {
                 // A fresh thread may start at any position for an
                 // unanchored search (and only at 0 otherwise).
                 generation += 1;
-                let mut stack = vec![0usize];
-                if self.add_threads(
-                    &mut current,
-                    &mut mark,
-                    generation,
-                    &mut stack,
-                    pos,
-                    path.len(),
-                ) {
+                stack.clear();
+                stack.push(0);
+                if self.add_threads(current, mark, generation, stack, pos, len) {
                     return true;
                 }
             }
+            // The AS at `pos`, taken whatever happens next so that the
+            // iterator stays at `pos + 1`.
+            let asn = path.next();
             if current.is_empty() {
                 if self.anchored_start {
                     return false;
                 }
                 continue;
             }
-            let Some(&asn) = path.get(pos) else {
+            let Some(asn) = asn else {
                 break;
             };
             generation += 1;
             next.clear();
-            for &pc in &current {
+            for &pc in current.iter() {
                 let step = match &self.insts[pc] {
                     Inst::Asn(a) => *a == asn.0,
                     Inst::Any => true,
@@ -454,20 +484,14 @@ impl AsPathRegex {
                     _ => false,
                 };
                 if step {
-                    let mut stack = vec![pc + 1];
-                    if self.add_threads(
-                        &mut next,
-                        &mut mark,
-                        generation,
-                        &mut stack,
-                        pos + 1,
-                        path.len(),
-                    ) {
+                    stack.clear();
+                    stack.push(pc + 1);
+                    if self.add_threads(next, mark, generation, stack, pos + 1, len) {
                         return true;
                     }
                 }
             }
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(current, next);
             // Threads that started earlier survive in `current`; new ones
             // join on the next iteration, so this stays a plain union.
         }
@@ -530,6 +554,112 @@ mod tests {
 
     fn m(pattern: &str, asns: &[u32]) -> bool {
         AsPathRegex::new(pattern).unwrap().is_match(&path(asns))
+    }
+
+    /// The matcher as it was before it took an iterator and kept its
+    /// lists per thread: the reference for the one that replaced it.
+    fn reference(re: &AsPathRegex, path: &[Asn]) -> bool {
+        let n = re.insts.len();
+        let mut current: Vec<usize> = Vec::with_capacity(n);
+        let mut next: Vec<usize> = Vec::with_capacity(n);
+        let mut mark = vec![usize::MAX; n];
+        let mut generation = 0usize;
+        for pos in 0..=path.len() {
+            if pos == 0 || !re.anchored_start {
+                generation += 1;
+                let mut stack = vec![0usize];
+                if re.add_threads(
+                    &mut current,
+                    &mut mark,
+                    generation,
+                    &mut stack,
+                    pos,
+                    path.len(),
+                ) {
+                    return true;
+                }
+            }
+            if current.is_empty() {
+                if re.anchored_start {
+                    return false;
+                }
+                continue;
+            }
+            let Some(&asn) = path.get(pos) else {
+                break;
+            };
+            generation += 1;
+            next.clear();
+            for &pc in &current {
+                let step = match &re.insts[pc] {
+                    Inst::Asn(a) => *a == asn.0,
+                    Inst::Any => true,
+                    Inst::Class { negated, ranges } => {
+                        ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&asn.0)) != *negated
+                    }
+                    _ => false,
+                };
+                if step {
+                    let mut stack = vec![pc + 1];
+                    if re.add_threads(
+                        &mut next,
+                        &mut mark,
+                        generation,
+                        &mut stack,
+                        pos + 1,
+                        path.len(),
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+        false
+    }
+
+    #[test]
+    fn matches_like_the_matcher_it_replaced() {
+        let patterns = [
+            "1",
+            "^1",
+            "1$",
+            "^1$",
+            "^$",
+            "$",
+            ".",
+            "^.",
+            ".$",
+            "1 2",
+            "^1 2",
+            "2 3$",
+            "1 .* 3",
+            "^1+$",
+            "^(1|2)* 3",
+            "[1-2]+",
+            "[^1] 3",
+            "^.* .* .*$",
+            "(1 2)|(3 4)",
+            "^1_",
+            "2?4",
+            "^(1?)* 4$",
+        ];
+        for pat in patterns {
+            let re = AsPathRegex::new(pat).unwrap();
+            for len in 0..=5u32 {
+                for code in 0..4u32.pow(len) {
+                    let p: Vec<Asn> = (0..len).map(|i| Asn(1 + code / 4u32.pow(i) % 4)).collect();
+                    // As a policy hands it over: two segments, iterated.
+                    let (a, b) = p.split_at(p.len() / 2);
+                    let iter = a.iter().chain(b).copied();
+                    assert_eq!(
+                        re.matches(iter, p.len()),
+                        reference(&re, &p),
+                        "{pat} on {p:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

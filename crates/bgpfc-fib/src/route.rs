@@ -143,10 +143,18 @@ impl RouteMsg {
     /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_REPLACE`: add or replace.
     #[must_use]
     pub fn encode_set(&self, seq: u32) -> Vec<u8> {
+        self.encode_set_with(seq, true)
+    }
+
+    /// As [`RouteMsg::encode_set`], asking for an acknowledgement only if
+    /// `ack`: the kernel reports a failure either way (`netlink(7)`,
+    /// `NLM_F_ACK`), so in a batch only the last request needs one.
+    #[must_use]
+    pub fn encode_set_with(&self, seq: u32, ack: bool) -> Vec<u8> {
         netlink::encode(
             RTM_NEWROUTE,
             netlink::NLM_F_REQUEST
-                | netlink::NLM_F_ACK
+                | if ack { netlink::NLM_F_ACK } else { 0 }
                 | netlink::NLM_F_CREATE
                 | netlink::NLM_F_REPLACE,
             seq,
@@ -157,9 +165,16 @@ impl RouteMsg {
     /// `RTM_DELROUTE`.
     #[must_use]
     pub fn encode_delete(&self, seq: u32) -> Vec<u8> {
+        self.encode_delete_with(seq, true)
+    }
+
+    /// As [`RouteMsg::encode_delete`], with an acknowledgement only if
+    /// `ack` (see [`RouteMsg::encode_set_with`]).
+    #[must_use]
+    pub fn encode_delete_with(&self, seq: u32, ack: bool) -> Vec<u8> {
         netlink::encode(
             RTM_DELROUTE,
-            netlink::NLM_F_REQUEST | netlink::NLM_F_ACK,
+            netlink::NLM_F_REQUEST | if ack { netlink::NLM_F_ACK } else { 0 },
             seq,
             &self.payload(RT_SCOPE_NOWHERE, 0),
         )

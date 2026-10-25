@@ -190,8 +190,9 @@ cargo bench -p bgpfc-bench --bench micro            # or a name filter: ... micr
 ```
 
 UPDATE decoding (one prefix, so mostly the attribute section; and a full
-4096-octet message per prefix), RIB insert, withdraw, peer down and
-sending the table to a second peer per route over 100 000 routes, the
+4096-octet message per prefix), RIB insert (alone, and with a second peer
+up to export to), withdraw, peer down and sending the table to a second
+peer per route over 100 000 routes, the
 decision process over 1–16 candidates,
 interning an attribute set already held, and `Instant::now` itself. Each
 warms up for 300 ms and reports the median of 15 samples, setup excluded,
@@ -205,7 +206,8 @@ The criterion benches (`cargo bench -p bgpfc-wire`, `-p bgpfc-rib`,
 
 ```sh
 cargo test --workspace --features profiling
-cargo test -p bgpfcd --features profiling -- --ignored     # loadgen to daemon, 10 000 prefixes
+cargo test -p bgpfcd --features profiling -- --ignored     # loadgen to daemon, 10 000 prefixes;
+                                                            # two peers, 100 000 each
 ```
 
 ## Reading the report line
@@ -282,7 +284,7 @@ The histograms count from daemon start, not per event.
 | `rib_insert` | one announced route into the Adj-RIB-In, import policy and the decision process for its destination included |
 | `rib_remove` | one withdrawn route out of the Adj-RIB-In |
 | `best_path` | one decision process run for one destination (see `best_path_runs`) |
-| `adj_rib_out_build` | packing one peer's batch of changes into UPDATEs |
+| `adj_rib_out_build` | packing one peer's batch of changes into UPDATEs, the session rewrite of each attribute set included |
 | `rib_peer_down` | removing every route of a peer that went down |
 | `rib_update` | the RIB thread on one UPDATE: Adj-RIB-In, decision process, Adj-RIB-Out, outputs handed to the FIB and peer threads |
 | `update_total` | one UPDATE from the start of its decode on the peer thread to the RIB thread finishing it, the wait in the RIB queue included |
@@ -303,7 +305,7 @@ of microseconds.
 | `as_paths` | distinct `AS_PATH`s among the sets |
 | `as_path_bytes`, `as_path_bytes_if_interned` | `AS_PATH` heap octets as stored (one copy per set) and if each distinct path were stored once: their difference is what interning paths separately would save |
 | `candidate_bytes` | heap octets of the per-destination route vectors: only destinations with routes from two or more peers have one (a single route is held inline) |
-| `adj_rib_out`, `adj_rib_out_bytes` | Adj-RIB-Out entries and an estimate of their octets: a copy of the exported table per peer |
+| `adj_rib_out` | Adj-RIB-Out entries, all peers. They are counted, not stored: what a peer was told follows from the Loc-RIB and export |
 | `walk_ms` | how long the walk took (the RIB thread is busy meanwhile) |
 
 ### Structure sizes
@@ -314,7 +316,8 @@ of microseconds.
 
 prints `size_of` for the structures a route is made of (`Prefix` 18,
 `Destination` 24 with its first route inline, `Route` 16 for each further
-one, `PathAttrs` 184, a FIB route 26 octets on x86-64), and for the
+one, `PathAttrs` 144, an installed IPv4 route in the FIB 9 octets on
+x86-64), and for the
 messages and the per-peer state.
 
 ## External profilers
@@ -363,10 +366,11 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   interner leaves no duplicates. `as_path_bytes` against
   `as_path_bytes_if_interned` says whether interning `AS_PATH`s on their
   own would pay off.
-- **Per-peer RIB copies.** Every peer that is sent routes has an
-  Adj-RIB-Out map of the exported table (`adj_rib_out`,
-  `adj_rib_out_bytes`). With one load generator nothing is exported; add a
-  second session to see it grow.
+- **Per-peer cost.** A peer that is sent routes costs no table of its
+  own: its Adj-RIB-Out is what export makes of the Loc-RIB (`adj_rib_out`
+  counts it), and the session rewrite is applied when encoding
+  (`adj_rib_out_build`), so `interned` does not grow with the peers
+  either. What a second session adds is its queues: add one to see.
 - **Live bytes after `withdraw-all` or `flap`** (`residual_bytes`): an
   attribute set goes with its last route, so `interned` drops to zero
   with the routes and what stays is the maps' own capacity, under a
@@ -379,36 +383,45 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   `rib_update` is most of `load_us`, and the queue wait
   (`update_total` minus `rib_update`) is long. Its time per route grows
   with the table, because each B-tree lookup misses the cache more. In
-  install mode the FIB thread is: one netlink request and acknowledgement
-  per route, most of it in the kernel.
+  install mode the FIB thread is: netlink requests go to the kernel 256
+  to a message with one acknowledgement, and most of the time is the
+  kernel's.
 
 ## Baseline
 
 From this branch, in a 4-CPU cloud container (figures move with the host;
 see above). Synthetic table: 1 000 000 prefixes, 50 000 attribute sets,
-seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs. The second
-column is the same measurement where the profiling tools were added
-(24ae7d9), on the same host.
+seed 1, IPv4, 4096-octet UPDATEs, spans on, medians of 5 runs. The first
+two columns were measured interleaved, one run of each at a time, on the
+same host; 52f8429 is the end of the first round of memory work. The third
+is where the profiling tools were added (24ae7d9), measured earlier on a
+host that ran about 9 % faster (52f8429 loaded in 1.64 s there).
 
-| | now | 24ae7d9 |
-|---|---|---|
-| table load | 1.64 s (1.58–1.74), 30 500 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
-| of which on the RIB thread (`rib_update`) | 1.27 s; inserts and the decision process 0.70 s | 2.9 s |
-| decode on the peer thread (`msg_parse_update`) | 0.15 s, in parallel | 0.22 s |
-| bytes per prefix | 121 | 341 |
-| peak live / peak RSS | 121.7 MB / 130.3 MB | 341.7 MB / 360.4 MB |
-| allocations during the load | 1.02 M | 7.7 M |
-| spans off | 1.51 s | 3.02 s |
-| `withdraw-all`: peak live, residual | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
-| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.42–0.49 s, 0.98 MB, 133 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
+| | now | 52f8429 | 24ae7d9 |
+|---|---|---|---|
+| table load | 1.77 s (1.64–1.90), 28 300 UPDATEs/s | 1.79 s (1.75–1.88), 27 900 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
+| of which on the RIB thread (`rib_update`) | 1.37 s; inserts and the decision process 0.73 s | 1.43 s; 0.83 s | 2.9 s |
+| decode on the peer thread (`msg_parse_update`) | 0.15 s, in parallel | 0.17 s | 0.22 s |
+| bytes per prefix | 57 | 121 | 341 |
+| peak live / peak RSS | 57.4 MB / 66.2 MB | 121.7 MB / 130.4 MB | 341.7 MB / 360.4 MB |
+| allocations during the load | 0.78 M | 1.02 M | 7.7 M |
+| spans off | 1.64 s | 1.63 s | 3.02 s |
+| `withdraw-all`: peak live, residual | 89.3 MB, 0.20 MB | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
+| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.47–0.56 s, 0.42 MB, 68–71 MB | 0.45–0.56 s, 0.98 MB, 133–138 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
+
+With one peer the load time is the same; the time saved is in sending
+routes to other peers, which a single peer does not exercise (see "Two
+peers" below and the micro-benchmarks).
 
 A real table, RouteViews `route-views.sg` 2026-10-01 00:00, peer 39
 (AS23673): 1 114 715 routes over 159 391 attribute sets and 137 311
-`AS_PATH`s; load 2.44 s, 161 octets per prefix, 180 MB peak live, 195 MB
-RSS (at 24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
+`AS_PATH`s, interleaved as above: load 2.05 s (1.93–2.30), RIB thread
+1.71 s, 84 octets per prefix, 95.2 MB peak live, 110.3 MB RSS; at
+52f8429 2.71 s (2.31–3.03), 2.22 s, 161 octets, 180.5 MB, 195.4 MB (at
+24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
 
 A profiling build is slower than the default build. Measured from outside
-on the same host, interleaved, from starting the load generator until the
+at 52f8429, interleaved, from starting the load generator until the
 daemon reports every route received (session setup included, so not
 comparable with `load_us`): 1.87 s in the default build, 1.99 s in the
 profiling build with spans off and 2.06 s with spans on. Compare
@@ -418,13 +431,26 @@ against 3.38 s and 360 MB.
 
 Install mode, 1M routes into the kernel of a network namespace of their
 own (a veth pair, one end 192.0.2.10/24, so the load generator's next
-hops resolve), default build, three runs each, timed until the FIB
-thread goes idle with every route in the kernel: 5.2–5.6 s and 131 MB
-RSS, against 9.4–9.6 s and 416 MB at 24ae7d9, which held the desired and
-the installed routes as two tables. The FIB thread bounds it: 4.7 s of
-CPU (8.7 s at 24ae7d9), two thirds of it in the kernel, for one netlink
-request and acknowledgement per route. Listing the kernel table while it
-fills (`ip route | wc -l`) slows the inserts; count it once, at the end.
+hops resolve), default build, three runs each, interleaved, timed until
+every route is in the kernel: 4.4–4.6 s and 86.5 MB RSS, against
+6.1–6.6 s and 130.6 MB at 52f8429 on the same host (9.4–9.6 s and 416 MB
+at 24ae7d9, which held the desired and the installed routes as two
+tables, on the faster host). The FIB thread bounds it: 3.1–3.3 s of CPU
+(4.6–5.1 s at 52f8429), two thirds of it in the kernel, now that
+requests go 256 to a netlink message with one acknowledgement. Listing
+the kernel table while it fills (`ip route | wc -l`) slows the inserts;
+count it once, at the end.
+
+Two peers, one relaying its full table to the other, in a network
+namespace, release build: the synthetic million peaks at 69 MB RSS and the
+RouteViews table at 117 MB, about what one peer needs, since a peer's
+Adj-RIB-Out is no longer stored (measured before `AS_PATH`s were packed,
+which saves as much here as with one peer: no peer holds sets of its
+own). Before this branch the peer loading the
+table was reset (Cease, Out of Resources) about 39 000 UPDATEs in, every
+time: the RIB's UPDATEs to it went through its input queue, full of its
+own. With that fixed and the Adj-RIB-Out still a hash map per peer, the
+synthetic million peaked at 201 MB.
 
 ## Caveats
 

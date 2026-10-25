@@ -249,6 +249,24 @@ impl Response {
     /// # Errors
     /// The write failure.
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
+        self.write_head(w, Some(self.body.len()))?;
+        w.write_all(self.body.as_bytes())?;
+        w.flush()
+    }
+
+    /// Write the status line and fields of a response whose body the
+    /// caller writes after, as it is produced (a full routing table), and
+    /// ends by closing the connection: without `Content-Length`, the body
+    /// is what comes before the close (RFC 9112 §6.3, item 8). `body` is
+    /// not sent.
+    ///
+    /// # Errors
+    /// The write failure.
+    pub fn write_head_until_close(&self, w: &mut impl Write) -> io::Result<()> {
+        self.write_head(w, None)
+    }
+
+    fn write_head(&self, w: &mut impl Write, length: Option<usize>) -> io::Result<()> {
         let reason = match self.status {
             200 => "OK",
             400 => "Bad Request",
@@ -271,14 +289,14 @@ impl Response {
                 "application/json"
             }
         )?;
-        write!(w, "Content-Length: {}\r\n", self.body.len())?;
+        if let Some(n) = length {
+            write!(w, "Content-Length: {n}\r\n")?;
+        }
         w.write_all(b"Connection: close\r\nCache-Control: no-store\r\n")?;
         for (k, v) in &self.extra {
             write!(w, "{k}: {v}\r\n")?;
         }
-        w.write_all(b"\r\n")?;
-        w.write_all(self.body.as_bytes())?;
-        w.flush()
+        w.write_all(b"\r\n")
     }
 }
 
@@ -373,5 +391,15 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(text.contains("WWW-Authenticate: Bearer\r\n"));
         assert!(text.ends_with(r#"{"error":"token"}"#));
+        // A body written after the head runs until the connection closes.
+        let mut out = Vec::new();
+        Response::json(200, String::new())
+            .write_head_until_close(&mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(!text.contains("Content-Length"), "{text}");
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
     }
 }

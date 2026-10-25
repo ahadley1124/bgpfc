@@ -1,17 +1,25 @@
 //! Property: applying the plan to the installed table yields the desired
-//! table, for any pair of tables (AGENTS.md §5, `bgpfc-fib` row).
+//! table, for any pair of tables, and the merge the FIB runs against the
+//! RIB's routes plans the same (AGENTS.md §5, `bgpfc-fib` row).
 #![cfg(not(miri))]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use bgpfc_fib::reconcile::{Routes, Table, apply, plan};
+use bgpfc_fib::reconcile::{Merge, Op, Routes, Table, apply, plan};
 use bgpfc_wire::prefix::Prefix;
 use proptest::prelude::*;
 
 fn table() -> impl Strategy<Value = Table> {
+    // Both families: IPv4 and IPv6 routes are kept apart and must come out
+    // in one prefix order.
     proptest::collection::btree_map(
-        (0u8..8, 0u8..3).prop_map(|(i, len)| {
-            Prefix::new(IpAddr::V4(Ipv4Addr::new(10, i, 0, 0)), 16 + len).unwrap()
+        (0u8..8, 0u8..3, any::<bool>()).prop_map(|(i, len, v6)| {
+            if v6 {
+                let addr = Ipv6Addr::new(0x2001, 0xdb8, u16::from(i), 0, 0, 0, 0, 0);
+                Prefix::new(IpAddr::V6(addr), 48 + len).unwrap()
+            } else {
+                Prefix::new(IpAddr::V4(Ipv4Addr::new(10, i, 0, 0)), 16 + len).unwrap()
+            }
         }),
         (1u8..4).prop_map(|g| IpAddr::V4(Ipv4Addr::new(192, 0, 2, g))),
         0..10,
@@ -34,38 +42,49 @@ proptest! {
         prop_assert_eq!(plan(&desired, &now), vec![]);
     }
 
-    /// The one-map store plans exactly what the two tables do, ends at the
-    /// same place, and gives back no gateway once nothing uses it.
+    /// Merging the desired table, cut in any places, against what is
+    /// installed gives the operations `plan` gives (in prefix order rather
+    /// than sets first), reaches the desired table, and gives back every
+    /// gateway once nothing uses it.
     #[test]
-    fn routes_plan_like_the_tables(desired in table(), installed in table(), later in table()) {
+    fn merge_plans_like_the_tables(
+        desired in table(),
+        installed in table(),
+        mut cuts in proptest::collection::vec(0usize..12, 0..4),
+    ) {
         let mut r = Routes::new();
         r.set_installed(&installed);
-        for (p, g) in &desired {
-            r.set_desired(*p, Some(*g));
-        }
-        prop_assert_eq!(r.desired_table(), desired.clone());
         prop_assert_eq!(r.installed_table(), installed.clone());
-        let ops = r.plan();
-        prop_assert_eq!(&ops, &plan(&desired, &installed));
+        let want: Vec<(Prefix, IpAddr)> = desired.iter().map(|(p, g)| (*p, *g)).collect();
+        cuts.sort_unstable();
+        let mut merge = Merge::default();
+        let mut ops = Vec::new();
+        let mut at = 0;
+        for cut in cuts {
+            let cut = cut.clamp(at, want.len());
+            r.merge(&mut merge, &want[at..cut], &mut ops);
+            at = cut;
+        }
+        r.merge(&mut merge, &want[at..], &mut ops);
+        r.merge_end(merge, &mut ops);
+        let mut expected = plan(&desired, &installed);
+        expected.sort_by_key(prefix);
+        prop_assert!(ops.is_sorted_by_key(prefix));
+        prop_assert_eq!(&ops, &expected);
         for op in &ops {
             r.apply(op);
         }
-        prop_assert_eq!(r.installed_table(), desired.clone());
-        // Move to another desired table, then to none.
-        for p in desired.keys() {
-            if !later.contains_key(p) {
-                r.set_desired(*p, None);
-            }
-        }
-        for (p, g) in &later {
-            r.set_desired(*p, Some(*g));
-        }
-        prop_assert_eq!(&r.plan(), &plan(&later, &desired));
-        r.clear_desired();
-        for op in r.plan() {
+        prop_assert_eq!(r.installed_table(), desired);
+        for op in r.delete_all() {
             r.apply(&op);
         }
         prop_assert_eq!(r.gateways(), 0);
-        prop_assert!(r.installed_table().is_empty());
+        prop_assert!(r.is_empty());
+    }
+}
+
+fn prefix(op: &Op) -> Prefix {
+    match op {
+        Op::Set { prefix, .. } | Op::Delete { prefix, .. } => *prefix,
     }
 }

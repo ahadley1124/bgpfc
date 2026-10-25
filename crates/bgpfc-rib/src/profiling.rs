@@ -2,14 +2,13 @@
 //! sizes, how much the attributes repeat, and the size of the structures a
 //! route is made of.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment};
+use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::mp::NextHop;
-use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::Asn;
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 
 use crate::attrs::PathAttrs;
 use crate::peer::PeerInfo;
@@ -33,7 +32,7 @@ impl Rib {
     #[must_use]
     pub fn sizes(&self) -> Sizes {
         Sizes {
-            destinations: self.tables.values().map(BTreeMap::len).sum(),
+            destinations: self.tables.values().map(crate::store::Table::len).sum(),
             adj_rib_in: self
                 .s
                 .peers
@@ -46,8 +45,7 @@ impl Rib {
                 .peers
                 .iter()
                 .flatten()
-                .flat_map(|p| p.adj_out.values())
-                .map(HashMap::len)
+                .flat_map(|p| p.advertised.values())
                 .sum(),
         }
     }
@@ -73,7 +71,7 @@ impl Rib {
                     if by_ptr.insert(Arc::as_ptr(&c.attrs).addr()) {
                         by_value.insert(&c.attrs);
                         paths.insert(&c.attrs.as_path);
-                        d.as_path_bytes += as_path_heap_bytes(&c.attrs.as_path);
+                        d.as_path_bytes += c.attrs.as_path.heap_size();
                     }
                 }
             }
@@ -81,14 +79,14 @@ impl Rib {
         d.attr_sets = by_ptr.len();
         d.attr_values = by_value.len();
         d.as_paths = paths.len();
-        d.as_path_bytes_if_interned = paths.iter().map(|p| as_path_heap_bytes(p)).sum();
-        for p in self.s.peers.iter().flatten() {
-            for out in p.adj_out.values() {
-                d.adj_rib_out += out.len();
-                // hashbrown: one entry and one control octet per bucket.
-                d.adj_rib_out_bytes += out.capacity() * (size_of::<(Prefix, Arc<PathAttrs>)>() + 1);
-            }
-        }
+        d.as_path_bytes_if_interned = paths.iter().map(|p| p.heap_size()).sum();
+        d.adj_rib_out = self
+            .s
+            .peers
+            .iter()
+            .flatten()
+            .flat_map(|p| p.advertised.values())
+            .sum();
         d
     }
 }
@@ -119,19 +117,9 @@ pub struct Duplication {
     /// Heap octets of the per-destination route vectors: destinations
     /// with routes from two or more peers (one route is held inline).
     pub candidate_bytes: usize,
-    /// Routes in all Adj-RIBs-Out: a copy of the exported table per peer.
+    /// Routes in all Adj-RIBs-Out, which are counted, not stored: each
+    /// follows from the Loc-RIB and export.
     pub adj_rib_out: usize,
-    /// Estimated heap octets of the Adj-RIB-Out maps.
-    pub adj_rib_out_bytes: usize,
-}
-
-/// Heap octets owned by `p`: its segment vector and their ASN vectors.
-fn as_path_heap_bytes(p: &AsPath) -> usize {
-    p.segments.capacity() * size_of::<AsPathSegment>()
-        + p.segments
-            .iter()
-            .map(|s| s.asns.capacity() * size_of::<Asn>())
-            .sum::<usize>()
 }
 
 /// `size_of` of the structures a route is made of, by name.
@@ -139,9 +127,15 @@ fn as_path_heap_bytes(p: &AsPath) -> usize {
 pub fn type_sizes() -> Vec<(&'static str, usize)> {
     vec![
         ("Prefix", size_of::<Prefix>()),
+        // A B-tree node keeps keys and values in separate arrays, so an
+        // entry costs the two sizes added, without padding between.
         (
-            "(Prefix, Destination) [Loc-RIB entry]",
-            size_of::<(Prefix, Destination)>(),
+            "Ipv4Key + Destination [IPv4 Loc-RIB entry]",
+            size_of::<Ipv4Key>() + size_of::<Destination>(),
+        ),
+        (
+            "Prefix + Destination [IPv6 Loc-RIB entry]",
+            size_of::<Prefix>() + size_of::<Destination>(),
         ),
         ("Destination", size_of::<Destination>()),
         ("Route [Adj-RIB-In route]", size_of::<Route>()),
@@ -151,12 +145,7 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
             size_of::<PathAttrs>() + 2 * size_of::<usize>(),
         ),
         ("AsPath", size_of::<AsPath>()),
-        ("AsPathSegment", size_of::<AsPathSegment>()),
         ("NextHop", size_of::<NextHop>()),
-        (
-            "(Prefix, Arc<PathAttrs>) [Adj-RIB-Out entry]",
-            size_of::<(Prefix, Arc<PathAttrs>)>(),
-        ),
         ("PeerInfo", size_of::<PeerInfo>()),
         ("PeerState", size_of::<PeerState>()),
         ("Rib", size_of::<Rib>()),
@@ -168,7 +157,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use bgpfc_wire::attribute::{Origin, PathAttribute};
-    use bgpfc_wire::types::{AddressFamily, RouterId};
+    use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
     use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 
     use super::*;
@@ -250,7 +239,6 @@ mod tests {
         // A has the lower BGP Identifier and wins all three destinations
         // (RFC 4271 §9.1.2.2 f), so only B is sent routes.
         assert_eq!(d.adj_rib_out, 3);
-        assert!(d.adj_rib_out_bytes > 0);
 
         let sizes = rib.sizes();
         assert_eq!(sizes.destinations, 3);

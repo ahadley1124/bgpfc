@@ -211,19 +211,34 @@ fn rib_work(filter: Option<&str>) -> Vec<DecodedUpdate> {
         }
         (t.elapsed(), routes)
     });
+    let second = || PeerInfo {
+        addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        remote_as: Asn(65_002),
+        router_id: RouterId::from(Ipv4Addr::new(10, 0, 0, 2)),
+        ..peer()
+    };
+    // With a second peer up, each route is also exported to it as it
+    // arrives (RFC 4271 §9.2) and recorded in its Adj-RIB-Out.
+    bench(filter, "rib_insert_two_peers_per_route_100k", || {
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        rib.peer_up(peer(), &mut out);
+        rib.peer_up(second(), &mut out);
+        let t = Instant::now();
+        for u in &adds {
+            rib.update(from, u, &mut out);
+            black_box(&out);
+            out.clear();
+        }
+        (t.elapsed(), routes)
+    });
     // A second peer coming up is sent the whole Loc-RIB (RFC 4271 §9.2):
     // export and UPDATE packing for every route.
     bench(filter, "rib_peer_up_send_per_route_100k", || {
         let mut rib = loaded(&adds);
         let mut out = Vec::new();
-        let second = PeerInfo {
-            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            remote_as: Asn(65_002),
-            router_id: RouterId::from(Ipv4Addr::new(10, 0, 0, 2)),
-            ..peer()
-        };
         let t = Instant::now();
-        rib.peer_up(second, &mut out);
+        rib.peer_up(second(), &mut out);
         black_box(&out);
         (t.elapsed(), routes)
     });

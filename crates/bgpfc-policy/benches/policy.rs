@@ -36,10 +36,10 @@ fn attrs() -> PathAttrs {
         local_pref: None,
         atomic_aggregate: false,
         aggregator: None,
-        communities: vec![Community::new(3356, 3), Community::new(3356, 22)],
-        ext_communities: Vec::new(),
-        large_communities: Vec::new(),
-        unknown: Vec::new(),
+        communities: vec![Community::new(3356, 3), Community::new(3356, 22)].into(),
+        ext_communities: Box::default(),
+        large_communities: Box::default(),
+        unknown: Box::default(),
     }
 }
 

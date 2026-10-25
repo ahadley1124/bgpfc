@@ -29,10 +29,10 @@ fn attrs(path: &[u32]) -> PathAttrs {
         local_pref: None,
         atomic_aggregate: false,
         aggregator: None,
-        communities: vec![Community::new(65_001, 1)],
-        ext_communities: Vec::new(),
-        large_communities: Vec::new(),
-        unknown: Vec::new(),
+        communities: vec![Community::new(65_001, 1)].into(),
+        ext_communities: Box::default(),
+        large_communities: Box::default(),
+        unknown: Box::default(),
     }
 }
 
@@ -126,15 +126,17 @@ fn every_match_clause_kind() {
         global: 1,
         local1: 2,
         local2: 3,
-    }];
+    }]
+    .into();
     assert_eq!(
         s.evaluate("P", &route("203.0.113.0/24", &a)),
         Verdict::Accept
     );
-    a.large_communities.clear();
+    a.large_communities = Box::default();
     a.ext_communities = vec![bgpfc_wire::community::ExtendedCommunity::two_octet_as(
         2, true, 1, 1,
-    )];
+    )]
+    .into();
     assert_eq!(
         s.evaluate("P", &route("203.0.113.0/24", &a)),
         Verdict::Accept
@@ -161,8 +163,8 @@ fn set_actions_modify_a_copy() {
     assert_eq!(m.local_pref, Some(200));
     assert_eq!(m.med, Some(10));
     assert_eq!(
-        m.communities,
-        vec![Community::new(65_000, 5), Community::NO_EXPORT]
+        *m.communities,
+        [Community::new(65_000, 5), Community::NO_EXPORT]
     );
     assert_eq!(m.large_communities.len(), 1);
     assert_eq!(

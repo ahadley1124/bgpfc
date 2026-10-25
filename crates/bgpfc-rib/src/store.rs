@@ -3,9 +3,12 @@
 //! octets in its table, with its first route inline and no allocation of
 //! its own until a second peer sends a route to it.
 
+use std::collections::BTreeMap;
 use std::mem;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::AddressFamily;
 
 use crate::attrs::PathAttrs;
@@ -141,6 +144,103 @@ impl Default for Destination {
     }
 }
 
+/// One family's values by prefix, in prefix order. IPv4 prefixes are
+/// keyed by a 5-octet [`Ipv4Key`] rather than an 18-octet [`Prefix`]: a
+/// full table is mostly B-tree nodes, eleven keys each. A family has one
+/// kind of prefix, so one of the two maps stays empty, which costs
+/// nothing.
+#[derive(Debug)]
+pub(crate) struct PrefixMap<V> {
+    pub(crate) v4: BTreeMap<Ipv4Key, V>,
+    pub(crate) v6: BTreeMap<Prefix, V>,
+}
+
+/// One family's destinations.
+pub(crate) type Table = PrefixMap<Destination>;
+
+impl<V> Default for PrefixMap<V> {
+    fn default() -> Self {
+        PrefixMap {
+            v4: BTreeMap::new(),
+            v6: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> PrefixMap<V> {
+    #[cfg(any(test, feature = "profiling"))]
+    pub(crate) fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
+    pub(crate) fn get(&self, prefix: Prefix) -> Option<&V> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.get(&k),
+            None => self.v6.get(&prefix),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, prefix: Prefix, value: V) -> Option<V> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.insert(k, value),
+            None => self.v6.insert(prefix, value),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, prefix: Prefix) -> Option<V> {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.remove(&k),
+            None => self.v6.remove(&prefix),
+        }
+    }
+
+    /// Every entry, in prefix order (IPv4 sorts first).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Prefix, &V)> {
+        self.after(None)
+    }
+
+    /// The entries after `from` (all of them for `None`), in prefix order.
+    pub(crate) fn after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, &V)> {
+        let (v4, v6) = match from {
+            None => (Some(self.v4.range(..)), self.v6.range(..)),
+            Some(p) => match Ipv4Key::new(p) {
+                Some(k) => (
+                    Some(self.v4.range((Excluded(k), Unbounded))),
+                    self.v6.range(..),
+                ),
+                None => (None, self.v6.range((Excluded(p), Unbounded))),
+            },
+        };
+        v4.into_iter()
+            .flatten()
+            .map(|(k, v)| (k.prefix(), v))
+            .chain(v6.map(|(p, v)| (*p, v)))
+    }
+
+    #[cfg(feature = "profiling")]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.v4.values().chain(self.v6.values())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_values(self) -> impl Iterator<Item = V> {
+        self.v4.into_values().chain(self.v6.into_values())
+    }
+
+    /// Keep the entries `keep` says to, in prefix order.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prefix, &mut V) -> bool) {
+        self.v4.retain(|k, v| keep(k.prefix(), v));
+        self.v6.retain(|p, v| keep(*p, v));
+    }
+}
+
 /// Values per address family. A session has one or two families, so a
 /// short list searched in order costs less on every route than hashing.
 #[derive(Debug)]
@@ -171,6 +271,7 @@ impl<T> FamilyMap<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, family: AddressFamily) -> Option<T> {
         let i = self.0.iter().position(|(f, _)| *f == family)?;
         Some(self.0.swap_remove(i).1)
@@ -188,12 +289,6 @@ impl<T> FamilyMap<T> {
     #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.0.iter().map(|(_, v)| v)
-    }
-}
-
-impl<T> FamilyMap<T> {
-    pub(crate) fn into_values(self) -> impl Iterator<Item = T> {
-        self.0.into_iter().map(|(_, v)| v)
     }
 }
 
@@ -229,10 +324,10 @@ mod tests {
                 local_pref: None,
                 atomic_aggregate: false,
                 aggregator: None,
-                communities: Vec::new(),
-                ext_communities: Vec::new(),
-                large_communities: Vec::new(),
-                unknown: Vec::new(),
+                communities: Box::default(),
+                ext_communities: Box::default(),
+                large_communities: Box::default(),
+                unknown: Box::default(),
             }),
             peer: PeerId(peer),
         }
@@ -288,6 +383,42 @@ mod tests {
         assert!(!a.same(&b));
         // Equal attributes in another allocation are a different set.
         assert!(!a.same(&route(1)));
+    }
+
+    #[test]
+    fn prefix_map_holds_both_kinds_in_prefix_order() {
+        let p = |s: &str| s.parse::<Prefix>().unwrap();
+        let mut m: PrefixMap<u32> = PrefixMap::default();
+        assert!(m.is_empty());
+        assert_eq!(m.insert(p("2001:db8::/32"), 1), None);
+        assert_eq!(m.insert(p("192.0.2.0/24"), 2), None);
+        assert_eq!(m.insert(p("10.0.0.0/8"), 3), None);
+        assert_eq!(m.insert(p("10.0.0.0/8"), 4), Some(3));
+        assert_eq!(m.insert(p("10.0.0.0/16"), 5), None);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.get(p("192.0.2.0/24")), Some(&2));
+        assert_eq!(m.get(p("192.0.2.0/25")), None);
+        let order: Vec<String> = m.iter().map(|(p, _)| p.to_string()).collect();
+        assert_eq!(
+            order,
+            ["10.0.0.0/8", "10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]
+        );
+        let after = |from: &str| -> Vec<String> {
+            m.after(Some(p(from))).map(|(p, _)| p.to_string()).collect()
+        };
+        assert_eq!(
+            after("10.0.0.0/8"),
+            ["10.0.0.0/16", "192.0.2.0/24", "2001:db8::/32"]
+        );
+        assert_eq!(after("192.0.2.0/24"), ["2001:db8::/32"]);
+        assert_eq!(after("::/0"), ["2001:db8::/32"]);
+        assert_eq!(after("2001:db8::/32"), Vec::<String>::new());
+        assert_eq!(m.remove(p("2001:db8::/32")), Some(1));
+        m.retain(|p, v| {
+            *v += 1;
+            p.prefix_len() <= 16
+        });
+        assert_eq!(m.into_values().collect::<Vec<_>>(), vec![5, 6]);
     }
 
     #[test]

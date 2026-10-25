@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a09a68dd6530a34712745ad8cd25b99b0b9ef8d1ace2afc40beed5b59a70f7d0 # shrinks to a = PathAttrs { origin: Igp, as_path: AsPath { segments: [] }, next_hop: Ipv4(192.0.2.1), med: None, local_pref: None, atomic_aggregate: false, aggregator: None, communities: [0:1], ext_communities: [], large_communities: [], unknown: [] }, other = PathAttrs { origin: Igp, as_path: AsPath { segments: [] }, next_hop: Ipv4(192.0.2.1), med: Some(0), local_pref: None, atomic_aggregate: false, aggregator: None, communities: [0:1], ext_communities: [], large_communities: [], unknown: [] }, mask = 11576, to = PeerInfo { addr: 10.0.0.2, local_addr: 10.0.0.254, remote_as: Asn(65000), router_id: RouterId(2), kind: Internal, families: [AddressFamily { afi: Ipv4, safi: Unicast }, AddressFamily { afi: Ipv6, safi: Unicast }], four_octet_as: true, extended_messages: false }, v6 = false
