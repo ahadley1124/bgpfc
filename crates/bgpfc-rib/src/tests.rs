@@ -24,6 +24,7 @@ use crate::{FibChange, Output, Rib};
 mod add_path;
 mod adj_rib_in;
 mod roles;
+mod roles_add_path;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
