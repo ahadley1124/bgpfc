@@ -25,26 +25,30 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 20 are `done`, 5 `partial`,
-21 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 20 are `done`, 6 `partial`,
+20 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2545, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 8092, 8212, 8654, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
-- RFC 4271: the MinRouteAdvertisementIntervalTimer (§9.2.1.1, MUST) is
-  the last MUST row still `todo`. Also open: semantic `NEXT_HOP` checks
-  (§6.3, SHOULD) and a per-neighbor prefix limit (§6.7, MAY).
-- RFC 8950: the Extended Next Hop Encoding capability (§4, MUST).
+- RFC 4271: §6.3 a) is the one MUST row still `partial`: a received
+  `NEXT_HOP` is compared with our address on the session only, as bgpfc
+  tracks no interfaces. Four rows deviate (§6.3 b, §8.2.2, §9.1.2,
+  §9.2.1.1); its row below says how.
+- RFC 2545: bgpfc never sends a link-local next hop (§3, MUST), as it
+  cannot tell when it shares a subnet with the next hop and the peer.
+- RFC 6811: every route carries its validation state, from VRPs fetched
+  over RTR (§2, §4). Missing: a policy match on the state (§3, MUST) and
+  acting on it, AGENTS.md §9 step 13.
 - RFC 6286: §2.2 (our own identifier from an internal peer is Bad BGP
   Identifier) and §2.3 (equal identifiers in a collision: the larger AS
   keeps its connection).
-- RFC 7454 (BCP 194): maximum-prefix limits and GTSM.
+- RFC 7454 (BCP 194): GTSM (RFC 5082).
 - RFC 8326: an option to tag our announcements with `GRACEFUL_SHUTDOWN`.
 
 **Smaller items found in the review:**
 
-- RFC 4486 §4 (SHOULD): bound automatic restarts after damped failures.
 - RFC 8642 §6 (MUST): document in [`docs/config.md`](config.md) that
   `set community replace` also drops well-known communities.
 - [`docs/config.md`](config.md) cites RFC 6793 for "asplain"; the term
@@ -52,11 +56,13 @@ Of the 154 RFCs below, 20 are `done`, 5 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 6811, 7313, 7432, 7705, 7911, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7911, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
 
-Not in the list but used by bgpfc: RFC 6396 (MRT, read by
-`bgpfc-bench`), and for the control plane RFC 8259 (JSON), RFC 9112
-(HTTP/1.1) and RFC 6750 (bearer tokens).
+Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
+`bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
+COMPLIANCE.md beside RFC 6811), RFC 6396 (MRT, read by `bgpfc-bench`),
+and for the control plane RFC 8259 (JSON), RFC 9112 (HTTP/1.1) and
+RFC 6750 (bearer tokens).
 
 ## Core protocol and history
 
@@ -69,7 +75,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [1267](https://datatracker.ietf.org/doc/html/rfc1267) | Border Gateway Protocol 3 (BGP-3) | Historic | `n/a` |  |
 | [1654](https://datatracker.ietf.org/doc/html/rfc1654) | A Border Gateway Protocol 4 (BGP-4) | PS; obsoleted by 1771 | `n/a` |  |
 | [1771](https://datatracker.ietf.org/doc/html/rfc1771) | A Border Gateway Protocol 4 (BGP-4) | DS; obsoleted by 4271 | `n/a` |  |
-| [4271](https://datatracker.ietf.org/doc/html/rfc4271) | A Border Gateway Protocol 4 (BGP-4) | DS; updated by 4724, 6286, 6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774 | `partial` | Open in [COMPLIANCE.md](../COMPLIANCE.md): MinRouteAdvertisementInterval (§9.2.1.1, MUST, todo); `NEXT_HOP` semantic checks (§6.3, SHOULD, todo); prefix limit (§6.7, MAY, todo). Deviates: every next hop counts as resolvable, as there is no IGP (§9.1.2); a NOTIFICATION in OpenSent goes to Idle as in BIRD and FRR (§8.2.2). |
+| [4271](https://datatracker.ietf.org/doc/html/rfc4271) | A Border Gateway Protocol 4 (BGP-4) | DS; updated by 4724, 6286, 6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774 | `partial` | Open in [COMPLIANCE.md](../COMPLIANCE.md): a received `NEXT_HOP` is checked against our own address on the session, not every address of the host (§6.3 a, MUST, partial). Deviates, as bgpfc tracks no interfaces: next-hop resolvability (§9.1.2) and the one-hop EBGP shared-subnet check (§6.3 b) are left to the kernel, whose verdict is logged. Deviates by choice: a NOTIFICATION in OpenSent goes to Idle as in BIRD and FRR (§8.2.2); the MinRouteAdvertisementInterval paces announcements but never holds back a withdrawal (§9.2.1.1, issue #66). |
 | [1164](https://datatracker.ietf.org/doc/html/rfc1164) | Application of the Border Gateway Protocol in the Internet | Historic; obsoleted by 1268 | `n/a` |  |
 | [1268](https://datatracker.ietf.org/doc/html/rfc1268) | Application of the Border Gateway Protocol in the Internet | Historic; obsoleted by 1655 | `n/a` |  |
 | [1655](https://datatracker.ietf.org/doc/html/rfc1655) | Application of the Border Gateway Protocol in the Internet | PS; obsoleted by 1772 | `n/a` |  |
@@ -102,7 +108,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [8810](https://datatracker.ietf.org/doc/html/rfc8810) | Revision to Capability Codes Registration Procedures | PS | `n/a` | IANA procedure. |
 | [2918](https://datatracker.ietf.org/doc/html/rfc2918) | Route Refresh Capability for BGP-4 | PS; updated by 7313 | `done` |  |
 | [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `later` | RESOURCES.md, "Later: features". |
-| [4486](https://datatracker.ietf.org/doc/html/rfc4486) | Subcodes for BGP Cease Notification Message | PS; updated by 8203, 9003 | `done` | One SHOULD is partial: after a damped failure the IdleHoldTime doubles up to a cap, but automatic retries are not bounded (§4). |
+| [4486](https://datatracker.ietf.org/doc/html/rfc4486) | Subcodes for BGP Cease Notification Message | PS; updated by 8203, 9003 | `done` |  |
 | [8203](https://datatracker.ietf.org/doc/html/rfc8203) | BGP Administrative Shutdown Communication | PS; obsoleted by 9003 | `n/a` |  |
 | [9003](https://datatracker.ietf.org/doc/html/rfc9003) | Extended BGP Administrative Shutdown Communication | PS | `done` |  |
 | [9384](https://datatracker.ietf.org/doc/html/rfc9384) | A BGP Cease NOTIFICATION Subcode for Bidirectional Forwarding Detection (BFD) | PS | `no` | No BFD. A received Cease subcode 10 is logged as unrecognised. |
@@ -151,7 +157,7 @@ RFC 4360 is being replaced by rfc4360-bis, which is in the RFC Editor queue.
 | [2283](https://datatracker.ietf.org/doc/html/rfc2283) | Multiprotocol Extensions for BGP-4 | PS; obsoleted by 2858 | `n/a` |  |
 | [2858](https://datatracker.ietf.org/doc/html/rfc2858) | Multiprotocol Extensions for BGP-4 | PS; obsoleted by 4760 | `n/a` |  |
 | [4760](https://datatracker.ietf.org/doc/html/rfc4760) | Multiprotocol Extensions for BGP-4 | DS; updated by 7606 | `done` |  |
-| [2545](https://datatracker.ietf.org/doc/html/rfc2545) | Use of BGP-4 Multiprotocol Extensions for IPv6 Inter-Domain Routing | PS | `done` |  |
+| [2545](https://datatracker.ietf.org/doc/html/rfc2545) | Use of BGP-4 Multiprotocol Extensions for IPv6 Inter-Domain Routing | PS | `partial` | bgpfc tracks no interfaces, so it never sends a link-local next hop where it shares a subnet with the next hop and the peer (§3, MUST, partial). |
 | [4798](https://datatracker.ietf.org/doc/html/rfc4798) | Connecting IPv6 Islands over IPv4 MPLS Using IPv6 Provider Edge Routers (6PE) | PS | `no` | MPLS. |
 | [9012](https://datatracker.ietf.org/doc/html/rfc9012) | The BGP Tunnel Encapsulation Attribute | PS; updated by 9830 | `no` |  |
 
@@ -235,7 +241,7 @@ These come from GROW, SIDR/SIDROPS, L3VPN/BESS, IDR-adjacent work and BCPs. This
 | [9736](https://datatracker.ietf.org/doc/html/rfc9736) | The BGP Monitoring Protocol (BMP) Peer Up Message Namespace | PS | `no` |  |
 | [9972](https://datatracker.ietf.org/doc/html/rfc9972) | Advanced BGP Monitoring Protocol (BMP) Statistics Types | PS | `no` |  |
 | [6397](https://datatracker.ietf.org/doc/html/rfc6397) | Multi-Threaded Routing Toolkit (MRT) Border Gateway Protocol (BGP) Routing Information Export Format with Geo-Location Extensions | PS | `no` | `bgpfc-bench` reads RFC 6396 `TABLE_DUMP_V2` dumps for benchmarks; the daemon has no MRT export. |
-| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `later` | RPKI, AGENTS.md §9. |
+| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `partial` | Every route is validated on arrival and again when the VRPs change (§2, §4), against VRPs fetched over RTR (RFC 8210). Missing: route policy matching the validation state (§3, MUST) and dropping Invalid by default, AGENTS.md §9 step 13. |
 | [8097](https://datatracker.ietf.org/doc/html/rfc8097) | BGP Prefix Origin Validation State Extended Community | PS | `later` | RPKI. Matchable today as a hex extended community. |
 | [8481](https://datatracker.ietf.org/doc/html/rfc8481) | Clarifications to BGP Origin Validation Based on Resource Public Key Infrastructure (RPKI) | PS; updated by 9324 | `later` | RPKI, AGENTS.md §9. |
 | [8893](https://datatracker.ietf.org/doc/html/rfc8893) | Resource Public Key Infrastructure (RPKI) Origin Validation for BGP Export | PS | `later` | RPKI, AGENTS.md §9. |
@@ -244,7 +250,7 @@ These come from GROW, SIDR/SIDROPS, L3VPN/BESS, IDR-adjacent work and BCPs. This
 | [8207](https://datatracker.ietf.org/doc/html/rfc8207) | BGPsec Operational Considerations | BCP 211 | `no` |  |
 | [8208](https://datatracker.ietf.org/doc/html/rfc8208) | BGPsec Algorithms, Key Formats, and Signature Formats | PS; obsoleted by 8608 | `no` |  |
 | [8209](https://datatracker.ietf.org/doc/html/rfc8209) | A Profile for BGPsec Router Certificates, Certificate Revocation Lists, and Certification Requests | PS | `no` |  |
-| [7454](https://datatracker.ietf.org/doc/html/rfc7454) | BGP Operations and Security | BCP 194 | `partial` | Prefix and AS-path filtering are in the policy language. Missing: maximum-prefix limits (RFC 4271 §6.7), GTSM (RFC 5082) and TCP-MD5/AO (later). |
+| [7454](https://datatracker.ietf.org/doc/html/rfc7454) | BGP Operations and Security | BCP 194 | `partial` | Prefix and AS-path filtering are in the policy language, and `maximum-prefix` sets per-neighbor limits (RFC 4271 §6.7). Missing: GTSM (RFC 5082) and TCP-MD5/AO (later). |
 | [4384](https://datatracker.ietf.org/doc/html/rfc4384) | BGP Communities for Data Collection | BCP 114 | `n/a` |  |
 | [7999](https://datatracker.ietf.org/doc/html/rfc7999) | BLACKHOLE Community | Informational | `n/a` | Operator practice; `65535:666` can be matched and set in policy. |
 | [8326](https://datatracker.ietf.org/doc/html/rfc8326) | Graceful BGP Session Shutdown | PS | `partial` | Receiving works through policy (`match community 65535:0; set local-pref 0;`). There is no knob to tag our own announcements before a shutdown (§4.3, SHOULD). |
@@ -260,7 +266,7 @@ These come from GROW, SIDR/SIDROPS, L3VPN/BESS, IDR-adjacent work and BCPs. This
 | [6514](https://datatracker.ietf.org/doc/html/rfc6514) | BGP Encodings and Procedures for Multicast in MPLS/BGP IP VPNs | PS; updated by 13 RFCs | `later` | VPN families, AGENTS.md §9. |
 | [7432](https://datatracker.ietf.org/doc/html/rfc7432) | BGP MPLS-Based Ethernet VPN | PS; updated by 8584, 9161, 9572, 9573, 9746 | `later` | VPN families, AGENTS.md §9. |
 | [5549](https://datatracker.ietf.org/doc/html/rfc5549) | Advertising IPv4 Network Layer Reachability Information with an IPv6 Next Hop | PS; obsoleted by 8950 | `n/a` |  |
-| [8950](https://datatracker.ietf.org/doc/html/rfc8950) | Advertising IPv4 Network Layer Reachability Information (NLRI) with an IPv6 Next Hop | PS | `partial` | IPv4 NLRI with an IPv6 next hop is decoded (§3). Missing: the Extended Next Hop Encoding capability (§4, MUST), needed before we send one. |
+| [8950](https://datatracker.ietf.org/doc/html/rfc8950) | Advertising IPv4 Network Layer Reachability Information (NLRI) with an IPv6 Next Hop | PS | `done` | `extended-next-hop yes` advertises the capability for IPv4 unicast (§4). VPN-IPv4 with a VPN-IPv6 next hop (§3) is n/a: VPN families are out of scope. |
 | [9252](https://datatracker.ietf.org/doc/html/rfc9252) | BGP Overlay Services Based on Segment Routing over IPv6 (SRv6) | PS; updated by 9819 | `no` |  |
 
 ## Still in the pipeline
