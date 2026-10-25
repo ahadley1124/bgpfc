@@ -92,14 +92,15 @@ jobs:
 
   interop:
     # Drives BIRD, FRR and GoBGP in network namespaces and peers them with
-    # bgpfcd; needs root for the namespaces.
-    name: interop (BIRD, FRR, GoBGP)
+    # bgpfcd, which takes VRPs from StayRTR and from interop's own stub
+    # cache (rtr-stub); needs root for the namespaces.
+    name: interop (BIRD, FRR, GoBGP, StayRTR)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - run: sudo apt-get update -q && sudo apt-get install -y -q bird2 frr gobgpd iproute2 curl
-      - run: bird --version && /usr/lib/frr/bgpd --version | head -1 && gobgpd --version
+      - run: sudo apt-get update -q && sudo apt-get install -y -q bird2 frr gobgpd stayrtr iproute2 curl
+      - run: bird --version && /usr/lib/frr/bgpd --version | head -1 && gobgpd --version && stayrtr -version
       - run: cargo build -p bgpfcd -p bgpfcctl -p interop --tests
       - run: sudo -E env PATH="$PATH" "$(command -v cargo)" test -p interop -- --include-ignored --test-threads=1
       # The privilege-drop test changes the test process's own uid, so it

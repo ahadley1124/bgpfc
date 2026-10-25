@@ -306,6 +306,8 @@ of microseconds.
 | `as_path_bytes`, `as_path_bytes_if_interned` | `AS_PATH` heap octets as stored (one copy per set) and if each distinct path were stored once: their difference is what interning paths separately would save |
 | `candidate_bytes` | heap octets of the per-destination route vectors: only destinations with routes from two or more peers have one (a single route is held inline) |
 | `adj_rib_out` | Adj-RIB-Out entries, all peers. They are counted, not stored: what a peer was told follows from the Loc-RIB and export |
+| `pre_policy` | routes that keep the attributes they were received with besides those import policy made of them (policy changed or rejected them); each holds a second attribute set |
+| `pacing_bytes` | heap octets the RFC 4271 §9.2.1.1 pacing of all peers has room for: destinations held back, their wake-ups, and the advertisements and withdrawals of the last interval (about five octets an IPv4 destination advertised one at a time, kept for an interval) |
 | `walk_ms` | how long the walk took (the RIB thread is busy meanwhile) |
 
 ### Structure sizes

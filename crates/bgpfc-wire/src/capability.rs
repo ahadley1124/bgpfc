@@ -2,8 +2,9 @@
 //!
 //! Implements: RFC 5492 §4 (TLV encoding), §5 (unknown capabilities are
 //! ignored, never an error); RFC 4760 §8 (Multiprotocol Extensions, code 1);
-//! RFC 2918 §2 (Route Refresh, code 2); RFC 8654 §3 (Extended Message,
-//! code 6); RFC 6793 §3 (Four-octet AS, code 65).
+//! RFC 2918 §2 (Route Refresh, code 2); RFC 8950 §4 (Extended Next Hop
+//! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 6793 §3
+//! (Four-octet AS, code 65).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
@@ -16,6 +17,9 @@ pub enum Capability {
     Multiprotocol(AddressFamily),
     /// Route Refresh (RFC 2918 §2).
     RouteRefresh,
+    /// Extended Next Hop Encoding (RFC 8950 §4): the NLRI families the
+    /// speaker accepts with a next hop of another protocol.
+    ExtendedNextHop(Vec<NextHopEncoding>),
     /// Extended Message, 65535-octet messages (RFC 8654 §3).
     ExtendedMessage,
     /// Four-octet AS number support, carrying the speaker's ASN (RFC 6793 §3).
@@ -37,6 +41,7 @@ impl Capability {
         match self {
             Capability::Multiprotocol(_) => 1,
             Capability::RouteRefresh => 2,
+            Capability::ExtendedNextHop(_) => 5,
             Capability::ExtendedMessage => 6,
             Capability::FourOctetAs(_) => 65,
             Capability::Unknown { code, .. } => *code,
@@ -47,8 +52,9 @@ impl Capability {
     /// (RFC 5492 §4).
     ///
     /// # Errors
-    /// [`EncodeError::TooLong`] if an unknown capability's value exceeds the
-    /// one-octet Capability Length field.
+    /// [`EncodeError::TooLong`] if the value exceeds the one-octet
+    /// Capability Length field: an unknown capability's value over 255
+    /// octets, or more than 42 Extended Next Hop Encoding triples.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         out.put_u8(self.code());
         match self {
@@ -60,6 +66,22 @@ impl Capability {
                 out.put_u8(af.safi.to_u8());
             }
             Capability::RouteRefresh | Capability::ExtendedMessage => out.put_u8(0),
+            Capability::ExtendedNextHop(triples) => {
+                // RFC 8950 §4: six octets per <NLRI AFI, NLRI SAFI,
+                // Nexthop AFI> triple, each field two octets.
+                let len = triples.len() * NextHopEncoding::WIRE_LEN;
+                let len = u8::try_from(len).map_err(|_| EncodeError::TooLong {
+                    what: "extended next hop capability",
+                    len,
+                    max: usize::from(u8::MAX),
+                })?;
+                out.put_u8(len);
+                for t in triples {
+                    out.put_u16(t.nlri_afi.to_u16());
+                    out.put_u16(t.nlri_safi);
+                    out.put_u16(t.next_hop_afi.to_u16());
+                }
+            }
             Capability::FourOctetAs(asn) => {
                 out.put_u8(4);
                 out.put_u32(asn.0);
@@ -97,11 +119,26 @@ impl Capability {
             }
             // RFC 2918 §2: length 0.
             2 if len == 0 => Capability::RouteRefresh,
+            // RFC 8950 §4: whole six-octet triples.
+            // NOTE(interop): an empty value (no triples) is accepted and
+            // means nothing, as BIRD does; RFC 8950 §4 draws at least one
+            // triple but names no error for none.
+            5 if usize::from(len) % NextHopEncoding::WIRE_LEN == 0 => {
+                let mut triples = Vec::with_capacity(usize::from(len) / NextHopEncoding::WIRE_LEN);
+                while !v.is_empty() {
+                    triples.push(NextHopEncoding {
+                        nlri_afi: Afi::from_u16(v.u16().map_err(|_| malformed())?),
+                        nlri_safi: v.u16().map_err(|_| malformed())?,
+                        next_hop_afi: Afi::from_u16(v.u16().map_err(|_| malformed())?),
+                    });
+                }
+                Capability::ExtendedNextHop(triples)
+            }
             // RFC 8654 §3: length 0.
             6 if len == 0 => Capability::ExtendedMessage,
             // RFC 6793 §3: length 4, the speaker's ASN.
             65 if len == 4 => Capability::FourOctetAs(Asn(v.u32().map_err(|_| malformed())?)),
-            1 | 2 | 6 | 65 => return Err(malformed()),
+            1 | 2 | 5 | 6 | 65 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -110,6 +147,58 @@ impl Capability {
         };
         Ok(cap)
     }
+}
+
+/// One `<NLRI AFI, NLRI SAFI, Nexthop AFI>` triple of the Extended Next Hop
+/// Encoding capability (RFC 8950 §4): NLRI of that family may be advertised
+/// with a next hop of the Nexthop AFI's protocol, the protocol told apart
+/// by the next hop's length (RFC 8950 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NextHopEncoding {
+    /// NLRI AFI.
+    pub nlri_afi: Afi,
+    /// NLRI SAFI, two octets here (RFC 8950 §4) though one everywhere else
+    /// (RFC 4760 §3). Kept as received so that the capability round-trips;
+    /// a value above 255 names no family.
+    pub nlri_safi: u16,
+    /// Nexthop AFI: the protocol the next hop may belong to.
+    pub next_hop_afi: Afi,
+}
+
+impl NextHopEncoding {
+    /// `<1, 1, 2>`: IPv4 unicast NLRI with an IPv6 next hop (RFC 8950
+    /// §6.1), the one triple this implementation advertises.
+    pub const IPV4_UNICAST_VIA_IPV6: NextHopEncoding = NextHopEncoding {
+        nlri_afi: Afi::Ipv4,
+        nlri_safi: 1,
+        next_hop_afi: Afi::Ipv6,
+    };
+
+    /// Octets per triple on the wire (RFC 8950 §4).
+    const WIRE_LEN: usize = 6;
+
+    /// The NLRI `<AFI, SAFI>`, or `None` when the SAFI does not fit the
+    /// one-octet SAFI space (RFC 4760 §3).
+    #[must_use]
+    pub fn family(&self) -> Option<AddressFamily> {
+        let safi = u8::try_from(self.nlri_safi).ok()?;
+        Some(AddressFamily {
+            afi: self.nlri_afi,
+            safi: Safi::from_u8(safi),
+        })
+    }
+}
+
+/// Every triple of every Extended Next Hop Encoding capability in `caps`:
+/// RFC 5492 §4 lets a speaker send a capability more than once, and the
+/// triples of all instances count.
+pub fn next_hop_encodings(caps: &[Capability]) -> impl Iterator<Item = NextHopEncoding> + '_ {
+    caps.iter()
+        .filter_map(|c| match c {
+            Capability::ExtendedNextHop(t) => Some(t.iter().copied()),
+            _ => None,
+        })
+        .flatten()
 }
 
 /// RFC 4271 §6.2: a recognised but malformed optional parameter is reported
@@ -151,6 +240,84 @@ mod tests {
             &Capability::FourOctetAs(Asn(4_200_000_000)),
             &[65, 4, 0xfa, 0x56, 0xea, 0x00],
         );
+    }
+
+    #[test]
+    fn extended_next_hop_round_trips() {
+        // RFC 8950 §6.1: <NLRI AFI=1, NLRI SAFI=1, Nexthop AFI=2>, two
+        // octets per field.
+        round_trip(
+            &Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6]),
+            &[5, 6, 0, 1, 0, 1, 0, 2],
+        );
+        // RFC 8950 §6.2 and §6.3: VPN-IPv4 unicast and multicast as well.
+        let vpn = |safi| NextHopEncoding {
+            nlri_safi: safi,
+            ..NextHopEncoding::IPV4_UNICAST_VIA_IPV6
+        };
+        round_trip(
+            &Capability::ExtendedNextHop(vec![
+                NextHopEncoding::IPV4_UNICAST_VIA_IPV6,
+                vpn(128),
+                vpn(129),
+            ]),
+            &[
+                5, 18, 0, 1, 0, 1, 0, 2, 0, 1, 0, 128, 0, 2, 0, 1, 0, 129, 0, 2,
+            ],
+        );
+        // RFC 8950 §4 specifies no other triples. They are kept, so the
+        // capability round-trips, and match nothing.
+        let odd = NextHopEncoding {
+            nlri_afi: Afi::Unknown(25),
+            nlri_safi: 0x1234,
+            next_hop_afi: Afi::Ipv4,
+        };
+        round_trip(
+            &Capability::ExtendedNextHop(vec![odd]),
+            &[5, 6, 0, 25, 0x12, 0x34, 0, 1],
+        );
+        assert_eq!(odd.family(), None);
+        assert_eq!(
+            NextHopEncoding::IPV4_UNICAST_VIA_IPV6.family(),
+            Some(AddressFamily::IPV4_UNICAST)
+        );
+        assert_eq!(vpn(128).family().map(|f| f.safi), Some(Safi::Unknown(128)));
+        // An empty value is accepted (NOTE(interop) in `decode`).
+        round_trip(&Capability::ExtendedNextHop(vec![]), &[5, 0]);
+    }
+
+    #[test]
+    fn extended_next_hop_limits_and_merging() {
+        // 42 triples fill 252 of the 255 octets a capability may hold.
+        let fits = Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6; 42]);
+        let mut out = Vec::new();
+        fits.encode(&mut out).unwrap();
+        assert_eq!(out.len(), 2 + 252);
+        let over = Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6; 43]);
+        assert_eq!(
+            over.encode(&mut Vec::new()),
+            Err(EncodeError::TooLong {
+                what: "extended next hop capability",
+                len: 258,
+                max: 255,
+            })
+        );
+        // RFC 5492 §4: several instances; their triples add up.
+        let caps = [
+            Capability::RouteRefresh,
+            Capability::ExtendedNextHop(vec![NextHopEncoding::IPV4_UNICAST_VIA_IPV6]),
+            Capability::ExtendedNextHop(vec![NextHopEncoding {
+                nlri_safi: 2,
+                ..NextHopEncoding::IPV4_UNICAST_VIA_IPV6
+            }]),
+        ];
+        assert_eq!(
+            next_hop_encodings(&caps)
+                .map(|t| t.nlri_safi)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(next_hop_encodings(&caps[..1]).count(), 0);
     }
 
     #[test]
@@ -196,12 +363,15 @@ mod tests {
     #[test]
     fn malformed_known_capabilities_are_unspecific_open_errors() {
         for wire in [
-            &[1, 3, 0, 1, 0][..],     // MP with wrong length
-            &[2, 1, 0][..],           // route refresh with a value
-            &[6, 4, 0, 0, 0, 0][..],  // extended message with a value
-            &[65, 2, 0xfd, 0xe8][..], // 4-octet AS with two octets
-            &[65, 4, 0, 0][..],       // truncated value
-            &[1][..],                 // truncated length
+            &[1, 3, 0, 1, 0][..],             // MP with wrong length
+            &[2, 1, 0][..],                   // route refresh with a value
+            &[6, 4, 0, 0, 0, 0][..],          // extended message with a value
+            &[5, 4, 0, 1, 0, 1][..],          // extended next hop: a partial triple
+            &[5, 7, 0, 1, 0, 1, 0, 2, 0][..], // a triple and one octet more
+            &[5, 6, 0, 1, 0, 1][..],          // extended next hop: truncated value
+            &[65, 2, 0xfd, 0xe8][..],         // 4-octet AS with two octets
+            &[65, 4, 0, 0][..],               // truncated value
+            &[1][..],                         // truncated length
             &[][..],
         ] {
             let e = Capability::decode(&mut Reader::new(wire)).unwrap_err();

@@ -4,7 +4,9 @@
 //!
 //! Implements: RFC 4271 §9.1.1 (local policy sets the degree of
 //! preference), §9.1.3 (export policy); RFC 1997, 4360, 8092 (community
-//! matching and setting); `docs/config.md`, "Policies".
+//! matching and setting); RFC 8950 §5 (`next-hop self` on an IPv6 session
+//! gives IPv4 routes our IPv6 address once negotiated); `docs/config.md`,
+//! "Policies".
 #![forbid(unsafe_code)]
 
 pub mod prefix_list;
@@ -17,7 +19,7 @@ use std::net::IpAddr;
 
 use bgpfc_config::ast::{Action, CommunityOp, Config, Match, SetAction};
 use bgpfc_config::error::Pos;
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Verdict};
+use bgpfc_rib::{PathAttrs, PeerInfo, Policies, RovState, Verdict};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::NextHop;
@@ -92,6 +94,11 @@ pub struct Route<'a> {
     pub neighbor: IpAddr,
     /// Our address on that peer's session; what `set next-hop self` uses.
     pub local_addr: IpAddr,
+    /// Routes of the route's family may go to the peer with an IPv6 next
+    /// hop, since it advertised Extended Next Hop Encoding for the family,
+    /// and so did we (RFC 8950 §4): an IPv4 route may take an IPv6
+    /// `local_addr` as its next hop.
+    pub extended_next_hop: bool,
 }
 
 impl PolicySet {
@@ -247,6 +254,15 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
         SetAction::NextHopSelf => {
             a.next_hop = match (route.family, route.local_addr) {
                 (AddressFamily::IPV4_UNICAST, IpAddr::V4(v4)) => NextHop::Ipv4(v4),
+                // RFC 8950 §5: our own address is of the session's
+                // protocol, which an IPv4 route may carry once RFC 8950 §4
+                // negotiated it.
+                (AddressFamily::IPV4_UNICAST, IpAddr::V6(v6)) if route.extended_next_hop => {
+                    NextHop::Ipv6 {
+                        global: v6,
+                        link_local: None,
+                    }
+                }
                 (AddressFamily::IPV6_UNICAST, IpAddr::V6(v6)) => NextHop::Ipv6 {
                     global: v6,
                     link_local: None,
@@ -341,6 +357,8 @@ impl Engine {
     }
 }
 
+/// No clause matches on the validation state yet, so `rov` is accepted
+/// and not read: the RFC 6811 §3 row in COMPLIANCE.md says what is left.
 impl Policies for Engine {
     fn import(
         &self,
@@ -348,6 +366,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        _rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -355,6 +374,7 @@ impl Policies for Engine {
             attrs,
             neighbor: peer.addr,
             local_addr: peer.local_addr,
+            extended_next_hop: peer.extended_next_hop.contains(&family),
         };
         self.run(|n| n.0, peer, &route)
     }
@@ -365,6 +385,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
+        _rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -372,6 +393,7 @@ impl Policies for Engine {
             attrs,
             neighbor: peer.addr,
             local_addr: peer.local_addr,
+            extended_next_hop: peer.extended_next_hop.contains(&family),
         };
         self.run(|n| n.1, peer, &route)
     }

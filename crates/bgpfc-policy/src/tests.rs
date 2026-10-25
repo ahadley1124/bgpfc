@@ -3,7 +3,7 @@
 
 use std::net::IpAddr;
 
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Verdict};
+use bgpfc_rib::{PathAttrs, PeerInfo, Policies, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, LargeCommunity};
@@ -56,6 +56,7 @@ fn route<'a>(prefix: &str, a: &'a PathAttrs) -> Route<'a> {
         attrs: a,
         neighbor: ip("10.0.0.1"),
         local_addr: ip("10.0.0.254"),
+        extended_next_hop: false,
     }
 }
 
@@ -181,6 +182,19 @@ fn set_actions_modify_a_copy() {
         panic!("expected a modification");
     };
     assert_eq!(m.next_hop, a.next_hop);
+    // RFC 8950 §5: with the capability negotiated, our IPv6 address on the
+    // session is a next hop the IPv4 route may carry.
+    r6.extended_next_hop = true;
+    let Verdict::Modified(m) = s.evaluate("P", &r6) else {
+        panic!("expected a modification");
+    };
+    assert_eq!(
+        m.next_hop,
+        NextHop::Ipv6 {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: None
+        }
+    );
     // Modifications accumulate across `next` terms, and the later term
     // sees them.
     let s = set("policy Q {
@@ -231,23 +245,100 @@ fn engine_applies_each_neighbors_policies() {
         router_id: RouterId::new(1).unwrap(),
         kind: PeerKind::External,
         families: vec![V4],
+        receive_families: vec![V4],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
+        advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
-    let Verdict::Modified(m) = engine.import(&peer, V4, p, &a) else {
+    let Verdict::Modified(m) = engine.import(&peer, V4, p, &a, RovState::Disabled) else {
         panic!("import should set local-pref");
     };
     assert_eq!(m.local_pref, Some(50));
-    assert_eq!(engine.export(&peer, V4, p, &a), Verdict::Accept);
+    assert_eq!(
+        engine.export(&peer, V4, p, &a, RovState::Disabled),
+        Verdict::Accept
+    );
     let other: Prefix = "198.51.100.0/24".parse().unwrap();
-    assert_eq!(engine.export(&peer, V4, other, &a), Verdict::Reject);
+    assert_eq!(
+        engine.export(&peer, V4, other, &a, RovState::Disabled),
+        Verdict::Reject
+    );
     // An unconfigured peer gets nothing.
     let mut stranger = peer.clone();
     stranger.addr = ip("10.0.0.2");
-    assert_eq!(engine.import(&stranger, V4, p, &a), Verdict::Reject);
-    assert_eq!(engine.export(&stranger, V4, p, &a), Verdict::Reject);
+    assert_eq!(
+        engine.import(&stranger, V4, p, &a, RovState::Disabled),
+        Verdict::Reject
+    );
+    assert_eq!(
+        engine.export(&stranger, V4, p, &a, RovState::Disabled),
+        Verdict::Reject
+    );
+    // The engine is given each route's RFC 6811 validation state, and no
+    // clause matches on it: every state gets the same verdicts.
+    for rov in RovState::ALL {
+        for prefix in [p, other] {
+            assert_eq!(
+                engine.import(&peer, V4, prefix, &a, rov),
+                engine.import(&peer, V4, prefix, &a, RovState::Disabled),
+                "{rov} {prefix}"
+            );
+            assert_eq!(
+                engine.export(&peer, V4, prefix, &a, rov),
+                engine.export(&peer, V4, prefix, &a, RovState::Disabled),
+                "{rov} {prefix}"
+            );
+        }
+    }
+}
+
+#[test]
+fn engine_tells_next_hop_self_what_the_session_negotiated() {
+    // RFC 8950 §5 through the Engine: the peer's negotiated families
+    // decide whether an IPv4 route may take our IPv6 session address.
+    let cfg = bgpfc_config::parse_str(
+        "t",
+        "router-id 192.0.2.1; local-as 65000;
+         policy SELF { term t { set next-hop self; action accept; } }
+         neighbor 2001:db8::2 { remote-as 65000; import SELF; export SELF; }",
+    )
+    .unwrap();
+    let engine = Engine::new(&cfg).unwrap();
+    let mut peer = PeerInfo {
+        addr: ip("2001:db8::2"),
+        local_addr: ip("2001:db8::1"),
+        remote_as: Asn(65_000),
+        router_id: RouterId::new(2).unwrap(),
+        kind: PeerKind::Internal,
+        families: vec![V4],
+        receive_families: vec![V4],
+        four_octet_as: true,
+        extended_messages: false,
+        extended_next_hop: Vec::new(),
+        advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
+    };
+    let a = attrs(&[65_001]);
+    let p: Prefix = "203.0.113.0/24".parse().unwrap();
+    let Verdict::Modified(m) = engine.export(&peer, V4, p, &a, RovState::Disabled) else {
+        panic!("next-hop self modifies");
+    };
+    assert_eq!(m.next_hop, a.next_hop);
+    peer.extended_next_hop = vec![V4];
+    let Verdict::Modified(m) = engine.export(&peer, V4, p, &a, RovState::Disabled) else {
+        panic!("next-hop self modifies");
+    };
+    assert_eq!(
+        m.next_hop,
+        NextHop::Ipv6 {
+            global: "2001:db8::1".parse().unwrap(),
+            link_local: None
+        }
+    );
 }
 
 #[test]
@@ -270,8 +361,12 @@ fn engine_keeps_each_neighbors_policies_apart() {
         router_id: RouterId::new(1).unwrap(),
         kind: PeerKind::External,
         families: vec![V4],
+        receive_families: vec![V4],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: Vec::new(),
+        advertisement_interval: std::time::Duration::ZERO,
+        prefix_limits: Vec::new(),
     };
     let local_pref = |v: Verdict| match v {
         Verdict::Modified(m) => m.local_pref,
@@ -283,18 +378,24 @@ fn engine_keeps_each_neighbors_policies_apart() {
     // neighbor's own policy every time.
     for _ in 0..2 {
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a)),
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
             Some(50)
         );
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a)),
+            local_pref(engine.import(&peer("10.0.0.1"), V4, p, &a, RovState::Disabled)),
             Some(50)
         );
-        assert_eq!(engine.import(&peer("10.0.0.9"), V4, p, &a), Verdict::Reject);
         assert_eq!(
-            local_pref(engine.import(&peer("10.0.0.2"), V4, p, &a)),
+            engine.import(&peer("10.0.0.9"), V4, p, &a, RovState::Disabled),
+            Verdict::Reject
+        );
+        assert_eq!(
+            local_pref(engine.import(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled)),
             Some(200)
         );
-        assert_eq!(engine.export(&peer("10.0.0.2"), V4, p, &a), Verdict::Reject);
+        assert_eq!(
+            engine.export(&peer("10.0.0.2"), V4, p, &a, RovState::Disabled),
+            Verdict::Reject
+        );
     }
 }

@@ -26,10 +26,22 @@ Config {
             },
         ),
     },
+    rpki: Rpki {
+        mode: Disabled,
+        caches: [],
+        version: 1,
+        connect_timeout: 10s,
+        response_timeout: 60s,
+        reply_timeout: 1800s,
+        max_expire: 172800s,
+        max_vrps: 4000000,
+        backoff_min: 1s,
+        backoff_max: 600s,
+    },
     prefix_lists: [
         PrefixList {
             pos: Pos {
-                line: 25,
+                line: 32,
                 col: 1,
             },
             name: "BOGONS",
@@ -54,14 +66,14 @@ Config {
     policies: [
         Policy {
             pos: Pos {
-                line: 30,
+                line: 37,
                 col: 1,
             },
             name: "UPSTREAM-IN",
             terms: [
                 Term {
                     pos: Pos {
-                        line: 31,
+                        line: 38,
                         col: 5,
                     },
                     name: "no-bogons",
@@ -75,7 +87,7 @@ Config {
                 },
                 Term {
                     pos: Pos {
-                        line: 32,
+                        line: 39,
                         col: 5,
                     },
                     name: "rest",
@@ -91,14 +103,14 @@ Config {
         },
         Policy {
             pos: Pos {
-                line: 35,
+                line: 42,
                 col: 1,
             },
             name: "UPSTREAM-OUT",
             terms: [
                 Term {
                     pos: Pos {
-                        line: 36,
+                        line: 43,
                         col: 5,
                     },
                     name: "own",
@@ -116,7 +128,7 @@ Config {
                 },
                 Term {
                     pos: Pos {
-                        line: 37,
+                        line: 44,
                         col: 5,
                     },
                     name: "rest",
@@ -130,7 +142,7 @@ Config {
     neighbors: [
         Neighbor {
             pos: Pos {
-                line: 40,
+                line: 47,
                 col: 1,
             },
             addr: 198.51.100.1,
@@ -162,6 +174,12 @@ Config {
             passive: false,
             allow_as_set: false,
             collision_detect_established: false,
+            advertisement_interval: None,
+            extended_next_hop: [],
+            restart_limit: Some(
+                10,
+            ),
+            maximum_prefix: [],
         },
     ],
 }

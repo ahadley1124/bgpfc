@@ -34,10 +34,13 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(again.len(), data.len());
         }
     }
-    if let Ok(m) = MpReach::decode(data) {
-        let mut again = Vec::new();
-        m.encode(&mut again);
-        assert_eq!(MpReach::decode(&again).unwrap(), m);
+    // Both with and without RFC 8950 negotiated for IPv4 unicast.
+    for extended_next_hop in [false, true] {
+        if let Ok(m) = MpReach::decode(data, extended_next_hop) {
+            let mut again = Vec::new();
+            m.encode(&mut again);
+            assert_eq!(MpReach::decode(&again, extended_next_hop).unwrap(), m);
+        }
     }
     if let Ok(m) = MpUnreach::decode(data) {
         let mut again = Vec::new();

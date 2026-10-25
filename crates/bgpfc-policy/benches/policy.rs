@@ -53,6 +53,7 @@ fn bench(c: &mut Criterion) {
         attrs: &a,
         neighbor: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         local_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
+        extended_next_hop: false,
     };
     c.bench_function("policy_evaluate_six_terms", |b| {
         b.iter(|| set.evaluate("IN", black_box(&route)));

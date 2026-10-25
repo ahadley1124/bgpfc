@@ -13,3 +13,9 @@ validation-errors.conf:8:1: neighbor 192.0.2.3: keepalive-time 30s must be below
 validation-errors.conf:8:1: neighbor 192.0.2.3: send-hold-time 30s must exceed hold-time 30s (RFC 9687 §4.4)
   neighbor 192.0.2.3 {
   ^
+validation-errors.conf:12:1: neighbor 2001:db8::4: extended-next-hop needs the ipv4-unicast family (RFC 8950 §4)
+  neighbor 2001:db8::4 {
+  ^
+validation-errors.conf:12:1: neighbor 2001:db8::4: maximum-prefix for ipv4-unicast, which is not in its families
+  neighbor 2001:db8::4 {
+  ^

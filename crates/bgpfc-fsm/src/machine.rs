@@ -3,11 +3,12 @@
 //!
 //! Every arm cites the paragraph it implements. "Releases all BGP
 //! resources" is [`Fsm::release_resources`]; "performs peer oscillation
-//! damping" is the `damp` argument of [`Fsm::go_idle`].
+//! damping" is the `damp` argument of [`Fsm::go_idle`], which also applies
+//! the RFC 4486 §4 bound on consecutive automatic restarts.
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::Capability;
+use bgpfc_wire::capability::{Capability, NextHopEncoding, next_hop_encodings};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, FsmSubcode, OpenSubcode};
 use bgpfc_wire::header::MessageType;
 use bgpfc_wire::notification::NotificationMessage;
@@ -36,6 +37,13 @@ pub struct Fsm {
     jitter: Jitter,
     /// Current `IdleHoldTime` under damping; doubles on each damped failure.
     idle_hold_time: Duration,
+    /// Damped failures in the current run (see [`crate::Damping`]).
+    damped_failures: u32,
+    /// `AllowAutomaticStart` (RFC 4271 §8.1.1): cleared when the run
+    /// exceeds the restart limit (RFC 4486 §4), set again by `ManualStart`.
+    automatic_start: bool,
+    /// When the current session reached Established.
+    established_at: Option<Instant>,
     /// Set by `ManualStop`: no automatic restart until `ManualStart`.
     admin_down: bool,
     /// A `ManualStartPassive` asked for one passive attempt.
@@ -62,6 +70,9 @@ impl Fsm {
             delay_open: Timer::default(),
             idle_hold: Timer::default(),
             send_hold: Timer::default(),
+            damped_failures: 0,
+            automatic_start: true,
+            established_at: None,
             admin_down: false,
             passive_once: false,
             session: None,
@@ -97,6 +108,20 @@ impl Fsm {
     #[must_use]
     pub const fn is_admin_down(&self) -> bool {
         self.admin_down
+    }
+
+    /// `AllowAutomaticStart` (RFC 4271 §8.1.1): false once consecutive
+    /// damped failures exceeded the restart limit (RFC 4486 §4), until a
+    /// `ManualStart`.
+    #[must_use]
+    pub const fn automatic_start_allowed(&self) -> bool {
+        self.automatic_start
+    }
+
+    /// Damped failures in the current run (see [`crate::Damping`]).
+    #[must_use]
+    pub const fn damped_failures(&self) -> u32 {
+        self.damped_failures
     }
 
     /// The timer of the given kind.
@@ -179,24 +204,39 @@ impl Fsm {
     fn in_idle(&mut self, event: &Event, now: Instant, actions: &mut Vec<Action>) {
         match event {
             // RFC 4271 §8.2.2 Idle: events 1, 3 (and 4, 5–7 via config).
+            // A manual start is the "administrative intervention" of
+            // RFC 4486 §4: it allows automatic starts again and ends the
+            // run of damped failures.
             Event::ManualStart => {
                 self.admin_down = false;
+                self.automatic_start = true;
                 self.reset_damping();
                 self.start(now, self.config.passive, actions);
             }
             Event::ManualStartPassive => {
                 self.admin_down = false;
+                self.automatic_start = true;
                 self.reset_damping();
                 self.passive_once = true;
                 self.start(now, true, actions);
             }
-            // RFC 4271 §8.2.2 Idle: event 13 ends the damping hold.
-            Event::AutomaticStart | Event::IdleHoldTimerExpires if !self.admin_down => {
+            // RFC 4271 §8.2.2 Idle: event 13 ends the damping hold. Neither
+            // it nor events 3 and 5 start a peer the operator stopped, or
+            // one whose AllowAutomaticStart the restart limit cleared
+            // (RFC 4486 §4), and none of them ends a run of damped
+            // failures.
+            Event::AutomaticStart | Event::IdleHoldTimerExpires
+                if !self.admin_down && self.automatic_start =>
+            {
                 self.start(now, self.config.passive, actions);
+            }
+            Event::AutomaticStartPassive if !self.admin_down && self.automatic_start => {
+                self.passive_once = true;
+                self.start(now, true, actions);
             }
             // RFC 4271 §8.2.2 Idle: ManualStop is ignored for the state, but
             // it must cancel a pending automatic restart.
-            Event::ManualStop => {
+            Event::ManualStop(_) => {
                 self.admin_down = true;
                 self.idle_hold.stop();
             }
@@ -230,9 +270,10 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Connect: ManualStop.
-            Event::ManualStop => self.manual_stop(now, actions),
+            Event::ManualStop(_) => self.manual_stop(now, actions),
             // RFC 4271 §8.2.2 Connect: ConnectRetryTimer_Expires.
             Event::ConnectRetryTimerExpires => {
                 actions.push(Action::DropConnection);
@@ -300,14 +341,13 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid => {}
             // RFC 4271 §8.2.2 Active: ManualStop, with the optional Cease
             // when an OPEN was being delayed.
-            Event::ManualStop => {
+            Event::ManualStop(cease) => {
                 if self.delay_open.is_running() && self.config.send_notification_without_open {
-                    actions.push(Action::SendNotification(NotificationMessage::cease(
-                        CeaseSubcode::AdministrativeShutdown,
-                    )));
+                    actions.push(Action::SendNotification(cease));
                 }
                 self.manual_stop(now, actions);
             }
@@ -373,15 +413,14 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
             | Event::TcpCrInvalid => {}
             // RFC 4271 §8.2.2 OpenSent: ManualStop sends a Cease.
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 self.manual_stop(now, actions);
             }
             // RFC 4271 §8.2.2 OpenSent: AutomaticStop sends a Cease.
@@ -464,15 +503,14 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
             | Event::TcpCrInvalid
             | Event::BgpOpen(_) => {}
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 self.manual_stop(now, actions);
             }
             Event::AutomaticStop(cease) => {
@@ -521,7 +559,9 @@ impl Fsm {
                 }
                 self.state = State::Established;
                 self.restart_send_hold(now);
-                self.reset_damping();
+                // Reaching Established does not end a run of damped
+                // failures by itself; see `forget_stable_session`.
+                self.established_at = Some(now);
                 actions.push(Action::SessionUp(session));
             }
             other => {
@@ -541,10 +581,8 @@ impl Fsm {
     fn in_established(&mut self, event: Event, now: Instant, actions: &mut Vec<Action>) {
         match event {
             // RFC 4271 §8.2.2 Established: ManualStop deletes routes too.
-            Event::ManualStop => {
-                actions.push(Action::SendNotification(NotificationMessage::cease(
-                    CeaseSubcode::AdministrativeShutdown,
-                )));
+            Event::ManualStop(cease) => {
+                actions.push(Action::SendNotification(cease));
                 actions.push(Action::SessionDown);
                 self.manual_stop(now, actions);
             }
@@ -575,6 +613,7 @@ impl Fsm {
             Event::ManualStart
             | Event::ManualStartPassive
             | Event::AutomaticStart
+            | Event::AutomaticStartPassive
             | Event::TcpConnectionValid
             | Event::TcpCrAcked
             | Event::TcpConnectionConfirmed
@@ -583,8 +622,10 @@ impl Fsm {
             | Event::OpenCollisionDump
             | Event::RouteRefreshMsg => {}
             // RFC 4271 §8.2.2 Established: NOTIFICATION or TCP failure; no
-            // damping named.
-            Event::NotifMsgVerErr | Event::NotifMsg(_) | Event::TcpConnectionFails => {
+            // damping named. RFC 4486 §4 RECOMMENDS damping after some
+            // received Cease subcodes, though.
+            Event::NotifMsg(n) => self.session_down(now, damped_cease(&n), actions),
+            Event::NotifMsgVerErr | Event::TcpConnectionFails => {
                 self.session_down(now, false, actions);
             }
             // RFC 4271 §8.2.2 Established: KEEPALIVE / UPDATE restart the
@@ -721,6 +762,40 @@ impl Fsm {
         // RFC 2918 §4: send ROUTE-REFRESH only if the peer advertised it.
         let route_refresh = open.has(&Capability::RouteRefresh);
         let families = negotiate_families(ours, &open.capabilities);
+        // RFC 4760 §8 asks both sides to advertise a family only for "a
+        // bi-directional exchange"; a sender may use a capability its
+        // receiver advertised (RFC 5492 §3), so the peer may send us routes
+        // of every family we advertised, whether it advertised it or not.
+        let receive_families = advertised_families(ours);
+        // RFC 8950 §4: each triple "indicates that the NLRI of <NLRI AFI /
+        // NLRI SAFI> may be advertised with a next-hop address belonging to
+        // the network-layer protocol of Nexthop AFI", to the speaker that
+        // listed it. The capability works one way: ours tells the peer it
+        // may send us an IPv6 next hop for IPv4 unicast, the peer's tells us
+        // we may send it one. It says nothing about whether the family is
+        // used; the Multiprotocol capability alone decides that (RFC 4760
+        // §8), hence the checks against the families.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let extended_next_hop_receive =
+            if receive_families.contains(&v4) && ipv4_unicast_via_ipv6(ours) {
+                vec![v4]
+            } else {
+                Vec::new()
+            };
+        // RFC 8950 §4: "A BGP speaker MUST only advertise the IPv4 ... NLRI
+        // with an IPv6 next hop to a BGP peer if the BGP speaker has first
+        // ascertained via the BGP Capability Advertisement that the BGP
+        // peer supports the Extended Next Hop Encoding capability". Only
+        // where we advertised it too, so that the configuration turns the
+        // extension on or off as a whole.
+        let extended_next_hop_send = if families.contains(&v4)
+            && ipv4_unicast_via_ipv6(ours)
+            && ipv4_unicast_via_ipv6(&open.capabilities)
+        {
+            vec![v4]
+        } else {
+            Vec::new()
+        };
         if families.is_empty() {
             // RFC 5492 §5: Unsupported Capability, Data = the capabilities
             // we require, encoded as in the OPEN.
@@ -750,6 +825,9 @@ impl Fsm {
             extended_messages,
             route_refresh,
             families,
+            receive_families,
+            extended_next_hop_receive,
+            extended_next_hop_send,
             peer_capabilities: open.capabilities.clone(),
         })
     }
@@ -806,16 +884,21 @@ impl Fsm {
     }
 
     /// RFC 4271 §8.2.2 event 23: Cease / Connection Collision Resolution
-    /// (RFC 4486 §4).
+    /// (RFC 4486 §4). The damping RFC 4271 §8.2.2 makes optional here is
+    /// left out: this FSM runs one connection at a time, and the
+    /// coordinator goes on at once with the connection that won
+    /// ([`Event::AutomaticStartPassive`]), so the losing one is no failure
+    /// of the peer. Counting it would end the session against the RFC
+    /// 4486 §4 restart limit for a collision the peer cannot avoid.
     fn collision_dump(&mut self, now: Instant, established: bool, actions: &mut Vec<Action>) {
         actions.push(Action::SendNotification(NotificationMessage::cease(
             CeaseSubcode::ConnectionCollisionResolution,
         )));
         if established {
-            self.session_down(now, true, actions);
+            self.session_down(now, false, actions);
         } else {
             self.connect_retry.stop();
-            self.go_idle(now, true, true, actions);
+            self.go_idle(now, true, false, actions);
         }
     }
 
@@ -857,7 +940,22 @@ impl Fsm {
     fn session_down(&mut self, now: Instant, damp: bool, actions: &mut Vec<Action>) {
         actions.push(Action::SessionDown);
         self.connect_retry.stop();
+        self.forget_stable_session(now);
         self.go_idle(now, true, damp, actions);
+    }
+
+    /// A session that stayed Established for `forget_after` ends the run
+    /// of damped failures before it went down: whatever ended it starts a
+    /// new run. A shorter session leaves the run as it was, so that a
+    /// peer that keeps getting to Established and being torn down again
+    /// (by a prefix limit, say) is damped and bounded like any other
+    /// oscillation (RFC 4486 §4).
+    fn forget_stable_session(&mut self, now: Instant) {
+        if let (Some(d), Some(at)) = (self.config.damping, self.established_at)
+            && now.saturating_duration_since(at) >= d.forget_after
+        {
+            self.reset_damping();
+        }
     }
 
     /// RFC 4271 §8.2.2 `ManualStop` (all non-Idle states): no NOTIFICATION
@@ -878,11 +976,13 @@ impl Fsm {
         self.delay_open.stop();
         self.send_hold.stop();
         self.session = None;
+        self.established_at = None;
     }
 
     /// The common tail of every transition to Idle: drop the connection,
     /// release resources, bump the counter, damp, and schedule the
-    /// automatic restart unless the operator stopped the peer.
+    /// automatic restart unless the operator stopped the peer or the run
+    /// of damped failures exceeded the restart limit.
     fn go_idle(&mut self, now: Instant, increment: bool, damp: bool, actions: &mut Vec<Action>) {
         actions.push(Action::DropConnection);
         self.release_resources();
@@ -895,44 +995,95 @@ impl Fsm {
             self.idle_hold.stop();
             return;
         }
+        let damping = if damp { self.config.damping } else { None };
+        if let Some(d) = damping {
+            self.damped_failures = self.damped_failures.saturating_add(1);
+            // RFC 4486 §4: "An implementation SHOULD impose an upper bound
+            // on the number of consecutive automatic retries. Once this
+            // bound is reached, the implementation would stop re-trying
+            // any BGP connections until some administrative intervention,
+            // i.e., set the AllowAutomaticStart attribute [BGP-4] to
+            // FALSE."
+            if d.restart_limit.is_some_and(|l| self.damped_failures > l) {
+                self.idle_hold.stop();
+                self.automatic_start = false;
+                actions.push(Action::RestartLimitReached {
+                    failures: self.damped_failures,
+                });
+                return;
+            }
+        }
         // RFC 4271 §8.1.1 group 1: hold the peer in Idle for IdleHoldTime
         // before an automatic restart; damping lengthens that hold.
         let wait = self.jitter.apply(self.idle_hold_time);
         self.idle_hold.start(now, wait);
-        if damp && let Some(d) = self.config.damping {
+        if let Some(d) = damping {
             self.idle_hold_time = (self.idle_hold_time * 2).min(d.max);
         }
     }
 
-    /// A successful session or a manual start ends the damping escalation.
+    /// A manual start, or the end of a session that stayed up long
+    /// enough, ends a run of damped failures: the escalation and the
+    /// count start over.
     fn reset_damping(&mut self) {
         self.idle_hold_time = self
             .config
             .damping
             .map_or(self.config.connect_retry_time, |d| d.initial);
+        self.damped_failures = 0;
     }
 }
 
-/// RFC 4760 §8: a family is usable only if both sides advertised it. A side
-/// with no Multiprotocol capability at all is an IPv4-unicast-only speaker.
-fn negotiate_families(ours: &[Capability], theirs: &[Capability]) -> Vec<AddressFamily> {
-    fn families(caps: &[Capability]) -> Vec<AddressFamily> {
-        let mut v: Vec<AddressFamily> = caps
-            .iter()
-            .filter_map(|c| match c {
-                Capability::Multiprotocol(f) => Some(*f),
-                _ => None,
-            })
-            .collect();
-        if v.is_empty() {
-            v.push(AddressFamily::IPV4_UNICAST);
-        }
-        v.sort();
-        v.dedup();
-        v
+/// Whether a received NOTIFICATION is a Cease after which the retry is
+/// damped.
+// RFC 4486 §4: "It is RECOMMENDED that a BGP speaker behave as though the
+// DampPeerOscillations attribute [BGP-4] were true for this peer when
+// re-trying a BGP connection after the speaker receives a Cease
+// NOTIFICATION message with a subcode of "Administrative Shutdown", "Peer
+// De-configured", "Connection Rejected", or "Out of Resources"."
+fn damped_cease(n: &NotificationMessage) -> bool {
+    n.code == ErrorCode::Cease
+        && [
+            CeaseSubcode::AdministrativeShutdown,
+            CeaseSubcode::PeerDeconfigured,
+            CeaseSubcode::ConnectionRejected,
+            CeaseSubcode::OutOfResources,
+        ]
+        .iter()
+        .any(|s| *s as u8 == n.subcode)
+}
+
+/// Whether `caps` include the RFC 8950 §4 triple `<1, 1, 2>`: IPv4 unicast
+/// NLRI with an IPv6 next hop, in any Extended Next Hop Encoding instance.
+fn ipv4_unicast_via_ipv6(caps: &[Capability]) -> bool {
+    next_hop_encodings(caps).any(|t| t == NextHopEncoding::IPV4_UNICAST_VIA_IPV6)
+}
+
+/// The families a speaker advertised with the Multiprotocol capability
+/// (RFC 4760 §8), sorted. A speaker with none at all is an
+/// IPv4-unicast-only speaker.
+fn advertised_families(caps: &[Capability]) -> Vec<AddressFamily> {
+    let mut v: Vec<AddressFamily> = caps
+        .iter()
+        .filter_map(|c| match c {
+            Capability::Multiprotocol(f) => Some(*f),
+            _ => None,
+        })
+        .collect();
+    if v.is_empty() {
+        v.push(AddressFamily::IPV4_UNICAST);
     }
-    let theirs = families(theirs);
-    families(ours)
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// RFC 4760 §8: "To have a bi-directional exchange of routing information
+/// for a particular <AFI, SAFI> between a pair of BGP speakers, each such
+/// speaker MUST advertise to the other" the capability for it.
+fn negotiate_families(ours: &[Capability], theirs: &[Capability]) -> Vec<AddressFamily> {
+    let theirs = advertised_families(theirs);
+    advertised_families(ours)
         .into_iter()
         .filter(|f| theirs.contains(f))
         .collect()

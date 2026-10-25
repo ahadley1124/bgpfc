@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Interoperability tests against BIRD, FRR and GoBGP (dev-only, needs root)"
+description = "Interoperability tests against BIRD, FRR, GoBGP and StayRTR (dev-only, needs root)"
 
+# The PDU codec of the RTR stub cache (src/bin/rtr-stub.rs).
 [dependencies]
+bgpfc-rpki.workspace = true
+bgpfc-rtr.workspace = true
+bgpfc-wire.workspace = true
 
 [lints]
 workspace = true

@@ -23,6 +23,8 @@ fn bird_opts(lab: &Lab, passive: bool, statics: &[&str]) -> BirdOpts {
         hold_time: 30,
         passive,
         statics: statics.iter().map(|s| (*s).to_owned()).collect(),
+        channel: String::new(),
+        protocol: String::new(),
     }
 }
 
@@ -173,8 +175,17 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             hold_time: 30,
             passive: true,
             statics: Vec::new(),
+            channel: String::new(),
+            protocol: String::new(),
         },
     );
+    // The scenario re-announces the statics seconds after the first
+    // advertisement; with the 30 s EBGP default of RFC 4271 §10 that
+    // re-announcement would be held past the 15 s wait (§9.2.1.1). An
+    // explicit 1 s interval keeps the test quick and still paced; the
+    // default itself is unchanged.
+    let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
+    to_bird2.advertisement_interval = Some(1);
     let bgpfcd = start_bgpfcd(
         &lab,
         &lab.a.clone(),
@@ -182,10 +193,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             local_as: BGPFC_AS,
             router_id: lab.a_addr,
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
-            neighbors: vec![
-                NeighborOpts::new(lab.b_addr, BIRD_AS),
-                NeighborOpts::new(lab.c_addr, BIRD2_AS),
-            ],
+            neighbors: vec![NeighborOpts::new(lab.b_addr, BIRD_AS), to_bird2],
             extra: String::new(),
         },
     );
@@ -278,6 +286,8 @@ fn export_policy_filters_and_sets() {
             hold_time: 30,
             passive: true,
             statics: Vec::new(),
+            channel: String::new(),
+            protocol: String::new(),
         },
     );
     let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
@@ -450,6 +460,8 @@ fn control_plane_commands() {
         ok && out.contains("*192.0.2.0/24") && out.contains("65001"),
         "{out}"
     );
+    // No validation source: the route is not validated (issue #52).
+    assert!(out.contains(" disabled "), "{out}");
     let (out, ok) = ctl(&["show", "fib"]);
     assert!(ok && out.starts_with("mode dry-run"), "{out}");
     let (out, ok) = ctl(&["show", "status"]);
@@ -476,7 +488,9 @@ fn control_plane_commands() {
     assert!(r.contains("\"state\":\"Established\""), "{r}");
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/routes?family=ipv4"]);
     assert!(
-        r.contains("\"prefix\":\"192.0.2.0/24\"") && r.contains("\"as_path\":[65001]"),
+        r.contains("\"prefix\":\"192.0.2.0/24\"")
+            && r.contains("\"as_path\":[65001]")
+            && r.contains("\"rov\":\"disabled\""),
         "{r}"
     );
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/nope"]);
@@ -534,7 +548,7 @@ fn control_plane_reload_and_reset() {
     // ManualStart), often before the passive BIRD has finished closing the
     // old session; BIRD then resets the new connection, and bgpfcd waits
     // ConnectRetryTime in Active before it tries again. Keep that wait
-    // well inside the test's.
+    // well inside the test's, as `extended_next_hop_with_bird` does.
     opts.neighbors[0].extra = "connect-retry-time 5;".to_owned();
     let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
     assert_established(&lab, &bird, &bgpfcd);
@@ -582,4 +596,263 @@ fn control_plane_reload_and_reset() {
         bgpfcd.log_text().matches("session established").count() >= 2
     });
     assert!(ok, "no reconnect:\n{}", bgpfcd.log_text());
+}
+
+/// RFC 8950 with BIRD on both sides of bgpfcd, over IPv4 sessions. The
+/// test hosts may run without IPv6 (one boots with `ipv6.disable=1`), so
+/// the IPv6 next hop is BIRD's configured `next hop address`, not a session
+/// address. BIRD in B (external) originates 192.0.2.0/24 with the IPv6 next
+/// hop; bgpfcd passes it unchanged to BIRD in C (internal, §5), and sends
+/// C's 203.0.113.0/24 to B with its own IPv4 address on that session (§5).
+/// A reload then turns the capability off towards C: the session resets
+/// and C no longer gets the route (§4).
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn extended_next_hop_with_bird() {
+    let mut lab = Lab::new("e", 13);
+    let (bird_b, bird_c, bgpfcd, socket) = start_extended_next_hop_lab(&mut lab);
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().matches("session established").count() == 2
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
+    // RFC 8950 §4: both sides list <1, 1, 2> on both sessions, so IPv6
+    // next hops may go either way.
+    let ok = wait_for(Duration::from_secs(5), || {
+        bgpfcd
+            .log_text()
+            .matches("extended_next_hop_send=ipv4-unicast")
+            .count()
+            == 2
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
+    for addr in [lab.b_addr, lab.c_addr] {
+        let (out, ok) = ctl(&["show", "neighbor", &addr.to_string()]);
+        assert!(
+            ok && out.contains("extended-next-hop receive ipv4-unicast send ipv4-unicast"),
+            "{out}"
+        );
+    }
+    let status = bird_b.peer_status(&lab);
+    assert!(status.contains("IPv6 nexthop: ipv4"), "{status}");
+
+    // RFC 8950 §3: BIRD's IPv6 next hop is decoded and kept in the RIB,
+    // and the FIB (dry-run here) is asked for an IPv4 route via it.
+    let ok = wait_for(Duration::from_secs(15), || {
+        ctl(&["show", "routes", "192.0.2.0/24"])
+            .0
+            .contains("2001:db8::1")
+    });
+    assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
+    let (out, ok) = ctl(&["show", "fib"]);
+    assert!(ok && out.contains("2001:db8::1"), "{out}");
+
+    // §5: passed on unchanged to the internal peer, encoding included.
+    let route_c = || bird_c.birdc(&lab, &["show", "route", "all", "192.0.2.0/24"]);
+    let ok = wait_for(Duration::from_secs(15), || {
+        route_c().contains("BGP.next_hop: 2001:db8::1")
+    });
+    assert!(ok, "{}\n{}", route_c(), bgpfcd.log_text());
+    assert!(route_c().contains("BGP.as_path: 65001"), "{}", route_c());
+
+    // §5: our own next hop towards B is of the session's protocol, IPv4.
+    // The 30 s RFC 4271 §10 interval may hold it behind C's first route.
+    let route_b = || bird_b.birdc(&lab, &["show", "route", "all", "203.0.113.0/24"]);
+    let ok = wait_for(Duration::from_secs(40), || {
+        route_b().contains(&format!("BGP.next_hop: {}", lab.a_addr))
+    });
+    assert!(ok, "{}\n{}", route_b(), bgpfcd.log_text());
+
+    assert_extended_next_hop_off_towards_c(&lab, &bird_c, &bgpfcd, &socket);
+}
+
+/// B, C and bgpfcd for `extended_next_hop_with_bird`, all three with
+/// RFC 8950 on, and bgpfcd's control socket.
+fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, std::path::PathBuf) {
+    let ns_c = lab.add_c();
+    let bird_b = Bird::start(
+        lab,
+        &lab.b.clone(),
+        &BirdOpts {
+            channel: "extended next hop on; next hop address 2001:db8::1;".to_owned(),
+            protocol: String::new(),
+            ..bird_opts(lab, true, &["192.0.2.0/24"])
+        },
+    );
+    let bird_c = Bird::start(
+        lab,
+        &ns_c,
+        &BirdOpts {
+            local_as: BGPFC_AS,
+            local: lab.c_addr,
+            local_port: 179,
+            neighbor: lab.a2_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: vec!["203.0.113.0/24".to_owned()],
+            channel: "extended next hop on;".to_owned(),
+            protocol: String::new(),
+        },
+    );
+    let socket = lab.dir.join("ctl.sock");
+    let to_b = NeighborOpts {
+        extra: "extended-next-hop yes;".to_owned(),
+        ..NeighborOpts::new(lab.b_addr, BIRD_AS)
+    };
+    // A short ConnectRetryTime, so that the reset in the test reconnects
+    // quickly even if BIRD refuses the first attempt.
+    let to_c = NeighborOpts {
+        extra: "connect-retry-time 5; extended-next-hop yes;".to_owned(),
+        ..NeighborOpts::new(lab.c_addr, BGPFC_AS)
+    };
+    let bgpfcd = start_bgpfcd(
+        lab,
+        &lab.a.clone(),
+        &BgpfcdOpts {
+            local_as: BGPFC_AS,
+            router_id: lab.a_addr,
+            listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
+            neighbors: vec![to_b, to_c],
+            extra: format!("control {{ socket {}; }}", socket.display()),
+        },
+    );
+    (bird_b, bird_c, bgpfcd, socket)
+}
+
+/// Reload bgpfcd with `extended-next-hop` off towards C: the session resets
+/// (the OPEN changes), comes back without the capability, and C loses the
+/// route with the IPv6 next hop while bgpfcd keeps it (RFC 8950 §4, §5).
+fn assert_extended_next_hop_off_towards_c(
+    lab: &Lab,
+    bird_c: &Bird,
+    bgpfcd: &interop::Daemon,
+    socket: &std::path::Path,
+) {
+    use std::fs;
+    let ctl = |args: &[&str]| interop::bgpfcctl(socket, args);
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
+    let cfg = fs::read_to_string(&cfg_path).unwrap().replace(
+        "connect-retry-time 5; extended-next-hop yes;",
+        "connect-retry-time 5;",
+    );
+    fs::write(&cfg_path, cfg).unwrap();
+    let (out, ok) = ctl(&["reload"]);
+    assert!(ok && out.contains("reset 1"), "{out}");
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().matches("session established").count() >= 3
+    });
+    assert!(ok, "no reconnect:\n{}", bgpfcd.log_text());
+    let c = lab.c_addr.to_string();
+    let ok = wait_for(Duration::from_secs(15), || {
+        let (out, _) = ctl(&["show", "neighbor", &c]);
+        out.contains("Established") && out.contains("routes received 1 advertised 0")
+    });
+    let (out, _) = ctl(&["show", "neighbor", &c]);
+    assert!(ok, "{out}\n{}", bgpfcd.log_text());
+    assert!(!out.contains("extended-next-hop"), "{out}");
+    let route_c = || bird_c.birdc(lab, &["show", "route", "all", "192.0.2.0/24"]);
+    let ok = wait_for(Duration::from_secs(10), || {
+        !route_c().contains("192.0.2.0/24")
+    });
+    assert!(ok, "{}\n{}", route_c(), bgpfcd.log_text());
+    let (out, _) = ctl(&["show", "routes", "192.0.2.0/24"]);
+    assert!(out.contains("2001:db8::1"), "{out}");
+}
+
+/// RFC 4271 §6.7 and RFC 4486 §4 against BIRD: BIRD sends three routes to
+/// a neighbor whose `maximum-prefix` is two. bgpfcd ends the session with
+/// Cease / Maximum Number of Prefixes Reached carrying AFI 1, SAFI 1 and
+/// the limit, keeps none of BIRD's routes, retries once (`restart-limit
+/// 1`) and then stays Idle. A reload raising the limit applies without a
+/// reset, and `bgpfcctl clear neighbor` is the manual start that brings
+/// the session back for good.
+#[test]
+#[ignore = "needs root, bird and iproute2"]
+fn prefix_limit_and_restart_limit_with_bird() {
+    use std::fs;
+    let lab = Lab::new("l", 14);
+    let mut b = bird_opts(
+        &lab,
+        true,
+        &["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"],
+    );
+    // BIRD refuses connections for its `error wait time` (60 s at first)
+    // after a session ends in an error; keep its retries quick.
+    b.protocol = "error wait time 1, 2;".to_owned();
+    let bird = Bird::start(&lab, &lab.b.clone(), &b);
+    let socket = lab.dir.join("ctl.sock");
+    let mut opts = bgpfcd_opts(&lab, false);
+    opts.neighbors[0].extra =
+        "connect-retry-time 5; maximum-prefix ipv4-unicast 2; restart-limit 1;".to_owned();
+    opts.extra = format!("control {{ socket {}; }}", socket.display());
+    let bgpfcd = start_bgpfcd(&lab, &lab.a.clone(), &opts);
+    let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
+    let b_addr = lab.b_addr.to_string();
+
+    // Over the limit: the Cease, logged on both sides.
+    let ok = wait_for(ESTABLISH, || {
+        bgpfcd.log_text().contains("maximum prefixes reached")
+    });
+    assert!(ok, "no prefix limit:\n{}", bgpfcd.log_text());
+    let log = bgpfcd.log_text();
+    assert!(log.contains("family=ipv4-unicast limit=2"), "{log}");
+    assert!(
+        log.contains("Cease/Maximum Number of Prefixes Reached"),
+        "{log}"
+    );
+    // RFC 4486 §4 Figure 1 as BIRD logs the data: AFI, SAFI, upper bound.
+    let ok = wait_for(Duration::from_secs(10), || {
+        bird.daemon
+            .log_text()
+            .contains("Received: Maximum number of prefixes reached: 00010100000002")
+    });
+    assert!(ok, "bird log:\n{}", bird.daemon.log_text());
+
+    // RFC 4486 §4: one automatic retry, which fails the same way, then no
+    // more until the operator acts.
+    let ok = wait_for(Duration::from_secs(60), || {
+        bgpfcd.log_text().contains("restart limit reached")
+    });
+    assert!(ok, "no restart limit:\n{}", bgpfcd.log_text());
+    let log = bgpfcd.log_text();
+    assert_eq!(log.matches("maximum prefixes reached").count(), 2, "{log}");
+    assert!(log.contains("damped_failures=2 restart_limit=1"), "{log}");
+    let (out, ok) = ctl(&["show", "neighbor", &b_addr]);
+    assert!(ok && out.contains("state Idle"), "{out}");
+    assert!(out.contains("restart limit reached"), "{out}");
+    let (out, _) = ctl(&["show", "routes"]);
+    assert!(!out.contains("192.0.2.0/24"), "{out}");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        bgpfcd.log_text().matches("session established").count(),
+        2,
+        "{}",
+        bgpfcd.log_text()
+    );
+
+    // A higher limit applies without a reset; the clear starts the peer.
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
+    let cfg = fs::read_to_string(&cfg_path).unwrap().replace(
+        "maximum-prefix ipv4-unicast 2;",
+        "maximum-prefix ipv4-unicast 10;",
+    );
+    fs::write(&cfg_path, cfg).unwrap();
+    let (out, ok) = ctl(&["reload"]);
+    assert!(
+        ok && out.contains("reset 0") && out.contains("limit 1"),
+        "{out}"
+    );
+    let (out, ok) = ctl(&["clear", "neighbor", &b_addr]);
+    assert!(ok, "{out}");
+    let ok = wait_for(ESTABLISH, || {
+        let (out, _) = ctl(&["show", "neighbor", &b_addr]);
+        out.contains("ipv4-unicast received 3 advertised 0 maximum-prefix 10")
+    });
+    let (out, _) = ctl(&["show", "neighbor", &b_addr]);
+    assert!(ok, "{out}\n{}", bgpfcd.log_text());
+    assert!(!out.contains("restart limit reached"), "{out}");
+    let (out, _) = ctl(&["show", "routes"]);
+    assert!(out.contains("203.0.113.0/24"), "{out}");
 }

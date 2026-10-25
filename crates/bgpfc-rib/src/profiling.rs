@@ -68,6 +68,7 @@ impl Rib {
                 d.candidate_bytes += dest.heap_bytes();
                 for c in dest.routes() {
                     d.routes += 1;
+                    d.pre_policy += usize::from(c.received.is_some());
                     if by_ptr.insert(Arc::as_ptr(&c.attrs).addr()) {
                         by_value.insert(&c.attrs);
                         paths.insert(&c.attrs.as_path);
@@ -86,6 +87,14 @@ impl Rib {
             .iter()
             .flatten()
             .flat_map(|p| p.advertised.values())
+            .sum();
+        d.pacing_bytes = self
+            .s
+            .peers
+            .iter()
+            .flatten()
+            .flat_map(|p| p.pacing.values())
+            .map(crate::pacing::Pacing::heap_bytes)
             .sum();
         d
     }
@@ -120,6 +129,14 @@ pub struct Duplication {
     /// Routes in all Adj-RIBs-Out, which are counted, not stored: each
     /// follows from the Loc-RIB and export.
     pub adj_rib_out: usize,
+    /// Routes that keep the attributes they were received with apart
+    /// from those import policy made (RFC 4271 §3.2 Adj-RIB-In): those
+    /// policy changed or rejected.
+    pub pre_policy: usize,
+    /// Heap octets the RFC 4271 §9.2.1.1 pacing of all peers has room
+    /// for: held destinations, wake-ups, and the advertisements and
+    /// withdrawals of the last interval.
+    pub pacing_bytes: usize,
 }
 
 /// `size_of` of the structures a route is made of, by name.
@@ -155,6 +172,7 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::{Duration, Instant};
 
     use bgpfc_wire::attribute::{Origin, PathAttribute};
     use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
@@ -174,8 +192,12 @@ mod tests {
             router_id: RouterId::new(u32::from(i)).unwrap(),
             kind,
             families: vec![AddressFamily::IPV4_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST],
             four_octet_as: true,
             extended_messages: false,
+            extended_next_hop: Vec::new(),
+            advertisement_interval: Duration::from_secs(30),
+            prefix_limits: Vec::new(),
         }
     }
 
@@ -196,42 +218,54 @@ mod tests {
                 attributes,
                 ..UpdateMessage::default()
             },
-            treated_as_withdraw: None,
-            discarded: Vec::new(),
+            ..DecodedUpdate::default()
         }
     }
 
     #[test]
     fn counts_repeated_attribute_sets_and_paths() {
+        let now = Instant::now();
         let mut rib = Rib::new(Asn(65_000));
         let a = peer(1, PeerKind::External);
         let b = peer(2, PeerKind::External);
-        rib.peer_up(a.clone(), &mut Vec::new());
-        rib.peer_up(b.clone(), &mut Vec::new());
+        rib.peer_up(a.clone(), now, &mut Vec::new());
+        rib.peer_up(b.clone(), now, &mut Vec::new());
         // Two attribute sets from A that share an AS_PATH and differ in MED.
         rib.update(
             a.addr,
             &update(&[65_001, 7], None, &["192.0.2.0/24", "198.51.100.0/24"]),
+            now,
             &mut Vec::new(),
         );
         rib.update(
             a.addr,
             &update(&[65_001, 7], Some(5), &["203.0.113.0/24"]),
+            now,
             &mut Vec::new(),
         );
         // One from B, for one of the same destinations.
         rib.update(
             b.addr,
             &update(&[65_002, 7], None, &["192.0.2.0/24"]),
+            now,
+            &mut Vec::new(),
+        );
+        // A change inside B's interval is held back.
+        rib.update(
+            a.addr,
+            &update(&[65_001, 7, 8], None, &["198.51.100.0/24"]),
+            now + Duration::from_secs(1),
             &mut Vec::new(),
         );
 
         let d = rib.duplication();
         assert_eq!(d.destinations, 3);
         assert_eq!(d.routes, 4);
-        assert_eq!(d.attr_sets, 3);
-        assert_eq!(d.attr_values, 3);
-        assert_eq!(d.as_paths, 2);
+        assert_eq!(d.attr_sets, 4);
+        assert_eq!(d.attr_values, 4);
+        assert_eq!(d.as_paths, 3);
+        assert_eq!(d.pre_policy, 0);
+        assert!(d.pacing_bytes > 0);
         assert!(d.as_path_bytes > d.as_path_bytes_if_interned);
         assert!(d.interned >= d.attr_sets);
         // Only 192.0.2.0/24 has two routes; the others hold theirs inline.

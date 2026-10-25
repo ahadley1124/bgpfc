@@ -90,9 +90,37 @@ name = "bgpfc-rib"
 version = "0.1.0"
 dependencies = [
  "bgpfc-prof",
+ "bgpfc-rpki",
  "bgpfc-wire",
  "criterion",
  "proptest",
+]
+
+[[package]]
+name = "bgpfc-rpki"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-wire",
+ "criterion",
+ "proptest",
+]
+
+[[package]]
+name = "bgpfc-rtr"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+ "bgpfc-rpki",
+ "bgpfc-wire",
+ "proptest",
+]
+
+[[package]]
+name = "bgpfc-sidecar"
+version = "0.1.0"
+dependencies = [
+ "bgpfc-log",
+ "bgpfc-sys",
 ]
 
 [[package]]
@@ -128,6 +156,8 @@ dependencies = [
  "bgpfc-policy",
  "bgpfc-prof",
  "bgpfc-rib",
+ "bgpfc-rpki",
+ "bgpfc-rtr",
  "bgpfc-sys",
  "bgpfc-wire",
 ]
@@ -385,6 +415,11 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 [[package]]
 name = "interop"
 version = "0.1.0"
+dependencies = [
+ "bgpfc-rpki",
+ "bgpfc-rtr",
+ "bgpfc-wire",
+]
 
 [[package]]
 name = "is-terminal"

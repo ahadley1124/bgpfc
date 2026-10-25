@@ -6,6 +6,7 @@
 #![cfg(not(miri))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use bgpfc_rib::attrs::UnknownAttribute;
 use bgpfc_rib::export::{rewrite, same_rewrite};
@@ -50,6 +51,12 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
         Just(NextHop::Ipv6 {
             global: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
             link_local: None,
+        }),
+        // The same global address with a link-local one, which no rewrite
+        // passes on (RFC 2545 §3).
+        Just(NextHop::Ipv6 {
+            global: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            link_local: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
         }),
     ];
     let ext =
@@ -106,11 +113,12 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
         )
 }
 
-/// External over IPv4 or IPv6, or internal.
+/// External over IPv4, over IPv6 without and with RFC 8950 Extended Next
+/// Hop Encoding for IPv4, or internal.
 fn peer() -> impl Strategy<Value = PeerInfo> {
-    (0u8..3).prop_map(|k| PeerInfo {
+    (0u8..4).prop_map(|k| PeerInfo {
         addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-        local_addr: if k == 1 {
+        local_addr: if k == 1 || k == 3 {
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xfe))
         } else {
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))
@@ -123,8 +131,16 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
             PeerKind::External
         },
         families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+        receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        extended_next_hop: if k == 3 {
+            vec![AddressFamily::IPV4_UNICAST]
+        } else {
+            Vec::new()
+        },
+        advertisement_interval: Duration::ZERO,
+        prefix_limits: Vec::new(),
     })
 }
 

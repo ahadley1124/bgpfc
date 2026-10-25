@@ -21,6 +21,16 @@ pub struct ConfigDiff {
     /// anything those policies reference) changed: re-evaluate their
     /// routes, with route refresh where the peer supports it.
     pub policy_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `advertisement-interval`
+    /// changed: the RIB paces the running session with the new value
+    /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
+    /// in `policy_changed` too.
+    pub interval_changed: Vec<IpAddr>,
+    /// Neighbors in both, not reset, whose `maximum-prefix` limits
+    /// changed: the RIB applies them to the running session (RFC 4271
+    /// §6.7), which ends at once if it already holds more routes than a
+    /// new limit allows. A neighbor may be in the lists above too.
+    pub prefix_limit_changed: Vec<IpAddr>,
     /// Neighbors in both with only a description change, or none.
     pub unchanged: Vec<IpAddr>,
     /// Which global settings changed.
@@ -40,6 +50,12 @@ pub enum GlobalChange {
     Log,
     /// The `control` block.
     Control,
+    /// The `rpki` block, an absent one counting as `mode disabled` with
+    /// the defaults: the RTR client starts, stops or restarts. A block
+    /// that only spells something differently, such as a default written
+    /// out or a cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)),
+    /// is no change.
+    Rpki,
 }
 
 impl ConfigDiff {
@@ -54,6 +70,7 @@ impl ConfigDiff {
             (old.fib != new.fib, GlobalChange::Fib),
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
+            (!old.rpki.same_as(&new.rpki), GlobalChange::Rpki),
         ] {
             if changed {
                 d.global.push(what);
@@ -71,9 +88,21 @@ impl ConfigDiff {
             };
             if identity_changed || !o.same_session(n) {
                 d.reset.push(n.addr);
-            } else if policy_differs(old, o, new, n) {
+                continue;
+            }
+            let policy = policy_differs(old, o, new, n);
+            let interval = o.advertisement_interval != n.advertisement_interval;
+            let limit = o.maximum_prefix != n.maximum_prefix;
+            if policy {
                 d.policy_changed.push(n.addr);
-            } else {
+            }
+            if interval {
+                d.interval_changed.push(n.addr);
+            }
+            if limit {
+                d.prefix_limit_changed.push(n.addr);
+            }
+            if !policy && !interval && !limit {
                 d.unchanged.push(n.addr);
             }
         }
@@ -87,6 +116,8 @@ impl ConfigDiff {
             && self.removed.is_empty()
             && self.reset.is_empty()
             && self.policy_changed.is_empty()
+            && self.interval_changed.is_empty()
+            && self.prefix_limit_changed.is_empty()
             && self.global.is_empty()
     }
 }
@@ -162,6 +193,24 @@ mod tests {
         assert_eq!(d.added, vec![addr("192.0.2.4")]);
         assert_eq!(d.global, vec![]);
         assert!(!d.is_empty());
+        // RFC 8950 §4: extended-next-hop changes the OPEN, so it is a
+        // session parameter.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; extended-next-hop yes;",
+        ));
+        assert_eq!(ConfigDiff::between(&a, &c).reset, vec![addr("192.0.2.3")]);
+        // The RFC 4486 §4 restart limit is the FSM's, like the timers: a
+        // change resets the session, which also starts a peer it stopped.
+        let unbounded =
+            cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit off;"));
+        assert_eq!(
+            ConfigDiff::between(&a, &unbounded).reset,
+            vec![addr("192.0.2.3")]
+        );
+        // Spelling out the default is no change.
+        let explicit = cfg(&BASE.replace("remote-as 65002;", "remote-as 65002; restart-limit 10;"));
+        assert!(ConfigDiff::between(&a, &explicit).is_empty());
     }
 
     #[test]
@@ -193,6 +242,70 @@ mod tests {
     }
 
     #[test]
+    fn advertisement_interval_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // Set where it was the default, and alongside a policy change.
+        let b = cfg(&BASE
+            .replace(
+                "description \"a\";",
+                "description \"a\"; advertisement-interval 0;",
+            )
+            .replace(
+                "remote-as 65002; import IN;",
+                "remote-as 65002; advertisement-interval 5; import OUT;",
+            ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(
+            d.interval_changed,
+            vec![addr("192.0.2.2"), addr("192.0.2.3")]
+        );
+        assert_eq!(d.policy_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, Vec::<IpAddr>::new());
+        assert!(!d.is_empty());
+        // The explicit default is still a change from "the default": the
+        // daemon resolves both to the same value and does nothing.
+        let c = cfg(&BASE.replace(
+            "description \"a\";",
+            "description \"a\"; advertisement-interval 30;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&a, &c).interval_changed,
+            vec![addr("192.0.2.2")]
+        );
+        assert!(ConfigDiff::between(&b, &b).is_empty());
+    }
+
+    #[test]
+    fn prefix_limit_changes_need_no_reset() {
+        let a = cfg(BASE);
+        // RFC 4271 §6.7: a limit is the RIB's, not the session's.
+        let b = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 100;",
+        ));
+        let d = ConfigDiff::between(&a, &b);
+        assert_eq!(d.prefix_limit_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.reset, Vec::<IpAddr>::new());
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+        assert!(!d.is_empty());
+        // Raised, lowered or removed alike.
+        let c = cfg(&BASE.replace(
+            "remote-as 65002;",
+            "remote-as 65002; maximum-prefix ipv4-unicast 50;",
+        ));
+        assert_eq!(
+            ConfigDiff::between(&b, &c).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert_eq!(
+            ConfigDiff::between(&c, &a).prefix_limit_changed,
+            vec![addr("192.0.2.3")]
+        );
+        assert!(ConfigDiff::between(&c, &c).is_empty());
+    }
+
+    #[test]
     fn global_changes() {
         let a = cfg(BASE);
         let b = cfg(&BASE
@@ -208,6 +321,83 @@ mod tests {
         assert_eq!(
             ConfigDiff::between(&a, &c).global,
             vec![GlobalChange::Fib, GlobalChange::Log, GlobalChange::Control]
+        );
+    }
+
+    #[test]
+    fn rpki_changes_are_one_global_change() {
+        let a = cfg(BASE);
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let external = with("rpki { mode external; cache 192.0.2.10; }");
+        let d = ConfigDiff::between(&a, &external);
+        assert_eq!(d.global, vec![GlobalChange::Rpki]);
+        // No neighbor is touched.
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+        assert!(d.reset.is_empty() && d.policy_changed.is_empty());
+        assert!(!d.is_empty());
+        // Spelling out a default, or moving the block, is no change: the
+        // running client is left alone.
+        for same in [
+            "rpki { mode external; cache 192.0.2.10 port 323 preference 0; }",
+            "rpki { mode external; version 1; max-expire 172800; cache 192.0.2.10; }",
+            "rpki { mode external; backoff 1 600; connect-timeout 10; cache 192.0.2.10; }",
+        ] {
+            assert!(
+                ConfigDiff::between(&external, &with(same)).is_empty(),
+                "{same}"
+            );
+        }
+        // Nor is respelling a cache as the parser reads it: the same
+        // address, or the same name in another case or with its final dot.
+        let named = with("rpki { mode external; cache rtr.example.net; cache 2001:db8::1; }");
+        for same in [
+            "rpki { mode external; cache RTR.Example.NET; cache 2001:db8::1; }",
+            "rpki { mode external; cache rtr.example.net.; cache 2001:0db8:0::1; }",
+            "rpki { mode external; cache rtr.example.net port 323; cache 2001:db8::1; }",
+        ] {
+            assert!(
+                ConfigDiff::between(&named, &with(same)).is_empty(),
+                "{same}"
+            );
+        }
+        for other in [
+            "rpki { mode external; cache rtr.example.org; cache 2001:db8::1; }",
+            "rpki { mode external; cache rtr.example.net; cache 2001:db8::2; }",
+            "rpki { mode external; cache rtr.example.net port 3323; cache 2001:db8::1; }",
+            "rpki { mode external; cache 2001:db8::1; cache rtr.example.net; }",
+        ] {
+            assert_eq!(
+                ConfigDiff::between(&named, &with(other)).global,
+                vec![GlobalChange::Rpki],
+                "{other}"
+            );
+        }
+        let moved = cfg(&format!(
+            "rpki {{ mode external; cache 192.0.2.10; }}\n# moved\n{BASE}"
+        ));
+        assert!(ConfigDiff::between(&external, &moved).is_empty());
+        // No block is `mode disabled`.
+        assert!(ConfigDiff::between(&a, &with("rpki { mode disabled; }")).is_empty());
+        // Anything else is a change: the mode, a cache, the order of the
+        // caches (it breaks ties of preference), a setting.
+        for other in [
+            "rpki { mode disabled; cache 192.0.2.10; }",
+            "rpki { mode external; cache 192.0.2.10 port 3323; }",
+            "rpki { mode external; cache 192.0.2.10 preference 1; }",
+            "rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }",
+            "rpki { mode external; cache 192.0.2.10; max-vrps 10; }",
+        ] {
+            assert_eq!(
+                ConfigDiff::between(&external, &with(other)).global,
+                vec![GlobalChange::Rpki],
+                "{other}"
+            );
+        }
+        let two = with("rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }");
+        let swapped = with("rpki { mode external; cache 192.0.2.11; cache 192.0.2.10; }");
+        assert_eq!(
+            ConfigDiff::between(&two, &swapped).global,
+            vec![GlobalChange::Rpki]
         );
     }
 }
