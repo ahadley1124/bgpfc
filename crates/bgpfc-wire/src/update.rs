@@ -530,6 +530,10 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
         // The value is an AS number and kept whatever it is: the RFC names
         // no check on it, and "once the OTC Attribute has been set, it MUST
         // be preserved unchanged".
+        // NOTE(interop): FRR 8.4 treats a value of 0 as malformed
+        // (treat-as-withdraw); BIRD 2.14 and RFC 9234 §5 do not. Following
+        // the RFC, it is kept; from a peer it is a leak anyway, as no AS 0
+        // is a peer's.
         code::ONLY_TO_CUSTOMER => match u32_value(v) {
             Some(a) => Outcome::Keep(PathAttribute::OnlyToCustomer(Asn(a))),
             None => length_error(),
@@ -1569,6 +1573,33 @@ mod tests {
             d.message.attribute(code::ONLY_TO_CUSTOMER),
             Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
         );
+    }
+
+    #[test]
+    fn bird_update_with_otc_is_read_and_written_back() {
+        // Captured from BIRD 2.14, AS 65001, `local role provider`, sending
+        // a static route to its customer: ORIGIN, AS_PATH 65001, NEXT_HOP,
+        // and the Only to Customer attribute (RFC 9234 §5: 0xc0, type 35,
+        // length 4) set to its own AS, as §5 egress 1 has it.
+        let wire = [
+            0, 0, // withdrawn routes length
+            0, 27, // total path attribute length
+            0x40, 1, 1, 0, // ORIGIN igp
+            0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9, // AS_PATH seq 65001
+            0x40, 3, 4, 10, 77, 0, 2, // NEXT_HOP
+            0xc0, 35, 4, 0, 0, 0xfd, 0xe9, // OTC 65001
+            24, 192, 0, 2, // NLRI 192.0.2.0/24
+        ];
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.discarded, vec![]);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+        assert_eq!(d.message.nlri, vec![p("192.0.2.0/24")]);
+        // The canonical form: the encoder writes the same octets.
+        assert_eq!(d.message.encode(&ENC4).unwrap(), wire);
     }
 
     #[test]

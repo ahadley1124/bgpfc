@@ -276,7 +276,7 @@ impl std::error::Error for ShutdownCommunicationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::HeaderSubcode;
+    use crate::error::{HeaderSubcode, OpenSubcode};
 
     fn round_trip(m: &NotificationMessage, wire: &[u8]) {
         assert_eq!(m.encode(false).unwrap(), wire, "{m}");
@@ -301,6 +301,19 @@ mod tests {
             )),
             &[1, 2, 0x10, 0x01],
         );
+    }
+
+    #[test]
+    fn role_mismatch_is_open_message_error_11_without_data() {
+        // RFC 9234 §4.2 and §7: "the Role Mismatch Notification (code 2,
+        // subcode 11)". Seen from BIRD 2.14 and sent by bgpfc alike.
+        let m = NotificationMessage::from_decode_error(DecodeError::open(
+            OpenSubcode::RoleMismatch,
+            vec![],
+        ));
+        round_trip(&m, &[2, 11]);
+        assert!(m.is_recognised());
+        assert_eq!(m.to_string(), "OPEN Message Error/Role Mismatch");
     }
 
     #[test]

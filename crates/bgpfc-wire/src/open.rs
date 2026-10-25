@@ -357,6 +357,31 @@ mod tests {
     }
 
     #[test]
+    fn bird_open_with_a_role_is_read_and_written_back() {
+        // Captured from BIRD 2.14, AS 65001, `local role provider`, to a
+        // neighbor in AS 65000: Multiprotocol, Route Refresh, the Role
+        // (RFC 9234 §4.1: 9, 1, 0), Graceful Restart, 4-octet AS, Enhanced
+        // Route Refresh and Long-lived Graceful Restart. The ones this
+        // implementation does not know are kept as they came (RFC 5492 §5).
+        let wire = [
+            4, 0xfd, 0xe9, 0, 30, 10, 77, 0, 2, // version, AS, hold, ID
+            27, 2, 25, // optional parameters: a Capabilities parameter
+            1, 4, 0, 1, 0, 1, // Multiprotocol, IPv4 unicast
+            2, 0, // Route Refresh
+            9, 1, 0, // BGP Role: Provider
+            64, 2, 0, 120, // Graceful Restart
+            65, 4, 0, 0, 0xfd, 0xe9, // 4-octet AS
+            70, 0, // Enhanced Route Refresh
+            71, 0, // Long-lived Graceful Restart
+        ];
+        let m = OpenMessage::decode(&wire).unwrap();
+        assert_eq!(m.asn(), Asn(65_001));
+        assert!(m.has(&Capability::Role(Role::Provider)));
+        assert_eq!(m.capabilities.len(), 7);
+        assert_eq!(m.encode().unwrap(), wire);
+    }
+
+    #[test]
     fn new_uses_as_trans_for_a_four_octet_asn() {
         // RFC 6793 §3.
         let m = OpenMessage::new(
