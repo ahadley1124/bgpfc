@@ -40,6 +40,11 @@ fn retention(notification: bool) -> Retention {
     }
 }
 
+/// The families route selection waits for, with the peers each waits for.
+fn deferred(rib: &Rib) -> Vec<(AddressFamily, usize)> {
+    rib.deferred().into_iter().map(|(f, n, _)| (f, n)).collect()
+}
+
 fn stale_flags(rib: &Rib, prefix: &str) -> Vec<(IpAddr, bool)> {
     routes(rib, V4, p(prefix))
         .into_iter()
@@ -604,7 +609,7 @@ fn route_selection_waits_for_every_end_of_rib() {
     let b = gr_peer("10.0.0.2", 65_002, 2);
     let t0 = now();
     rib.defer_selection(&waiting(&[&a, &b], t0));
-    assert_eq!(rib.deferred(), vec![(V4, 2), (V6, 2)]);
+    assert_eq!(deferred(&rib), vec![(V4, 2), (V6, 2)]);
     assert_eq!(rib.next_deadline(), Some(t0 + RESTART));
     let mut out = Vec::new();
     rib.peer_up(a.clone(), t0, &mut out);
@@ -637,7 +642,7 @@ fn route_selection_waits_for_every_end_of_rib() {
         rib.end_of_rib(a.addr, V6, t0, o);
         rib.end_of_rib(b.addr, V6, t0, o);
     });
-    assert_eq!(rib.deferred(), vec![(V4, 1)]);
+    assert_eq!(deferred(&rib), vec![(V4, 1)]);
     // IPv6 is done: nothing to bring to the FIB, a table of nothing and its
     // marker for each peer.
     assert!(
@@ -648,7 +653,7 @@ fn route_selection_waits_for_every_end_of_rib() {
     assert_eq!(markers(&out, &b), vec![V6]);
     assert_eq!(fib(&out).len(), 0);
     let out = outputs(|o| rib.end_of_rib(b.addr, V4, t0, o));
-    assert_eq!(rib.deferred().len(), 0);
+    assert_eq!(deferred(&rib).len(), 0);
     assert!(
         out.iter()
             .any(|o| matches!(o, Output::SelectionDone { family } if *family == V4))
@@ -712,11 +717,11 @@ fn route_selection_does_not_wait_for_peers_that_will_not_send_a_marker() {
             until: t0 + RESTART,
         });
         rib.peer_up(a.clone(), t0, &mut Vec::new());
-        assert_eq!(rib.deferred(), vec![(V4, 2)], "{label}");
+        assert_eq!(deferred(&rib), vec![(V4, 2)], "{label}");
         rib.peer_up(other.clone(), t0, &mut Vec::new());
-        assert_eq!(rib.deferred(), vec![(V4, 1)], "{label}");
+        assert_eq!(deferred(&rib), vec![(V4, 1)], "{label}");
         let out = outputs(|o| rib.end_of_rib(a.addr, V4, t0, o));
-        assert!(rib.deferred().is_empty(), "{label}");
+        assert!(deferred(&rib).is_empty(), "{label}");
         assert!(
             out.iter()
                 .any(|o| matches!(o, Output::SelectionDone { .. })),
@@ -748,7 +753,7 @@ fn the_deferral_timer_ends_the_wait() {
         })
         .collect();
     assert_eq!(done, vec![V4, V6]);
-    assert_eq!(rib.deferred().len(), 0);
+    assert_eq!(deferred(&rib).len(), 0);
     // A is sent its table (nothing of its own back) and the markers.
     assert_eq!(markers(&out, &a), vec![V4, V6]);
     assert_eq!(rib.next_deadline(), None);
@@ -764,10 +769,10 @@ fn a_peer_that_is_gone_is_not_waited_for() {
     rib.peer_up(a.clone(), t0, &mut Vec::new());
     rib.end_of_rib(a.addr, V4, t0, &mut Vec::new());
     rib.end_of_rib(a.addr, V6, t0, &mut Vec::new());
-    assert_eq!(rib.deferred(), vec![(V4, 1), (V6, 1)]);
+    assert_eq!(deferred(&rib), vec![(V4, 1), (V6, 1)]);
     // B's session is not one that comes back: it was removed.
     let out = outputs(|o| rib.peer_down(b.addr, t0, o));
-    assert_eq!(rib.deferred().len(), 0);
+    assert_eq!(deferred(&rib).len(), 0);
     assert_eq!(
         out.iter()
             .filter(|o| matches!(o, Output::SelectionDone { .. }))
@@ -784,7 +789,7 @@ fn a_family_nobody_waits_for_is_not_deferred() {
         waiting: vec![(a.addr, vec![V4])],
         until: now() + RESTART,
     });
-    assert_eq!(rib.deferred(), vec![(V4, 1)]);
+    assert_eq!(deferred(&rib), vec![(V4, 1)]);
     // IPv6 goes ahead as usual: a table and its marker.
     let out = outputs(|o| rib.peer_up(a.clone(), now(), o));
     assert_eq!(markers(&out, &a), vec![V6]);

@@ -18,6 +18,7 @@ mod privileges;
 #[cfg(feature = "profiling")]
 mod profiling;
 mod reader;
+mod restart;
 mod rib;
 mod rpki;
 mod wiring;
@@ -26,6 +27,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
@@ -33,6 +35,7 @@ use bgpfc_wire::error::CeaseSubcode;
 use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
 use crate::messages::{FibMsg, PeerInput, RibMsg};
+use crate::restart::RestartState;
 
 /// docs/PROFILING.md: a profiling build counts every allocation.
 #[cfg(feature = "profiling")]
@@ -137,22 +140,13 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     // The netlink socket and the listeners are opened while still
     // privileged (README, "Option B"); the FIB thread flushes stale
     // routes right away.
-    let fib_tx = match fib::start(bgpfc_fib::Fib::new(
-        fib::mode_of(config.fib.mode),
-        config.fib.table,
-        config.fib.protocol,
-    )) {
-        Ok(tx) => tx,
-        Err(e) => {
-            bgpfc_log::error!("cannot start the fib", error = e);
-            std::process::exit(1);
-        }
-    };
+    let restart = Arc::new(RestartState::default());
+    let (fib_tx, kept) = start_fib(&config, &restart);
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
     let table: PeerTable = Arc::new(RwLock::new(HashMap::new()));
     let mut peers = Vec::new();
     for n in &config.neighbors {
-        peers.push(prepare_peer(&config, n, &rib_tx, &table));
+        peers.push(prepare_peer(&config, n, &rib_tx, &table, &restart));
     }
     for addr in &config.listen {
         if let Err(e) = coordinator::listen(*addr, Arc::clone(&table)) {
@@ -183,12 +177,14 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
     // RFC 4271 §10: the advertisement intervals are jittered too.
     rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
+    defer_selection(&config, &kept, &mut rib, &restart);
     rib::spawn(
         rib,
         wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
+        Arc::clone(&restart),
     );
     // Before the peers, so that the VRPs often arrive before the routes
     // and most routes are validated once, on arrival.
@@ -205,6 +201,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         rib_tx,
         fib_tx,
         rpki,
+        restart,
     };
     while let Ok(msg) = coord_rx.recv() {
         match msg {
@@ -232,6 +229,66 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
             }
         }
     }
+}
+
+/// Open the netlink socket, flush the routes of our protocol number that
+/// are in the kernel, and start the FIB thread. Except, in install mode,
+/// the routes of a family a neighbor with `graceful-restart yes` can send
+/// again: RFC 4724 §4.1 has a daemon that restarted keep its forwarding
+/// state until then (AGENTS.md §3, "FIB"). In dry-run mode nothing was
+/// installed, so nothing is kept. The families that have routes kept are
+/// returned with the thread's queue.
+fn start_fib(
+    config: &bgpfc_config::Config,
+    restart: &Arc<RestartState>,
+) -> (SyncSender<FibMsg>, Vec<bgpfc_wire::types::AddressFamily>) {
+    let keep = if config.fib.mode == bgpfc_config::ast::FibMode::Install {
+        restart::keepable(config)
+    } else {
+        Vec::new()
+    };
+    let fib = bgpfc_fib::Fib::new(
+        fib::mode_of(config.fib.mode),
+        config.fib.table,
+        config.fib.protocol,
+    );
+    match fib::start(fib, &keep, Arc::clone(restart)) {
+        Ok(started) => started,
+        Err(e) => {
+            bgpfc_log::error!("cannot start the fib", error = e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// RFC 4724 §4.1: if we restarted with forwarding state kept (`kept` are
+/// the families that have routes in the kernel), route selection waits for
+/// the End-of-RIB of the neighbors that can send the routes again, and our
+/// OPENs say that we have restarted.
+fn defer_selection(
+    config: &bgpfc_config::Config,
+    kept: &[bgpfc_wire::types::AddressFamily],
+    rib: &mut bgpfc_rib::Rib,
+    restart: &RestartState,
+) {
+    let Some(deferral) = restart::deferral(config, kept, Instant::now()) else {
+        return;
+    };
+    bgpfc_log::info!(
+        "restarted with forwarding state kept, deferring route selection",
+        families = kept
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        neighbors = deferral.waiting.len(),
+        seconds = deferral
+            .until
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+    );
+    rib.defer_selection(&deferral);
+    restart.set_restarting(true);
 }
 
 /// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
@@ -299,6 +356,7 @@ fn prepare_peer(
     n: &bgpfc_config::ast::Neighbor,
     rib_tx: &SyncSender<RibMsg>,
     table: &PeerTable,
+    restart: &Arc<RestartState>,
 ) -> peer::Peer {
     let cfg = wiring::peer_config(config.local_as, config.router_id, n);
     bgpfc_log::info!(
@@ -309,7 +367,7 @@ fn prepare_peer(
         import = n.import,
         export = n.export
     );
-    let (handle, peer) = peer::prepare(cfg, rib_tx.clone());
+    let (handle, peer) = peer::prepare(cfg, rib_tx.clone(), Arc::clone(restart));
     if let Ok(mut t) = table.write() {
         t.insert(handle.addr, handle);
     }
@@ -326,6 +384,8 @@ struct Coordinator<'a> {
     fib_tx: SyncSender<FibMsg>,
     /// The `rpki` block at work: the RTR client, if one runs.
     rpki: rpki::Rpki,
+    /// What the OPENs of new sessions say of a restart.
+    restart: Arc<RestartState>,
 }
 
 impl Coordinator<'_> {
@@ -422,7 +482,13 @@ impl Coordinator<'_> {
         let mut started = Vec::new();
         for addr in diff.added.iter().chain(&diff.reset) {
             if let Some(n) = new.neighbor(*addr) {
-                started.push(prepare_peer(&new, n, &self.rib_tx, &self.table));
+                started.push(prepare_peer(
+                    &new,
+                    n,
+                    &self.rib_tx,
+                    &self.table,
+                    &self.restart,
+                ));
             }
         }
         for p in started {

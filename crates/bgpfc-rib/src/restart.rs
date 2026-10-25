@@ -395,15 +395,16 @@ impl Rib {
         }
     }
 
-    /// The families whose route selection is deferred, and how many peers
-    /// are still waited for, for the control plane.
+    /// The families whose route selection is deferred, how many peers are
+    /// still waited for, and when the wait ends whatever comes, for the
+    /// control plane.
     #[must_use]
-    pub fn deferred(&self) -> Vec<(AddressFamily, usize)> {
+    pub fn deferred(&self) -> Vec<(AddressFamily, usize, Instant)> {
         let mut v: Vec<_> = self
             .s
             .deferral
             .iter()
-            .map(|(f, w)| (f, w.peers.len()))
+            .map(|(f, w)| (f, w.peers.len(), w.until))
             .collect();
         v.sort();
         v

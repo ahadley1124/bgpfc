@@ -62,6 +62,12 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
     // RFC 9234 §4.1, §4.2: our BGP Role, advertised and checked by the FSM
     // on an external session.
     fsm.role = n.role;
+    // RFC 4724 §3, RFC 8538 §2: the Graceful Restart capability, with the
+    // Restart Time; the Restart State and Forwarding State bits are the
+    // peer thread's to fill in for each OPEN.
+    fsm.graceful_restart = n.graceful_restart.map(|gr| bgpfc_fsm::GracefulRestart {
+        restart_time: gr.restart_time,
+    });
     // RFC 4271 §10: jitter from something that differs per process.
     fsm.jitter_seed = jitter_seed(&n.addr);
     PeerConfig {
@@ -69,6 +75,7 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         port: n.port,
         fsm,
         allow_as_set: n.allow_as_set,
+        stale_time: n.graceful_restart.map(|gr| gr.stale_time),
     }
 }
 
@@ -212,6 +219,30 @@ mod tests {
         assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
+    }
+
+    #[test]
+    fn graceful_restart_reaches_the_fsm_and_the_stale_timer_the_peer() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A;
+                 graceful-restart yes; restart-time 90; stale-time 200; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        let p = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        // RFC 4724 §3: advertised with the Restart Time configured.
+        assert_eq!(
+            p.fsm.graceful_restart.map(|g| g.restart_time.secs()),
+            Some(90)
+        );
+        assert_eq!(p.stale_time, Some(Duration::from_secs(200)));
+        // Off by default: no capability, nothing kept.
+        let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert_eq!(q.fsm.graceful_restart, None);
+        assert_eq!(q.stale_time, None);
     }
 
     #[test]

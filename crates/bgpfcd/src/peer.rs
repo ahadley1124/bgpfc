@@ -7,7 +7,10 @@
 //! tracked until its OPEN), §8.2.2 (Idle refuses connections); RFC 4760 §7
 //! (AFI/SAFI disable is reported to the RIB, the session kept); RFC 2918
 //! §4 (ROUTE-REFRESH for an unadvertised family is ignored); RFC 9003 §2
-//! (a received Shutdown Communication is logged).
+//! (a received Shutdown Communication is logged); RFC 4724 §2, §4.2, §5 and
+//! RFC 8538 §4 (the End-of-RIB marker goes to the RIB, a session that ends
+//! gracefully leaves its routes there as stale ones, and a connection from a
+//! peer that restarted replaces the established session).
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -29,6 +32,7 @@ use bgpfc_wire::update::{DecodeContext, PeerKind, UpdateMessage};
 
 use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
 use crate::reader;
+use crate::restart::RestartState;
 
 /// How long an outgoing TCP connect may take; RFC 4271 §8.2.2 asks the
 /// `ConnectRetryTime` to leave room for it, and 120 s does.
@@ -59,6 +63,9 @@ pub(crate) struct PeerConfig {
     pub(crate) fsm: bgpfc_fsm::Config,
     /// Accept `AS_SET` in UPDATEs (RFC 9774 §3 override).
     pub(crate) allow_as_set: bool,
+    /// `stale-time` of a neighbor with `graceful-restart yes` (RFC 8538
+    /// §4.1): the RIB bounds the wait for the End-of-RIB marker with it.
+    pub(crate) stale_time: Option<Duration>,
 }
 
 /// How other threads reach a peer thread.
@@ -172,6 +179,9 @@ pub(crate) struct Peer {
     outbox: Receiver<Vec<Vec<u8>>>,
     outbox_state: Arc<Outbox>,
     prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
+    /// What the next OPEN says of a restart, kept by the FIB and RIB
+    /// threads (RFC 4724 §3).
+    restart: Arc<RestartState>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -182,7 +192,11 @@ pub(crate) struct Peer {
 
 /// Prepare a peer: its handle can go into the peer table before the
 /// thread runs (listeners bind and privileges drop in between).
-pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
+pub(crate) fn prepare(
+    cfg: PeerConfig,
+    rib: SyncSender<RibMsg>,
+    restart: Arc<RestartState>,
+) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
     // Unbounded in entries: send_updates bounds it by octets.
     let (outbox_tx, outbox) = channel();
@@ -211,6 +225,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         outbox,
         outbox_state: state,
         prefix_limit,
+        restart,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -264,6 +279,12 @@ impl Peer {
     /// Feed one event to the FSM and execute what it asks for.
     fn event(&mut self, event: Event, now: Instant) {
         let before = self.fsm.state();
+        if self.cfg.fsm.graceful_restart.is_some() && before != State::Established {
+            // RFC 4724 §3, §4.1: the OPEN this event may send says whether
+            // we have restarted and for which families the forwarding
+            // state has been preserved, as of now.
+            self.fsm.set_restart_advert(self.restart.advert());
+        }
         let number = event.number();
         let actions = self.fsm.handle(event, now);
         let after = self.fsm.state();
@@ -362,15 +383,21 @@ impl Peer {
                         peer: self.cfg.addr,
                         local_addr,
                         session,
+                        stale_time: self.cfg.stale_time,
                     });
                 }
-                Action::SessionDown { .. } => {
+                Action::SessionDown { retain } => {
                     #[cfg(feature = "profiling")]
                     bgpfc_prof::metrics::SESSIONS_DROPPED.inc();
-                    bgpfc_log::info!("session down", peer = self.cfg.addr);
+                    bgpfc_log::info!(
+                        "session down",
+                        peer = self.cfg.addr,
+                        routes_kept = retain.is_some()
+                    );
                     self.session = None;
                     self.rib_send(RibMsg::PeerDown {
                         peer: self.cfg.addr,
+                        retain,
                     });
                 }
                 Action::LogError(msg) => bgpfc_log::error!(msg, peer = self.cfg.addr),
@@ -434,13 +461,30 @@ impl Peer {
                 // Cease for it (Administrative Shutdown, Peer De-configured,
                 // Other Configuration Change). No failure of the peer, so
                 // nothing is damped or counted toward the restart limit.
-                self.event(Event::ManualStop(NotificationMessage::cease(subcode)), now);
+                let cease = self.hard_if_suggested(NotificationMessage::cease(subcode));
+                self.event(Event::ManualStop(cease), now);
                 self.drop_conn();
                 return false;
             }
-            PeerInput::Reset(message) => {
-                bgpfc_log::info!("session reset by operator", peer = self.cfg.addr);
-                for event in reset_events(message.as_deref()) {
+            PeerInput::Reset { message, hard } => {
+                // RFC 8538 §4: a Hard Reset goes only to a peer that sent
+                // the Graceful Notification bit ("SHOULD NOT" otherwise);
+                // any other NOTIFICATION ends the session the old way for
+                // a peer that did not, which is what a Hard Reset is for.
+                let hard_reset = hard && self.graceful_notification();
+                bgpfc_log::info!(
+                    "session reset by operator",
+                    peer = self.cfg.addr,
+                    hard_reset = hard_reset
+                );
+                if hard && !hard_reset {
+                    bgpfc_log::info!(
+                        "the neighbor did not exchange the graceful notification bit, so the \
+                         reset is the usual one",
+                        peer = self.cfg.addr
+                    );
+                }
+                for event in reset_events(message.as_deref(), hard_reset) {
                     self.event(event, now);
                 }
             }
@@ -465,12 +509,30 @@ impl Peer {
                     updates_out: self.updates_out,
                     admin_down: self.fsm.is_admin_down(),
                     restart_limit_reached: !self.fsm.automatic_start_allowed(),
+                    restart_time: self.cfg.fsm.graceful_restart.map(|g| g.restart_time),
                 });
             }
             PeerInput::PrefixLimit { family, limit } => self.prefix_limit(family, limit, now),
         }
         self.flags(now);
         true
+    }
+
+    /// Whether both sides set the Graceful Notification bit on this
+    /// session (RFC 8538 §2): a NOTIFICATION other than a Hard Reset leaves
+    /// the routes of both as stale ones.
+    fn graceful_notification(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(Session::peer_restart)
+            .is_some_and(|r| r.notification)
+    }
+
+    /// `cease` as RFC 8538 §5.1 suggests sending it: a Hard Reset
+    /// carrying it for the reasons that are no short-term matter, when the
+    /// peer exchanged the Graceful Notification bit.
+    fn hard_if_suggested(&self, cease: NotificationMessage) -> NotificationMessage {
+        suggested_hard_reset(cease, self.graceful_notification())
     }
 
     /// What the RIB thread flagged because the queue was full when it had
@@ -515,10 +577,9 @@ impl Peer {
         // AFI, SAFI and upper bound of Figure 1 as its data. The FSM goes
         // to Idle through AutomaticStop (RFC 4271 §8.2.2), damped, so the
         // restart-limit bounds a peer that keeps sending too much.
-        self.event(
-            Event::AutomaticStop(NotificationMessage::max_prefixes_reached(family, limit)),
-            now,
-        );
+        let cease =
+            self.hard_if_suggested(NotificationMessage::max_prefixes_reached(family, limit));
+        self.event(Event::AutomaticStop(cease), now);
     }
 
     /// RFC 2918 §4: ask for every negotiated family again, only if the
@@ -571,6 +632,9 @@ impl Peer {
             // RFC 4271 §8.2.2 OpenSent/OpenConfirm: track the second
             // connection until an OPEN arrives on it.
             State::OpenSent | State::OpenConfirm => self.track_pending(stream, initiator),
+            State::Established if self.fsm.takes_over_on_connection() => {
+                self.take_over(stream, initiator, now);
+            }
             State::Established => {
                 if self.fsm.config().collision_detect_established {
                     self.track_pending(stream, initiator);
@@ -585,6 +649,30 @@ impl Peer {
                 }
             }
         }
+    }
+
+    /// RFC 4724 §4.2: a connection from a peer that advertised Graceful
+    /// Restart while its session is Established means it has restarted
+    /// and we have not noticed. "The previous TCP session MUST be closed,
+    /// and the new one retained", with no NOTIFICATION, and the routes of
+    /// the peer are kept. The FSM does that, ending in Connect (§5); the
+    /// event of the new connection is then fed again for it to go on.
+    fn take_over(&mut self, stream: TcpStream, initiator: Initiator, now: Instant) {
+        bgpfc_log::info!(
+            "connection from a restarted peer replaces the session",
+            peer = self.cfg.addr
+        );
+        // The pending second connection of RFC 4271 §6.8 is moot.
+        self.pending = None;
+        let new = self.new_conn(stream, initiator);
+        let event = match initiator {
+            Initiator::Local => Event::TcpCrAcked,
+            Initiator::Remote => Event::TcpConnectionConfirmed,
+        };
+        // Drops the old connection, which is `self.conn`, as an action.
+        self.event(event.clone(), now);
+        self.conn = Some(new);
+        self.event(event, now);
     }
 
     fn track_pending(&mut self, stream: TcpStream, initiator: Initiator) {
@@ -837,6 +925,21 @@ impl Peer {
                         PREFIXES_ANNOUNCED.add(decoded.announcements().count());
                         PREFIXES_WITHDRAWN.add(decoded.withdrawals().count());
                     }
+                    // RFC 4724 §2: an UPDATE that announces and withdraws
+                    // nothing ends the initial update of a family. It
+                    // carries no routes, and the RIB wants it as what it
+                    // is. A damaged one (RFC 7606) is no marker.
+                    let marker = decoded.message.end_of_rib_family().filter(|_| {
+                        decoded.disabled.is_empty() && decoded.treated_as_withdraw.is_none()
+                    });
+                    if let Some(family) = marker {
+                        bgpfc_log::debug!("end-of-rib", peer = self.cfg.addr, family = family);
+                        self.rib_send(RibMsg::EndOfRib {
+                            peer: self.cfg.addr,
+                            family,
+                        });
+                        return;
+                    }
                     self.rib_send(RibMsg::Update {
                         peer: self.cfg.addr,
                         update: decoded,
@@ -899,17 +1002,49 @@ impl Peer {
 
 /// What the FSM is fed for `bgpfcctl clear neighbor`: a `ManualStop` with
 /// RFC 4486 §4 Administrative Reset, carrying the RFC 9003 communication
-/// when one was given, then a `ManualStart`. The stop is the operator's,
-/// not a failure of the peer, so it is neither damped nor counted toward
-/// the restart limit, and the start is the "administrative intervention"
-/// that ends a run of failures (RFC 4486 §4).
-fn reset_events(message: Option<&str>) -> [Event; 2] {
+/// when one was given, then a `ManualStart`. With `hard_reset` the Cease is
+/// the data of a Hard Reset (RFC 8538 §3.1, §5.2), which has both sides
+/// delete the other's routes instead of keeping them as stale ones. The stop
+/// is the operator's, not a failure of the peer, so it is neither damped nor
+/// counted toward the restart limit, and the start is the "administrative
+/// intervention" that ends a run of failures (RFC 4486 §4).
+fn reset_events(message: Option<&str>, hard_reset: bool) -> [Event; 2] {
     let cease = match message {
         Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
             .unwrap_or_else(|_| NotificationMessage::cease(CeaseSubcode::AdministrativeReset)),
         None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
     };
+    let cease = if hard_reset {
+        NotificationMessage::hard_reset(&cease)
+    } else {
+        cease
+    };
     [Event::ManualStop(cease), Event::ManualStart]
+}
+
+/// `cease` wrapped in a Hard Reset where RFC 8538 §5.1 suggests one and
+/// `exchanged` says the peer can read it: Maximum Number of Prefixes
+/// Reached, Administrative Shutdown and Peer De-configured end a session
+/// for good, or for long, so "there is no realistic hope that forwarding
+/// can continue or that the session will be re-established within the
+/// deadline". The others (Other Configuration Change, Collision
+/// Resolution, Out of Resources, Administrative Reset) stay graceful
+/// Ceases; Administrative Reset is the operator's choice.
+fn suggested_hard_reset(cease: NotificationMessage, exchanged: bool) -> NotificationMessage {
+    let hard = exchanged
+        && cease.code == ErrorCode::Cease
+        && [
+            CeaseSubcode::MaxPrefixesReached,
+            CeaseSubcode::AdministrativeShutdown,
+            CeaseSubcode::PeerDeconfigured,
+        ]
+        .iter()
+        .any(|s| *s as u8 == cease.subcode);
+    if hard {
+        NotificationMessage::hard_reset(&cease)
+    } else {
+        cease
+    }
 }
 
 /// What the FSM is fed when the connection it runs on loses a collision
@@ -1078,7 +1213,7 @@ mod tests {
             fsm.handle(Event::ManualStart, now);
             fsm.handle(Event::TcpCrAcked, now);
             assert_eq!(fsm.state(), State::OpenSent);
-            let actions: Vec<Action> = reset_events(message)
+            let actions: Vec<Action> = reset_events(message, false)
                 .into_iter()
                 .flat_map(|e| fsm.handle(e, now))
                 .collect();
@@ -1108,6 +1243,72 @@ mod tests {
             assert_eq!(fsm.damped_failures(), 0);
             assert!(fsm.automatic_start_allowed());
         }
+    }
+
+    #[test]
+    fn a_hard_clear_carries_the_reset_in_a_hard_reset() {
+        // RFC 8538 §3.1: the Hard Reset encapsulates the NOTIFICATION that
+        // says why; §5.2: a Shutdown Communication goes inside, with the
+        // Administrative Reset.
+        let [stop, start] = reset_events(Some("maintenance"), true);
+        let Event::ManualStop(n) = stop else {
+            panic!("{stop:?}");
+        };
+        assert!(n.is_hard_reset());
+        let inner = n.hard_reset_inner().unwrap();
+        assert_eq!(
+            (inner.code, inner.subcode),
+            (ErrorCode::Cease, CeaseSubcode::AdministrativeReset as u8)
+        );
+        assert_eq!(
+            n.shutdown_communication().and_then(Result::ok),
+            Some("maintenance")
+        );
+        assert_eq!(start, Event::ManualStart);
+        let [stop, _] = reset_events(None, true);
+        assert!(matches!(stop, Event::ManualStop(n) if n.is_hard_reset()));
+    }
+
+    #[test]
+    fn hard_resets_are_suggested_for_the_reasons_rfc_8538_gives() {
+        // RFC 8538 §5.1, the table: Hard Reset for Maximum Number of
+        // Prefixes Reached, Administrative Shutdown and Peer De-configured,
+        // a graceful Cease for the others.
+        for (subcode, hard) in [
+            (CeaseSubcode::MaxPrefixesReached, true),
+            (CeaseSubcode::AdministrativeShutdown, true),
+            (CeaseSubcode::PeerDeconfigured, true),
+            (CeaseSubcode::AdministrativeReset, false),
+            (CeaseSubcode::ConnectionRejected, false),
+            (CeaseSubcode::OtherConfigurationChange, false),
+            (CeaseSubcode::ConnectionCollisionResolution, false),
+            (CeaseSubcode::OutOfResources, false),
+        ] {
+            let cease = NotificationMessage::cease(subcode);
+            let sent = suggested_hard_reset(cease.clone(), true);
+            assert_eq!(sent.is_hard_reset(), hard, "{subcode:?}");
+            if hard {
+                assert_eq!(sent.hard_reset_inner(), Some(cease.clone()));
+            } else {
+                assert_eq!(sent, cease);
+            }
+            // RFC 8538 §4: a peer that did not send the bit gets the
+            // Cease as it was, which ends the session for it all the same.
+            assert_eq!(suggested_hard_reset(cease.clone(), false), cease);
+        }
+        // The data of a Maximum Number of Prefixes Reached goes along.
+        let max = NotificationMessage::max_prefixes_reached(AddressFamily::IPV4_UNICAST, 9);
+        assert_eq!(
+            suggested_hard_reset(max.clone(), true).hard_reset_inner(),
+            Some(max)
+        );
+        // No other code, and no Hard Reset already, is touched.
+        let hold = NotificationMessage::hold_timer_expired();
+        assert_eq!(suggested_hard_reset(hold.clone(), true), hold);
+        let already = NotificationMessage::hard_reset(&NotificationMessage::cease(
+            CeaseSubcode::AdministrativeShutdown,
+        ));
+        assert_eq!(suggested_hard_reset(already.clone(), true), already);
     }
 
     /// The session an FSM advertising `ours` negotiates with a peer
