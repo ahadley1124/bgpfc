@@ -190,8 +190,9 @@ cargo bench -p bgpfc-bench --bench micro            # or a name filter: ... micr
 ```
 
 UPDATE decoding (one prefix, so mostly the attribute section; and a full
-4096-octet message per prefix), RIB insert, withdraw, peer down and
-sending the table to a second peer per route over 100 000 routes, the
+4096-octet message per prefix), RIB insert (alone, and with a second peer
+up to export to), withdraw, peer down and sending the table to a second
+peer per route over 100 000 routes, the
 decision process over 1–16 candidates,
 interning an attribute set already held, and `Instant::now` itself. Each
 warms up for 300 ms and reports the median of 15 samples, setup excluded,
