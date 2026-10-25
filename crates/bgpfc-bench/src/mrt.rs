@@ -17,7 +17,6 @@ use std::io::{self, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
 use bgpfc_wire::attribute::{PathAttribute, code, parse_raw};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::Prefix;
@@ -303,7 +302,7 @@ impl PeerRoutes {
                     if let PathAttribute::AsPath(p) = a {
                         keep[i] = !p.contains(peer_as);
                         if !internal {
-                            *p = prepend(p, local_as);
+                            *p = p.prepend(local_as);
                         }
                     }
                 }
@@ -322,21 +321,6 @@ impl PeerRoutes {
             .collect();
         Table { sets, routes }
     }
-}
-
-fn prepend(p: &AsPath, asn: Asn) -> AsPath {
-    let mut p = p.clone();
-    match p.segments.first_mut() {
-        Some(s) if s.kind == SegmentType::Sequence && s.asns.len() < 255 => s.asns.insert(0, asn),
-        _ => p.segments.insert(
-            0,
-            AsPathSegment {
-                kind: SegmentType::Sequence,
-                asns: vec![asn],
-            },
-        ),
-    }
-    p
 }
 
 /// Turn one RIB entry's attributes into an attribute set, decoding them

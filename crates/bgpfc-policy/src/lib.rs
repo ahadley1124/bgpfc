@@ -17,7 +17,6 @@ use std::net::IpAddr;
 
 use bgpfc_config::ast::{Action, CommunityOp, Config, Match, SetAction};
 use bgpfc_config::error::Pos;
-use bgpfc_rib::export::prepend;
 use bgpfc_rib::{PathAttrs, PeerInfo, Policies, Verdict};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
@@ -242,7 +241,7 @@ fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
         SetAction::AsPathPrepend(asns) => {
             // `prepend 1 2` yields `1 2 <path>`: prepend from the right.
             for asn in asns.iter().rev() {
-                a.as_path = prepend(&a.as_path, *asn);
+                a.as_path = a.as_path.prepend(*asn);
             }
         }
         SetAction::NextHopSelf => {

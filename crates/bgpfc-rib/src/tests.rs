@@ -15,7 +15,7 @@ use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
 use crate::attrs::PathAttrs;
 use crate::decision::{Candidate, Neighbor, best};
-use crate::export::{Source, export, prepend};
+use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
@@ -185,10 +185,16 @@ fn as_set_counts_as_one_hop() {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     let mut a = attrs(&[65_001], "10.0.0.1");
-    a.as_path.segments.push(AsPathSegment {
-        kind: SegmentType::Set,
-        asns: vec![Asn(1), Asn(2), Asn(3)],
-    });
+    a.as_path = AsPath::from_segments(&[
+        AsPathSegment {
+            kind: SegmentType::Sequence,
+            asns: vec![Asn(65_001)],
+        },
+        AsPathSegment {
+            kind: SegmentType::Set,
+            asns: vec![Asn(1), Asn(2), Asn(3)],
+        },
+    ]);
     let b = attrs(&[65_002, 9, 9], "10.0.0.2");
     // a: 1 + 1 (the set) = 2 hops; b: 3 hops.
     let c = [(&e1, a), (&e2, b)];
@@ -424,32 +430,6 @@ fn ipv6_next_hop_self_and_v4_over_v6_session() {
     let a4 = attrs(&[65_001], "192.0.2.1");
     let e = export(LOCAL_AS, V4, src, &a4, &to).unwrap();
     assert_eq!(e.next_hop, a4.next_hop);
-}
-
-#[test]
-fn prepend_respects_segment_limit_and_sets() {
-    use bgpfc_wire::as_path::{AsPathSegment, SegmentType};
-    let p1 = prepend(&AsPath::empty(), Asn(1));
-    assert_eq!(p1.asns().collect::<Vec<_>>(), vec![Asn(1)]);
-    let p2 = prepend(&p1, Asn(2));
-    assert_eq!(p2.segments.len(), 1);
-    assert_eq!(p2.asns().collect::<Vec<_>>(), vec![Asn(2), Asn(1)]);
-    // Sized exactly: exported sets are kept as long as their routes.
-    let five = prepend(&AsPath::sequence(&[Asn(9); 4]), Asn(1));
-    assert_eq!(five.segments[0].asns.capacity(), 5);
-    let full = AsPath::sequence(&vec![Asn(9); 255]);
-    let p3 = prepend(&full, Asn(1));
-    assert_eq!(p3.segments.len(), 2);
-    assert_eq!(p3.segments[0].asns, vec![Asn(1)]);
-    let set = AsPath {
-        segments: vec![AsPathSegment {
-            kind: SegmentType::Set,
-            asns: vec![Asn(5)],
-        }],
-    };
-    let p4 = prepend(&set, Asn(1));
-    assert_eq!(p4.segments[0].kind, SegmentType::Sequence);
-    assert_eq!(p4.segments.len(), 2);
 }
 
 // --- The RIB end to end --------------------------------------------------

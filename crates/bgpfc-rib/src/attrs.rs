@@ -247,14 +247,16 @@ impl Hash for PathAttrs {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut w = Chunks::new(state);
         w.put(&[self.origin as u8]);
-        w.len(self.as_path.segments.len());
-        for seg in &self.as_path.segments {
+        let mut segments = 0;
+        for seg in self.as_path.segments() {
             w.put(&[seg.kind as u8]);
-            w.len(seg.asns.len());
-            for asn in &seg.asns {
+            w.len(seg.len());
+            for asn in seg.asns() {
                 w.put(&asn.0.to_be_bytes());
             }
+            segments += 1;
         }
+        w.len(segments);
         match &self.next_hop {
             NextHop::Ipv4(a) => {
                 w.put(&[4]);

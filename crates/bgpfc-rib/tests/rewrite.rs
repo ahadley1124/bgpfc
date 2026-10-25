@@ -40,7 +40,7 @@ fn as_path() -> impl Strategy<Value = AsPath> {
                 asns: asns.into_iter().map(Asn).collect(),
             }
         });
-    proptest::collection::vec(segment, 0..3).prop_map(|segments| AsPath { segments })
+    proptest::collection::vec(segment, 0..3).prop_map(|segments| AsPath::from_segments(&segments))
 }
 
 fn attrs() -> impl Strategy<Value = PathAttrs> {

@@ -14,7 +14,6 @@ use std::collections::hash_map::Entry;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment, SegmentType};
 use bgpfc_wire::community::{Community, ExtendedCommunity};
 use bgpfc_wire::error::EncodeError;
 use bgpfc_wire::header::{HEADER_LEN, MessageType, frame};
@@ -109,7 +108,7 @@ pub fn rewrite(
         PeerKind::External => {
             // RFC 4271 §5.1.2 c): prepend our AS. RFC 9774 §5: as a
             // sequence; never a set.
-            out.as_path = prepend(&attrs.as_path, local_as);
+            out.as_path = attrs.as_path.prepend(local_as);
             // RFC 4271 §5.1.3: the next hop is our address on the session
             // when it is of the NLRI's family (RFC 2545 §3 for IPv6).
             // NOTE(interop): for a family the session address does not
@@ -179,30 +178,6 @@ pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &Pe
                     == b.local_pref.unwrap_or(DEFAULT_LOCAL_PREF)
         }
     }
-}
-
-/// `as_path` with `asn` prepended to its leading `AS_SEQUENCE`, or as a
-/// new one (RFC 4271 §5.1.2 c, RFC 4271 §4.3: at most 255 ASes per
-/// segment).
-#[must_use]
-pub fn prepend(as_path: &AsPath, asn: Asn) -> AsPath {
-    let mut path = as_path.clone();
-    match path.segments.first_mut() {
-        Some(seg) if seg.kind == SegmentType::Sequence && seg.asns.len() < 255 => {
-            // One more, not double: the set is kept for as long as routes
-            // are exported with it, once per peer.
-            seg.asns.reserve_exact(1);
-            seg.asns.insert(0, asn);
-        }
-        _ => path.segments.insert(
-            0,
-            AsPathSegment {
-                kind: SegmentType::Sequence,
-                asns: vec![asn],
-            },
-        ),
-    }
-    path
 }
 
 /// Announcements and withdrawals for one peer and family, grouped so that

@@ -33,7 +33,7 @@ pub mod route_refresh;
 pub mod types;
 pub mod update;
 
-pub use as_path::{AsPath, AsPathSegment, SegmentType};
+pub use as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 pub use attribute::{Aggregator, Origin, PathAttribute};
 pub use capability::Capability;
 pub use community::{Community, ExtendedCommunity, LargeCommunity};

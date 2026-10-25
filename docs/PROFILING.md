@@ -316,7 +316,7 @@ of microseconds.
 
 prints `size_of` for the structures a route is made of (`Prefix` 18,
 `Destination` 24 with its first route inline, `Route` 16 for each further
-one, `PathAttrs` 152, an installed IPv4 route in the FIB 9 octets on
+one, `PathAttrs` 144, an installed IPv4 route in the FIB 9 octets on
 x86-64), and for the
 messages and the per-peer state.
 
@@ -401,13 +401,13 @@ host that ran about 9 % faster (52f8429 loaded in 1.64 s there).
 |---|---|---|---|
 | table load | 1.77 s (1.64–1.90), 28 300 UPDATEs/s | 1.79 s (1.75–1.88), 27 900 UPDATEs/s | 3.26 s, 15 300 UPDATEs/s |
 | of which on the RIB thread (`rib_update`) | 1.37 s; inserts and the decision process 0.73 s | 1.43 s; 0.83 s | 2.9 s |
-| decode on the peer thread (`msg_parse_update`) | 0.17 s, in parallel | 0.17 s | 0.22 s |
-| bytes per prefix | 58 | 121 | 341 |
-| peak live / peak RSS | 59.2 MB / 67.7 MB | 121.7 MB / 130.4 MB | 341.7 MB / 360.4 MB |
-| allocations during the load | 0.88 M | 1.02 M | 7.7 M |
+| decode on the peer thread (`msg_parse_update`) | 0.15 s, in parallel | 0.17 s | 0.22 s |
+| bytes per prefix | 57 | 121 | 341 |
+| peak live / peak RSS | 57.4 MB / 66.2 MB | 121.7 MB / 130.4 MB | 341.7 MB / 360.4 MB |
+| allocations during the load | 0.78 M | 1.02 M | 7.7 M |
 | spans off | 1.64 s | 1.63 s | 3.02 s |
-| `withdraw-all`: peak live, residual | 91.1 MB, 0.20 MB | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
-| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.47–0.61 s, 0.42 MB, 70–73 MB | 0.45–0.56 s, 0.98 MB, 133–138 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
+| `withdraw-all`: peak live, residual | 89.3 MB, 0.20 MB | 153.6 MB, 0.76 MB | 373.6 MB, 13.7 MB |
+| `flap`, 3 cycles: `rib_peer_down`, live after a reset, `hwm_kb` | 0.47–0.56 s, 0.42 MB, 68–71 MB | 0.45–0.56 s, 0.98 MB, 133–138 MB | 1.2–1.3 s, 14.2 MB, 595 MB |
 
 With one peer the load time is the same; the time saved is in sending
 routes to other peers, which a single peer does not exercise (see "Two
@@ -415,8 +415,8 @@ peers" below and the micro-benchmarks).
 
 A real table, RouteViews `route-views.sg` 2026-10-01 00:00, peer 39
 (AS23673): 1 114 715 routes over 159 391 attribute sets and 137 311
-`AS_PATH`s, interleaved as above: load 2.48 s (2.19–2.59), RIB thread
-2.01 s, 90 octets per prefix, 101.0 MB peak live, 115.8 MB RSS; at
+`AS_PATH`s, interleaved as above: load 2.05 s (1.93–2.30), RIB thread
+1.71 s, 84 octets per prefix, 95.2 MB peak live, 110.3 MB RSS; at
 52f8429 2.71 s (2.31–3.03), 2.22 s, 161 octets, 180.5 MB, 195.4 MB (at
 24ae7d9: 4.55 s, 386 octets, 431 MB, 457 MB).
 
@@ -444,7 +444,9 @@ count it once, at the end.
 Two peers, one relaying its full table to the other, in a network
 namespace, release build: the synthetic million peaks at 69 MB RSS and the
 RouteViews table at 117 MB, about what one peer needs, since a peer's
-Adj-RIB-Out is no longer stored. Before this branch the peer loading the
+Adj-RIB-Out is no longer stored (measured before `AS_PATH`s were packed,
+which saves as much here as with one peer: no peer holds sets of its
+own). Before this branch the peer loading the
 table was reset (Cease, Out of Resources) about 39 000 UPDATEs in, every
 time: the RIB's UPDATEs to it went through its input queue, full of its
 own. With that fixed and the Adj-RIB-Out still a hash map per peer, the

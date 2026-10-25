@@ -6,10 +6,9 @@ use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use bgpfc_wire::as_path::{AsPath, AsPathSegment};
+use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
-use bgpfc_wire::types::Asn;
 
 use crate::attrs::PathAttrs;
 use crate::peer::PeerInfo;
@@ -72,7 +71,7 @@ impl Rib {
                     if by_ptr.insert(Arc::as_ptr(&c.attrs).addr()) {
                         by_value.insert(&c.attrs);
                         paths.insert(&c.attrs.as_path);
-                        d.as_path_bytes += as_path_heap_bytes(&c.attrs.as_path);
+                        d.as_path_bytes += c.attrs.as_path.heap_size();
                     }
                 }
             }
@@ -80,7 +79,7 @@ impl Rib {
         d.attr_sets = by_ptr.len();
         d.attr_values = by_value.len();
         d.as_paths = paths.len();
-        d.as_path_bytes_if_interned = paths.iter().map(|p| as_path_heap_bytes(p)).sum();
+        d.as_path_bytes_if_interned = paths.iter().map(|p| p.heap_size()).sum();
         d.adj_rib_out = self
             .s
             .peers
@@ -123,15 +122,6 @@ pub struct Duplication {
     pub adj_rib_out: usize,
 }
 
-/// Heap octets owned by `p`: its segment vector and their ASN vectors.
-fn as_path_heap_bytes(p: &AsPath) -> usize {
-    p.segments.capacity() * size_of::<AsPathSegment>()
-        + p.segments
-            .iter()
-            .map(|s| s.asns.capacity() * size_of::<Asn>())
-            .sum::<usize>()
-}
-
 /// `size_of` of the structures a route is made of, by name.
 #[must_use]
 pub fn type_sizes() -> Vec<(&'static str, usize)> {
@@ -155,7 +145,6 @@ pub fn type_sizes() -> Vec<(&'static str, usize)> {
             size_of::<PathAttrs>() + 2 * size_of::<usize>(),
         ),
         ("AsPath", size_of::<AsPath>()),
-        ("AsPathSegment", size_of::<AsPathSegment>()),
         ("NextHop", size_of::<NextHop>()),
         ("PeerInfo", size_of::<PeerInfo>()),
         ("PeerState", size_of::<PeerState>()),
@@ -168,7 +157,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use bgpfc_wire::attribute::{Origin, PathAttribute};
-    use bgpfc_wire::types::{AddressFamily, RouterId};
+    use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
     use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
 
     use super::*;
