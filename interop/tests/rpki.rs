@@ -6,7 +6,9 @@
 //! route is accepted and relayed whatever its state, and the state moves
 //! nothing but itself. The others test what acts on the state (RFC 6811
 //! §5): the default, `drop-invalid`, which holds the Invalid routes back
-//! from the decision process, the relay and the kernel (issues #61, #59).
+//! from the decision process, the relay and the kernel (issues #61, #59),
+//! and `prefer-valid`, which ranks the routes by state, and a reload from
+//! one to another (#47).
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
@@ -774,7 +776,8 @@ fn session_line(show_rpki: &str) -> String {
 }
 
 /// BIRD's routes come out valid, invalid (by length and by origin) and
-/// not-found, by the CLI and the HTTP API, and all of them are relayed.
+/// not-found, by the CLI and the HTTP API, and with `enforcement off` all
+/// of them are used and relayed (RFC 8481 §5, "Set State, Don't Act").
 /// A new VRP file then changes the state of every route without any BGP
 /// UPDATE: `StayRTR` sends a Serial Notify, bgpfcd asks for the changes
 /// (RFC 8210 §8.2), and the routes they cover are validated again
@@ -819,8 +822,9 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
         "{body}"
     );
 
-    // Nothing acts on the states yet: the invalid routes reach the relay
-    // too.
+    // `enforcement off`: nothing acts on the states, so no route is held
+    // and the invalid routes reach the relay too.
+    assert!(s.held().is_empty(), "{}", s.report());
     let relay = s.relay.as_ref().expect("relay");
     let relayed = || {
         let routes = relay.birdc(&s.lab, &["show", "route"]);
@@ -860,9 +864,10 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
         s.report()
     );
     // No UPDATE came from BIRD, no session was reset, and every route is
-    // still relayed.
+    // still used and relayed.
     assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
     assert_eq!(s.count("session established"), sessions, "{}", s.report());
+    assert!(s.held().is_empty(), "{}", s.report());
     assert!(relayed(), "{}", relay.birdc(&s.lab, &["show", "route"]));
 }
 
@@ -1442,4 +1447,209 @@ fn a_roa_created_changed_and_deleted_moves_installed_routes_without_an_update() 
         "{}",
         s.report()
     );
+}
+
+/// The VRP of the preference scenario: 192.0.2.0/24 belongs to the
+/// relay's AS, so BIRD's route to it is Invalid and the relay's Valid.
+const RELAY_OWNS: [(&str, u8, u32); 1] = [("192.0.2.0/24", 24, RELAY_AS)];
+
+/// An import policy for BIRD in B that prefers its routes to any other:
+/// `LOCAL_PREF` 200 against the default 100 (RFC 4271 §9.1.1).
+const PREFER_B: &str = "policy PREFER-B { term all { set local-pref 200; action accept; } }";
+
+/// A route as `show routes PREFIX` lists it: the mark (`*` best, `!`
+/// held, ` ` neither), the local preference, the validation state and the
+/// peer.
+type Row = (char, String, String, String);
+
+/// A [`Row`] from its parts.
+fn row(mark: char, local_pref: &str, rov: &str, peer: &str) -> Row {
+    (mark, local_pref.to_owned(), rov.to_owned(), peer.to_owned())
+}
+
+impl Setup {
+    /// The routes `show routes PREFIX` lists, in its order: the best first,
+    /// then the other candidates, then the held routes.
+    fn rows_at(&self, prefix: &str) -> Vec<Row> {
+        self.routes_at(prefix)
+            .iter()
+            .map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let peer = line
+                    .split_once(" via ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or_default();
+                row(
+                    line.chars().next().unwrap_or(' '),
+                    words.get(3).copied().unwrap_or_default(),
+                    words.get(5).copied().unwrap_or_default(),
+                    peer,
+                )
+            })
+            .collect()
+    }
+
+    /// Wait up to `timeout` for `show routes PREFIX` to list `rows`.
+    fn wait_for_rows(&self, timeout: Duration, prefix: &str, rows: &[Row]) {
+        assert!(
+            wait_for(timeout, || self.rows_at(prefix) == rows),
+            "{:?}, not {rows:?}\n{}",
+            self.routes_at(prefix),
+            self.report()
+        );
+    }
+
+    /// Rewrite bgpfcd's `enforcement` from `from` to `to` and reload; the
+    /// reload's summary.
+    fn reload_enforcement(&self, from: &str, to: &str) -> String {
+        let path = self.config_path();
+        let text = fs::read_to_string(&path).unwrap();
+        let old = format!(" enforcement {from};");
+        assert!(text.contains(&old), "{text}");
+        fs::write(&path, text.replace(&old, &format!(" enforcement {to};"))).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok, "{out}");
+        out
+    }
+
+    /// How often the RTR client connected to a cache and asked it for all
+    /// its data: bgpfcd's `rtr cache connected` lines and the cache's Reset
+    /// Queries.
+    fn rtr_starts(&self) -> (usize, usize) {
+        (
+            self.count("msg=\"rtr cache connected\""),
+            self.caches[0]
+                .daemon
+                .log_text()
+                .matches("Reset Query")
+                .count(),
+        )
+    }
+}
+
+/// Issue #47 and #61's non-enforcing mode: "the non-enforcing mode
+/// de-preferences rather than drops". BIRD in B and the relay BIRD in C
+/// both originate 192.0.2.0/24; a VRP makes B's route Invalid and C's
+/// Valid, and B's import policy gives B's routes `LOCAL_PREF` 200. Under
+/// `enforcement prefer-valid` C's Valid route is chosen all the same: the
+/// validation state comes before the degree of preference (RFC 6811 §5,
+/// "adjusting a route's degree of preference in the selection algorithm
+/// based on its validation state"; docs/config.md, "Route selection"),
+/// and B's Invalid route stays a candidate, as does B's Invalid /25, the
+/// only route to its prefix. A reload to `enforcement off` puts B's route
+/// first by its `LOCAL_PREF`, one to `drop-invalid` holds both of B's
+/// Invalid routes, and one back to `off` uses them again, with no UPDATE.
+/// None restarts the RTR client, which the `enforcement` does not
+/// concern.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn prefer_valid_takes_the_valid_path_over_a_higher_local_pref() {
+    let opts = Opts {
+        import: Some(PREFER_B),
+        relay: Some(&["192.0.2.0/24"]),
+        ..Opts::enforcing(Some("prefer-valid"))
+    };
+    let s = Setup::start("q", 23, &opts, &RELAY_OWNS);
+    let (b, c) = (s.lab.b_addr.to_string(), s.lab.c_addr.to_string());
+    // C's Valid route over B's Invalid one with the higher LOCAL_PREF.
+    s.wait_for_rows(
+        ESTABLISH,
+        "192.0.2.0/24",
+        &[row('*', "-", "valid", &c), row(' ', "200", "invalid", &b)],
+    );
+    s.wait_for_states(
+        Duration::ZERO,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("192.0.2.128/25", "invalid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    assert!(s.held().is_empty(), "{}", s.report());
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(ok && out.contains("\nenforcement prefer-valid\n"), "{out}");
+    let starts = s.rtr_starts();
+    assert_eq!(starts.0, 1, "{}", s.report());
+    assert!(starts.1 >= 1, "{}", s.report());
+
+    // `enforcement off`: the state no longer ranks, LOCAL_PREF decides.
+    let out = s.reload_enforcement("prefer-valid", "off");
+    assert!(
+        out.contains("; rpki enforcement off") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "200", "invalid", &b), row(' ', "-", "valid", &c)],
+    );
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=prefer-valid to=off ")
+            && changed.ends_with(" held=0 released=0 best_changed=1"),
+        "{changed}"
+    );
+
+    // `drop-invalid`: B's Invalid routes are held, C's route is used. A
+    // held route is kept as its neighbor sent it, without the LOCAL_PREF
+    // import policy gave it.
+    let out = s.reload_enforcement("off", "drop-invalid");
+    assert!(
+        out.contains("; rpki enforcement drop-invalid") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "-", "valid", &c), row('!', "-", "invalid", &b)],
+    );
+    let at = s.routes_at("192.0.2.0/24");
+    assert!(
+        at.len() == 2 && at[1].ends_with(&format!(" via {b} held by enforcement")),
+        "{at:?}"
+    );
+    assert_eq!(
+        s.held(),
+        held_by(
+            &[("192.0.2.0/24", "invalid"), ("192.0.2.128/25", "invalid")],
+            "enforcement"
+        ),
+        "{}",
+        s.report()
+    );
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=off to=drop-invalid ") && changed.contains(" held=2 released=0 "),
+        "{changed}"
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains("\nenforcement drop-invalid\n") && out.contains("state idle, connected"),
+        "{out}"
+    );
+
+    // Back to `off`: both routes are used again, B's with the LOCAL_PREF
+    // its import policy gives it again, with no UPDATE from BIRD.
+    let updates = s.updates_from_bird();
+    let out = s.reload_enforcement("drop-invalid", "off");
+    assert!(
+        out.contains("; rpki enforcement off") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "200", "invalid", &b), row(' ', "-", "valid", &c)],
+    );
+    assert!(s.held().is_empty(), "{}", s.report());
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=drop-invalid to=off ") && changed.contains(" held=0 released=2 "),
+        "{changed}"
+    );
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    // None of the reloads touched the RTR client or a BGP session.
+    assert_eq!(s.rtr_starts(), starts, "{}", s.report());
+    assert_eq!(s.count("session established"), 2, "{}", s.report());
 }
