@@ -142,6 +142,9 @@ fn handle(
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
+                role = session
+                    .role
+                    .map_or_else(|| "none".to_owned(), |r| r.to_string()),
                 advertisement_interval = interval.as_secs()
             );
             let mut info = peer_info(peer, local_addr, &session, interval);
