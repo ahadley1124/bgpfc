@@ -31,14 +31,14 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
 }
 
 fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
+    // Kept between batches, so that applying one allocates nothing.
+    let mut applied = Vec::new();
     while let Ok(msg) = rx.recv() {
         match msg {
             FibMsg::Changes(changes) => {
-                for c in changes {
-                    if let Some(applied) = fib.set(c.prefix, c.next_hop) {
-                        report(std::slice::from_ref(&applied));
-                    }
-                }
+                applied.clear();
+                fib.set_all(changes.iter().map(|c| (c.prefix, c.next_hop)), &mut applied);
+                report(&applied);
             }
             FibMsg::SetMode(mode, reply) => {
                 bgpfc_log::info!("fib: mode", mode = mode);

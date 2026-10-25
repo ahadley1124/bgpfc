@@ -16,6 +16,7 @@ pub mod netlink;
 pub mod reconcile;
 pub mod route;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -95,6 +96,14 @@ pub struct Applied {
     pub dry_run: bool,
 }
 
+/// Operations sent to the kernel in one netlink message at most.
+pub const BATCH: usize = 256;
+
+/// Room for a datagram of acknowledgements: errors carry the request
+/// they answer, so a batch with many failures fills several.
+#[cfg(not(miri))]
+const ACK_BUF: usize = 8192;
+
 /// The desired and installed tables and the socket between them.
 pub struct Fib {
     mode: Mode,
@@ -105,10 +114,15 @@ pub struct Fib {
     seq: u32,
     #[cfg(not(miri))]
     socket: Option<bgpfc_sys::NetlinkSocket>,
-    /// The buffer acknowledgements are read into, kept between
-    /// operations: install mode sends one per route.
+    /// Operations chosen and not yet carried out.
+    pending: Vec<Op>,
+    /// The prefixes `pending` changes.
+    touched: HashSet<Prefix>,
+    /// The batch being sent, then the acknowledgements read. Like the two
+    /// above, kept between batches: the FIB thread allocates nothing per
+    /// batch once they have grown.
     #[cfg(not(miri))]
-    ack: Vec<u8>,
+    buf: Vec<u8>,
 }
 
 impl Fib {
@@ -123,8 +137,10 @@ impl Fib {
             seq: 1,
             #[cfg(not(miri))]
             socket: None,
+            pending: Vec::new(),
+            touched: HashSet::new(),
             #[cfg(not(miri))]
-            ack: Vec::new(),
+            buf: Vec::new(),
         }
     }
 
@@ -186,6 +202,49 @@ impl Fib {
     /// Change the desired route for `prefix` (`None` deletes) and apply
     /// what follows: at most one operation.
     pub fn set(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Option<Applied> {
+        let op = self.plan_one(prefix, gateway)?;
+        self.run(&[op]).pop()
+    }
+
+    /// Change the desired routes of several prefixes, in order, and apply
+    /// what follows, adding it to `out`. In install mode the operations go
+    /// to the kernel together, up to [`BATCH`] in one netlink message,
+    /// rather than one round trip each.
+    pub fn set_all(
+        &mut self,
+        changes: impl IntoIterator<Item = (Prefix, Option<IpAddr>)>,
+        out: &mut Vec<Applied>,
+    ) {
+        for (prefix, gateway) in changes {
+            // An operation is chosen from what is installed, which the
+            // pending ones are about to change: a prefix changed twice
+            // waits for the operations before it to be carried out.
+            if self.mode == Mode::Install && !self.touched.insert(prefix) {
+                self.flush(out);
+                self.touched.insert(prefix);
+            }
+            if let Some(op) = self.plan_one(prefix, gateway) {
+                self.pending.push(op);
+            }
+            if self.pending.len() == BATCH {
+                self.flush(out);
+            }
+        }
+        self.flush(out);
+    }
+
+    /// Carry out the pending operations.
+    fn flush(&mut self, out: &mut Vec<Applied>) {
+        let ops = std::mem::take(&mut self.pending);
+        self.run_into(&ops, out);
+        self.pending = ops;
+        self.pending.clear();
+        self.touched.clear();
+    }
+
+    /// Record the desired route of `prefix` and choose the operation that
+    /// follows, if any.
+    fn plan_one(&mut self, prefix: Prefix, gateway: Option<IpAddr>) -> Option<Op> {
         let previous = self.routes.set_desired(prefix, gateway);
         // Dry-run installs nothing, so what it reports is the change to
         // the desired table itself: what install mode would have done.
@@ -196,12 +255,11 @@ impl Fib {
         };
         // Only this prefix can differ now; a full plan is cheap enough
         // but a single-prefix plan keeps the common case O(log n).
-        let op = match (gateway, reference) {
-            (Some(d), i) if i != Some(d) => Op::Set { prefix, gateway: d },
-            (None, Some(i)) => Op::Delete { prefix, gateway: i },
-            _ => return None,
-        };
-        Some(self.run_one(op))
+        match (gateway, reference) {
+            (Some(d), i) if i != Some(d) => Some(Op::Set { prefix, gateway: d }),
+            (None, Some(i)) => Some(Op::Delete { prefix, gateway: i }),
+            _ => None,
+        }
     }
 
     /// Switch modes. Going to install performs a full reconcile (README,
@@ -224,29 +282,37 @@ impl Fib {
     /// Apply the full plan.
     pub fn reconcile(&mut self) -> Vec<Applied> {
         let ops = self.routes.plan();
-        self.run(ops)
+        self.run(&ops)
     }
 
-    fn run(&mut self, ops: Vec<Op>) -> Vec<Applied> {
-        ops.into_iter().map(|op| self.run_one(op)).collect()
+    /// Carry out `ops`, in order.
+    fn run(&mut self, ops: &[Op]) -> Vec<Applied> {
+        let mut out = Vec::with_capacity(ops.len());
+        self.run_into(ops, &mut out);
+        out
     }
 
-    fn run_one(&mut self, op: Op) -> Applied {
-        if self.mode == Mode::DryRun {
-            return Applied {
-                op,
+    /// Carry out `ops`, in order, adding the outcomes to `out`: report
+    /// them in dry-run, send them in batches in install mode and record
+    /// those that succeeded.
+    fn run_into(&mut self, ops: &[Op], out: &mut Vec<Applied>) {
+        let dry_run = self.mode == Mode::DryRun;
+        for chunk in ops.chunks(BATCH) {
+            let first = out.len();
+            out.extend(chunk.iter().map(|op| Applied {
+                op: op.clone(),
                 result: Ok(()),
-                dry_run: true,
-            };
-        }
-        let result = self.send_op(&op);
-        if result.is_ok() {
-            self.routes.apply(&op);
-        }
-        Applied {
-            op,
-            result,
-            dry_run: false,
+                dry_run,
+            }));
+            if dry_run {
+                continue;
+            }
+            self.send_batch(chunk, &mut out[first..]);
+            for a in &out[first..] {
+                if a.result.is_ok() {
+                    self.routes.apply(&a.op);
+                }
+            }
         }
     }
 
@@ -255,55 +321,103 @@ impl Fib {
         self.seq
     }
 
+    /// `n` consecutive sequence numbers, none of them 0; the first.
+    fn reserve_seqs(&mut self, n: usize) -> u32 {
+        // invariant: n is at most BATCH.
+        let n = u32::try_from(n).unwrap();
+        if self.seq > u32::MAX - n {
+            self.seq = 0;
+        }
+        let first = self.seq + 1;
+        self.seq += n;
+        first
+    }
+
+    /// Send `ops` as one netlink message and set the result of each in
+    /// `out`, which holds them as successes. Only the last asks for an
+    /// acknowledgement: the kernel handles requests in order and reports
+    /// a failed one whether asked or not, so when the last is
+    /// acknowledged, every failure has been reported and any other
+    /// request succeeded.
     #[cfg(not(miri))]
-    fn send_op(&mut self, op: &Op) -> Result<(), FibError> {
-        let seq = self.next_seq();
-        let (route, bytes) = match op {
-            Op::Set { prefix, gateway } => {
-                let r = RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol);
-                let b = r.encode_set(seq);
-                (r, b)
-            }
-            Op::Delete { prefix, gateway } => {
-                let r = RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol);
-                let b = r.encode_delete(seq);
-                (r, b)
+    fn send_batch(&mut self, ops: &[Op], out: &mut [Applied]) {
+        let n = ops.len();
+        if n == 0 {
+            return;
+        }
+        let first = self.reserve_seqs(n);
+        // invariant: n is at most BATCH.
+        let last = first + u32::try_from(n - 1).unwrap();
+        self.buf.clear();
+        for (seq, op) in (first..).zip(ops) {
+            let ack = seq == last;
+            self.buf.extend_from_slice(&match op {
+                Op::Set { prefix, gateway } => {
+                    RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol)
+                        .encode_set_with(seq, ack)
+                }
+                Op::Delete { prefix, gateway } => {
+                    RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol)
+                        .encode_delete_with(seq, ack)
+                }
+            });
+        }
+        let fail_all = |out: &mut [Applied], e: &std::io::Error| {
+            for a in out {
+                a.result = Err(FibError::Io(std::io::Error::new(e.kind(), e.to_string())));
             }
         };
-        let _ = route;
-        let socket = self.socket.as_ref().ok_or_else(|| {
-            FibError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "netlink socket not open",
-            ))
-        })?;
-        socket.send(&bytes)?;
-        if self.ack.is_empty() {
-            self.ack = vec![0u8; 8192];
+        let Some(socket) = self.socket.as_ref() else {
+            let e =
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "netlink socket not open");
+            return fail_all(out, &e);
+        };
+        if let Err(e) = socket.send(&self.buf) {
+            return fail_all(out, &e);
         }
+        self.buf.resize(ACK_BUF, 0);
         loop {
-            let n = socket.recv(&mut self.ack)?;
-            for m in netlink::parse(&self.ack[..n])? {
-                if m.header.seq != seq {
+            let k = match socket.recv(&mut self.buf) {
+                Ok(k) => k,
+                Err(e) => return fail_all(out, &e),
+            };
+            let messages = match netlink::parse(&self.buf[..k]) {
+                Ok(m) => m,
+                Err(e) => {
+                    for a in out {
+                        a.result = Err(FibError::Protocol(e.clone()));
+                    }
+                    return;
+                }
+            };
+            let mut done = false;
+            for m in messages {
+                if m.header.ty != netlink::NLMSG_ERROR {
                     continue;
                 }
-                if m.header.ty == netlink::NLMSG_ERROR {
-                    let code = netlink::parse_error(m.payload)?;
-                    return if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(FibError::Kernel(-code))
-                    };
+                // An answer to an earlier request is not ours.
+                let Some(a) = usize::try_from(m.header.seq.wrapping_sub(first))
+                    .ok()
+                    .and_then(|i| out.get_mut(i))
+                else {
+                    continue;
+                };
+                match netlink::parse_error(m.payload) {
+                    Ok(0) => {}
+                    Ok(code) => a.result = Err(FibError::Kernel(-code)),
+                    Err(e) => a.result = Err(FibError::Protocol(e)),
                 }
+                done |= m.header.seq == last;
+            }
+            if done {
+                return;
             }
         }
     }
 
     #[cfg(miri)]
-    #[allow(clippy::unnecessary_wraps, reason = "mirrors the real signature")]
-    fn send_op(&mut self, _: &Op) -> Result<(), FibError> {
-        let _ = self.next_seq();
-        Ok(())
+    fn send_batch(&mut self, ops: &[Op], _: &mut [Applied]) {
+        let _ = self.reserve_seqs(ops.len());
     }
 
     /// Every unicast route of `afi` the kernel reports.
@@ -381,6 +495,95 @@ mod tests {
         assert_eq!(fib.mode(), Mode::DryRun);
         assert_eq!(Mode::Install.to_string(), "install");
         assert_eq!(fib.clear().len(), 0);
+    }
+
+    #[test]
+    fn set_all_reports_what_set_would() {
+        let changes = [
+            (p("192.0.2.0/24"), Some(ip("10.0.0.1"))),
+            (p("2001:db8::/32"), Some(ip("fe80::1"))),
+            (p("192.0.2.0/24"), Some(ip("10.0.0.1"))),
+            (p("192.0.2.0/24"), Some(ip("10.0.0.2"))),
+            (p("198.51.100.0/24"), None),
+            (p("2001:db8::/32"), None),
+        ];
+        let mut one = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let expected: Vec<Op> = changes
+            .iter()
+            .filter_map(|&(prefix, gw)| one.set(prefix, gw))
+            .map(|a| a.op)
+            .collect();
+        let mut all = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let mut out = Vec::new();
+        all.set_all(changes, &mut out);
+        assert_eq!(
+            out.iter().map(|a| a.op.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(out.iter().all(|a| a.dry_run && a.result.is_ok()));
+        assert_eq!(all.desired(), one.desired());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn install_without_a_socket_fails_every_operation() {
+        let mut fib = Fib::new(Mode::Install, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let changes = (0..=u8::MAX).chain(0..3).map(|i| {
+            let prefix = Prefix::new(IpAddr::from([10, i, 0, 0]), 16).unwrap();
+            (prefix, Some(ip("192.0.2.1")))
+        });
+        let mut out = Vec::new();
+        fib.set_all(changes, &mut out);
+        // Each change of a prefix not installed is retried: none succeeded.
+        assert_eq!(out.len(), 259);
+        assert!(out.iter().all(|a| matches!(a.result, Err(FibError::Io(_)))));
+        assert_eq!(fib.installed().len(), 0);
+        assert_eq!(fib.desired().len(), 256);
+    }
+
+    /// Run in a network namespace of its own where 192.0.2.0/24 is
+    /// connected, for example:
+    /// `sudo unshare -n sh -c 'ip link set lo up && ip addr add 192.0.2.10/24 dev lo && cargo test -p bgpfc-fib -- --ignored'`.
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN and 192.0.2.0/24 connected; changes table 250"]
+    fn batches_reach_the_kernel_with_a_result_per_operation() {
+        const TABLE: u32 = 250;
+        let installed = || {
+            let mut f = Fib::new(Mode::DryRun, TABLE, route::RTPROT_BGP);
+            f.open().unwrap();
+            f.sync().unwrap();
+            f.installed()
+        };
+        let mut fib = Fib::new(Mode::Install, TABLE, route::RTPROT_BGP);
+        fib.open().unwrap();
+        fib.sync().unwrap();
+        let mut changes: Vec<_> = (0..300u16)
+            .map(|i| {
+                let [a, b] = i.to_be_bytes();
+                let prefix = Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap();
+                (prefix, Some(ip("192.0.2.1")))
+            })
+            .collect();
+        // One request the kernel refuses, in the middle of the first
+        // batch: no route to the gateway.
+        changes[100].1 = Some(ip("203.0.113.1"));
+        // The same prefix twice in the second batch: the second change
+        // sees the first carried out.
+        changes.push((changes[260].0, Some(ip("192.0.2.2"))));
+        changes.push((changes[261].0, None));
+        let mut out = Vec::new();
+        fib.set_all(changes.clone(), &mut out);
+        assert_eq!(out.len(), changes.len());
+        let failed: Vec<usize> = (0..out.len()).filter(|&i| out[i].result.is_err()).collect();
+        assert_eq!(failed, vec![100]);
+        assert!(matches!(out[100].result, Err(FibError::Kernel(_))));
+        let kernel = installed();
+        assert_eq!(kernel, fib.installed());
+        assert_eq!(kernel.len(), 298);
+        assert_eq!(kernel.get(&changes[260].0), Some(&ip("192.0.2.2")));
+        assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+        assert_eq!(installed().len(), 0);
     }
 
     #[cfg(not(miri))]

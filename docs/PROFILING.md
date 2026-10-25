@@ -379,8 +379,9 @@ and stop the daemon with Ctrl-C (SIGINT is a clean shutdown).
   `rib_update` is most of `load_us`, and the queue wait
   (`update_total` minus `rib_update`) is long. Its time per route grows
   with the table, because each B-tree lookup misses the cache more. In
-  install mode the FIB thread is: one netlink request and acknowledgement
-  per route, most of it in the kernel.
+  install mode the FIB thread is: netlink requests go to the kernel 256
+  to a message with one acknowledgement, and most of the time is the
+  kernel's.
 
 ## Baseline
 
