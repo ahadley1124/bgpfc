@@ -11,7 +11,7 @@
 //! §4.2, §6; RFC 9072 §2, §3; RFC 7607 §2; RFC 6286 §2.1; RFC 4486 §3,
 //! §4; RFC 6608 §3, §4; RFC 9003 §2, §4; RFC 7606 §3–§5, §7; RFC 2545 §3;
 //! RFC 8950 §3, §4; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774
-//! §3.
+//! §3; RFC 9234 §4, §5 (the Role capability and the OTC attribute).
 //!
 //! With the `profiling` feature, UPDATE and attribute decoding are timed
 //! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only
@@ -30,6 +30,7 @@ pub mod notification;
 pub mod open;
 pub mod prefix;
 pub mod reader;
+pub mod role;
 pub mod route_refresh;
 pub mod types;
 pub mod update;
@@ -48,6 +49,7 @@ pub use mp::{MpReach, MpUnreach, NextHop};
 pub use notification::{NotificationMessage, ShutdownCommunicationError};
 pub use open::OpenMessage;
 pub use prefix::Prefix;
+pub use role::Role;
 pub use route_refresh::RouteRefreshMessage;
 pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
 pub use update::{

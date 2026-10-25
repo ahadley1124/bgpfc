@@ -33,6 +33,7 @@ fn attrs(path: &[u32]) -> PathAttrs {
         ext_communities: Box::default(),
         large_communities: Box::default(),
         unknown: Box::default(),
+        otc: None,
     }
 }
 

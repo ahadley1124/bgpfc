@@ -1151,6 +1151,7 @@ mod tests {
             ext_communities: Box::default(),
             large_communities: Box::default(),
             unknown: Box::default(),
+            otc: None,
         };
         let body = attrs
             .to_update(v4, vec!["192.0.2.0/24".parse().unwrap()])

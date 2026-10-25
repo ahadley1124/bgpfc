@@ -92,10 +92,16 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
             list(ext),
             list(large),
             unknown,
+            // RFC 9234 §5: passed on unchanged.
+            proptest::option::of(prop_oneof![Just(Asn(1)), Just(Asn(2))]),
         ),
     )
         .prop_map(
-            |((origin, as_path, next_hop, med), (local_pref, atomic, aggregator), (c, e, l, u))| {
+            |(
+                (origin, as_path, next_hop, med),
+                (local_pref, atomic, aggregator),
+                (c, e, l, u, otc),
+            )| {
                 PathAttrs {
                     origin: Origin::from_u8(origin).unwrap(),
                     as_path,
@@ -108,6 +114,7 @@ fn attrs() -> impl Strategy<Value = PathAttrs> {
                     ext_communities: e,
                     large_communities: l,
                     unknown: u,
+                    otc,
                 }
             },
         )
@@ -205,6 +212,9 @@ fn mix(a: &PathAttrs, b: &PathAttrs, mask: u16) -> PathAttrs {
     }
     if take(10) {
         m.unknown.clone_from(&b.unknown);
+    }
+    if take(11) {
+        m.otc = b.otc;
     }
     m
 }

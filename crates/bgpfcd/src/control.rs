@@ -1798,6 +1798,7 @@ mod tests {
                 ext_communities: Box::default(),
                 large_communities: Box::default(),
                 unknown: Box::default(),
+                otc: None,
             }),
             best: false,
             rov: RovState::Disabled,

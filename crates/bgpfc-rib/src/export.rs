@@ -211,6 +211,7 @@ pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &Pe
         && a.communities == b.communities
         && a.large_communities == b.large_communities
         && a.unknown == b.unknown
+        && a.otc == b.otc
         && (!keeps_next_hop(family, to) || global_only(a.next_hop) == global_only(b.next_hop));
     kept && match to.kind {
         PeerKind::External => {

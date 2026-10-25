@@ -4,7 +4,9 @@
 //! Implements: RFC 4271 §4.3 (the well-known attributes), §5 (unknown
 //! optional transitive attributes are carried with the Partial bit);
 //! RFC 4760 §3 (the next hop of multiprotocol routes); RFC 8950 §3 (IPv4
-//! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities).
+//! routes with an IPv6 next hop); RFC 1997, 4360, 8092 (communities);
+//! RFC 9234 §5 (the Only to Customer attribute, kept in the set so that it
+//! is passed on unchanged).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState};
@@ -16,7 +18,7 @@ use bgpfc_wire::attribute::{Aggregator, Origin, PathAttribute, flags};
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Afi};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 use bgpfc_wire::update::{DecodedUpdate, UpdateMessage};
 
 /// An optional transitive attribute this implementation does not know,
@@ -60,6 +62,11 @@ pub struct PathAttrs {
     pub large_communities: Box<[LargeCommunity]>,
     /// Unknown optional transitive attributes, by type code.
     pub unknown: Box<[UnknownAttribute]>,
+    /// Only to Customer: the AS that marked the route as not for a
+    /// provider, a peer or a route server (RFC 9234 §5). "Once the OTC
+    /// Attribute has been set, it MUST be preserved unchanged", so it is
+    /// part of the set like any attribute passed on.
+    pub otc: Option<Asn>,
 }
 
 /// Sort `list` and drop repeats; the common case, already so, allocates
@@ -115,6 +122,7 @@ impl PathAttrs {
             ext_communities: Box::default(),
             large_communities: Box::default(),
             unknown: Box::default(),
+            otc: None,
         };
         let mut unknown = Vec::new();
         for a in &m.attributes {
@@ -130,6 +138,7 @@ impl PathAttrs {
                     attrs.ext_communities = c.as_slice().into();
                 }
                 PathAttribute::LargeCommunities(c) => attrs.large_communities = c.as_slice().into(),
+                PathAttribute::OnlyToCustomer(a) => attrs.otc = Some(*a),
                 PathAttribute::Unknown { flags, code, value } => {
                     unknown.push(UnknownAttribute {
                         flags: *flags,
@@ -232,6 +241,9 @@ impl PathAttrs {
                 self.large_communities.to_vec(),
             ));
         }
+        if let Some(a) = self.otc {
+            out.push(PathAttribute::OnlyToCustomer(a));
+        }
         for u in &self.unknown {
             out.push(PathAttribute::Unknown {
                 // RFC 4271 §5: an unrecognised optional transitive
@@ -323,6 +335,13 @@ impl Hash for PathAttrs {
             w.put(&c.global.to_be_bytes());
             w.put(&c.local1.to_be_bytes());
             w.put(&c.local2.to_be_bytes());
+        }
+        match self.otc {
+            Some(a) => {
+                w.put(&[1]);
+                w.put(&a.0.to_be_bytes());
+            }
+            None => w.put(&[0]),
         }
         w.len(self.unknown.len());
         for u in &self.unknown {
