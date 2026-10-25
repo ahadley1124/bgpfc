@@ -22,7 +22,9 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
 > 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
 > link-local next hop, which §3 asks for where it shares a subnet with the next
-> hop and the peer. Nothing else is claimed.
+> hop and the peer. RFC 9234 has one partial row too: a route learned over a
+> session with no BGP Role carries no Only to Customer mark (§3.1). Nothing
+> else is claimed.
 
 ### What works
 
@@ -44,6 +46,9 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)).
+- BGP Roles and the Only to Customer attribute (RFC 9234, `role` per neighbor),
+  with the Role Mismatch NOTIFICATION and an optional strict mode; interop
+  tests against BIRD 2.14.
 - An RFC 6811 origin validation state on every route, from VRPs fetched over
   RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
   with failover in order of preference; `bgpfcctl show rpki` reports the
@@ -108,10 +113,27 @@ policy match on the validation state (RFC 6811 §3). Then bgpfcd will be
 able to start and supervise an optional Routinator as a child process.
 Routinator is a separate program; bgpfc neither bundles nor links it.
 
+### BGP roles and Only to Customer
+
+`role provider|rs|rs-client|customer|peer;` on a neighbor (RFC 9234,
+[`docs/config.md`](docs/config.md), "BGP Roles") sends the BGP Role
+capability and checks the neighbor's: a Role that does not correspond, or
+with `role-strict yes;` none at all, is refused with OPEN Message Error /
+Role Mismatch. The session then runs the Only to Customer procedures of
+§5: a route leak, one with the attribute from a customer, an RS-Client or
+a peer with another AS in it, is dropped; the attribute is added to routes
+from a provider, a peer or an RS and to those sent to a customer, a peer
+or an RS-Client; and a route that has it is never sent to a provider, a
+peer or an RS. A neighbor without a `role` is untouched. One rule is open:
+a route learned over a session with no Role carries no mark, so it is the
+operator's policy that keeps it from a provider (the `partial` row of
+[`COMPLIANCE.md`](COMPLIANCE.md), RFC 9234 §3.1). Tested against BIRD 2.14
+(`interop/tests/roles.rs`).
+
 ### Later
 
-ASPA (planned for v1.1.0), origin validation on export (RFC 8893), BGP roles
-and OTC (RFC 9234), RFC 8212 default policy, graceful restart (RFC 4724),
+ASPA (planned for v1.1.0), origin validation on export (RFC 8893),
+RFC 8212 default policy, graceful restart (RFC 4724),
 ADD-PATH (RFC 7911), route reflection (RFC 4456), multipath, and
 TCP-MD5/TCP-AO.
 
