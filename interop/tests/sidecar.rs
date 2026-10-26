@@ -667,7 +667,7 @@ fn sigkill_of_bgpfcd_leaves_no_orphan() {
 #[test]
 #[ignore = "needs root, bird, curl and iproute2"]
 fn a_killed_routinator_is_restarted_and_bgpfcd_resyncs() {
-    let s = Setup::start("sd", 29, &Opts::default(), |_| {});
+    let mut s = Setup::start("sd", 29, &Opts::default(), |_| {});
     let (used, held) = split_invalid(&VALIDATED);
     s.wait_for_states(ESTABLISH, &used);
     assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
@@ -733,6 +733,38 @@ fn a_killed_routinator_is_restarted_and_bgpfcd_resyncs() {
         s.report()
     );
     assert_eq!(s.count("session established"), 1, "{}", s.report());
+    stop_with_routinator(&mut s, new_pid);
+}
+
+/// Issue #70: "restarting the child during our own shutdown is a bug".
+/// `SIGTERM` reaches bgpfcd and Routinator, whose process `pid` is, at the
+/// same moment, as systemd's default `KillMode=control-group` sends it:
+/// bgpfcd, which stops Routinator right at the start of its shutdown,
+/// starts no other, even past the restart back-off.
+fn stop_with_routinator(s: &mut Setup, pid: u32) {
+    let starts = s.fake.invocations().len();
+    let both = Command::new("kill")
+        .args(["-TERM", &s.bgpfcd.pid().to_string(), &pid.to_string()])
+        .status()
+        .expect("kill");
+    assert!(both.success());
+    assert!(
+        s.bgpfcd.wait(Duration::from_secs(20)).is_some(),
+        "{}",
+        s.report()
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(s.fake.invocations().len(), starts, "{}", s.report());
+    assert_eq!(s.fake.serving(), Vec::<u32>::new());
+    let log = s.bgpfcd.log_text();
+    let shutting = log
+        .find("msg=\"shutting down\"")
+        .unwrap_or_else(|| panic!("no shutdown:\n{log}"));
+    assert!(
+        !log[shutting..].contains("msg=\"restarting the RPKI sidecar\""),
+        "{log}"
+    );
+    assert!(log[shutting..].contains("msg=\"bgpfcd stopped\""), "{log}");
 }
 
 /// Issue #70: "a persistently failing binary backs off rather than
