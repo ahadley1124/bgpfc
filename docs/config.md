@@ -643,11 +643,21 @@ uid M as bgpfcd is: another process holds the port"`, the last of them in
 `show rpki`; its VRPs never reach the RIB, and the routes keep the states
 they had (`disabled`, while validation waits). Routinator, finding the
 port taken, fails to start, and its failures raise the alarm (issue #70).
-A process that runs as bgpfcd's own user is not told apart: it could
-change Routinator's repository and configuration anyway. Run bgpfcd as a
-user of its own, not as one other daemons share, such as `nobody`, and
-keep untrusted code off that user. Without `/proc` no connection to the
-sidecar is used.
+The check tells users apart and nothing finer, so it is only as strong
+as the user bgpfcd runs as. A process that runs as bgpfcd's own user is
+not told apart: it could change Routinator's repository and
+configuration anyway. Root, which can make a socket as any user, can
+pass it too. Run bgpfcd as a user of its own, not as one other daemons
+share, such as `nobody`, and keep untrusted code off that user. In a user
+namespace the kernel's socket tables show every user the namespace does
+not map as the overflow user (`/proc/sys/kernel/overflowuid`, 65534,
+`nobody`), so a bgpfcd that runs as that user there, or in a namespace
+with no user map at all, where it is that user itself, takes every
+process of an unmapped user, root's included, for its own: give it a
+mapped user of its own there too. Without `/proc` no connection to the sidecar is used. For
+these reasons COMPLIANCE.md marks the RFC 8210 §9, §13 requirement
+(cache and router on a trusted, controlled network) `partial` with `mode
+sidecar`.
 
 **Startup window.** Until the RTR client's first full set arrives there
 are no VRPs, and every route is `disabled`: shown so, not as `not-found`,

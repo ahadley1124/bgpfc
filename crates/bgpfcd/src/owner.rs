@@ -19,6 +19,15 @@
 //! §13: the router relies on the cache being one it trusts). A process of
 //! bgpfcd's own user is not told apart: such a process can already change
 //! Routinator's repository and configuration.
+//!
+//! Nor are users the tables cannot name. In a user namespace they give
+//! every user the namespace does not map as the overflow user, 65534
+//! (`from_kuid_munged` in the kernel), so a bgpfcd that runs as that user
+//! there, or in a namespace with no user map, where it is that user
+//! itself, passes a server of any unmapped user, root's included. That,
+//! and a user other processes share, such as `nobody`, is why
+//! COMPLIANCE.md has the RFC 8210 §9, §13 row `partial` with `mode
+//! sidecar` (`docs/config.md`, "Who serves the sidecar's port").
 
 use std::fs;
 use std::io::{self, ErrorKind};

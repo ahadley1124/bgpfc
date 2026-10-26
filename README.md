@@ -389,7 +389,9 @@ start rpki` naming both versions.
   validation run, another local process could bind the port; bgpfcd's RTR
   client uses only a server that runs as bgpfcd's own user, as
   Routinator does, so give bgpfcd a user of its own (`bgpfc`, not
-  `nobody`).
+  `nobody`), and in a user namespace one the namespace maps: there every
+  unmapped user, root included, reads as `nobody` (`docs/config.md`, "Who
+  serves the sidecar's port").
 - **systemd**: `contrib/bgpfcd.service` has `KillMode=mixed`, so that
   `systemctl stop` signals bgpfcd alone, which stops its RTR client and
   then Routinator itself; with the default mode systemd would signal
