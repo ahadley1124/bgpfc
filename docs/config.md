@@ -896,11 +896,13 @@ running Routinator goes on serving: a reload onto a binary that would not
 start never stops the one that works. Should Routinator still fail to
 start after that, as when the binary changes in between, the reload goes
 ahead with validation off, every route `disabled`, and its summary and an
-error line say so. The next reload starts it again, after the same
-checks, also when the file has not changed: fix the cause, then reload.
-The same holds for an RTR client that could not be started. A Routinator
-that keeps failing is not restarted by a reload that leaves its block
-alone: bgpfcd keeps retrying it at the back-off's cap.
+error line say so; `show status` raises the alarm
+`rpki-sidecar-not-running` until it runs (`docs/control.md`, "Alarms").
+The next reload starts it again, after the same checks, also when the
+file has not changed: fix the cause, then reload. The same holds for an
+RTR client that could not be started (`rpki-client-not-running`). A
+Routinator that keeps failing is not restarted by a reload that leaves its
+block alone: bgpfcd keeps retrying it at the back-off's cap.
 
 ## Command line
 

@@ -364,11 +364,13 @@ Routinator is not restarted by a reload that leaves its block alone.
 `show status` and `GET /v1/status` end with what needs an operator now:
 a line `alarm ...` for each alarm, and their names in `alarms`, an empty
 array when there is none. They are the one reply a monitoring system
-needs to poll; this is not a health check. There is one alarm:
+needs to poll; this is not a health check. These are the alarms:
 
 | Name | Line | Raised while |
 |---|---|---|
 | `rpki-sidecar-failed` | `alarm rpki sidecar failed: N failures in a row` | Routinator has failed `failure-threshold` times in a row and waits for its next start: the `failed` state of `show rpki` (see [RPKI](#rpki)) |
+| `rpki-sidecar-not-running` | `alarm rpki sidecar not running: validation is off` | the `rpki` block has `mode sidecar`, but a reload could not start Routinator: `sidecar not running` in `show rpki`, and every route `disabled` while enforcement is expected (issue #71). The next reload starts it again, also from an unchanged file (`docs/config.md`, "Reload") |
+| `rpki-client-not-running` | `alarm rpki client not running: validation is off` | the same for an RTR client that a reload could not start, with `mode external` |
 
 Before the alarms, `show status` says `rpki MODE, validation STATE`, with
 the mode of the `rpki` block and `off`, `waiting` or `active` as `show

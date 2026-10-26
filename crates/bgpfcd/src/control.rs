@@ -430,8 +430,27 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
 /// times in a row may leave the speaker enforcing RPKI with a validator
 /// that is not running, which issue #70 wants surfaced "as an operational
 /// error, not just a log line"; the line gives its failures in a row.
+///
+/// So does a block whose mode validates with nothing running, after a
+/// reload that could not start Routinator or the RTR client: every route
+/// is `disabled` while enforcement is expected, which issue #71 forbids
+/// to happen silently. The next reload starts it again
+/// (`Rpki::in_effect`).
 fn alarms(r: &RpkiReport) -> Vec<(&'static str, String)> {
     let mut alarms = Vec::new();
+    if r.status.is_none() {
+        match (r.config.mode, &r.sidecar) {
+            (RpkiMode::Disabled, _) => {}
+            (RpkiMode::Sidecar, None) => alarms.push((
+                "rpki-sidecar-not-running",
+                "rpki sidecar not running: validation is off".to_owned(),
+            )),
+            (RpkiMode::External | RpkiMode::Sidecar, _) => alarms.push((
+                "rpki-client-not-running",
+                "rpki client not running: validation is off".to_owned(),
+            )),
+        }
+    }
     if let Some(s) = &r.sidecar
         && let SidecarState::Failed { failures: n, .. } = s.status.state
     {
@@ -3453,6 +3472,56 @@ mod tests {
             reply.json
         );
         assert_eq!(rpki.as_deref(), Some("coordinator busy"));
+    }
+
+    /// Issue #71: a block whose mode validates, with nothing running
+    /// after a reload that could not start it, leaves every route
+    /// `disabled` while enforcement is expected: an alarm, not only
+    /// `validation off`.
+    #[test]
+    fn status_lists_an_rpki_block_that_is_not_running() {
+        let off = |config: &str| RpkiReport {
+            config: rpki_block(config),
+            status: None,
+            waiting_since: None,
+            sidecar: None,
+        };
+        for (report, mode, name, line) in [
+            (
+                off("rpki { mode sidecar; }"),
+                "sidecar",
+                "rpki-sidecar-not-running",
+                "alarm rpki sidecar not running: validation is off",
+            ),
+            (
+                off("rpki { mode external; cache 192.0.2.10; }"),
+                "external",
+                "rpki-client-not-running",
+                "alarm rpki client not running: validation is off",
+            ),
+        ] {
+            let r = render_status(&status_report(Some(report)));
+            assert_eq!(
+                r.lines[4..],
+                [format!("rpki {mode}, validation off"), line.to_owned()]
+            );
+            let json =
+                format!(r#""rpki":{{"mode":"{mode}","validation":"off"}},"alarms":["{name}"]}}"#);
+            assert!(r.json.ends_with(&json), "{}", r.json);
+        }
+        // A sidecar with no client, which no reload leaves behind, is said
+        // as a client that is not running.
+        let mut no_client = sidecar_report(Instant::now(), SidecarState::Starting);
+        no_client.status = None;
+        let r = render_status(&status_report(Some(no_client)));
+        assert_eq!(
+            r.lines[5],
+            "alarm rpki client not running: validation is off"
+        );
+        // `mode disabled` wants no validation: no alarm.
+        let r = render_status(&status_report(Some(off("rpki { mode disabled; }"))));
+        assert_eq!(r.lines.len(), 5, "{:?}", r.lines);
+        assert!(r.json.ends_with(r#""alarms":[]}"#), "{}", r.json);
     }
 
     #[test]
