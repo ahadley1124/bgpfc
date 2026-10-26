@@ -385,6 +385,24 @@ fn alive(pid: u32) -> bool {
     !state.is_empty() && !state.starts_with('Z')
 }
 
+/// The process group of process `pid`: the fifth field of
+/// `/proc/PID/stat`, after the command in parentheses.
+fn pgid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+/// Whether none of the children the fake's starts left runs: the
+/// stand-ins for Routinator's `rsync`, which went with its process group.
+fn no_child_runs(fake: &FakeRoutinator) -> bool {
+    fake.children().into_iter().all(|child| !alive(child))
+}
+
 /// The `Name:` line of `/proc/PID/status`, without its name.
 fn proc_status(pid: u32, name: &str) -> String {
     fs::read_to_string(format!("/proc/{pid}/status"))
@@ -450,6 +468,9 @@ impl Setup {
         assert_eq!(self.fake.invocations().len(), starts, "{}", self.report());
         assert_eq!(self.fake.serving(), Vec::<u32>::new());
         assert!(!alive(pid), "{pid} still runs");
+        // Nor anything Routinator started: its process group went with it.
+        assert_eq!(self.fake.children().len(), starts, "{}", self.report());
+        assert!(no_child_runs(&self.fake), "{:?}", self.fake.children());
     }
 }
 
@@ -631,6 +652,15 @@ fn a_bad_sidecar_stops_the_start() {
 /// gets no chance to stop Routinator; the parent-death signal its
 /// supervisor thread set ends it (`PR_SET_PDEATHSIG`), and its RTR port is
 /// free again.
+///
+/// What Routinator started is another matter, and this documents it
+/// (`docs/config.md`, "Routinator sidecar"): the death signal is not
+/// inherited, and Routinator's process group is killed only when bgpfcd
+/// reaps Routinator, which a killed bgpfcd never does. So the fake's
+/// stand-in for an `rsync` under way runs on, adopted by init, in
+/// Routinator's old process group, until something else ends it, as
+/// systemd's `KillMode=mixed` does with what is left of the service's
+/// control group; here the test does.
 #[test]
 #[ignore = "needs root, bird, curl and iproute2"]
 fn sigkill_of_bgpfcd_leaves_no_orphan() {
@@ -643,6 +673,10 @@ fn sigkill_of_bgpfcd_leaves_no_orphan() {
     let rtr = s.rtr();
     let pid = s.fake.pid().expect("the fake's pid");
     assert_eq!(s.fake.serving(), [pid]);
+    let children = s.fake.children();
+    assert_eq!(children.len(), 1, "{children:?}");
+    let child = children[0];
+    assert_eq!(pgid(child), Some(pid), "the child is in Routinator's group");
 
     s.bgpfcd.kill();
     assert!(
@@ -655,6 +689,13 @@ fn sigkill_of_bgpfcd_leaves_no_orphan() {
     // The port can be bound again: a stub listens on it.
     let ns_a = s.lab.a.clone();
     let _stub = RtrStub::start(&s.lab, &ns_a, &rtr, 9, &FIRST);
+
+    // NOTE: the documented limit of the death signal: Routinator's own
+    // child outlives it, still in its process group.
+    assert!(alive(child), "{child} was ended: update docs/config.md");
+    assert_eq!(pgid(child), Some(pid));
+    s.fake.kill_children();
+    assert!(wait_for(Duration::from_secs(5), || !alive(child)));
 }
 
 /// Issues #26 and #70: "killing Routinator results in a restart". The
@@ -705,6 +746,12 @@ fn a_killed_routinator_is_restarted_and_bgpfcd_resyncs() {
     assert!(restarted.is_some(), "{}", s.report());
 
     let new_pid = s.fake.pid().expect("the new pid");
+    // The killed Routinator's own child went with its process group; the
+    // new one has its own.
+    let children = s.fake.children();
+    assert_eq!(children.len(), 2, "{children:?}");
+    assert!(!alive(children[0]), "{children:?}");
+    assert!(alive(children[1]), "{children:?}");
     let session = format!("session-id {} serial 1\n", new_pid % 65_535 + 1);
     s.wait_for_rpki(
         Duration::from_secs(10),
@@ -765,6 +812,7 @@ fn stop_with_routinator(s: &mut Setup, pid: u32) {
         "{log}"
     );
     assert!(log[shutting..].contains("msg=\"bgpfcd stopped\""), "{log}");
+    assert!(no_child_runs(&s.fake), "{:?}", s.fake.children());
 }
 
 /// Issue #70: "a persistently failing binary backs off rather than

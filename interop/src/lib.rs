@@ -1006,9 +1006,12 @@ pub const NOBODY: u32 = 65_534;
 /// `invocations`, insists on `server` and `--rtr=ADDR:PORT` as bgpfcd
 /// derives them, and then becomes this crate's `rtr-stub` on that address,
 /// serving the VRPs of the file `vrps` under a new Session ID each time,
-/// as a restarted Routinator does. `fail` makes every start exit 1 at once;
-/// `delay` holds the start that many seconds before it listens, as
-/// Routinator's first validation run does. Every `--version` adds a line
+/// as a restarted Routinator does. `fail` makes every start exit 1 at once.
+/// Otherwise each start leaves a child of its own running, in its process
+/// group, as Routinator's `rsync` runs during a validation run: a `sleep`,
+/// whose process ID goes to `children`. `delay` holds the start that many
+/// seconds before it listens, as Routinator's first validation run does.
+/// Every `--version` adds a line
 /// to `version-checks`; from the one whose number `version-from` holds on,
 /// it prints `version-later` instead of `version`. `@DIR@` is the
 /// directory of these files.
@@ -1028,6 +1031,8 @@ for a in "$@"; do
 done
 [ -n "$server" ] && [ -n "$rtr" ] || { echo "fake routinator: expected server --rtr=ADDR:PORT" >&2; exit 2; }
 [ -e "$dir/fail" ] && { echo "fake routinator: failing as asked" >&2; exit 1; }
+sleep @CHILD@ </dev/null >/dev/null 2>&1 &   # Routinator's rsync
+echo $! >> "$dir/children"
 delay=$(cat "$dir/delay" 2>/dev/null || echo 0)
 [ "$delay" -gt 0 ] && sleep "$delay"   # Routinator listens after its first run
 echo $$ > "$dir/pid"
@@ -1035,6 +1040,9 @@ echo $$ > "$dir/pid"
 # parent-death signal (prctl(2)); a new Session ID per start, as Routinator.
 exec "$dir/rtr-stub" "$rtr" $(( $$ % 65535 + 1 )) $(cat "$dir/vrps")
 "#;
+
+/// How long the child each start of a [`FakeRoutinator`] leaves runs.
+const CHILD_SECONDS: u32 = 300;
 
 /// A fake Routinator 0.15.2 for `rpki { mode sidecar; }` (AGENTS.md §5:
 /// never a real Routinator), in the directory `routinator` of a lab: the
@@ -1072,7 +1080,10 @@ impl FakeRoutinator {
             !dir_text.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"'),
             "{dir_text}: the script takes the path unquoted"
         );
-        fs::write(&binary, FAKE_ROUTINATOR.replace("@DIR@", dir_text)).expect("fake routinator");
+        let script = FAKE_ROUTINATOR
+            .replace("@DIR@", dir_text)
+            .replace("@CHILD@", &CHILD_SECONDS.to_string());
+        fs::write(&binary, script).expect("fake routinator");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
             .expect("fake routinator mode");
         let stub = dir.join("rtr-stub");
@@ -1161,6 +1172,32 @@ impl FakeRoutinator {
         read(&self.dir.join("pid")).trim().parse().ok()
     }
 
+    /// The process IDs of the children its starts left, the stand-ins for
+    /// Routinator's `rsync`, in order: dead ones too.
+    #[must_use]
+    pub fn children(&self) -> Vec<u32> {
+        read(&self.dir.join("children"))
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    /// Kill the children that still run, as systemd kills what is left of
+    /// a service's control group. A process ID is signalled only while it
+    /// still runs the child's command, so not once another process has it.
+    pub fn kill_children(&self) {
+        let command = format!("sleep\0{CHILD_SECONDS}\0");
+        for pid in self.children() {
+            let running =
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == command.as_bytes());
+            if running {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+
     /// The processes that run this fake's `rtr-stub`, by their command
     /// lines: the fake Routinators serving RTR now.
     #[must_use]
@@ -1192,6 +1229,14 @@ impl FakeRoutinator {
             self.binary.display(),
             self.repository.display()
         )
+    }
+}
+
+impl Drop for FakeRoutinator {
+    /// [`FakeRoutinator::kill_children`]: a test leaves no `sleep` behind,
+    /// also one that fails.
+    fn drop(&mut self) {
+        self.kill_children();
     }
 }
 
@@ -1298,8 +1343,22 @@ mod tests {
         assert_eq!(fake.pid(), Some(serving.pid()));
         assert_eq!(fake.serving(), [serving.pid()]);
         assert_eq!(fake.invocations().len(), 3);
+        // One child, in the server's process group, which a kill of the
+        // server alone leaves running.
+        let children = fake.children();
+        assert_eq!(children.len(), 1, "{children:?}");
+        let alive = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+            })
+        };
+        assert!(alive(children[0]));
         serving.kill();
         assert_eq!(fake.serving(), Vec::<u32>::new());
+        assert!(alive(children[0]));
+        fake.kill_children();
+        assert!(wait_for(Duration::from_secs(5), || !alive(children[0])));
 
         let cfg = lab.dir.join("check.conf");
         fs::write(
