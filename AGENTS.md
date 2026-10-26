@@ -247,9 +247,11 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
   Each term has match clauses and then actions. A term ends with `accept`,
   `reject`, or `next`. If no term decides, the route is rejected.
 - Match clauses: `prefix`, `prefix-list` (with `ge`/`le`), `as-path` regex,
-  `community`/`ext-community`/`large-community`, `origin`, and `neighbor`.
+  `community`/`ext-community`/`large-community`, `origin`, `neighbor`, and
+  `rpki` (the origin validation state, RFC 6811 §3).
 - Set actions: `local-pref`, `med`, add/remove/replace communities (all three
-  kinds), `as-path prepend`, and `next-hop self`.
+  kinds), `as-path prepend`, `next-hop self`, and `rpki` (the validation
+  state, RFC 6811 §3).
 - The AS-path regex engine is our own. Operators match on ASN tokens, not
   characters: `^ $ . * + ? [ ] ( ) |` and `_`. Build it as a Thompson NFA or
   a backtracker with a step limit, so that pathological patterns cannot hang
@@ -486,7 +488,12 @@ maintainer chose this order for the steps still open: 15, 16, 17, 18, 13,
 13. **ROV (issues #59–#61).**
     - RFC 6811 in the decision process, and a policy match on validation
       state (RFC 6811 §3).
-    - Drop Invalid by default, with a non-enforcing prefer-valid mode.
+    - Drop Invalid when the operator says `invalid drop`, with a
+      non-enforcing `prefer-valid` mode, and `policy` for nothing of its
+      own. The `invalid` statement of an external `rpki` block is required
+      and has no default: RFC 8481 §5 says that "absent specific operator
+      configuration, policy MUST NOT be applied", which a cache in the file
+      is not.
     - Re-evaluate only the prefixes a VRP delta affects (RFC 6811 §4).
     - `rpki` config: external caches, or disabled.
 14. **Routinator sidecar (new crate `bgpfc-sidecar`, issues #70–#72).**
