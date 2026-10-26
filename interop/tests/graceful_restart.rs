@@ -581,10 +581,15 @@ impl Triangle {
                 && self.kernel_is(&self.all_v4, &self.all_v6)
         });
         assert!(ok, "not converged: {}", self.state());
+        // B gets C's IPv4 routes only. Both sessions run over IPv4, so C's
+        // IPv6 routes go to B with C's next hop as received (NOTE(interop)
+        // in rib/export.rs `rewrite`), which is not on B's link. BIRD, a
+        // single-hop external neighbor, finds that NEXT_HOP semantically
+        // incorrect and ignores the routes (RFC 4271 §6.3), counting them
+        // as withdrawn.
         let ok = wait_for(Duration::from_secs(20), || {
             [C_V4_KEPT, C_V4_DROPPED]
                 .iter()
-                .chain(self.all_v6.iter().skip(1))
                 .all(|p| self.peer.has(&self.lab, p))
         });
         assert!(ok, "{}", self.peer.status(&self.lab));
@@ -687,15 +692,21 @@ fn bgpfcd_restarts_in_install_mode(speaker: &str, v6: bool) {
     // B hears of the removal when bgpfcd's End-of-RIB comes (§4.2), not
     // before.
     assert!(!t.peer.has(&t.lab, C_V4_DROPPED) && t.peer.has(&t.lab, C_V4_KEPT));
-    if v6 {
-        assert!(!t.peer.has(&t.lab, C_V6_DROPPED) && t.peer.has(&t.lab, C_V6_KEPT));
-    }
     // RFC 4724 §3: B saw the Restart State bit and the Forwarding State bit
-    // of the families that have routes installed.
+    // of the families that have routes installed, IPv6 included when the
+    // kernel kept IPv6 routes.
     let status = t.peer.status(&t.lab);
     if let Peer::Bird(_) = t.peer {
         assert!(status.contains("Restart recovery"), "{status}");
         assert!(status.contains("AF preserved: ipv4"), "{status}");
+        if v6 {
+            assert!(
+                status
+                    .lines()
+                    .any(|l| l.contains("AF preserved:") && l.contains("ipv6")),
+                "{status}"
+            );
+        }
     }
 }
 
@@ -707,7 +718,7 @@ fn bird_keeps_the_routes_of_a_bgpfcd_that_restarts_and_the_kernel_keeps_its_own(
 
 #[test]
 #[ignore = "needs root, bird and iproute2, and IPv6 in the kernel"]
-fn bird_keeps_the_ipv6_routes_of_a_bgpfcd_that_restarts_too() {
+fn the_kernel_keeps_the_ipv6_routes_of_a_bgpfcd_that_restarts_too() {
     bgpfcd_restarts_in_install_mode("bird", true);
 }
 
