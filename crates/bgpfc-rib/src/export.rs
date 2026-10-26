@@ -11,11 +11,16 @@
 //! whether a subnet is shared); RFC 8654 §4 (65535-octet UPDATEs); RFC
 //! 8950 §4 (an IPv6 next hop for IPv4 NLRI only to a peer that advertised
 //! it), §5 (our own address is of the session's protocol; a next hop
-//! passed on keeps its encoding).
+//! passed on keeps its encoding); RFC 7911 §3, §5 (a Path Identifier with
+//! each prefix sent to a peer that takes several paths); RFC 9234 §5 (a
+//! route with the Only to Customer attribute is not sent to a provider, a
+//! peer or a route server, and one without it gets ours when sent to a
+//! customer, a peer or an RS-Client); RFC 4724 §2 (the End-of-RIB marker).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::IpAddr;
+use std::ops::Range;
 use std::sync::Arc;
 
 use bgpfc_wire::community::{Community, ExtendedCommunity};
@@ -23,11 +28,12 @@ use bgpfc_wire::error::EncodeError;
 use bgpfc_wire::header::{HEADER_LEN, MessageType, frame};
 use bgpfc_wire::mp::{MpUnreach, NextHop};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Asn};
-use bgpfc_wire::update::{EncodeContext, PeerKind, UpdateMessage};
+use bgpfc_wire::types::{AddressFamily, Asn, PathId};
+use bgpfc_wire::update::{AddPathFamilies, EncodeContext, PathIds, PeerKind, UpdateMessage};
 
 use crate::attrs::PathAttrs;
 use crate::decision::DEFAULT_LOCAL_PREF;
+use crate::otc;
 use crate::peer::PeerInfo;
 
 /// Where a Loc-RIB route came from, for the export rules.
@@ -74,15 +80,37 @@ pub fn export(
     Some(rewrite(local_as, family, attrs, to))
 }
 
+/// The End-of-RIB marker for `family` as sent to `to`, framed (RFC 4724
+/// §2): the empty UPDATE for IPv4 unicast, an UPDATE with an empty
+/// `MP_UNREACH_NLRI` for any other family. It has no prefixes, so what was
+/// negotiated about them changes nothing about it.
+///
+/// # Errors
+/// [`EncodeError`] if it cannot be encoded, which a marker never cannot.
+pub fn end_of_rib(family: AddressFamily, to: &PeerInfo) -> Result<Vec<u8>, EncodeError> {
+    let ctx = EncodeContext {
+        four_octet_as: to.four_octet_as,
+        extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
+    };
+    frame(
+        MessageType::Update,
+        &UpdateMessage::end_of_rib(family).encode(&ctx)?,
+    )
+}
+
 /// Whether attributes allow a route of `family` to `to` at all: RFC 1997
 /// `NO_ADVERTISE` goes nowhere; `NO_EXPORT` and `NO_EXPORT_SUBCONFED` stay
 /// inside the AS (no confederations here). RFC 8950 §4: an IPv6 next hop
 /// for IPv4 NLRI goes only to a peer that advertised the capability for
 /// the family, and §5: a next hop passed on unchanged keeps its encoding,
-/// so a peer that cannot take it does not get the route at all.
+/// so a peer that cannot take it does not get the route at all. RFC 9234
+/// §5: a route with the Only to Customer attribute does not go to a
+/// provider, a peer or a route server; no policy can change that, as this
+/// is asked of what policy leaves.
 #[must_use]
 pub fn permitted(family: AddressFamily, attrs: &PathAttrs, to: &PeerInfo) -> bool {
-    if attrs.has_community(Community::NO_ADVERTISE) {
+    if attrs.has_community(Community::NO_ADVERTISE) || otc::blocks_egress(attrs, to) {
         return false;
     }
     if to.kind == PeerKind::External
@@ -171,6 +199,9 @@ pub fn rewrite(
             out.local_pref = Some(attrs.local_pref.unwrap_or(DEFAULT_LOCAL_PREF));
         }
     }
+    // RFC 9234 §5: the egress procedure adds the attribute, with our AS, to
+    // a route sent to a customer, a peer or an RS-Client that has none.
+    out.otc = otc::egress(local_as, attrs.otc, to);
     // RFC 2545 §3: "The link-local address shall be included in the Next
     // Hop field if and only if the BGP speaker shares a common subnet with
     // the entity identified by the global IPv6 address ... and the peer the
@@ -201,9 +232,15 @@ fn global_only(next_hop: NextHop) -> NextHop {
 /// without making either: what the session overwrites or drops is not
 /// compared. When true the rewrites are equal, so the peer needs no new
 /// UPDATE; it may be false for some equal rewrites, which only costs a
-/// redundant one.
+/// redundant one. `local_as` is our AS.
 #[must_use]
-pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &PeerInfo) -> bool {
+pub fn same_rewrite(
+    local_as: Asn,
+    family: AddressFamily,
+    a: &PathAttrs,
+    b: &PathAttrs,
+    to: &PeerInfo,
+) -> bool {
     let kept = a.origin == b.origin
         && a.as_path == b.as_path
         && a.atomic_aggregate == b.atomic_aggregate
@@ -211,6 +248,7 @@ pub fn same_rewrite(family: AddressFamily, a: &PathAttrs, b: &PathAttrs, to: &Pe
         && a.communities == b.communities
         && a.large_communities == b.large_communities
         && a.unknown == b.unknown
+        && otc::egress(local_as, a.otc, to) == otc::egress(local_as, b.otc, to)
         && (!keeps_next_hop(family, to) || global_only(a.next_hop) == global_only(b.next_hop));
     kept && match to.kind {
         PeerKind::External => {
@@ -243,6 +281,13 @@ pub struct Batch {
     /// search for every prefix. The batch holds every set it indexes, so
     /// no address is reused while it is in here.
     index: HashMap<usize, usize>,
+    /// The Path Identifiers of `withdraw`, one each (RFC 7911 §3); empty
+    /// unless the batch is for a peer sent paths with identifiers, so a
+    /// batch for any other peer costs nothing for them.
+    withdraw_ids: Vec<PathId>,
+    /// The identifiers of the prefixes of each entry of `announce`; empty
+    /// likewise.
+    announce_ids: Vec<Vec<PathId>>,
 }
 
 impl Batch {
@@ -264,9 +309,36 @@ impl Batch {
         }
     }
 
+    /// Record the announcement of path `id` of `prefix` (RFC 7911 §3).
+    /// A batch takes either these or [`Batch::announce`], not both.
+    pub fn announce_path(&mut self, attrs: &Arc<PathAttrs>, prefix: Prefix, id: PathId) {
+        let at = match self.index.entry(Arc::as_ptr(attrs).addr()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                e.insert(self.announce.len());
+                self.announce.push((Arc::clone(attrs), Vec::new()));
+                self.announce.len() - 1
+            }
+        };
+        self.announce[at].1.push(prefix);
+        if self.announce_ids.len() <= at {
+            self.announce_ids.resize_with(at + 1, Vec::new);
+        }
+        self.announce_ids[at].push(id);
+    }
+
+    /// Record the withdrawal of path `id` of `prefix` (RFC 7911 §3). A
+    /// batch takes either these or plain withdrawals.
+    pub fn withdraw_path(&mut self, prefix: Prefix, id: PathId) {
+        self.withdraw.push(prefix);
+        self.withdraw_ids.push(id);
+    }
+
     /// Empty the batch, giving back the sets it announced.
     pub fn take_sets(&mut self) -> impl Iterator<Item = Arc<PathAttrs>> + '_ {
         self.withdraw.clear();
+        self.withdraw_ids.clear();
+        self.announce_ids.clear();
         self.index.clear();
         self.announce.drain(..).map(|(a, _)| a)
     }
@@ -292,31 +364,59 @@ impl Batch {
     ) -> Result<Vec<Vec<u8>>, EncodeError> {
         #[cfg(feature = "profiling")]
         let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::ADJ_RIB_OUT_BUILD);
+        // RFC 7911 §5: the extended NLRI encoding for a family the peer is
+        // sent several paths of, and only then.
+        let with_ids = to.path_limit(family).is_some();
         let ctx = EncodeContext {
             four_octet_as: to.four_octet_as,
             // RFC 8950 §4; export already keeps such routes from a peer
             // without it, and the encoder refuses them as well.
             extended_next_hop: to.extended_next_hop.contains(&AddressFamily::IPV4_UNICAST),
+            add_path: if with_ids {
+                AddPathFamilies::of(&[family])
+            } else {
+                AddPathFamilies::NONE
+            },
         };
+        // RFC 7911 §3: four octets more per prefix.
+        let extra = if with_ids { PATH_ID_OCTETS } else { 0 };
         let max_body = to.max_message_len() - HEADER_LEN;
         let mut out = Vec::new();
-        for chunk in chunks(&self.withdraw, max_body - WITHDRAW_OVERHEAD) {
+        for range in chunks(&self.withdraw, max_body - WITHDRAW_OVERHEAD, extra) {
+            let withdrawn = self.withdraw[range.clone()].to_vec();
+            let ids = if with_ids {
+                self.withdraw_ids
+                    .get(range)
+                    .ok_or(EncodeError::PathIdsMissing(family))?
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
             let m = match family {
                 AddressFamily::IPV4_UNICAST => UpdateMessage {
-                    withdrawn: chunk.to_vec(),
+                    withdrawn,
+                    path_ids: with_ids.then(|| {
+                        Box::new(PathIds {
+                            withdrawn: ids,
+                            ..PathIds::default()
+                        })
+                    }),
                     ..UpdateMessage::default()
                 },
                 _ => UpdateMessage {
-                    mp_unreach: Some(MpUnreach {
-                        family,
-                        withdrawn: chunk.to_vec(),
+                    mp_unreach: Some(MpUnreach { family, withdrawn }),
+                    path_ids: with_ids.then(|| {
+                        Box::new(PathIds {
+                            mp_unreach: ids,
+                            ..PathIds::default()
+                        })
                     }),
                     ..UpdateMessage::default()
                 },
             };
             out.push(frame(MessageType::Update, &m.encode(&ctx)?)?);
         }
-        for (attrs, prefixes) in &self.announce {
+        for (n, (attrs, prefixes)) in self.announce.iter().enumerate() {
             let attrs = rewrite(local_as, family, attrs, to);
             // Size the attributes once, then fill each message with as
             // many prefixes as fit.
@@ -328,14 +428,27 @@ impl Batch {
                     len: empty.len(),
                     max: max_body,
                 })?;
-            for chunk in chunks(prefixes, room) {
-                let m = attrs.to_update(family, chunk.to_vec());
+            for range in chunks(prefixes, room, extra) {
+                let chunk = prefixes[range.clone()].to_vec();
+                let m = if with_ids {
+                    let ids = self
+                        .announce_ids
+                        .get(n)
+                        .and_then(|v| v.get(range))
+                        .ok_or(EncodeError::PathIdsMissing(family))?;
+                    attrs.to_update_paths(family, chunk, ids.to_vec())
+                } else {
+                    attrs.to_update(family, chunk)
+                };
                 out.push(frame(MessageType::Update, &m.encode(&ctx)?)?);
             }
         }
         Ok(out)
     }
 }
+
+/// Octets a Path Identifier adds to a prefix (RFC 7911 §3).
+const PATH_ID_OCTETS: usize = 4;
 
 /// Octets the withdrawn-routes / `MP_UNREACH_NLRI` framing may add beyond
 /// the prefixes: the length fields and the attribute header.
@@ -345,22 +458,24 @@ const WITHDRAW_OVERHEAD: usize = 16;
 /// extended, plus slack.
 const ANNOUNCE_OVERHEAD: usize = 8;
 
-/// Split `prefixes` into runs whose encoded size stays within `room`.
-fn chunks(prefixes: &[Prefix], room: usize) -> Vec<&[Prefix]> {
+/// Split `prefixes` into runs, as index ranges, whose encoded size stays
+/// within `room`, each prefix taking `extra` octets more than it would
+/// plain (a Path Identifier).
+fn chunks(prefixes: &[Prefix], room: usize, extra: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut used = 0;
     for (i, p) in prefixes.iter().enumerate() {
-        let len = 1 + usize::from(p.prefix_len().div_ceil(8));
+        let len = extra + 1 + usize::from(p.prefix_len().div_ceil(8));
         if used + len > room && i > start {
-            out.push(&prefixes[start..i]);
+            out.push(start..i);
             start = i;
             used = 0;
         }
         used += len;
     }
     if start < prefixes.len() {
-        out.push(&prefixes[start..]);
+        out.push(start..prefixes.len());
     }
     out
 }

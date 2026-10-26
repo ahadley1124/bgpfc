@@ -137,6 +137,30 @@ impl Lab {
         c
     }
 
+    /// Give both ends of each link an IPv6 address: `2001:db8:9::1` and
+    /// `2001:db8:9::2` on the link from A to B, `2001:db8:8::1` and
+    /// `2001:db8:8::2` on the one to C, if there is one, all /64. Whether
+    /// the kernel took them: a host that boots with `ipv6.disable=1` has no
+    /// IPv6 to give.
+    #[must_use]
+    pub fn add_ipv6(&self) -> bool {
+        let mut links = vec![
+            (&self.a, format!("v{}a", self.id), "2001:db8:9::1/64"),
+            (&self.b, format!("v{}b", self.id), "2001:db8:9::2/64"),
+        ];
+        if let Some(c) = &self.c {
+            links.push((&self.a, format!("v{}a2", self.id), "2001:db8:8::1/64"));
+            links.push((c, format!("v{}c", self.id), "2001:db8:8::2/64"));
+        }
+        links.iter().all(|(ns, dev, addr)| {
+            // No duplicate address detection: the address is usable at once.
+            Command::new("ip")
+                .args(["-n", ns, "addr", "add", addr, "dev", dev, "nodad"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    }
+
     /// An address on the link between A and B where what A sends goes
     /// nowhere: A has a permanent neighbour entry for it with a MAC address
     /// nobody has, and B drops frames for that address. A connection to
@@ -162,6 +186,30 @@ impl Lab {
                 &format!("v{}a", self.id),
                 "nud",
                 "permanent",
+            ],
+        );
+        addr
+    }
+
+    /// Another address of A's on the link, `10.99.<subnet>.<host>`, for a
+    /// second speaker in A to bind to and connect from.
+    ///
+    /// # Panics
+    /// If `ip` fails.
+    #[must_use]
+    pub fn add_a_addr(&self, host: u8) -> Ipv4Addr {
+        let [a, b, c, _] = self.a_addr.octets();
+        let addr = Ipv4Addr::new(a, b, c, host);
+        sh(
+            "ip",
+            &[
+                "-n",
+                &self.a,
+                "addr",
+                "add",
+                &format!("{addr}/24"),
+                "dev",
+                &format!("v{}a", self.id),
             ],
         );
         addr
@@ -486,8 +534,56 @@ impl Bird {
     /// If the config cannot be written or `bird` cannot be spawned.
     #[must_use]
     pub fn start(lab: &Lab, ns: &str, opts: &BirdOpts) -> Bird {
-        let cfg = lab.dir.join(format!("bird-{ns}.conf"));
-        let socket = lab.dir.join(format!("bird-{ns}.ctl"));
+        Bird::start_with(lab, ns, opts, "")
+    }
+
+    /// [`Bird::start`] with `extra` appended to the configuration: more
+    /// protocols, such as a second `static` one whose import filter gives
+    /// its routes other attributes than the first's.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn start_with(lab: &Lab, ns: &str, opts: &BirdOpts, extra: &str) -> Bird {
+        Bird::start_named(lab, ns, ns, opts, extra)
+    }
+
+    /// [`Bird::start_with`] for a second BIRD process in a namespace that
+    /// has one: its files are named after `name` instead of the namespace,
+    /// which must differ from the other's. BIRD takes only one BGP protocol
+    /// per neighbor address, so a speaker that peers with one address
+    /// twice needs two processes.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn start_named(lab: &Lab, ns: &str, name: &str, opts: &BirdOpts, extra: &str) -> Bird {
+        Bird::launch(lab, ns, name, opts, extra, false)
+    }
+
+    /// [`Bird::start_with`] for a BIRD that comes back from a graceful
+    /// restart (`birdc graceful restart`, then this): `bird -R` applies the
+    /// recovery, so that its BGP speaks as a Restarting Speaker (RFC 4724
+    /// §4.1): the Restart State and Forwarding State bits are set, and it
+    /// waits for End-of-RIB markers before it selects routes.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn start_recovering(lab: &Lab, ns: &str, opts: &BirdOpts, extra: &str) -> Bird {
+        Bird::launch(lab, ns, ns, opts, extra, true)
+    }
+
+    fn launch(
+        lab: &Lab,
+        ns: &str,
+        name: &str,
+        opts: &BirdOpts,
+        extra: &str,
+        recover: bool,
+    ) -> Bird {
+        let cfg = lab.dir.join(format!("bird-{name}.conf"));
+        let socket = lab.dir.join(format!("bird-{name}.ctl"));
         let mut statics = String::new();
         for p in &opts.statics {
             use std::fmt::Write as _;
@@ -512,7 +608,8 @@ impl Bird {
                  {passive}\
                  \x20   {protocol}\n\
                  \x20   ipv4 {{ import all; export all; {channel} }};\n\
-                 }}\n",
+                 }}\n\
+                 {extra}\n",
                 local = opts.local,
                 local_port = opts.local_port,
                 local_as = opts.local_as,
@@ -533,12 +630,63 @@ impl Bird {
             "-s",
             socket.to_str().expect("path"),
         ]);
-        let daemon = Daemon::start(cmd, lab.dir.join(format!("bird-{ns}.log")));
+        if recover {
+            cmd.arg("-R");
+        }
+        let daemon = Daemon::start(cmd, lab.dir.join(format!("bird-{name}.log")));
         Bird {
             daemon,
             socket,
             lab_ns: ns.to_owned(),
         }
+    }
+
+    /// A BIRD in namespace `ns` (the lab's C) that originates
+    /// `192.0.2.0/24` three times, as the `static` protocols `short`,
+    /// `long` and `longest` whose import filters give the routes AS paths
+    /// of one, two and three more hops than the first, and sends bgpfcd
+    /// all three under `add paths tx` (RFC 7911 §5). It is passive, in AS
+    /// `local_as`, and peers with the lab's A (AS 65000) at `a2_addr`.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn three_paths(lab: &Lab, ns: &str, local_as: u32) -> Bird {
+        Bird::three_paths_with(lab, ns, local_as, "")
+    }
+
+    /// [`Bird::three_paths`] with `protocol` added to the BGP protocol,
+    /// such as `local role provider;` (RFC 9234).
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn three_paths_with(lab: &Lab, ns: &str, local_as: u32, protocol: &str) -> Bird {
+        const THREE: &str = "\
+            protocol static short {\n    ipv4 { import all; };\n    route 192.0.2.0/24 blackhole;\n}\n\
+            protocol static long {\n    ipv4 { import filter { bgp_path.prepend(64999); accept; }; };\n\
+            \x20   route 192.0.2.0/24 blackhole;\n}\n\
+            protocol static longest {\n    ipv4 { import filter {\n\
+            \x20       bgp_path.prepend(64998); bgp_path.prepend(64999); accept; }; };\n\
+            \x20   route 192.0.2.0/24 blackhole;\n}\n";
+        Bird::start_with(
+            lab,
+            ns,
+            &BirdOpts {
+                local_as,
+                local: lab.c_addr,
+                local_port: 179,
+                neighbor: lab.a2_addr,
+                neighbor_port: 179,
+                remote_as: 65_000,
+                hold_time: 30,
+                passive: true,
+                statics: Vec::new(),
+                channel: "add paths tx;".to_owned(),
+                protocol: protocol.to_owned(),
+            },
+            THREE,
+        )
     }
 
     /// Output of `birdc <args>`.
@@ -617,6 +765,19 @@ impl Frr {
     /// If the config cannot be written or `bgpd` cannot be spawned.
     #[must_use]
     pub fn start(lab: &Lab, ns: &str, opts: &OtherOpts) -> Frr {
+        Frr::start_with(lab, ns, opts, "", "")
+    }
+
+    /// [`Frr::start`] with lines added to `router bgp` (`global`, such as
+    /// more `neighbor` statements) and to its `address-family ipv4
+    /// unicast` (`family`, such as `  neighbor X addpath-tx-all-paths`):
+    /// complete lines, ending in a newline, indented by one space and by
+    /// two as the rest of those blocks are.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bgpd` cannot be spawned.
+    #[must_use]
+    pub fn start_with(lab: &Lab, ns: &str, opts: &OtherOpts, global: &str, family: &str) -> Frr {
         let dir = lab.dir.join(format!("frr-{ns}"));
         fs::create_dir_all(&dir).expect("frr dir");
         let mut networks = String::new();
@@ -635,9 +796,11 @@ impl Frr {
                  \x20no bgp network import-check\n\
                  \x20neighbor {neighbor} remote-as {remote_as}\n\
                  \x20neighbor {neighbor} timers 10 30\n\
+                 {global}\
                  \x20address-family ipv4 unicast\n\
                  {networks}\
                  \x20 neighbor {neighbor} activate\n\
+                 {family}\
                  \x20exit-address-family\n",
                 local_as = opts.local_as,
                 local = opts.local,
@@ -932,6 +1095,92 @@ impl RtrStub {
             stub.daemon.log_text()
         );
         stub
+    }
+}
+
+/// A script that stands in for Routinator as `bgpfcd`'s sidecar
+/// (AGENTS.md §9 step 14), never the real one: it answers `--version` as
+/// the release the daemon drives, and run as `server --rtr=ADDR:PORT ...`
+/// it waits `delay` seconds, as Routinator does for its first validation
+/// run before it opens its RTR listener, and then becomes this crate's
+/// `rtr-stub` on that address.
+///
+/// Every start is a new session of the cache: the script counts its starts
+/// in a file and gives the stub the count as its Session ID (RFC 8210
+/// §5.1), so a restart after a kill looks to the router as a Routinator
+/// that restarted does, and the VRPs are read from a file at each start, so
+/// a test can change what the next start serves with
+/// [`set_vrps`](Self::set_vrps). What the script prints on standard error
+/// reaches `bgpfcd`'s log as the sidecar's output.
+pub struct StubRoutinator {
+    /// The script, for the `binary` statement.
+    pub binary: PathBuf,
+    /// A directory of its own, for the `repository-dir` statement.
+    pub repository: PathBuf,
+    vrps: PathBuf,
+}
+
+impl StubRoutinator {
+    /// Write the script and the VRPs it serves, (prefix, max length,
+    /// origin AS), in the lab's directory.
+    ///
+    /// # Panics
+    /// If the files cannot be written.
+    #[must_use]
+    pub fn new(lab: &Lab, delay: u32, vrps: &[(&str, u8, u32)]) -> StubRoutinator {
+        let binary = lab.dir.join("routinator");
+        let repository = lab.dir.join("repository");
+        fs::create_dir_all(&repository).expect("repository dir");
+        let stub = StubRoutinator {
+            binary,
+            repository,
+            vrps: lab.dir.join("routinator-vrps"),
+        };
+        stub.set_vrps(vrps);
+        let counter = lab.dir.join("routinator-starts");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 'Routinator 0.15.2'; exit 0; fi\n\
+             echo \"routinator stub: $*\" >&2\n\
+             rtr=\n\
+             for a in \"$@\"; do case \"$a\" in --rtr=*) rtr=\"${{a#--rtr=}}\";; esac; done\n\
+             [ -n \"$rtr\" ] || {{ echo 'routinator stub: no --rtr' >&2; exit 2; }}\n\
+             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
+             n=$((n + 1))\n\
+             echo \"$n\" > '{counter}'\n\
+             sleep {delay}\n\
+             exec '{rtr_stub}' \"$rtr\" \"$n\" $(cat '{vrps}')\n",
+            counter = counter.display(),
+            rtr_stub = rtr_stub_path().display(),
+            vrps = stub.vrps.display(),
+        );
+        // Written and made executable by another process: this one has
+        // threads that fork, and a forked child holding the file open for
+        // writing makes running it fail with ETXTBSY.
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                "sh",
+                &script,
+            ])
+            .arg(&stub.binary)
+            .status()
+            .expect("sh");
+        assert!(status.success(), "writing {}", stub.binary.display());
+        stub
+    }
+
+    /// What the next start serves.
+    ///
+    /// # Panics
+    /// If the file cannot be written.
+    pub fn set_vrps(&self, vrps: &[(&str, u8, u32)]) {
+        let lines: Vec<String> = vrps
+            .iter()
+            .map(|(prefix, max_len, asn)| format!("{prefix}-{max_len}-{asn}"))
+            .collect();
+        fs::write(&self.vrps, lines.join("\n")).expect("vrps file");
     }
 }
 

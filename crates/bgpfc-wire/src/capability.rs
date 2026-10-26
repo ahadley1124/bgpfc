@@ -3,12 +3,15 @@
 //! Implements: RFC 5492 §4 (TLV encoding), §5 (unknown capabilities are
 //! ignored, never an error); RFC 4760 §8 (Multiprotocol Extensions, code 1);
 //! RFC 2918 §2 (Route Refresh, code 2); RFC 8950 §4 (Extended Next Hop
-//! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 6793 §3
-//! (Four-octet AS, code 65).
+//! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 9234
+//! §4.1 (BGP Role, code 9); RFC 4724 §3 and RFC 8538 §2 (Graceful Restart,
+//! code 64); RFC 6793 §3 (Four-octet AS, code 65); RFC 7911 §4 (ADD-PATH,
+//! code 69); RFC 7313 §3.1 (Enhanced Route Refresh, code 70).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
-use crate::types::{AddressFamily, Afi, Asn, Safi};
+use crate::role::Role;
+use crate::types::{AddressFamily, Afi, Asn, RestartTime, Safi};
 
 /// One capability TLV.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,8 +25,23 @@ pub enum Capability {
     ExtendedNextHop(Vec<NextHopEncoding>),
     /// Extended Message, 65535-octet messages (RFC 8654 §3).
     ExtendedMessage,
+    /// BGP Role: the speaker's relationship to the other end of an eBGP
+    /// session (RFC 9234 §4.1).
+    Role(Role),
+    /// Graceful Restart: the speaker's Restart State, Restart Time and, per
+    /// `<AFI, SAFI>`, whether its forwarding state was preserved (RFC 4724
+    /// §3), with the Graceful Notification bit (RFC 8538 §2).
+    GracefulRestart(GracefulRestart),
     /// Four-octet AS number support, carrying the speaker's ASN (RFC 6793 §3).
     FourOctetAs(Asn),
+    /// ADD-PATH: per `<AFI, SAFI>`, whether the speaker can receive and/or
+    /// send multiple paths (RFC 7911 §4). A speaker lists all its families
+    /// in one instance; the tuples of several instances add up.
+    AddPath(Vec<AddPathTuple>),
+    /// Enhanced Route Refresh: the speaker supports the ROUTE-REFRESH
+    /// message subtypes and the procedures that go with them (RFC 7313
+    /// §3.1).
+    EnhancedRouteRefresh,
     /// A capability this implementation does not understand. Kept so that
     /// the OPEN round-trips; the FSM ignores it (RFC 5492 §5).
     Unknown {
@@ -43,7 +61,11 @@ impl Capability {
             Capability::RouteRefresh => 2,
             Capability::ExtendedNextHop(_) => 5,
             Capability::ExtendedMessage => 6,
+            Capability::Role(_) => 9,
+            Capability::GracefulRestart(_) => 64,
             Capability::FourOctetAs(_) => 65,
+            Capability::AddPath(_) => 69,
+            Capability::EnhancedRouteRefresh => 70,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -65,7 +87,10 @@ impl Capability {
                 out.put_u8(0);
                 out.put_u8(af.safi.to_u8());
             }
-            Capability::RouteRefresh | Capability::ExtendedMessage => out.put_u8(0),
+            // RFC 2918 §2, RFC 8654 §3, RFC 7313 §3.1: length zero.
+            Capability::RouteRefresh
+            | Capability::ExtendedMessage
+            | Capability::EnhancedRouteRefresh => out.put_u8(0),
             Capability::ExtendedNextHop(triples) => {
                 // RFC 8950 §4: six octets per <NLRI AFI, NLRI SAFI,
                 // Nexthop AFI> triple, each field two octets.
@@ -82,9 +107,31 @@ impl Capability {
                     out.put_u16(t.next_hop_afi.to_u16());
                 }
             }
+            Capability::Role(role) => {
+                // RFC 9234 §4.1: length 1, the Role Value.
+                out.put_u8(1);
+                out.put_u8(role.to_u8());
+            }
+            Capability::GracefulRestart(gr) => gr.encode(out)?,
             Capability::FourOctetAs(asn) => {
                 out.put_u8(4);
                 out.put_u32(asn.0);
+            }
+            Capability::AddPath(tuples) => {
+                // RFC 7911 §4: four octets per tuple, AFI (2), SAFI (1),
+                // Send/Receive (1).
+                let len = tuples.len() * AddPathTuple::WIRE_LEN;
+                let len = u8::try_from(len).map_err(|_| EncodeError::TooLong {
+                    what: "add-path capability",
+                    len,
+                    max: usize::from(u8::MAX),
+                })?;
+                out.put_u8(len);
+                for t in tuples {
+                    out.put_u16(t.family.afi.to_u16());
+                    out.put_u8(t.family.safi.to_u8());
+                    out.put_u8(t.mode.to_u8());
+                }
             }
             Capability::Unknown { value, .. } => {
                 let len = u8::try_from(value.len()).map_err(|_| EncodeError::TooLong {
@@ -136,9 +183,55 @@ impl Capability {
             }
             // RFC 8654 §3: length 0.
             6 if len == 0 => Capability::ExtendedMessage,
+            // RFC 9234 §4.1: length 1, the Role Value. An unassigned value is
+            // kept: RFC 9234 §4.2 has it correspond to no Role, which is a
+            // Role Mismatch for the FSM to answer, not a malformed
+            // capability.
+            9 if len == 1 => Capability::Role(Role::from_u8(v.u8().map_err(|_| malformed())?)),
+            // RFC 4724 §3: the flags and Restart Time in two octets, then
+            // whole four-octet tuples (so a length of 2 plus a multiple of
+            // 4: "0 to 63" of them).
+            64 if GracefulRestart::is_whole(usize::from(len)) => {
+                Capability::GracefulRestart(GracefulRestart::decode(&mut v)?)
+            }
             // RFC 6793 §3: length 4, the speaker's ASN.
             65 if len == 4 => Capability::FourOctetAs(Asn(v.u32().map_err(|_| malformed())?)),
-            1 | 2 | 5 | 6 | 65 => return Err(malformed()),
+            // RFC 7911 §4: whole four-octet tuples.
+            // NOTE(interop): an empty value (no tuples) is accepted and means
+            // nothing, as with RFC 8950 above; RFC 7911 §4 draws one or more
+            // tuples but names no error for none.
+            69 if usize::from(len) % AddPathTuple::WIRE_LEN == 0 => {
+                let raw = v.rest_peek();
+                let mut tuples = Vec::with_capacity(usize::from(len) / AddPathTuple::WIRE_LEN);
+                let mut understood = true;
+                while !v.is_empty() {
+                    let afi = Afi::from_u16(v.u16().map_err(|_| malformed())?);
+                    let safi = Safi::from_u8(v.u8().map_err(|_| malformed())?);
+                    match AddPathMode::from_u8(v.u8().map_err(|_| malformed())?) {
+                        Some(mode) => tuples.push(AddPathTuple {
+                            family: AddressFamily { afi, safi },
+                            mode,
+                        }),
+                        None => understood = false,
+                    }
+                }
+                if understood {
+                    Capability::AddPath(tuples)
+                } else {
+                    // RFC 7911 §4: "If any other value is received, then the
+                    // capability SHOULD be treated as not understood and
+                    // ignored": the whole capability, kept as unknown so
+                    // that the OPEN round-trips.
+                    Capability::Unknown {
+                        code,
+                        value: raw.to_vec(),
+                    }
+                }
+            }
+            // RFC 7313 §3.1: "The Capability Length field of this capability
+            // is zero."
+            70 if len == 0 => Capability::EnhancedRouteRefresh,
+            1 | 2 | 5 | 6 | 9 | 64 | 65 | 69 | 70 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -189,6 +282,238 @@ impl NextHopEncoding {
     }
 }
 
+/// The Send/Receive field of an ADD-PATH tuple (RFC 7911 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AddPathMode {
+    /// 1: the sender is able to receive multiple paths from its peer.
+    Receive,
+    /// 2: the sender is able to send multiple paths to its peer.
+    Send,
+    /// 3: both.
+    Both,
+}
+
+impl AddPathMode {
+    /// From the wire value; `None` for anything but 1, 2 and 3, which
+    /// RFC 7911 §4 has the receiver treat as not understood.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<AddPathMode> {
+        match v {
+            1 => Some(AddPathMode::Receive),
+            2 => Some(AddPathMode::Send),
+            3 => Some(AddPathMode::Both),
+            _ => None,
+        }
+    }
+
+    /// Wire value.
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            AddPathMode::Receive => 1,
+            AddPathMode::Send => 2,
+            AddPathMode::Both => 3,
+        }
+    }
+
+    /// Whether the speaker can receive multiple paths (value 1 or 3).
+    #[must_use]
+    pub const fn receives(self) -> bool {
+        matches!(self, AddPathMode::Receive | AddPathMode::Both)
+    }
+
+    /// Whether the speaker can send multiple paths (value 2 or 3).
+    #[must_use]
+    pub const fn sends(self) -> bool {
+        matches!(self, AddPathMode::Send | AddPathMode::Both)
+    }
+
+    /// The mode that can do what `receive` and `send` say; `None` if
+    /// neither.
+    #[must_use]
+    pub const fn of(receive: bool, send: bool) -> Option<AddPathMode> {
+        match (receive, send) {
+            (true, true) => Some(AddPathMode::Both),
+            (true, false) => Some(AddPathMode::Receive),
+            (false, true) => Some(AddPathMode::Send),
+            (false, false) => None,
+        }
+    }
+}
+
+/// One `<AFI, SAFI, Send/Receive>` tuple of the ADD-PATH capability
+/// (RFC 7911 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AddPathTuple {
+    /// The `<AFI, SAFI>` the tuple is about (as in RFC 4760).
+    pub family: AddressFamily,
+    /// What the speaker can do for it.
+    pub mode: AddPathMode,
+}
+
+impl AddPathTuple {
+    /// Octets per tuple on the wire (RFC 7911 §4).
+    const WIRE_LEN: usize = 4;
+}
+
+/// The Graceful Restart capability (RFC 4724 §3, RFC 8538 §2).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GracefulRestart {
+    /// The Restart State bit: the speaker has restarted, and its peer must
+    /// not wait for its End-of-RIB before advertising to it (RFC 4724 §3).
+    pub restarting: bool,
+    /// The Graceful Notification bit: the speaker keeps the routes of a
+    /// peer it exchanged the bit with over a NOTIFICATION, other than a
+    /// Hard Reset (RFC 8538 §2, §4).
+    pub notification: bool,
+    /// The estimated time the session takes to come back after a restart
+    /// (RFC 4724 §3). Irrelevant when no family is listed.
+    pub restart_time: RestartTime,
+    /// The families the speaker supports Graceful Restart for. None means
+    /// it cannot preserve forwarding state, but follows the Receiving
+    /// Speaker procedures and sends End-of-RIB (RFC 4724 §3).
+    pub families: Vec<GracefulRestartFamily>,
+}
+
+/// One `<AFI, SAFI, Flags>` tuple of the Graceful Restart capability
+/// (RFC 4724 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GracefulRestartFamily {
+    /// The `<AFI, SAFI>` the tuple is about.
+    pub family: AddressFamily,
+    /// The Forwarding State bit: the forwarding state for the family's
+    /// routes has been preserved during the restart (RFC 4724 §3).
+    pub forwarding: bool,
+}
+
+impl GracefulRestartFamily {
+    /// Octets per tuple on the wire (RFC 4724 §3): AFI (2), SAFI (1),
+    /// flags (1).
+    const WIRE_LEN: usize = 4;
+
+    /// RFC 4724 §3: the Forwarding State bit is the most significant of the
+    /// flags octet; the rest are reserved.
+    const FORWARDING: u8 = 0x80;
+}
+
+impl GracefulRestart {
+    /// Octets before the tuples (RFC 4724 §3): four bits of flags and
+    /// twelve of Restart Time.
+    const HEAD_LEN: usize = 2;
+
+    /// RFC 4724 §3: the Restart State bit is the most significant of the
+    /// four flag bits.
+    const RESTARTING: u8 = 0x8;
+
+    /// RFC 8538 §2: the Graceful Notification bit is the second.
+    const NOTIFICATION: u8 = 0x4;
+
+    /// The most tuples a capability holds: "0 to 63" (RFC 4724 §3), the
+    /// ones that fit the one-octet Capability Length.
+    pub const MAX_FAMILIES: usize =
+        (255 - GracefulRestart::HEAD_LEN) / GracefulRestartFamily::WIRE_LEN;
+
+    /// Whether the speaker listed `family`.
+    #[must_use]
+    pub fn family(&self, family: AddressFamily) -> Option<GracefulRestartFamily> {
+        self.families.iter().copied().find(|f| f.family == family)
+    }
+
+    /// Whether a Capability Length of `len` octets holds the flags and
+    /// Restart Time and a whole number of tuples (RFC 4724 §3).
+    const fn is_whole(len: usize) -> bool {
+        len >= GracefulRestart::HEAD_LEN
+            && (len - GracefulRestart::HEAD_LEN).is_multiple_of(GracefulRestartFamily::WIRE_LEN)
+    }
+
+    /// Append the length and the value (RFC 4724 §3).
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let len = GracefulRestart::HEAD_LEN + self.families.len() * GracefulRestartFamily::WIRE_LEN;
+        let len = u8::try_from(len).map_err(|_| EncodeError::TooLong {
+            what: "graceful restart capability",
+            len,
+            max: usize::from(u8::MAX),
+        })?;
+        out.put_u8(len);
+        let mut flags = 0u8;
+        if self.restarting {
+            flags |= GracefulRestart::RESTARTING;
+        }
+        if self.notification {
+            flags |= GracefulRestart::NOTIFICATION;
+        }
+        out.put_u16((u16::from(flags) << 12) | self.restart_time.secs());
+        for t in &self.families {
+            out.put_u16(t.family.afi.to_u16());
+            out.put_u8(t.family.safi.to_u8());
+            out.put_u8(if t.forwarding {
+                GracefulRestartFamily::FORWARDING
+            } else {
+                0
+            });
+        }
+        Ok(())
+    }
+
+    /// Decode a value whose length is two plus a multiple of four. The
+    /// reserved bits are "ignored by the receiver" (RFC 4724 §3).
+    fn decode(v: &mut Reader<'_>) -> Result<GracefulRestart, DecodeError> {
+        let head = v.u16().map_err(|_| malformed())?;
+        // The four flag bits, then twelve of Restart Time.
+        let flags = u8::try_from(head >> 12).unwrap_or(0);
+        // invariant: twelve bits always fit.
+        let restart_time = RestartTime::new(head & 0x0fff).unwrap_or(RestartTime::MAX);
+        let mut families = Vec::with_capacity(v.remaining() / GracefulRestartFamily::WIRE_LEN);
+        while !v.is_empty() {
+            let afi = Afi::from_u16(v.u16().map_err(|_| malformed())?);
+            let safi = Safi::from_u8(v.u8().map_err(|_| malformed())?);
+            let flags = v.u8().map_err(|_| malformed())?;
+            families.push(GracefulRestartFamily {
+                family: AddressFamily { afi, safi },
+                forwarding: flags & GracefulRestartFamily::FORWARDING != 0,
+            });
+        }
+        Ok(GracefulRestart {
+            restarting: flags & GracefulRestart::RESTARTING != 0,
+            notification: flags & GracefulRestart::NOTIFICATION != 0,
+            restart_time,
+            families,
+        })
+    }
+}
+
+/// The Graceful Restart capability `caps` carry: "If more than one
+/// instance of the Graceful Restart Capability is carried in the
+/// capability advertisement, the receiver of the advertisement MUST ignore
+/// all but the last instance" (RFC 4724 §3).
+#[must_use]
+pub fn graceful_restart(caps: &[Capability]) -> Option<&GracefulRestart> {
+    caps.iter().rev().find_map(|c| match c {
+        Capability::GracefulRestart(gr) => Some(gr),
+        _ => None,
+    })
+}
+
+/// What the ADD-PATH capabilities in `caps` say about `family`: the
+/// speaker can receive and/or send multiple paths for it, as
+/// `(receive, send)`. RFC 5492 §4 lets a capability be sent more than
+/// once and RFC 7911 §4 asks a speaker to use a single instance, so the
+/// tuples of all instances count, and a family listed twice has both
+/// abilities either entry gives.
+#[must_use]
+pub fn add_path_abilities(caps: &[Capability], family: AddressFamily) -> (bool, bool) {
+    caps.iter()
+        .filter_map(|c| match c {
+            Capability::AddPath(t) => Some(t),
+            _ => None,
+        })
+        .flatten()
+        .filter(|t| t.family == family)
+        .fold((false, false), |(r, s), t| {
+            (r || t.mode.receives(), s || t.mode.sends())
+        })
+}
+
 /// Every triple of every Extended Next Hop Encoding capability in `caps`:
 /// RFC 5492 §4 lets a speaker send a capability more than once, and the
 /// triples of all instances count.
@@ -199,6 +524,15 @@ pub fn next_hop_encodings(caps: &[Capability]) -> impl Iterator<Item = NextHopEn
             _ => None,
         })
         .flatten()
+}
+
+/// The Role Value of every BGP Role capability in `caps`, in order: RFC 9234
+/// §4.2 lets a speaker receive several, and acts on them together.
+pub fn roles(caps: &[Capability]) -> impl Iterator<Item = Role> + '_ {
+    caps.iter().filter_map(|c| match c {
+        Capability::Role(r) => Some(*r),
+        _ => None,
+    })
 }
 
 /// RFC 4271 §6.2: a recognised but malformed optional parameter is reported
@@ -232,6 +566,9 @@ mod tests {
         );
         round_trip(&Capability::RouteRefresh, &[2, 0]);
         round_trip(&Capability::ExtendedMessage, &[6, 0]);
+        // RFC 7313 §3.1: code 70, length zero.
+        round_trip(&Capability::EnhancedRouteRefresh, &[70, 0]);
+        assert_eq!(Capability::EnhancedRouteRefresh.code(), 70);
         round_trip(
             &Capability::FourOctetAs(Asn(65_000)),
             &[65, 4, 0, 0, 0xfd, 0xe8],
@@ -240,6 +577,41 @@ mod tests {
             &Capability::FourOctetAs(Asn(4_200_000_000)),
             &[65, 4, 0xfa, 0x56, 0xea, 0x00],
         );
+    }
+
+    #[test]
+    fn role_capability_follows_rfc_9234() {
+        // RFC 9234 §4.1: code 9, length 1, then the Role Value of Table 1.
+        for (role, value) in [
+            (Role::Provider, 0),
+            (Role::RouteServer, 1),
+            (Role::RouteServerClient, 2),
+            (Role::Customer, 3),
+            (Role::Peer, 4),
+        ] {
+            round_trip(&Capability::Role(role), &[9, 1, value]);
+        }
+        // Values 5 to 255 are unassigned: kept, so that the capability
+        // round-trips and the FSM can reject the pairing (§4.2).
+        round_trip(&Capability::Role(Role::Unknown(5)), &[9, 1, 5]);
+        round_trip(&Capability::Role(Role::Unknown(255)), &[9, 1, 255]);
+        assert_eq!(Capability::Role(Role::Peer).code(), 9);
+    }
+
+    #[test]
+    fn roles_lists_every_role_capability() {
+        // RFC 9234 §4.2: several may arrive, each one counts.
+        let caps = [
+            Capability::RouteRefresh,
+            Capability::Role(Role::Customer),
+            Capability::ExtendedMessage,
+            Capability::Role(Role::Peer),
+        ];
+        assert_eq!(
+            roles(&caps).collect::<Vec<_>>(),
+            [Role::Customer, Role::Peer]
+        );
+        assert_eq!(roles(&caps[..1]).count(), 0);
     }
 
     #[test]
@@ -321,6 +693,285 @@ mod tests {
     }
 
     #[test]
+    fn add_path_round_trips() {
+        // RFC 7911 §4: AFI (2), SAFI (1), Send/Receive (1), per tuple.
+        let tuple = |family, mode| AddPathTuple { family, mode };
+        round_trip(
+            &Capability::AddPath(vec![tuple(
+                AddressFamily::IPV4_UNICAST,
+                AddPathMode::Receive,
+            )]),
+            &[69, 4, 0, 1, 1, 1],
+        );
+        // One instance for several families (RFC 7911 §4 MUST).
+        round_trip(
+            &Capability::AddPath(vec![
+                tuple(AddressFamily::IPV4_UNICAST, AddPathMode::Send),
+                tuple(AddressFamily::IPV6_UNICAST, AddPathMode::Both),
+            ]),
+            &[69, 8, 0, 1, 1, 2, 0, 2, 1, 3],
+        );
+        // A family this implementation does not speak is still a tuple.
+        round_trip(
+            &Capability::AddPath(vec![tuple(
+                AddressFamily {
+                    afi: Afi::Unknown(25),
+                    safi: Safi::Unknown(65),
+                },
+                AddPathMode::Both,
+            )]),
+            &[69, 4, 0, 25, 65, 3],
+        );
+        // An empty value is accepted (NOTE(interop) in `decode`).
+        round_trip(&Capability::AddPath(vec![]), &[69, 0]);
+        assert_eq!(Capability::AddPath(vec![]).code(), 69);
+    }
+
+    #[test]
+    fn add_path_with_a_value_other_than_1_to_3_is_not_understood() {
+        // RFC 7911 §4: the capability is treated as not understood and
+        // ignored; it is kept so that the OPEN round-trips.
+        for mode in [0u8, 4, 255] {
+            let wire = [69, 8, 0, 1, 1, 3, 0, 2, 1, mode];
+            round_trip(
+                &Capability::Unknown {
+                    code: 69,
+                    value: wire[2..].to_vec(),
+                },
+                &wire,
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_length_must_be_whole_tuples() {
+        for wire in [
+            &[69, 3, 0, 1, 1][..],
+            &[69, 5, 0, 1, 1, 1, 0][..],
+            &[69, 4, 0, 1, 1][..], // truncated value
+            &[69][..],
+        ] {
+            let e = Capability::decode(&mut Reader::new(wire)).unwrap_err();
+            assert_eq!(
+                e,
+                DecodeError::open(OpenSubcode::Unspecific, vec![]),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_limits_and_abilities() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // 63 tuples fill 252 of the 255 octets a capability may hold.
+        let tuple = AddPathTuple {
+            family: v4,
+            mode: AddPathMode::Both,
+        };
+        let mut out = Vec::new();
+        Capability::AddPath(vec![tuple; 63])
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 2 + 252);
+        assert_eq!(
+            Capability::AddPath(vec![tuple; 64]).encode(&mut Vec::new()),
+            Err(EncodeError::TooLong {
+                what: "add-path capability",
+                len: 256,
+                max: 255,
+            })
+        );
+        // Modes name what the sender can do.
+        assert!(AddPathMode::Receive.receives() && !AddPathMode::Receive.sends());
+        assert!(!AddPathMode::Send.receives() && AddPathMode::Send.sends());
+        assert!(AddPathMode::Both.receives() && AddPathMode::Both.sends());
+        assert_eq!(AddPathMode::of(true, true), Some(AddPathMode::Both));
+        assert_eq!(AddPathMode::of(true, false), Some(AddPathMode::Receive));
+        assert_eq!(AddPathMode::of(false, true), Some(AddPathMode::Send));
+        assert_eq!(AddPathMode::of(false, false), None);
+        for v in 0..=u8::MAX {
+            assert_eq!(
+                AddPathMode::from_u8(v).map(AddPathMode::to_u8),
+                (1..=3).contains(&v).then_some(v)
+            );
+        }
+        // RFC 5492 §4: several instances add up, and a family listed twice
+        // has what either entry gives.
+        let caps = [
+            Capability::RouteRefresh,
+            Capability::AddPath(vec![
+                AddPathTuple {
+                    family: v4,
+                    mode: AddPathMode::Receive,
+                },
+                AddPathTuple {
+                    family: v4,
+                    mode: AddPathMode::Send,
+                },
+            ]),
+            Capability::AddPath(vec![AddPathTuple {
+                family: v6,
+                mode: AddPathMode::Receive,
+            }]),
+        ];
+        assert_eq!(add_path_abilities(&caps, v4), (true, true));
+        assert_eq!(add_path_abilities(&caps, v6), (true, false));
+        assert_eq!(
+            add_path_abilities(&caps[..1], v4),
+            (false, false),
+            "no capability"
+        );
+    }
+
+    fn gr(
+        restarting: bool,
+        notification: bool,
+        secs: u16,
+        families: &[(AddressFamily, bool)],
+    ) -> Capability {
+        Capability::GracefulRestart(GracefulRestart {
+            restarting,
+            notification,
+            restart_time: RestartTime::new(secs).unwrap(),
+            families: families
+                .iter()
+                .map(|&(family, forwarding)| GracefulRestartFamily { family, forwarding })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn graceful_restart_follows_rfc_4724_section_3() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // No family: the speaker cannot preserve forwarding state but
+        // follows the Receiving Speaker procedures; 0x0078 is 120 seconds
+        // with no flag. This is what BIRD sends by default.
+        round_trip(&gr(false, false, 120, &[]), &[64, 2, 0x00, 0x78]);
+        // RFC 4724 §3: the Restart State bit is the most significant bit
+        // of the flags.
+        round_trip(&gr(true, false, 120, &[]), &[64, 2, 0x80, 0x78]);
+        // RFC 8538 §2: the Graceful Notification bit is the second. Both,
+        // as FRR sends them: 0xc078.
+        round_trip(&gr(false, true, 120, &[]), &[64, 2, 0x40, 0x78]);
+        round_trip(&gr(true, true, 120, &[]), &[64, 2, 0xc0, 0x78]);
+        // One tuple: AFI 1, SAFI 1, the Forwarding State bit the most
+        // significant of the flags octet.
+        round_trip(
+            &gr(false, true, 120, &[(v4, true)]),
+            &[64, 6, 0x40, 0x78, 0, 1, 1, 0x80],
+        );
+        round_trip(
+            &gr(true, true, 300, &[(v4, true), (v6, false)]),
+            &[64, 10, 0xc1, 0x2c, 0, 1, 1, 0x80, 0, 2, 1, 0x00],
+        );
+        // The most the twelve bits of Restart Time hold.
+        round_trip(&gr(false, false, 4095, &[]), &[64, 2, 0x0f, 0xff]);
+        round_trip(&gr(true, true, 4095, &[]), &[64, 2, 0xcf, 0xff]);
+        round_trip(&gr(false, false, 0, &[]), &[64, 2, 0x00, 0x00]);
+        assert_eq!(gr(false, false, 0, &[]).code(), 64);
+        // A family this implementation does not speak is still a tuple.
+        let odd = AddressFamily {
+            afi: Afi::Unknown(25),
+            safi: Safi::Unknown(65),
+        };
+        round_trip(
+            &gr(false, false, 1, &[(odd, true)]),
+            &[64, 6, 0x00, 0x01, 0, 25, 65, 0x80],
+        );
+    }
+
+    #[test]
+    fn graceful_restart_ignores_reserved_bits() {
+        // RFC 4724 §3: reserved bits "MUST be set to zero by the sender and
+        // ignored by the receiver", in the flags and in each tuple's flags.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        for (wire, want) in [
+            (
+                &[64, 6, 0x30, 0x78, 0, 1, 1, 0x7f][..],
+                gr(false, false, 120, &[(v4, false)]),
+            ),
+            (
+                &[64, 6, 0xf0, 0x78, 0, 1, 1, 0xff][..],
+                gr(true, true, 120, &[(v4, true)]),
+            ),
+        ] {
+            assert_eq!(
+                Capability::decode(&mut Reader::new(wire)).unwrap(),
+                want,
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graceful_restart_length_must_be_two_plus_whole_tuples() {
+        for wire in [
+            &[64, 0][..],
+            &[64, 1, 0x00][..],
+            &[64, 3, 0x00, 0x78, 0][..],
+            &[64, 5, 0x00, 0x78, 0, 1, 1][..],
+            &[64, 7, 0x00, 0x78, 0, 1, 1, 0x80, 0][..],
+            &[64, 6, 0x00, 0x78, 0, 1][..], // truncated value
+            &[64][..],
+        ] {
+            let e = Capability::decode(&mut Reader::new(wire)).unwrap_err();
+            assert_eq!(
+                e,
+                DecodeError::open(OpenSubcode::Unspecific, vec![]),
+                "{wire:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graceful_restart_holds_at_most_63_tuples() {
+        // RFC 4724 §3: "0 to 63 of the tuples"; 63 fill 254 of the 255
+        // octets a capability may hold.
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let mut out = Vec::new();
+        gr(false, false, 120, &[(v4, true); 63])
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), 2 + 254);
+        assert_eq!(GracefulRestart::MAX_FAMILIES, 63);
+        assert_eq!(
+            gr(false, false, 120, &[(v4, true); 64]).encode(&mut Vec::new()),
+            Err(EncodeError::TooLong {
+                what: "graceful restart capability",
+                len: 258,
+                max: 255,
+            })
+        );
+    }
+
+    #[test]
+    fn the_last_graceful_restart_capability_counts() {
+        // RFC 4724 §3: "the receiver of the advertisement MUST ignore all
+        // but the last instance".
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let caps = [
+            gr(false, false, 10, &[]),
+            Capability::RouteRefresh,
+            gr(true, false, 20, &[(v4, true)]),
+            Capability::ExtendedMessage,
+        ];
+        let last = graceful_restart(&caps).unwrap();
+        assert_eq!(last.restart_time.secs(), 20);
+        assert!(last.restarting && !last.notification);
+        assert_eq!(
+            last.family(v4),
+            Some(GracefulRestartFamily {
+                family: v4,
+                forwarding: true
+            })
+        );
+        assert_eq!(last.family(AddressFamily::IPV6_UNICAST), None);
+        assert_eq!(graceful_restart(&caps[1..2]), None);
+    }
+
+    #[test]
     fn multiprotocol_ignores_the_reserved_octet() {
         // RFC 4760 §8: Res. SHOULD be zero and is ignored by the receiver.
         let mut r = Reader::new(&[1, 4, 0, 1, 0xff, 1]);
@@ -332,13 +983,14 @@ mod tests {
 
     #[test]
     fn unknown_capabilities_are_kept_not_rejected() {
-        // Graceful Restart (64) with a two-octet value, and an empty one.
+        // Prestandard Route Refresh (128) with a two-octet value, and
+        // another with none.
         round_trip(
             &Capability::Unknown {
-                code: 64,
+                code: 128,
                 value: vec![0x40, 0x78],
             },
-            &[64, 2, 0x40, 0x78],
+            &[128, 2, 0x40, 0x78],
         );
         round_trip(
             &Capability::Unknown {
@@ -366,9 +1018,16 @@ mod tests {
             &[1, 3, 0, 1, 0][..],             // MP with wrong length
             &[2, 1, 0][..],                   // route refresh with a value
             &[6, 4, 0, 0, 0, 0][..],          // extended message with a value
+            &[70, 1, 0][..],                  // enhanced route refresh with a value
+            &[70, 2, 0, 1][..],               // ... or two octets of one
+            &[70][..],                        // ... or no length at all
             &[5, 4, 0, 1, 0, 1][..],          // extended next hop: a partial triple
             &[5, 7, 0, 1, 0, 1, 0, 2, 0][..], // a triple and one octet more
             &[5, 6, 0, 1, 0, 1][..],          // extended next hop: truncated value
+            &[9, 0][..],                      // role with no Role Value
+            &[9, 2, 0, 3][..],                // role with two octets
+            &[9, 1][..],                      // role truncated
+            &[64, 3, 0, 0, 0][..],            // graceful restart: a partial tuple
             &[65, 2, 0xfd, 0xe8][..],         // 4-octet AS with two octets
             &[65, 4, 0, 0][..],               // truncated value
             &[1][..],                         // truncated length

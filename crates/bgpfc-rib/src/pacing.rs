@@ -211,6 +211,16 @@ pub(crate) struct Held {
     pub(crate) due: Tick,
     /// What the peer has.
     pub(crate) has: Option<Arc<PathAttrs>>,
+    /// The peer has paths of the destination (RFC 7911) instead, which the
+    /// RIB keeps itself; `has` is then empty.
+    pub(crate) paths: bool,
+}
+
+impl Held {
+    /// Whether the peer has anything for the destination meanwhile.
+    pub(crate) fn had(&self) -> bool {
+        self.has.is_some() || self.paths
+    }
 }
 
 /// What a wake-up for one destination found.
@@ -409,7 +419,55 @@ impl Pacing {
 
     /// Hold `prefix` back until `due`, the peer having `has` meanwhile.
     pub(crate) fn hold(&mut self, prefix: Prefix, due: Tick, has: Option<Arc<PathAttrs>>) {
-        self.held.insert(prefix, Held { due, has });
+        self.held.insert(
+            prefix,
+            Held {
+                due,
+                has,
+                paths: false,
+            },
+        );
+    }
+
+    /// As [`Self::hold`], for a destination the peer has paths of, if
+    /// `has_paths` (RFC 7911): the RIB works out what is to go out when
+    /// the interval ends from the paths it has sent.
+    pub(crate) fn hold_paths(&mut self, prefix: Prefix, due: Tick, has_paths: bool) {
+        self.held.insert(
+            prefix,
+            Held {
+                due,
+                has: None,
+                paths: has_paths,
+            },
+        );
+    }
+
+    /// Whether `prefix` is held back, and the peer has paths of it.
+    pub(crate) fn holds_paths(&self, prefix: Prefix) -> Option<bool> {
+        self.held(prefix).map(|h| h.paths)
+    }
+
+    /// The peer has, or has not, paths of the held destination `prefix`
+    /// meanwhile (RFC 7911): some were withdrawn at once.
+    pub(crate) fn set_held_paths(&mut self, prefix: Prefix, has_paths: bool) {
+        if let Some(h) = self.held.get_mut(&prefix) {
+            h.paths = has_paths;
+        }
+    }
+
+    /// A held destination's paths were all withdrawn at once: as
+    /// [`Self::withdrew_held`], for a destination of paths.
+    pub(crate) fn withdrew_held_paths(&mut self, prefix: Prefix, pace: &Pace<'_>) {
+        let had = self.held.get(&prefix).is_some_and(Held::had);
+        let remembered = had && self.withdrew(prefix, pace);
+        if remembered {
+            if let Some(h) = self.held.get_mut(&prefix) {
+                h.paths = false;
+            }
+        } else {
+            self.held.remove(&prefix);
+        }
     }
 
     /// `prefix` was advertised now: remember when, for an interval, unless
@@ -478,7 +536,7 @@ impl Pacing {
         prefix: Prefix,
         pace: &Pace<'_>,
     ) -> Option<Arc<PathAttrs>> {
-        let had = self.held.get(&prefix).is_some_and(|h| h.has.is_some());
+        let had = self.held.get(&prefix).is_some_and(Held::had);
         let remembered = had && self.withdrew(prefix, pace);
         if remembered {
             self.held.get_mut(&prefix).and_then(|h| h.has.take())
@@ -555,7 +613,7 @@ impl Pacing {
         let mut held = std::mem::take(&mut self.held);
         let mut out = Vec::with_capacity(held.len());
         for (prefix, h) in &mut held {
-            h.due = match self.last(*prefix, h.has.is_some()) {
+            h.due = match self.last(*prefix, h.had()) {
                 Some(l) if !pace.interval.is_zero() => {
                     l.after(secs_ceil(pace.jitter.apply(pace.interval)))
                 }
@@ -696,6 +754,7 @@ mod tests {
             ext_communities: Box::default(),
             large_communities: Box::default(),
             unknown: Box::default(),
+            otc: None,
         })
     }
 

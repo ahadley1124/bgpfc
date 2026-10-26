@@ -10,7 +10,10 @@
 //! against the prefix limit); RFC 8210 §10 (the cache list, the cache
 //! whose data is in use, marked as to source, and the one the client talks
 //! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
-//! with the VRPs that Cover and Match it).
+//! with the VRPs that Cover and Match it); RFC 8538 §3 (`clear neighbor`
+//! can send a Hard Reset); RFC 4724 §3, §4.1, §4.2 (a neighbor's Graceful
+//! Restart capability, its stale routes and the timers that end them, the
+//! families whose route selection is deferred).
 
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -28,13 +31,14 @@ use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
 use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_sidecar::SidecarState;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
-    RpkiReport,
+    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RestartReport, RibMsg, RibQuery, RibReply,
+    RouteReport, RpkiReport, SidecarReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -75,6 +79,21 @@ pub(crate) struct Ctx {
     pub(crate) token: Option<String>,
 }
 
+/// Which reset `clear neighbor` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clear {
+    /// Cease / Administrative Reset, then start again (RFC 4486 §4). Where
+    /// the neighbor exchanged the Graceful Notification bit this is a
+    /// graceful reset: both sides keep the other's routes as stale ones
+    /// (RFC 8538 §4).
+    Session,
+    /// ROUTE-REFRESH for every family and a full resend (RFC 2918 §4).
+    Soft,
+    /// Cease / Hard Reset (RFC 8538 §3) with the Administrative Reset in
+    /// its data: the neighbor deletes our routes at once, and so do we its.
+    Hard,
+}
+
 /// A parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -93,7 +112,7 @@ pub(crate) enum Command {
     },
     ClearNeighbor {
         addr: IpAddr,
-        soft: bool,
+        clear: Clear,
         message: Option<String>,
     },
     Reload,
@@ -150,21 +169,22 @@ impl Command {
             }),
             ["clear", "neighbor", a, rest @ ..] => {
                 let addr = parse_addr(a)?;
-                let (soft, rest) = match rest {
-                    ["soft", r @ ..] => (true, r),
-                    r => (false, r),
+                let (clear, rest) = match rest {
+                    ["soft", r @ ..] => (Clear::Soft, r),
+                    ["hard-reset", r @ ..] => (Clear::Hard, r),
+                    r => (Clear::Session, r),
                 };
                 let message = match rest {
                     [] => None,
                     [m] => Some(check_communication(m)?),
                     _ => return Err("too many arguments".to_owned()),
                 };
-                if soft && message.is_some() {
+                if clear == Clear::Soft && message.is_some() {
                     return Err("a soft reset sends no message".to_owned());
                 }
                 Ok(Command::ClearNeighbor {
                     addr,
-                    soft,
+                    clear,
                     message,
                 })
             }
@@ -222,14 +242,25 @@ impl Command {
             ("POST", ["v1", "reload"]) => Ok(Command::Reload),
             ("POST", ["v1", "neighbors", a, "clear"]) => {
                 let addr = parse_addr(a).map_err(|e| (400, e))?;
-                let soft = matches!(r.param("soft"), Some("1" | "true" | "yes"));
+                let flag = |name| matches!(r.param(name), Some("1" | "true" | "yes"));
+                let clear = match (flag("soft"), flag("hard")) {
+                    (false, false) => Clear::Session,
+                    (true, false) => Clear::Soft,
+                    (false, true) => Clear::Hard,
+                    (true, true) => {
+                        return Err((400, "soft and hard exclude each other".to_owned()));
+                    }
+                };
                 let message = r
                     .param("message")
                     .map(|m| check_communication(m).map_err(|e| (400, e)))
                     .transpose()?;
+                if clear == Clear::Soft && message.is_some() {
+                    return Err((400, "a soft reset sends no message".to_owned()));
+                }
                 Ok(Command::ClearNeighbor {
                     addr,
-                    soft,
+                    clear,
                     message,
                 })
             }
@@ -297,7 +328,8 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         Command::ShowNeighbors => {
             let reports = peer_reports(ctx, None)?;
             let stats = rib_peers(ctx)?;
-            Ok(render_neighbors(&reports, &stats))
+            let restart = rib_restart(ctx)?;
+            Ok(render_neighbors(&reports, &stats, &restart))
         }
         Command::ShowNeighbor(addr) => {
             let reports = peer_reports(ctx, Some(*addr))?;
@@ -305,7 +337,8 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
                 return Err(format!("no neighbor {addr}"));
             }
             let stats = rib_peers(ctx)?;
-            Ok(render_neighbor(&reports[0], &stats))
+            let restart = rib_restart(ctx)?;
+            Ok(render_neighbor(&reports[0], &stats, &restart))
         }
         // One destination and every candidate route to it. Without one,
         // execute answers with a listing.
@@ -321,9 +354,9 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         }
         Command::ClearNeighbor {
             addr,
-            soft,
+            clear,
             message,
-        } => clear_neighbor(ctx, *addr, *soft, message.as_deref()),
+        } => clear_neighbor(ctx, *addr, *clear, message.as_deref()),
         Command::Reload => {
             let (tx, rx) = sync_channel(1);
             ctx.coord
@@ -366,6 +399,7 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
         .send(FibMsg::Mode(tx))
         .ok()
         .and_then(|()| rx.recv_timeout(QUERY_TIMEOUT).ok());
+    let restart = rib_restart(ctx)?;
     let mut j = Json::new();
     j.begin_object()
         .field_str("version", env!("CARGO_PKG_VERSION"))
@@ -379,18 +413,40 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
             "established",
             u64::try_from(established).unwrap_or(u64::MAX),
         )
-        .field_opt("fib_mode", mode)
-        .end_object();
+        .field_opt("fib_mode", mode);
+    // RFC 4724 §4.1: the families whose routes are not selected, and so
+    // not installed or advertised, until the End-of-RIB markers are in.
+    j.key("graceful_restart")
+        .begin_object()
+        .key("deferred")
+        .begin_array();
+    for (family, waiting, left) in &restart.deferred {
+        j.begin_object()
+            .field_display("family", family)
+            .field_num("waiting_for", u64::try_from(*waiting).unwrap_or(u64::MAX))
+            .field_num("seconds_left", left.as_secs())
+            .end_object();
+    }
+    j.end_array().end_object().end_object();
+    let mut lines = vec![
+        format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
+        format!("local-as {} router-id {}", ctx.local_as, ctx.router_id),
+        format!("neighbors {} established {}", reports.len(), established),
+        format!(
+            "fib mode {}",
+            mode.map_or("unknown".to_owned(), |m| m.to_string())
+        ),
+    ];
+    for (family, waiting, left) in &restart.deferred {
+        lines.push(format!(
+            "graceful restart: route selection for {family} waits for {waiting} neighbor{} \
+             to send End-of-RIB, at most {}s more",
+            if *waiting == 1 { "" } else { "s" },
+            left.as_secs()
+        ));
+    }
     Ok(Reply {
-        lines: vec![
-            format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
-            format!("local-as {} router-id {}", ctx.local_as, ctx.router_id),
-            format!("neighbors {} established {}", reports.len(), established),
-            format!(
-                "fib mode {}",
-                mode.map_or("unknown".to_owned(), |m| m.to_string())
-            ),
-        ],
+        lines,
         json: j.finish(),
     })
 }
@@ -398,7 +454,7 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
 fn clear_neighbor(
     ctx: &Ctx,
     addr: IpAddr,
-    soft: bool,
+    clear: Clear,
     message: Option<&str>,
 ) -> Result<Reply, String> {
     let handle = ctx
@@ -408,18 +464,24 @@ fn clear_neighbor(
         .get(&addr)
         .cloned()
         .ok_or_else(|| format!("no neighbor {addr}"))?;
-    let input = if soft {
-        PeerInput::SoftReset
-    } else {
-        PeerInput::Reset(message.map(str::to_owned))
+    let input = match clear {
+        Clear::Soft => PeerInput::SoftReset,
+        Clear::Session | Clear::Hard => PeerInput::Reset {
+            message: message.map(str::to_owned),
+            hard: clear == Clear::Hard,
+        },
     };
     handle
         .tx
         .try_send(input)
         .map_err(|_| format!("neighbor {addr} is busy"))?;
     Ok(ok_reply(&format!(
-        "{} reset of {addr} requested",
-        if soft { "soft" } else { "hard" }
+        "{} of {addr} requested",
+        match clear {
+            Clear::Soft => "soft reset",
+            Clear::Session => "reset",
+            Clear::Hard => "hard reset",
+        }
     )))
 }
 
@@ -485,7 +547,10 @@ fn current(
 
 fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let status = r.status.as_ref();
-    let mut lines = vec![format!("mode {}", r.config.mode)];
+    let mut lines = vec![
+        format!("mode {}", r.config.mode),
+        format!("invalid {}", r.config.invalid),
+    ];
     for c in &r.config.caches {
         lines.push(format!(
             "cache {c} preference {}{}{}",
@@ -493,6 +558,9 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
             if in_use(status, c) { ", in use" } else { "" },
             if current(status, c) { ", current" } else { "" }
         ));
+    }
+    if let Some(sidecar) = &r.sidecar {
+        sidecar_lines(sidecar, now, &mut lines);
     }
     let Some(s) = status else {
         return lines;
@@ -544,6 +612,82 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     lines
 }
 
+/// How the sidecar's supervision stands, for a line: the state and what
+/// goes with it. The alarm of `docs/control.md` is the `failed` state.
+fn sidecar_state(state: SidecarState, now: Instant) -> String {
+    match state {
+        SidecarState::Stopped => "stopped".to_owned(),
+        SidecarState::Starting => "starting".to_owned(),
+        SidecarState::Running { pid, since } => {
+            format!("running, pid {pid}, up {}s", seconds_between(since, now))
+        }
+        SidecarState::BackingOff { until, failures } | SidecarState::Failed { until, failures } => {
+            format!(
+                "{state}, next attempt in {}s after {failures} failures in a row",
+                seconds_between(now, until)
+            )
+        }
+        SidecarState::ShuttingDown { pid: Some(pid) } => format!("shutting-down, pid {pid}"),
+        SidecarState::ShuttingDown { pid: None } => "shutting-down".to_owned(),
+    }
+}
+
+/// The `sidecar` lines of `show rpki`: the Routinator that bgpfcd runs
+/// (`docs/control.md`, "RPKI").
+fn sidecar_lines(r: &SidecarReport, now: Instant, lines: &mut Vec<String>) {
+    let s = &r.status;
+    lines.push(format!("sidecar state {}", sidecar_state(s.state, now)));
+    lines.push(format!(
+        "sidecar routinator {} {}, rtr {}",
+        r.version,
+        r.binary.display(),
+        s.rtr
+    ));
+    lines.push(format!(
+        "sidecar restarts {} failures {}",
+        s.restarts, s.consecutive_failures
+    ));
+    if let Some(exit) = &s.last_exit {
+        // A spawn error is the operating system's words, with the path.
+        lines.push(format!("sidecar last exit {}", one_line(&exit.to_string())));
+    }
+}
+
+/// The `sidecar` member of `show rpki`: `null` without a sidecar.
+fn write_sidecar(j: &mut Json, r: Option<&SidecarReport>, now: Instant) {
+    let Some(r) = r else {
+        j.null();
+        return;
+    };
+    let s = &r.status;
+    let (up, retry) = match s.state {
+        SidecarState::Running { since, .. } => (Some(seconds_between(since, now)), None),
+        SidecarState::BackingOff { until, .. } | SidecarState::Failed { until, .. } => {
+            (None, Some(seconds_between(now, until)))
+        }
+        SidecarState::Stopped | SidecarState::Starting | SidecarState::ShuttingDown { .. } => {
+            (None, None)
+        }
+    };
+    j.begin_object()
+        .field_str("state", s.state.name())
+        .field_bool("failed", matches!(s.state, SidecarState::Failed { .. }))
+        .field_opt_num("pid", s.pid)
+        .field_opt_num("up_seconds", up)
+        .field_opt_num("next_attempt_seconds", retry)
+        .field_num("restarts", s.restarts)
+        .field_num("failures", s.consecutive_failures)
+        .field_opt("last_exit", s.last_exit.as_ref())
+        .field_display("binary", r.binary.display())
+        .field_display("version", &r.version)
+        .key("rtr")
+        .begin_object()
+        .field_display("host", s.rtr.ip())
+        .field_num("port", s.rtr.port())
+        .end_object()
+        .end_object();
+}
+
 /// `text` with its control characters escaped (`\n`, `\r`, `\t`,
 /// `\u{001b}`), for a line of a reply. The line protocol of
 /// `docs/control.md` ends a line at a newline and a reply at a line of a
@@ -575,6 +719,7 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
     let status = r.status.as_ref();
     j.begin_object()
         .field_display("mode", r.config.mode)
+        .field_display("invalid", r.config.invalid)
         .key("caches")
         .begin_array();
     for c in &r.config.caches {
@@ -586,7 +731,8 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
             .field_bool("current", current(status, c))
             .end_object();
     }
-    j.end_array();
+    j.end_array().key("sidecar");
+    write_sidecar(j, r.sidecar.as_ref(), now);
     let Some(s) = status else {
         // The same members without a client, so that a reader needs no
         // second shape.
@@ -742,6 +888,20 @@ fn rib_peers(ctx: &Ctx) -> Result<Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats
     }
 }
 
+/// Graceful Restart as the RIB has it: the deferred families and the
+/// peers with stale routes.
+fn rib_restart(ctx: &Ctx) -> Result<RestartReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(RibQuery::Restart, tx))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::Restart(r)) => Ok(r),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
+    }
+}
+
 fn counts(stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)], addr: IpAddr) -> (usize, usize) {
     stats
         .iter()
@@ -776,10 +936,33 @@ fn per_family(
         .collect()
 }
 
+/// The paths per prefix `info` sends, per family (RFC 7911 §5): `all`, or
+/// how many of the best.
+fn send_limit(limit: bgpfc_rib::PathLimit) -> String {
+    match limit {
+        bgpfc_rib::PathLimit::All => "all".to_owned(),
+        bgpfc_rib::PathLimit::Best(n) => n.to_string(),
+    }
+}
+
+/// `ipv4-unicast=all ipv6-unicast=2` for the families `addr` is sent paths
+/// for; empty when it is sent one path per prefix.
+fn send_limits(
+    stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    addr: IpAddr,
+) -> Vec<(AddressFamily, bgpfc_rib::PathLimit)> {
+    stats
+        .iter()
+        .find(|(i, _)| i.addr == addr)
+        .map(|(i, _)| i.add_path_send.clone())
+        .unwrap_or_default()
+}
+
 fn write_neighbor(
     j: &mut Json,
     r: &PeerReport,
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
 ) {
     let (received, advertised) = counts(stats, r.addr);
     j.begin_object()
@@ -812,9 +995,10 @@ fn write_neighbor(
                 .field_num("keepalive_time", s.keepalive_time.as_secs())
                 .field_bool("four_octet_as", s.four_octet_as)
                 .field_bool("extended_messages", s.extended_messages)
-                .field_bool("route_refresh", s.route_refresh)
-                .key("families")
-                .begin_array();
+                .field_bool("route_refresh", s.route_refresh.peer_advertised())
+                .field_bool("enhanced_route_refresh", s.route_refresh.enhanced());
+            write_role(j, s);
+            j.key("families").begin_array();
             for f in &s.families {
                 j.display(f);
             }
@@ -832,7 +1016,139 @@ fn write_neighbor(
             for f in &s.extended_next_hop_send {
                 j.display(f);
             }
+            j.end_array().end_object();
+            // RFC 7911 §5: the families whose routes come with Path
+            // Identifiers from the peer, and those sent to it with them,
+            // each with how many paths of a prefix.
+            j.key("add_path")
+                .begin_object()
+                .key("receive")
+                .begin_array();
+            for f in &s.add_path_receive {
+                j.display(f);
+            }
+            j.end_array().key("send").begin_array();
+            for (family, limit) in send_limits(stats, r.addr) {
+                j.begin_object().field_display("family", family);
+                match limit {
+                    bgpfc_rib::PathLimit::All => j.field_str("paths", "all"),
+                    bgpfc_rib::PathLimit::Best(n) => j.field_num("paths", n),
+                };
+                j.end_object();
+            }
             j.end_array().end_object().end_object();
+        }
+        None => {
+            j.null();
+        }
+    }
+    write_graceful_restart(j, r, restart);
+    write_refreshing(j, r, restart);
+    j.end_object();
+}
+
+/// The `refreshing` member of a neighbor: the route refreshes it has begun
+/// and not ended, each with how many routes of the family are still stale
+/// and the time left before they go without an `EoRR` (RFC 7313 §4).
+fn write_refreshing(j: &mut Json, r: &PeerReport, restart: &RestartReport) {
+    j.key("refreshing").begin_array();
+    for s in restart
+        .refreshing
+        .iter()
+        .filter(|s| s.refresh.addr == r.addr)
+    {
+        j.begin_object()
+            .field_display("family", s.refresh.family)
+            .field_num("stale_routes", u64::try_from(s.routes).unwrap_or(u64::MAX))
+            .field_opt_num(
+                "stale_timer_seconds",
+                s.refresh.stale_in.map(|d| d.as_secs()),
+            )
+            .end_object();
+    }
+    j.end_array();
+}
+
+/// The lines of `show neighbor` about the route refreshes the neighbor has
+/// begun and not ended (RFC 7313 §4).
+fn refreshing_lines(r: &PeerReport, restart: &RestartReport) -> Vec<String> {
+    restart
+        .refreshing
+        .iter()
+        .filter(|s| s.refresh.addr == r.addr)
+        .map(|s| {
+            let timer = s
+                .refresh
+                .stale_in
+                .map_or(String::new(), |d| format!(", stale timer {}s", d.as_secs()));
+            format!(
+                "  route refresh under way for {}: {} stale routes{timer}",
+                s.refresh.family, s.routes
+            )
+        })
+        .collect()
+}
+
+/// The `graceful_restart` member of a neighbor: `null` without
+/// `graceful-restart yes`; otherwise the Restart Time we advertise, what
+/// the neighbor's capability said if the session is up, and the stale
+/// routes kept, if any (RFC 4724 §3, §4.2).
+fn write_graceful_restart(j: &mut Json, r: &PeerReport, restart: &RestartReport) {
+    j.key("graceful_restart");
+    let Some(ours) = r.restart_time else {
+        j.null();
+        return;
+    };
+    j.begin_object()
+        .field_num("restart_time", ours.secs())
+        .key("neighbor");
+    match r
+        .session
+        .as_ref()
+        .and_then(bgpfc_fsm::Session::peer_restart)
+    {
+        Some(p) => {
+            j.begin_object()
+                .field_num("restart_time", p.restart_time.secs())
+                .field_bool("restarting", p.restarting)
+                .field_bool("notification", p.notification)
+                .key("families")
+                .begin_array();
+            for (family, forwarding) in &p.families {
+                j.begin_object()
+                    .field_display("family", family)
+                    .field_bool("forwarding", *forwarding)
+                    .end_object();
+            }
+            j.end_array().end_object();
+        }
+        None => {
+            j.null();
+        }
+    }
+    j.key("stale");
+    match restart.stale.iter().find(|s| s.peer.addr == r.addr) {
+        Some(s) => {
+            j.begin_object()
+                .field_bool("session_down", s.peer.down)
+                .field_opt_num(
+                    "restart_timer_seconds",
+                    s.peer.restart_in.map(|d| d.as_secs()),
+                )
+                .field_opt_num("stale_timer_seconds", s.peer.stale_in.map(|d| d.as_secs()))
+                .key("awaiting_end_of_rib")
+                .begin_array();
+            for family in &s.peer.pending {
+                j.display(family);
+            }
+            j.end_array().key("routes").begin_array();
+            for (family, routes) in &s.routes {
+                j.begin_object()
+                    .field_display("family", family)
+                    .field_num("routes", u64::try_from(*routes).unwrap_or(u64::MAX))
+                    .end_object();
+            }
+            j.end_array().end_object();
         }
         None => {
             j.null();
@@ -841,9 +1157,97 @@ fn write_neighbor(
     j.end_object();
 }
 
+/// `ipv4-unicast,ipv6-unicast` for a line; `none` if empty.
+fn family_list(families: impl IntoIterator<Item = AddressFamily>) -> String {
+    let list: Vec<String> = families.into_iter().map(|f| f.to_string()).collect();
+    if list.is_empty() {
+        "none".to_owned()
+    } else {
+        list.join(",")
+    }
+}
+
+/// The lines of `show neighbor` about Graceful Restart.
+fn graceful_restart_lines(r: &PeerReport, restart: &RestartReport) -> Vec<String> {
+    let Some(ours) = r.restart_time else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "  graceful-restart restart-time {}s, advertised with the Graceful Notification bit",
+        ours.secs()
+    )];
+    if let Some(p) = r
+        .session
+        .as_ref()
+        .and_then(bgpfc_fsm::Session::peer_restart)
+    {
+        lines.push(format!(
+            "  graceful-restart neighbor restart-time {}s notification {} restarting {} forwarding {} without {}",
+            p.restart_time.secs(),
+            if p.notification { "yes" } else { "no" },
+            if p.restarting { "yes" } else { "no" },
+            family_list(p.families.iter().filter(|(_, f)| *f).map(|(f, _)| *f)),
+            family_list(p.families.iter().filter(|(_, f)| !*f).map(|(f, _)| *f)),
+        ));
+    }
+    if let Some(s) = restart.stale.iter().find(|s| s.peer.addr == r.addr) {
+        let routes: Vec<String> = s
+            .routes
+            .iter()
+            .map(|(family, n)| format!("{family}={n}"))
+            .collect();
+        let mut parts = vec![
+            format!(
+                "stale routes {}",
+                if routes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    routes.join(",")
+                }
+            ),
+            format!(
+                "awaiting end-of-rib {}",
+                family_list(s.peer.pending.iter().copied())
+            ),
+        ];
+        if let Some(left) = s.peer.restart_in {
+            parts.push(format!("session due back in {}s", left.as_secs()));
+        }
+        if let Some(left) = s.peer.stale_in {
+            parts.push(format!("stale timer {}s", left.as_secs()));
+        }
+        lines.push(format!("  {}", parts.join("; ")));
+    }
+    lines
+}
+
+/// The `role` member of a session: our BGP Role and the one the neighbor
+/// sent (RFC 9234 §4.1), `null` without a Role of ours.
+fn write_role(j: &mut Json, s: &bgpfc_fsm::Session) {
+    j.key("role");
+    let Some(local) = s.role else {
+        j.null();
+        return;
+    };
+    j.begin_object().field_display("local", local).key("remote");
+    match peer_role(s) {
+        Some(r) => j.display(r),
+        None => j.null(),
+    };
+    j.end_object();
+}
+
+/// The Role the neighbor advertised, if it did (RFC 9234 §4.1). Several,
+/// which the session would not have come up with unless they agree, are
+/// the first.
+fn peer_role(s: &bgpfc_fsm::Session) -> Option<bgpfc_wire::role::Role> {
+    bgpfc_wire::capability::roles(&s.peer_capabilities).next()
+}
+
 fn render_neighbors(
     reports: &[PeerReport],
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
 ) -> Reply {
     let mut lines = vec![format!(
         "{:<40} {:>10} {:<12} {:>9} {:>9} {:>9}",
@@ -863,7 +1267,7 @@ fn render_neighbors(
             received,
             advertised
         ));
-        write_neighbor(&mut j, r, stats);
+        write_neighbor(&mut j, r, stats, restart);
     }
     j.end_array();
     Reply {
@@ -872,7 +1276,11 @@ fn render_neighbors(
     }
 }
 
-fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)]) -> Reply {
+fn render_neighbor(
+    r: &PeerReport,
+    stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
+) -> Reply {
     let (received, advertised) = counts(stats, r.addr);
     let mut lines = vec![
         format!("neighbor {}", r.addr),
@@ -902,9 +1310,18 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
             s.keepalive_time.as_secs()
         ));
         lines.push(format!(
-            "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
-            s.four_octet_as, s.extended_messages, s.route_refresh
+            "  capabilities four-octet-as={} extended-messages={} route-refresh={} enhanced-route-refresh={}",
+            s.four_octet_as,
+            s.extended_messages,
+            s.route_refresh.peer_advertised(),
+            s.route_refresh.enhanced()
         ));
+        if let Some(local) = s.role {
+            lines.push(format!(
+                "  role {local} (neighbor sent {})",
+                peer_role(s).map_or("none".to_owned(), |r| r.to_string())
+            ));
+        }
         if !s.extended_next_hop_receive.is_empty() || !s.extended_next_hop_send.is_empty() {
             let list = |families: &[AddressFamily]| {
                 if families.is_empty() {
@@ -923,6 +1340,25 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
                 list(&s.extended_next_hop_send)
             ));
         }
+        if !s.add_path_receive.is_empty() || !s.add_path_send.is_empty() {
+            let receive: Vec<String> = s.add_path_receive.iter().map(ToString::to_string).collect();
+            let send: Vec<String> = send_limits(stats, r.addr)
+                .into_iter()
+                .map(|(f, l)| format!("{f}={}", send_limit(l)))
+                .collect();
+            let list = |v: Vec<String>| {
+                if v.is_empty() {
+                    "none".to_owned()
+                } else {
+                    v.join(",")
+                }
+            };
+            lines.push(format!(
+                "  add-path receive {} send {}",
+                list(receive),
+                list(send)
+            ));
+        }
         lines.push(format!(
             "  families {}",
             s.families
@@ -932,8 +1368,10 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
                 .join(" ")
         ));
     }
+    lines.extend(graceful_restart_lines(r, restart));
+    lines.extend(refreshing_lines(r, restart));
     let mut j = Json::new();
-    write_neighbor(&mut j, r, stats);
+    write_neighbor(&mut j, r, stats, restart);
     Reply {
         lines,
         json: j.finish(),
@@ -978,7 +1416,14 @@ fn route_line(r: &RouteReport) -> String {
             path.join(" ")
         },
         r.peer
-    )
+    ) + &r
+        .path_id
+        .map_or(String::new(), |id| format!(" id {}", id.0))
+        + &a.otc.map_or(String::new(), |asn| format!(" otc {}", asn.0))
+        + if r.held { " held" } else { "" }
+        // RFC 4724 §4.2: its peer's session ended, and the route is kept
+        // until the peer sends it again.
+        + if r.stale { " stale" } else { "" }
 }
 
 fn route_json(j: &mut Json, r: &RouteReport) {
@@ -989,8 +1434,16 @@ fn route_json(j: &mut Json, r: &RouteReport) {
         .field_display("origin", a.origin)
         .field_opt_num("local_pref", a.local_pref)
         .field_opt_num("med", a.med)
-        .field_display("peer", r.peer)
-        .field_bool("best", r.best)
+        .field_opt_num("otc", a.otc.map(|asn| asn.0))
+        .field_display("peer", r.peer);
+    // RFC 7911 §3: the identifier its peer sent it with, for the families
+    // the peer sends them for.
+    if let Some(id) = r.path_id {
+        j.field_num("path_id", id.0);
+    }
+    j.field_bool("best", r.best)
+        .field_bool("held", r.held)
+        .field_bool("stale", r.stale)
         .field_str("rov", r.rov.as_str())
         .key("as_path")
         .begin_array();
@@ -1537,11 +1990,15 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: true,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_send: vec![AddressFamily::IPV4_UNICAST],
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -1554,8 +2011,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  extended-next-hop receive ipv4-unicast send ipv4-unicast".to_owned()),
@@ -1572,7 +2030,7 @@ mod tests {
         // RFC 8950 §4 advertised by us alone: taken, not sent.
         session.extended_next_hop_send.clear();
         report.session = Some(session.clone());
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  extended-next-hop receive ipv4-unicast send none".to_owned()),
@@ -1588,11 +2046,149 @@ mod tests {
         // Not at all: no line, empty lists.
         session.extended_next_hop_receive.clear();
         report.session = Some(session);
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
         assert!(
             r.json
                 .contains(r#""extended_next_hop":{"receive":[],"send":[]}"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn routes_show_the_path_identifier_their_peer_sent_where_it_sent_one() {
+        // RFC 7911 §3: two paths of one peer to one prefix are told apart
+        // by the identifier alone.
+        let plain = route("192.0.2.0/24", "198.51.100.1", &[65_001], None, None);
+        let mut with = route("192.0.2.0/24", "198.51.100.2", &[65_002], None, None);
+        with.path_id = Some(bgpfc_wire::types::PathId(7));
+        let zero = RouteReport {
+            path_id: Some(bgpfc_wire::types::PathId(0)),
+            ..with.clone()
+        };
+        assert!(
+            !route_line(&plain).contains(" id "),
+            "{}",
+            route_line(&plain)
+        );
+        assert!(
+            route_line(&with).ends_with("via 198.51.100.2 id 7"),
+            "{}",
+            route_line(&with)
+        );
+        // Zero is an identifier like another (RFC 7911 §3).
+        assert!(
+            route_line(&zero).ends_with("via 198.51.100.2 id 0"),
+            "{}",
+            route_line(&zero)
+        );
+        let json = |r: &RouteReport| {
+            let mut j = Json::new();
+            route_json(&mut j, r);
+            j.finish()
+        };
+        assert!(!json(&plain).contains("path_id"), "{}", json(&plain));
+        assert!(
+            json(&with).contains(r#""peer":"198.51.100.2","path_id":7,"best":false,"held":false"#),
+            "{}",
+            json(&with)
+        );
+        assert!(json(&zero).contains(r#""path_id":0"#), "{}", json(&zero));
+    }
+
+    #[test]
+    fn neighbor_detail_shows_the_add_path_families_and_how_many_paths_go() {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            add_path_receive: vec![v4],
+            add_path_send: vec![v4, v6],
+            role: None,
+            restart: None,
+            peer_capabilities: Vec::new(),
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: None,
+        };
+        let info = bgpfc_rib::PeerInfo {
+            addr,
+            local_addr: "192.0.2.1".parse().unwrap(),
+            remote_as: Asn(65_001),
+            router_id: RouterId::new(2).unwrap(),
+            kind: bgpfc_wire::update::PeerKind::External,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            four_octet_as: true,
+            extended_messages: true,
+            extended_next_hop: Vec::new(),
+            advertisement_interval: Duration::ZERO,
+            prefix_limits: Vec::new(),
+            add_path_receive: vec![v4],
+            add_path_send: vec![
+                (v4, bgpfc_rib::PathLimit::All),
+                (v6, bgpfc_rib::PathLimit::Best(2)),
+            ],
+            role: None,
+            restart: None,
+            enhanced_refresh: None,
+        };
+        let stats = bgpfc_rib::PeerStats {
+            received: vec![(v4, 2), (v6, 0)],
+            advertised: vec![(v4, 5), (v6, 3)],
+        };
+        let r = render_neighbor(&report, &[(info, stats)], &RestartReport::default());
+        assert!(
+            r.lines.contains(
+                &"  add-path receive ipv4-unicast send ipv4-unicast=all,ipv6-unicast=2".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(
+                r#""add_path":{"receive":["ipv4-unicast"],"send":[{"family":"ipv4-unicast","paths":"all"},{"family":"ipv6-unicast","paths":2}]}"#
+            ),
+            "{}",
+            r.json
+        );
+        // Not negotiated: no line, empty lists.
+        let mut plain = report.clone();
+        if let Some(s) = &mut plain.session {
+            s.add_path_receive.clear();
+            s.add_path_send.clear();
+        }
+        let r = render_neighbor(&plain, &[], &RestartReport::default());
+        assert!(
+            !r.lines.iter().any(|l| l.contains("add-path")),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""add_path":{"receive":[],"send":[]}"#),
             "{}",
             r.json
         );
@@ -1617,6 +2213,11 @@ mod tests {
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::ZERO,
             prefix_limits: vec![(v4, 1000)],
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: None,
+            restart: None,
+            enhanced_refresh: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
@@ -1635,19 +2236,24 @@ mod tests {
                 keepalive_time: Duration::from_secs(30),
                 four_octet_as: true,
                 extended_messages: false,
-                route_refresh: true,
+                route_refresh: bgpfc_fsm::RouteRefresh::Supported,
                 families: vec![v4, v6],
                 receive_families: vec![v4, v6],
                 extended_next_hop_receive: Vec::new(),
                 extended_next_hop_send: Vec::new(),
+                add_path_receive: Vec::new(),
+                add_path_send: Vec::new(),
+                role: None,
+                restart: None,
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,
             updates_out: 1,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[(info, stats)]);
+        let r = render_neighbor(&report, &[(info, stats)], &RestartReport::default());
         // RFC 4271 §6.7: what the limit counts, next to the limit.
         for line in [
             "  routes received 15 advertised 4",
@@ -1664,7 +2270,7 @@ mod tests {
             r.json
         );
         // Not up in the RIB: no families.
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(r.json.contains(r#""prefixes":[]"#), "{}", r.json);
     }
 
@@ -1680,8 +2286,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(!r.lines.iter().any(|l| l.contains("restart limit")));
         assert!(
             r.json.contains(r#""restart_limit_reached":false"#),
@@ -1690,7 +2297,7 @@ mod tests {
         );
         // RFC 4486 §4: the operator must act, and is told how.
         report.restart_limit_reached = true;
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines.contains(
                 &"  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned()
@@ -1717,8 +2324,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbors(&[report], &[]);
+        let r = render_neighbors(&[report], &[], &RestartReport::default());
         assert_eq!(
             r.lines[1],
             format!(
@@ -1798,10 +2406,442 @@ mod tests {
                 ext_communities: Box::default(),
                 large_communities: Box::default(),
                 unknown: Box::default(),
+                otc: None,
             }),
+            path_id: None,
             best: false,
+            held: false,
+            stale: false,
             rov: RovState::Disabled,
         }
+    }
+
+    /// A neighbor up with Enhanced Route Refresh negotiated, and its report.
+    fn enhanced_neighbor(route_refresh: bgpfc_fsm::RouteRefresh, addr: IpAddr) -> PeerReport {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(bgpfc_fsm::Session {
+                peer_as: Asn(65_001),
+                peer_router_id: RouterId::new(2).unwrap(),
+                peer: bgpfc_wire::update::PeerKind::External,
+                hold_time: HoldTime::new(90).unwrap(),
+                keepalive_time: Duration::from_secs(30),
+                four_octet_as: true,
+                extended_messages: false,
+                route_refresh,
+                families: vec![v4],
+                receive_families: vec![v4],
+                extended_next_hop_receive: Vec::new(),
+                extended_next_hop_send: Vec::new(),
+                add_path_receive: Vec::new(),
+                add_path_send: Vec::new(),
+                role: None,
+                restart: None,
+                peer_capabilities: Vec::new(),
+            }),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: None,
+        }
+    }
+
+    #[test]
+    fn neighbor_detail_shows_whether_enhanced_route_refresh_is_in_use() {
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        // RFC 7313 §3.1: both sides advertised the capability.
+        let report = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Enhanced, addr);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
+        assert!(
+            r.lines
+                .iter()
+                .any(|l| l.contains("route-refresh=true enhanced-route-refresh=true")),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""route_refresh":true,"enhanced_route_refresh":true"#),
+            "{}",
+            r.json
+        );
+        // No refresh under way: no line, an empty list.
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("route refresh under way"))
+        );
+        assert!(r.json.contains(r#""refreshing":[]"#), "{}", r.json);
+        // Only the neighbor that advertised plain Route Refresh.
+        let plain = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Supported, addr);
+        let r = render_neighbor(&plain, &[], &RestartReport::default());
+        assert!(
+            r.json
+                .contains(r#""route_refresh":true,"enhanced_route_refresh":false"#)
+        );
+        assert!(
+            r.lines
+                .iter()
+                .any(|l| l.contains("enhanced-route-refresh=false"))
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_shows_a_refresh_under_way() {
+        use crate::messages::RefreshingReport;
+        let v4 = bgpfc_wire::types::AddressFamily::IPV4_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let report = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Enhanced, addr);
+        // RFC 7313 §4: one begun and not ended, with the routes still stale
+        // and the time left for its EoRR; another neighbor's does not show
+        // here.
+        let refreshing = |addr: IpAddr, left: Option<u64>| RefreshingReport {
+            refresh: bgpfc_rib::RefreshReport {
+                addr,
+                family: v4,
+                stale_in: left.map(Duration::from_secs),
+            },
+            routes: 12,
+        };
+        let restart = RestartReport {
+            refreshing: vec![
+                refreshing(addr, Some(340)),
+                refreshing("192.0.2.9".parse().unwrap(), Some(1)),
+            ],
+            ..RestartReport::default()
+        };
+        let r = render_neighbor(&report, &[], &restart);
+        assert!(
+            r.lines.contains(
+                &"  route refresh under way for ipv4-unicast: 12 stale routes, stale timer 340s"
+                    .to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(
+            r.lines.iter().filter(|l| l.contains("under way")).count(),
+            1
+        );
+        assert!(
+            r.json.contains(
+                r#""refreshing":[{"family":"ipv4-unicast","stale_routes":12,"stale_timer_seconds":340}]"#
+            ),
+            "{}",
+            r.json
+        );
+        // A refresh that marked nothing has no timer.
+        let idle = RestartReport {
+            refreshing: vec![refreshing(addr, None)],
+            ..RestartReport::default()
+        };
+        let r = render_neighbor(&report, &[], &idle);
+        assert!(
+            r.lines.contains(
+                &"  route refresh under way for ipv4-unicast: 12 stale routes".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""stale_timer_seconds":null"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_shows_the_roles() {
+        use bgpfc_wire::capability::Capability;
+        use bgpfc_wire::role::Role;
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: false,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
+            families: vec![AddressFamily::IPV4_UNICAST],
+            receive_families: vec![AddressFamily::IPV4_UNICAST],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: Some(Role::Customer),
+            restart: None,
+            peer_capabilities: vec![Capability::Role(Role::Provider)],
+        };
+        let mut report = PeerReport {
+            addr: "192.0.2.2".parse().unwrap(),
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session.clone()),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: None,
+        };
+        // RFC 9234 §4.1: our Role and the one the neighbor sent.
+        let r = render_neighbor(&report, &[], &RestartReport::default());
+        assert!(
+            r.lines
+                .contains(&"  role customer (neighbor sent provider)".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""role":{"local":"customer","remote":"provider"}"#),
+            "{}",
+            r.json
+        );
+        // A neighbor that sent none (RFC 9234 §4.2 lets the session go on).
+        report.session = Some(bgpfc_fsm::Session {
+            peer_capabilities: Vec::new(),
+            ..session.clone()
+        });
+        let r = render_neighbor(&report, &[], &RestartReport::default());
+        assert!(
+            r.lines
+                .contains(&"  role customer (neighbor sent none)".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""role":{"local":"customer","remote":null}"#),
+            "{}",
+            r.json
+        );
+        // No Role of ours: no line, and `null`.
+        report.session = Some(bgpfc_fsm::Session {
+            role: None,
+            ..session
+        });
+        let r = render_neighbor(&report, &[], &RestartReport::default());
+        assert!(!r.lines.iter().any(|l| l.contains("role")));
+        assert!(r.json.contains(r#""role":null"#), "{}", r.json);
+    }
+
+    #[test]
+    fn neighbor_detail_shows_graceful_restart_and_the_stale_routes() {
+        use crate::messages::StaleReport;
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: false,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: None,
+            restart: Some(Box::new(bgpfc_fsm::Restart {
+                peer: Some(bgpfc_fsm::PeerRestart {
+                    restart_time: RestartTime::new(90).unwrap(),
+                    restarting: false,
+                    notification: true,
+                    families: vec![(v4, true), (v6, false)],
+                }),
+            })),
+            peer_capabilities: Vec::new(),
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: Some(RestartTime::new(120).unwrap()),
+        };
+        let stale = RestartReport {
+            refreshing: Vec::new(),
+            deferred: Vec::new(),
+            stale: vec![StaleReport {
+                peer: bgpfc_rib::StalePeer {
+                    addr,
+                    down: false,
+                    pending: vec![v4],
+                    restart_in: None,
+                    stale_in: Some(Duration::from_secs(340)),
+                },
+                routes: vec![(v4, 12)],
+            }],
+        };
+        // RFC 4724 §3: what we advertise and what the neighbor did, with
+        // the Forwarding State bit per family; §4.2: the stale routes, the
+        // families still awaiting an End-of-RIB and the timer.
+        let r = render_neighbor(&report, &[], &stale);
+        for line in [
+            "  graceful-restart restart-time 120s, advertised with the Graceful Notification bit",
+            "  graceful-restart neighbor restart-time 90s notification yes restarting no forwarding ipv4-unicast without ipv6-unicast",
+            "  stale routes ipv4-unicast=12; awaiting end-of-rib ipv4-unicast; stale timer 340s",
+        ] {
+            assert!(r.lines.contains(&line.to_owned()), "{line}\n{:?}", r.lines);
+        }
+        assert!(
+            r.json.contains(concat!(
+                r#""graceful_restart":{"restart_time":120,"neighbor":{"restart_time":90,"#,
+                r#""restarting":false,"notification":true,"families":[{"family":"ipv4-unicast","#,
+                r#""forwarding":true},{"family":"ipv6-unicast","forwarding":false}]},"#,
+                r#""stale":{"session_down":false,"restart_timer_seconds":null,"#,
+                r#""stale_timer_seconds":340,"awaiting_end_of_rib":["ipv4-unicast"],"#,
+                r#""routes":[{"family":"ipv4-unicast","routes":12}]}}"#
+            )),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_of_a_neighbor_that_is_down_shows_only_the_stale_routes() {
+        use crate::messages::StaleReport;
+        use bgpfc_wire::types::{AddressFamily, Asn, RestartTime};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Active,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: Some(RestartTime::new(120).unwrap()),
+        };
+        // A neighbor whose session is down, its routes kept and its timer
+        // running; the session is not there to report what it said.
+        report.state = bgpfc_fsm::State::Active;
+        let down = RestartReport {
+            refreshing: Vec::new(),
+            deferred: Vec::new(),
+            stale: vec![StaleReport {
+                peer: bgpfc_rib::StalePeer {
+                    addr,
+                    down: true,
+                    pending: vec![v4, v6],
+                    restart_in: Some(Duration::from_secs(98)),
+                    stale_in: None,
+                },
+                routes: vec![(v4, 12), (v6, 3)],
+            }],
+        };
+        let r = render_neighbor(&report, &[], &down);
+        assert!(
+            r.lines.contains(
+                &"  stale routes ipv4-unicast=12,ipv6-unicast=3; awaiting end-of-rib \
+                   ipv4-unicast,ipv6-unicast; session due back in 98s"
+                    .to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("graceful-restart neighbor"))
+        );
+        assert!(
+            r.json.contains(
+                r#""session_down":true,"restart_timer_seconds":98,"stale_timer_seconds":null"#
+            ),
+            "{}",
+            r.json
+        );
+        // Without `graceful-restart yes` there is nothing to show.
+        report.restart_time = None;
+        let r = render_neighbor(&report, &[], &down);
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("graceful") || l.contains("stale"))
+        );
+        assert!(r.json.contains(r#""graceful_restart":null"#), "{}", r.json);
+    }
+
+    #[test]
+    fn routes_show_the_only_to_customer_attribute() {
+        use bgpfc_wire::types::Asn;
+        let mut with = route("192.0.2.0/24", "198.51.100.1", &[64_511], Some(100), None);
+        Arc::make_mut(&mut with.attrs).otc = Some(Asn(64_511));
+        let without = route(
+            "198.51.100.0/24",
+            "198.51.100.1",
+            &[64_511],
+            Some(100),
+            None,
+        );
+        let r = render_routes(&[with, without]);
+        assert!(
+            r.lines[1].ends_with("64511 via 198.51.100.1 otc 64511"),
+            "{}",
+            r.lines[1]
+        );
+        assert!(
+            r.lines[2].ends_with("64511 via 198.51.100.1"),
+            "{}",
+            r.lines[2]
+        );
+        assert!(
+            r.json.contains(r#""med":null,"otc":64511,"peer""#),
+            "{}",
+            r.json
+        );
+        assert!(
+            r.json.contains(r#""med":null,"otc":null,"peer""#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn a_path_with_an_identifier_and_the_attribute_shows_both() {
+        // RFC 7911 §3 and RFC 9234 §5 together, in the order docs/control.md
+        // gives: the identifier after the neighbor, then the attribute.
+        use bgpfc_wire::types::{Asn, PathId};
+        let mut r = route("192.0.2.0/24", "198.51.100.1", &[64_511], Some(100), None);
+        r.path_id = Some(PathId(7));
+        Arc::make_mut(&mut r.attrs).otc = Some(Asn(64_511));
+        assert!(
+            route_line(&r).ends_with("64511 via 198.51.100.1 id 7 otc 64511"),
+            "{}",
+            route_line(&r)
+        );
+        let mut j = Json::new();
+        route_json(&mut j, &r);
+        let json = j.finish();
+        assert!(
+            json.contains(r#""otc":64511,"peer":"198.51.100.1","path_id":7,"best""#),
+            "{json}"
+        );
     }
 
     #[test]
@@ -1820,6 +2860,8 @@ mod tests {
         best.rov = RovState::Valid;
         let mut other = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, Some(50));
         other.rov = RovState::Invalid;
+        // RFC 4724 §4.2: a route kept from a session that ended says so.
+        other.stale = true;
         let r = render_routes(&[best, other]);
         // Every column starts where its header does; `*` marks the best.
         assert_eq!(
@@ -1834,23 +2876,23 @@ mod tests {
                     "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-", "valid"
                 ),
                 format!(
-                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2",
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2 stale",
                     " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50", "invalid"
                 ),
             ]
         );
-        // docs/control.md: `local_pref` and `med` are numbers, or null;
-        // `rov` is the state's name.
+        // docs/control.md: `local_pref`, `med` and `otc` are numbers, or
+        // null; `rov` is the state's name.
         assert_eq!(
             r.json,
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
-                r#""local_pref":100,"med":null,"peer":"198.51.100.1","best":true,"#,
-                r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
+                r#""local_pref":100,"med":null,"otc":null,"peer":"198.51.100.1","best":true,"held":false,"#,
+                r#""stale":false,"rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
                 r#""large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
-                r#""local_pref":null,"med":50,"peer":"198.51.100.2","best":false,"#,
-                r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
+                r#""local_pref":null,"med":50,"otc":null,"peer":"198.51.100.2","best":false,"held":false,"#,
+                r#""stale":true,"rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
                 r#""large_communities":[]}]"#
             )
         );
@@ -1870,6 +2912,59 @@ mod tests {
                 out.json
             );
         }
+    }
+
+    #[test]
+    fn routes_held_for_their_validation_state_are_marked() {
+        // RFC 6811 §2: a route the Adj-RIB-In keeps but the RIB does not
+        // use (`invalid drop`, or import policy that rejects its state)
+        // follows the candidates of `show routes PREFIX`, marked `held`.
+        let mut best = route(
+            "192.0.2.0/24",
+            "198.51.100.1",
+            &[64_511, 64_496],
+            None,
+            None,
+        );
+        best.best = true;
+        best.rov = RovState::Valid;
+        let mut refused = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, None);
+        refused.rov = RovState::Invalid;
+        refused.held = true;
+        let r = render_routes(&[best, refused]);
+        assert!(!r.lines[1].ends_with(" held"), "{}", r.lines[1]);
+        assert!(
+            r.lines[2].ends_with("64497 via 198.51.100.2 held"),
+            "{}",
+            r.lines[2]
+        );
+        assert!(
+            r.json
+                .contains(r#""best":false,"held":true,"stale":false,"rov":"invalid""#)
+        );
+        assert!(
+            r.json
+                .contains(r#""best":true,"held":false,"stale":false,"rov":"valid""#)
+        );
+        // RFC 4724 §4.2 and RFC 6811 §5 together: a stale route of a
+        // neighbor whose session ended can be held for its state too, and
+        // says both, in the order docs/control.md gives.
+        let mut both = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, None);
+        both.rov = RovState::Invalid;
+        both.held = true;
+        both.stale = true;
+        let r = render_routes(&[both]);
+        assert!(
+            r.lines[1].ends_with("64497 via 198.51.100.2 held stale"),
+            "{}",
+            r.lines[1]
+        );
+        assert!(
+            r.json
+                .contains(r#""best":false,"held":true,"stale":true,"rov":"invalid""#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]
@@ -1900,8 +2995,31 @@ mod tests {
             Command::parse(&words("clear neighbor 10.0.0.1 soft")),
             Ok(Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: true,
+                clear: Clear::Soft,
                 message: None
+            })
+        );
+        // RFC 8538 §3: a Hard Reset, with or without a communication in it.
+        assert_eq!(
+            Command::parse(&words("clear neighbor 10.0.0.1 hard-reset")),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: None
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "clear".into(),
+                "neighbor".into(),
+                "10.0.0.1".into(),
+                "hard-reset".into(),
+                "bye".into()
+            ]),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: Some("bye".into())
             })
         );
         let m = Command::parse(&[
@@ -1915,7 +3033,7 @@ mod tests {
             m,
             Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: false,
+                clear: Clear::Session,
                 message: Some("bye now".into())
             }
         );
@@ -1931,6 +3049,7 @@ mod tests {
             "show neighbor nope",
             "show routes ipv7",
             "clear neighbor 10.0.0.1 soft msg",
+            "clear neighbor 10.0.0.1 soft hard-reset",
             "clear neighbor 10.0.0.1 a b",
             "fib mode maybe",
         ] {
@@ -1991,10 +3110,25 @@ mod tests {
             Command::from_http(&post("/v1/neighbors/10.0.0.1/clear?soft=1")),
             Ok(Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: true,
+                clear: Clear::Soft,
                 message: None
             })
         );
+        // RFC 8538 §3: a Hard Reset, with a message inside it.
+        assert_eq!(
+            Command::from_http(&post("/v1/neighbors/10.0.0.1/clear?hard=1&message=bye")),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: Some("bye".into())
+            })
+        );
+        for bad in [
+            "/v1/neighbors/10.0.0.1/clear?soft=1&hard=1",
+            "/v1/neighbors/10.0.0.1/clear?soft=1&message=bye",
+        ] {
+            assert_eq!(Command::from_http(&post(bad)).unwrap_err().0, 400, "{bad}");
+        }
         assert_eq!(Command::from_http(&get("/v1/nope")).unwrap_err().0, 404);
         assert_eq!(
             Command::from_http(&get("/v1/routes?family=x"))
@@ -2030,7 +3164,7 @@ mod tests {
         let set: VrpSet = vrps.iter().copied().collect();
         RpkiReport {
             config: rpki_block(
-                "rpki { mode external; cache 127.0.0.1 port 3323;
+                "rpki { mode external; invalid policy; cache 127.0.0.1 port 3323;
                  cache rtr.example.net preference 10; }",
             ),
             status: Some(Status {
@@ -2058,6 +3192,7 @@ mod tests {
                 last_error_at: now.checked_sub(Duration::from_secs(30)),
                 running: true,
             }),
+            sidecar: None,
         }
     }
 
@@ -2071,6 +3206,7 @@ mod tests {
             r.lines,
             [
                 "mode external",
+                "invalid policy",
                 "cache 127.0.0.1:3323 preference 0",
                 "cache rtr.example.net:323 preference 10, in use, current",
                 "state idle, connected, version 1",
@@ -2084,11 +3220,11 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"external","caches":["#,
+                r#"{"mode":"external","invalid":"policy","caches":["#,
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
                 r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
-                r#""current":true}],"#,
+                r#""current":true}],"sidecar":null,"#,
                 r#""running":true,"state":"idle","connected":true,"version":1,"#,
                 r#""session_id":4242,"serial":17,"synced_seconds_ago":12,"#,
                 r#""expires_in_seconds":7188,"#,
@@ -2097,6 +3233,149 @@ mod tests {
                 r#""last_error":"rtr cache connection timed out cache=127.0.0.1:3323","#,
                 r#""last_error_seconds_ago":30}"#
             )
+        );
+    }
+
+    /// The report of a sidecar in `state`, the child's last exit being
+    /// `last_exit`.
+    fn sidecar_report(
+        state: bgpfc_sidecar::SidecarState,
+        last_exit: Option<bgpfc_sidecar::ExitReason>,
+    ) -> RpkiReport {
+        let pid = match state {
+            bgpfc_sidecar::SidecarState::Running { pid, .. } => Some(pid),
+            bgpfc_sidecar::SidecarState::ShuttingDown { pid } => pid,
+            _ => None,
+        };
+        let mut report = RpkiReport {
+            config: rpki_block(
+                "rpki { mode sidecar; invalid drop; routinator {
+                 binary /usr/bin/routinator; repository-dir /var/lib/rpki; } }",
+            ),
+            status: None,
+            sidecar: None,
+        };
+        report.sidecar = Some(SidecarReport {
+            status: bgpfc_sidecar::SidecarStatus {
+                state,
+                pid,
+                restarts: 2,
+                consecutive_failures: 5,
+                last_exit,
+                rtr: "127.0.0.1:3323".parse().unwrap(),
+            },
+            version: bgpfc_sidecar::parse_version("Routinator 0.15.2").unwrap(),
+            binary: "/usr/bin/routinator".into(),
+        });
+        report
+    }
+
+    #[test]
+    fn the_sidecar_is_shown_in_every_state() {
+        use bgpfc_sidecar::{ExitReason, SidecarState};
+        let now = Instant::now();
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        let ago = |secs: u64| now.checked_sub(Duration::from_secs(secs)).unwrap();
+
+        // Running: the child, how long it has been up, the numbers.
+        let running = sidecar_report(
+            SidecarState::Running {
+                pid: 4242,
+                since: ago(35),
+            },
+            Some(ExitReason::Code(1)),
+        );
+        let r = render_rpki(&running, now);
+        assert_eq!(
+            r.lines,
+            [
+                "mode sidecar",
+                "invalid drop",
+                "sidecar state running, pid 4242, up 35s",
+                "sidecar routinator 0.15.2 /usr/bin/routinator, rtr 127.0.0.1:3323",
+                "sidecar restarts 2 failures 5",
+                "sidecar last exit exited with status 1",
+            ]
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#""caches":[],"sidecar":{"state":"running","failed":false,"pid":4242,"#,
+                r#""up_seconds":35,"next_attempt_seconds":null,"restarts":2,"failures":5,"#,
+                r#""last_exit":"exited with status 1","binary":"/usr/bin/routinator","#,
+                r#""version":"0.15.2","rtr":{"host":"127.0.0.1","port":3323}},"running":false"#,
+            )),
+            "{}",
+            r.json
+        );
+
+        // Backing off, and the alarm: the next attempt, and that it is
+        // the alarm.
+        let backing = sidecar_report(
+            SidecarState::BackingOff {
+                until: at(4),
+                failures: 2,
+            },
+            Some(ExitReason::Signal {
+                number: 9,
+                core_dumped: false,
+            }),
+        );
+        let r = render_rpki(&backing, now);
+        assert_eq!(
+            r.lines[2],
+            "sidecar state backing-off, next attempt in 4s after 2 failures in a row"
+        );
+        assert_eq!(r.lines[5], "sidecar last exit killed by signal 9 (SIGKILL)");
+        assert!(r.json.contains(r#""state":"backing-off","failed":false,"pid":null,"up_seconds":null,"next_attempt_seconds":4,"#));
+        let failed = sidecar_report(
+            SidecarState::Failed {
+                until: at(300),
+                failures: 7,
+            },
+            Some(ExitReason::SpawnFailed(
+                "No such file\nor directory".to_owned(),
+            )),
+        );
+        let r = render_rpki(&failed, now);
+        assert_eq!(
+            r.lines[2],
+            "sidecar state failed, next attempt in 300s after 7 failures in a row"
+        );
+        // What the operating system said stays on its line.
+        assert_eq!(
+            r.lines[5],
+            "sidecar last exit could not be started: No such file\\nor directory"
+        );
+        assert!(r.json.contains(r#""state":"failed","failed":true,"#));
+        assert!(
+            r.json
+                .contains(r#""last_exit":"could not be started: No such file\nor directory""#)
+        );
+
+        // The rest: the state alone, and a stop with and without its child.
+        for (state, line) in [
+            (SidecarState::Stopped, "stopped"),
+            (SidecarState::Starting, "starting"),
+            (
+                SidecarState::ShuttingDown { pid: Some(77) },
+                "shutting-down, pid 77",
+            ),
+            (SidecarState::ShuttingDown { pid: None }, "shutting-down"),
+        ] {
+            let r = render_rpki(&sidecar_report(state, None), now);
+            assert_eq!(r.lines[2], format!("sidecar state {line}"));
+            assert_eq!(r.lines.len(), 5, "no last exit: {:?}", r.lines);
+            assert!(r.json.contains(r#""last_exit":null"#));
+        }
+
+        // Without a sidecar the member is there and null.
+        let mut none = sidecar_report(SidecarState::Stopped, None);
+        none.sidecar = None;
+        let r = render_rpki(&none, now);
+        assert_eq!(r.lines, ["mode sidecar", "invalid drop"]);
+        assert!(
+            r.json
+                .contains(r#""caches":[],"sidecar":null,"running":false"#)
         );
     }
 
@@ -2113,7 +3392,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[3..],
+            r.lines[4..],
             [
                 "state connecting, version 1",
                 "session-id - serial -",
@@ -2134,24 +3413,29 @@ mod tests {
             s.running = false;
         }
         assert_eq!(
-            render_rpki(&report, now).lines[3],
+            render_rpki(&report, now).lines[4],
             "state stopped, version 1"
         );
         // Disabled: the configured caches, nothing else, every member there.
         let report = RpkiReport {
             config: rpki_block("rpki { mode disabled; cache 192.0.2.10; }"),
             status: None,
+            sidecar: None,
         };
         let r = render_rpki(&report, now);
         assert_eq!(
             r.lines,
-            ["mode disabled", "cache 192.0.2.10:323 preference 0"]
+            [
+                "mode disabled",
+                "invalid policy",
+                "cache 192.0.2.10:323 preference 0"
+            ]
         );
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","caches":[{"host":"192.0.2.10","port":323,"#,
-                r#""preference":0,"in_use":false,"current":false}],"#,
+                r#"{"mode":"disabled","invalid":"policy","caches":[{"host":"192.0.2.10","port":323,"#,
+                r#""preference":0,"in_use":false,"current":false}],"sidecar":null,"#,
                 r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
                 r#""synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"#,
@@ -2161,8 +3445,12 @@ mod tests {
         let none = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            sidecar: None,
         };
-        assert_eq!(render_rpki(&none, now).lines, ["mode disabled"]);
+        assert_eq!(
+            render_rpki(&none, now).lines,
+            ["mode disabled", "invalid policy"]
+        );
     }
 
     #[test]
@@ -2184,7 +3472,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[1..7],
+            r.lines[2..8],
             [
                 "cache 127.0.0.1:3323 preference 0, current",
                 "cache rtr.example.net:323 preference 10, in use",
@@ -2215,7 +3503,7 @@ mod tests {
             r.lines
         );
         assert_eq!(
-            r.lines[6],
+            r.lines[7],
             "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
         );
         assert!(
@@ -2227,11 +3515,11 @@ mod tests {
         // The list names the cache in use another way: still that cache.
         let mut respelled = rpki_report(now, &[]);
         respelled.config = rpki_block(
-            "rpki { mode external; cache 127.0.0.1 port 3323;
+            "rpki { mode external; invalid policy; cache 127.0.0.1 port 3323;
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(
-            render_rpki(&respelled, now).lines[2],
+            render_rpki(&respelled, now).lines[3],
             "cache RTR.Example.NET.:323 preference 10, in use, current"
         );
         // Held data that expired is no cache's: every route not-found.
@@ -2241,7 +3529,7 @@ mod tests {
             (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
         }
         let r = render_rpki(&report, now);
-        assert_eq!(r.lines[6], "vrps ipv4 0 ipv6 0");
+        assert_eq!(r.lines[7], "vrps ipv4 0 ipv6 0");
         assert!(
             r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
             "{}",
@@ -2343,6 +3631,7 @@ mod tests {
         let off = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            sidecar: None,
         };
         let r = render_validation(&off, p("192.0.2.0/24"), Asn(64_496));
         assert_eq!(

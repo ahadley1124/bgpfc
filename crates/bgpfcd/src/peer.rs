@@ -2,12 +2,20 @@
 //! peer's FSM, turns bytes and timers into events, and executes the
 //! actions the FSM returns (AGENTS.md §3).
 //!
-//! Implements: RFC 4271 §6.8 (collision resolution between this peer's two
+//! Implements: RFC 4271 §1, §4.5 (a NOTIFICATION is delivered before the TCP
+//! connection is closed), §6.8 (collision resolution between this peer's two
 //! connections), §8.2.1 (one FSM per connection; a second connection is
 //! tracked until its OPEN), §8.2.2 (Idle refuses connections); RFC 4760 §7
 //! (AFI/SAFI disable is reported to the RIB, the session kept); RFC 2918
 //! §4 (ROUTE-REFRESH for an unadvertised family is ignored); RFC 9003 §2
-//! (a received Shutdown Communication is logged).
+//! (a received Shutdown Communication is logged); RFC 4724 §2, §4.2, §5 and
+//! RFC 8538 §4 (the End-of-RIB marker goes to the RIB, a session that ends
+//! gracefully leaves its routes there as stale ones, and a connection from a
+//! peer that restarted replaces the established session); RFC 7313 §3.2,
+//! §4, §5 (the Message Subtype of a ROUTE-REFRESH is read only on a session
+//! with Enhanced Route Refresh, where a `BoRR` and an `EoRR` go to the RIB, an
+//! unknown subtype is ignored and logged, and a wrong length is a
+//! ROUTE-REFRESH Message Error).
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -21,14 +29,15 @@ use bgpfc_fsm::{Action, Event, Fsm, Session, State};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, OpenSubcode};
 use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
-use bgpfc_wire::notification::NotificationMessage;
+use bgpfc_wire::notification::{NotificationMessage, max_data_len};
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::route_refresh::RouteRefreshMessage;
+use bgpfc_wire::route_refresh::{RefreshSubtype, RouteRefreshMessage};
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::{DecodeContext, PeerKind, UpdateMessage};
 
 use crate::messages::{ConnId, Inbound, Initiator, PeerInput, PeerReport, RibMsg};
 use crate::reader;
+use crate::restart::RestartState;
 
 /// How long an outgoing TCP connect may take; RFC 4271 §8.2.2 asks the
 /// `ConnectRetryTime` to leave room for it, and 120 s does.
@@ -40,6 +49,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Inputs a peer thread will queue before its producers block.
 const INPUT_QUEUE: usize = 256;
+
+/// How long the connection of an Established session stays open after the
+/// NOTIFICATION that ends it, for the neighbor to read the NOTIFICATION
+/// and close first; see [`Linger`].
+const NOTIFICATION_LINGER: Duration = Duration::from_secs(3);
 
 /// Octets of UPDATEs that may wait for a peer thread to write them. More
 /// means the peer has fallen too far behind, and its session is reset
@@ -59,6 +73,12 @@ pub(crate) struct PeerConfig {
     pub(crate) fsm: bgpfc_fsm::Config,
     /// Accept `AS_SET` in UPDATEs (RFC 9774 §3 override).
     pub(crate) allow_as_set: bool,
+    /// `stale-time` of a neighbor with `graceful-restart yes` (RFC 8538
+    /// §4.1): the RIB bounds the wait for the End-of-RIB marker with it.
+    pub(crate) stale_time: Option<Duration>,
+    /// `refresh-stale-time` of a neighbor with `enhanced-refresh yes` (RFC
+    /// 7313 §4): the RIB bounds the wait for an `EoRR` with it.
+    pub(crate) refresh_stale_time: Option<Duration>,
 }
 
 /// How other threads reach a peer thread.
@@ -153,6 +173,31 @@ struct Conn {
     initiator: Initiator,
 }
 
+/// A connection a NOTIFICATION was written on, kept open until the
+/// neighbor closes it or `until` passes.
+///
+/// RFC 4271 §4.5 closes the connection after a NOTIFICATION, and RFC 4724
+/// §4.2 has a neighbor that sees the TCP connection fail keep our routes
+/// where it would delete them on a NOTIFICATION. Closing at once puts the
+/// FIN right behind the NOTIFICATION, and a neighbor that reads both in
+/// one go may take the end for a failure of the transport: the Hard Reset
+/// of RFC 8538 §3.2, which exists to have the routes deleted, is then
+/// lost. The neighbor closes when it has processed the NOTIFICATION
+/// (RFC 4271 §6), so waiting for that close delivers the NOTIFICATION
+/// as such. A reader thread goes on reading the connection and reports its
+/// end, which is also what keeps unread data from turning our close into
+/// a reset.
+///
+/// NOTE(interop): FRR 8.4 reads the NOTIFICATION and the FIN in one pass
+/// of its I/O thread under load, queues the connection closing for its main
+/// thread and never processes the NOTIFICATION behind it: it keeps the
+/// routes for its restart time after a Hard Reset that came with the FIN.
+struct Linger {
+    id: ConnId,
+    stream: TcpStream,
+    until: Instant,
+}
+
 /// One neighbour's thread state.
 pub(crate) struct Peer {
     cfg: PeerConfig,
@@ -165,6 +210,15 @@ pub(crate) struct Peer {
     /// A second connection, tracked until its OPEN arrives (RFC 4271
     /// §8.2.2 OpenSent/OpenConfirm) and then resolved per §6.8.
     pending: Option<Conn>,
+    /// The connection of the session that just ended with a NOTIFICATION
+    /// of ours, while it waits for the neighbor to close it.
+    lingering: Option<Linger>,
+    /// An outgoing connection the FSM asked for while `lingering`: made
+    /// once the old connection is gone, so that the neighbor has dealt
+    /// with the old session when the new OPEN reaches it (RFC 4271 §6.8
+    /// would otherwise have it resolve a collision with a session that is
+    /// ending).
+    connect_waits: bool,
     next_conn: ConnId,
     attempt: u64,
     session: Option<Session>,
@@ -172,6 +226,9 @@ pub(crate) struct Peer {
     outbox: Receiver<Vec<Vec<u8>>>,
     outbox_state: Arc<Outbox>,
     prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
+    /// What the next OPEN says of a restart, kept by the FIB and RIB
+    /// threads (RFC 4724 §3).
+    restart: Arc<RestartState>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -182,7 +239,11 @@ pub(crate) struct Peer {
 
 /// Prepare a peer: its handle can go into the peer table before the
 /// thread runs (listeners bind and privileges drop in between).
-pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, Peer) {
+pub(crate) fn prepare(
+    cfg: PeerConfig,
+    rib: SyncSender<RibMsg>,
+    restart: Arc<RestartState>,
+) -> (PeerHandle, Peer) {
     let (tx, rx) = sync_channel(INPUT_QUEUE);
     // Unbounded in entries: send_updates bounds it by octets.
     let (outbox_tx, outbox) = channel();
@@ -204,6 +265,8 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         rib,
         conn: None,
         pending: None,
+        lingering: None,
+        connect_waits: false,
         next_conn: 1,
         attempt: 0,
         session: None,
@@ -211,6 +274,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         outbox,
         outbox_state: state,
         prefix_limit,
+        restart,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -234,12 +298,16 @@ impl Peer {
         self.event(Event::ManualStart, Instant::now());
         loop {
             let now = Instant::now();
-            let timeout = self
-                .fsm
-                .next_deadline()
-                .map_or(Duration::from_secs(60), |d| {
-                    d.saturating_duration_since(now)
-                });
+            let deadline = [
+                self.fsm.next_deadline(),
+                self.lingering.as_ref().map(|l| l.until),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let timeout = deadline.map_or(Duration::from_secs(60), |d| {
+                d.saturating_duration_since(now)
+            });
             match self.rx.recv_timeout(timeout) {
                 Ok(input) => {
                     if !self.input(input) {
@@ -250,6 +318,7 @@ impl Peer {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             let now = Instant::now();
+            self.expire_linger(now);
             // Every timer expiry either stops or restarts its timer, so a
             // handful of rounds drains them; the bound guards a bug.
             for _ in 0..8 {
@@ -264,6 +333,12 @@ impl Peer {
     /// Feed one event to the FSM and execute what it asks for.
     fn event(&mut self, event: Event, now: Instant) {
         let before = self.fsm.state();
+        if self.cfg.fsm.graceful_restart.is_some() && before != State::Established {
+            // RFC 4724 §3, §4.1: the OPEN this event may send says whether
+            // we have restarted and for which families the forwarding
+            // state has been preserved, as of now.
+            self.fsm.set_restart_advert(self.restart.advert());
+        }
         let number = event.number();
         let actions = self.fsm.handle(event, now);
         let after = self.fsm.state();
@@ -301,10 +376,19 @@ impl Peer {
     }
 
     fn apply(&mut self, actions: Vec<Action>, _now: Instant) {
+        // The session is over by the time the connection is dropped (the
+        // `SessionDown` action comes first), so whether the NOTIFICATION
+        // ends an Established session is settled here.
+        let was_up = self.session.is_some();
+        let mut notified = false;
         for action in actions {
             match action {
+                Action::Connect if self.lingering.is_some() => self.connect_waits = true,
                 Action::Connect => self.start_connect(),
-                Action::DropConnection => self.drop_conn(),
+                Action::DropConnection => {
+                    self.drop_conn(notified && was_up && self.lingers_after_notification());
+                    notified = false;
+                }
                 Action::RejectConnection => {}
                 Action::SendOpen(open) => {
                     #[cfg(feature = "profiling")]
@@ -321,22 +405,7 @@ impl Peer {
                     }
                 }
                 Action::SendKeepalive => self.write_raw(&KEEPALIVE),
-                Action::SendNotification(n) => {
-                    bgpfc_log::warn!(
-                        "sending notification",
-                        peer = self.cfg.addr,
-                        notification = n
-                    );
-                    let extended = self.session.as_ref().is_some_and(|s| s.extended_messages);
-                    match n.encode(extended) {
-                        Ok(body) => self.write_message(MessageType::Notification, &body),
-                        Err(e) => bgpfc_log::error!(
-                            "cannot encode NOTIFICATION",
-                            peer = self.cfg.addr,
-                            error = e
-                        ),
-                    }
-                }
+                Action::SendNotification(n) => notified |= self.send_notification(&n),
                 Action::SessionUp(session) => {
                     #[cfg(feature = "profiling")]
                     self.open_timer.established();
@@ -362,15 +431,22 @@ impl Peer {
                         peer: self.cfg.addr,
                         local_addr,
                         session,
+                        stale_time: self.cfg.stale_time,
+                        refresh_stale_time: self.cfg.refresh_stale_time,
                     });
                 }
-                Action::SessionDown => {
+                Action::SessionDown { retain } => {
                     #[cfg(feature = "profiling")]
                     bgpfc_prof::metrics::SESSIONS_DROPPED.inc();
-                    bgpfc_log::info!("session down", peer = self.cfg.addr);
+                    bgpfc_log::info!(
+                        "session down",
+                        peer = self.cfg.addr,
+                        routes_kept = retain.is_some()
+                    );
                     self.session = None;
                     self.rib_send(RibMsg::PeerDown {
                         peer: self.cfg.addr,
+                        retain,
                     });
                 }
                 Action::LogError(msg) => bgpfc_log::error!(msg, peer = self.cfg.addr),
@@ -387,6 +463,31 @@ impl Peer {
                         .and_then(|d| d.restart_limit)
                         .unwrap_or_default()
                 ),
+            }
+        }
+    }
+
+    /// Write a NOTIFICATION on the FSM's connection. Whether it was framed
+    /// and written.
+    fn send_notification(&mut self, n: &NotificationMessage) -> bool {
+        bgpfc_log::warn!(
+            "sending notification",
+            peer = self.cfg.addr,
+            notification = n
+        );
+        let extended = self.session.as_ref().is_some_and(|s| s.extended_messages);
+        match n.encode(extended) {
+            Ok(body) => {
+                self.write_message(MessageType::Notification, &body);
+                true
+            }
+            Err(e) => {
+                bgpfc_log::error!(
+                    "cannot encode NOTIFICATION",
+                    peer = self.cfg.addr,
+                    error = e
+                );
+                false
             }
         }
     }
@@ -424,6 +525,9 @@ impl Peer {
                     self.event(Event::TcpConnectionFails, now);
                 } else if self.pending.as_ref().is_some_and(|c| c.id == conn) {
                     self.pending = None;
+                } else if self.lingering.as_ref().is_some_and(|l| l.id == conn) {
+                    // The neighbor has read the NOTIFICATION and closed.
+                    self.end_linger();
                 }
             }
             // The outbox is written below, after every input.
@@ -434,13 +538,31 @@ impl Peer {
                 // Cease for it (Administrative Shutdown, Peer De-configured,
                 // Other Configuration Change). No failure of the peer, so
                 // nothing is damped or counted toward the restart limit.
-                self.event(Event::ManualStop(NotificationMessage::cease(subcode)), now);
-                self.drop_conn();
+                let cease = self.hard_if_suggested(NotificationMessage::cease(subcode));
+                self.event(Event::ManualStop(cease), now);
+                self.drop_conn(false);
+                self.finish_linger();
                 return false;
             }
-            PeerInput::Reset(message) => {
-                bgpfc_log::info!("session reset by operator", peer = self.cfg.addr);
-                for event in reset_events(message.as_deref()) {
+            PeerInput::Reset { message, hard } => {
+                // RFC 8538 §4: a Hard Reset goes only to a peer that sent
+                // the Graceful Notification bit ("SHOULD NOT" otherwise);
+                // any other NOTIFICATION ends the session the old way for
+                // a peer that did not, which is what a Hard Reset is for.
+                let hard_reset = hard && self.graceful_notification();
+                bgpfc_log::info!(
+                    "session reset by operator",
+                    peer = self.cfg.addr,
+                    hard_reset = hard_reset
+                );
+                if hard && !hard_reset {
+                    bgpfc_log::info!(
+                        "the neighbor did not exchange the graceful notification bit, so the \
+                         reset is the usual one",
+                        peer = self.cfg.addr
+                    );
+                }
+                for event in reset_events(message.as_deref(), hard_reset) {
                     self.event(event, now);
                 }
             }
@@ -465,12 +587,30 @@ impl Peer {
                     updates_out: self.updates_out,
                     admin_down: self.fsm.is_admin_down(),
                     restart_limit_reached: !self.fsm.automatic_start_allowed(),
+                    restart_time: self.cfg.fsm.graceful_restart.map(|g| g.restart_time),
                 });
             }
             PeerInput::PrefixLimit { family, limit } => self.prefix_limit(family, limit, now),
         }
         self.flags(now);
         true
+    }
+
+    /// Whether both sides set the Graceful Notification bit on this
+    /// session (RFC 8538 §2): a NOTIFICATION other than a Hard Reset leaves
+    /// the routes of both as stale ones.
+    fn graceful_notification(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(Session::peer_restart)
+            .is_some_and(|r| r.notification)
+    }
+
+    /// `cease` as RFC 8538 §5.1 suggests sending it: a Hard Reset
+    /// carrying it for the reasons that are no short-term matter, when the
+    /// peer exchanged the Graceful Notification bit.
+    fn hard_if_suggested(&self, cease: NotificationMessage) -> NotificationMessage {
+        suggested_hard_reset(cease, self.graceful_notification())
     }
 
     /// What the RIB thread flagged because the queue was full when it had
@@ -515,10 +655,9 @@ impl Peer {
         // AFI, SAFI and upper bound of Figure 1 as its data. The FSM goes
         // to Idle through AutomaticStop (RFC 4271 §8.2.2), damped, so the
         // restart-limit bounds a peer that keeps sending too much.
-        self.event(
-            Event::AutomaticStop(NotificationMessage::max_prefixes_reached(family, limit)),
-            now,
-        );
+        let cease =
+            self.hard_if_suggested(NotificationMessage::max_prefixes_reached(family, limit));
+        self.event(Event::AutomaticStop(cease), now);
     }
 
     /// RFC 2918 §4: ask for every negotiated family again, only if the
@@ -532,7 +671,7 @@ impl Peer {
             );
             return false;
         };
-        if !session.route_refresh {
+        if !session.route_refresh.peer_advertised() {
             bgpfc_log::warn!(
                 "route refresh: peer did not advertise the capability",
                 peer = self.cfg.addr
@@ -540,7 +679,7 @@ impl Peer {
             return false;
         }
         for family in &session.families {
-            let body = RouteRefreshMessage { family: *family }.encode();
+            let body = RouteRefreshMessage::request(*family).encode();
             self.write_message(MessageType::RouteRefresh, &body);
             bgpfc_log::info!("route refresh sent", peer = self.cfg.addr, family = family);
         }
@@ -559,7 +698,7 @@ impl Peer {
             State::Connect | State::Active => {
                 if self.conn.is_some() {
                     // Cannot happen: the FSM has no connection in these states.
-                    self.drop_conn();
+                    self.drop_conn(false);
                 }
                 self.conn = Some(self.new_conn(stream, initiator));
                 let event = match initiator {
@@ -571,6 +710,9 @@ impl Peer {
             // RFC 4271 §8.2.2 OpenSent/OpenConfirm: track the second
             // connection until an OPEN arrives on it.
             State::OpenSent | State::OpenConfirm => self.track_pending(stream, initiator),
+            State::Established if self.fsm.takes_over_on_connection() => {
+                self.take_over(stream, initiator, now);
+            }
             State::Established => {
                 if self.fsm.config().collision_detect_established {
                     self.track_pending(stream, initiator);
@@ -585,6 +727,30 @@ impl Peer {
                 }
             }
         }
+    }
+
+    /// RFC 4724 §4.2: a connection from a peer that advertised Graceful
+    /// Restart while its session is Established means it has restarted
+    /// and we have not noticed. "The previous TCP session MUST be closed,
+    /// and the new one retained", with no NOTIFICATION, and the routes of
+    /// the peer are kept. The FSM does that, ending in Connect (§5); the
+    /// event of the new connection is then fed again for it to go on.
+    fn take_over(&mut self, stream: TcpStream, initiator: Initiator, now: Instant) {
+        bgpfc_log::info!(
+            "connection from a restarted peer replaces the session",
+            peer = self.cfg.addr
+        );
+        // The pending second connection of RFC 4271 §6.8 is moot.
+        self.pending = None;
+        let new = self.new_conn(stream, initiator);
+        let event = match initiator {
+            Initiator::Local => Event::TcpCrAcked,
+            Initiator::Remote => Event::TcpConnectionConfirmed,
+        };
+        // Drops the old connection, which is `self.conn`, as an action.
+        self.event(event.clone(), now);
+        self.conn = Some(new);
+        self.event(event, now);
     }
 
     fn track_pending(&mut self, stream: TcpStream, initiator: Initiator) {
@@ -651,12 +817,78 @@ impl Peer {
         }
     }
 
-    fn drop_conn(&mut self) {
+    /// Close the FSM's connection, or with `linger` leave it open for the
+    /// neighbor to close first (see [`Linger`]).
+    fn drop_conn(&mut self, linger: bool) {
         #[cfg(feature = "profiling")]
         self.open_timer.reset();
-        if let Some(c) = self.conn.take() {
+        let Some(c) = self.conn.take() else {
+            return;
+        };
+        if linger && !self.write_failed {
+            // One at a time: an older one, still waiting, goes now.
+            if let Some(old) = self.lingering.take() {
+                let _ = old.stream.shutdown(Shutdown::Both);
+            }
+            self.lingering = Some(Linger {
+                id: c.id,
+                stream: c.stream,
+                until: Instant::now() + NOTIFICATION_LINGER,
+            });
+        } else {
             let _ = c.stream.shutdown(Shutdown::Both);
         }
+    }
+
+    /// Whether the connection of a session that ends with our NOTIFICATION
+    /// waits for the neighbor to close it. Only a neighbor with Graceful
+    /// Restart on can tell the NOTIFICATION from a failure of the
+    /// transport (RFC 4724 §4.2), and for the others the close is as
+    /// before.
+    fn lingers_after_notification(&self) -> bool {
+        self.cfg.fsm.graceful_restart.is_some()
+    }
+
+    /// Close the connection that waited for the neighbor, and make the
+    /// connection the FSM asked for meanwhile.
+    fn end_linger(&mut self) {
+        if let Some(l) = self.lingering.take() {
+            let _ = l.stream.shutdown(Shutdown::Both);
+        }
+        if std::mem::take(&mut self.connect_waits) && self.fsm.state() == State::Connect {
+            self.start_connect();
+        }
+    }
+
+    /// Close the connection that waited for the neighbor if the time is up.
+    fn expire_linger(&mut self, now: Instant) {
+        if self.lingering.as_ref().is_some_and(|l| l.until <= now) {
+            bgpfc_log::debug!(
+                "the neighbor did not close after the notification, closing",
+                peer = self.cfg.addr
+            );
+            self.end_linger();
+        }
+    }
+
+    /// Before the thread ends: give the neighbor the time to close, as
+    /// the thread would otherwise close the connection at once.
+    fn finish_linger(&mut self) {
+        while let Some(until) = self.lingering.as_ref().map(|l| l.until) {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(PeerInput::Closed { conn })
+                    if self.lingering.as_ref().is_some_and(|l| l.id == conn) =>
+                {
+                    break;
+                }
+                // The thread is ending; nothing else is of interest.
+                Ok(_) if !left.is_zero() => {}
+                _ => break,
+            }
+        }
+        self.connect_waits = false;
+        self.end_linger();
     }
 
     /// Write the UPDATEs waiting in the outbox, or drop them outside
@@ -747,29 +979,7 @@ impl Peer {
                 }
             }
             Ok(Inbound::Keepalive) => self.event(Event::KeepAliveMsg, now),
-            Ok(Inbound::RouteRefresh(r)) => {
-                let established = self.fsm.state() == State::Established;
-                self.event(Event::RouteRefreshMsg, now);
-                if established {
-                    let known = self
-                        .session
-                        .as_ref()
-                        .is_some_and(|s| s.families.contains(&r.family));
-                    if known {
-                        self.rib_send(RibMsg::RouteRefresh {
-                            peer: self.cfg.addr,
-                            family: r.family,
-                        });
-                    } else {
-                        // RFC 2918 §4: a family we did not advertise is ignored.
-                        bgpfc_log::debug!(
-                            "route refresh for unadvertised family",
-                            peer = self.cfg.addr,
-                            family = r.family
-                        );
-                    }
-                }
-            }
+            Ok(Inbound::RouteRefresh(body)) => self.route_refresh(&body, now),
             Err(e) => {
                 // RFC 4271 §8.1.5: event 22 for an OPEN that failed §6.2,
                 // event 21 for anything the header checks rejected.
@@ -779,6 +989,84 @@ impl Peer {
                     self.event(Event::BgpHeaderErr(e), now);
                 }
             }
+        }
+    }
+
+    /// A ROUTE-REFRESH. The RFC 7313 §3.2 Message Subtype is read only on a
+    /// session that negotiated Enhanced Route Refresh; on any other the
+    /// octet is the Reserved one of RFC 2918 §3, which the receiver ignores,
+    /// and the message is a request.
+    fn route_refresh(&mut self, body: &[u8], now: Instant) {
+        let established = self.fsm.state() == State::Established;
+        // RFC 7313 §5: the error for a wrong length is for a session with the
+        // capability, and carries the message as far as a NOTIFICATION to the
+        // peer can hold it.
+        let enhanced = established
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.route_refresh.enhanced());
+        let echo = self
+            .session
+            .as_ref()
+            .filter(|_| enhanced)
+            .map(|s| max_data_len(s.extended_messages));
+        let message = match RouteRefreshMessage::decode(body, echo) {
+            Ok(m) => m,
+            // RFC 7313 §5, or RFC 4271 §6.1 where it does not apply.
+            Err(e) => {
+                self.event(Event::BgpHeaderErr(e), now);
+                return;
+            }
+        };
+        self.event(Event::RouteRefreshMsg, now);
+        if !established {
+            return;
+        }
+        bgpfc_log::debug!(
+            "route refresh received",
+            peer = self.cfg.addr,
+            family = message.family,
+            subtype = message.subtype.to_u8(),
+            enhanced = enhanced
+        );
+        let family = message.family;
+        let subtype = if enhanced {
+            message.subtype
+        } else {
+            RefreshSubtype::Request
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        // RFC 2918 §4: a request for a family we did not negotiate is
+        // ignored. The brackets of the peer's own refresh are for the routes
+        // it sends, those of any family we advertised.
+        let known = match subtype {
+            RefreshSubtype::Request => session.families.contains(&family),
+            _ => session.receive_families.contains(&family),
+        };
+        if !known {
+            bgpfc_log::debug!(
+                "route refresh for unadvertised family",
+                peer = self.cfg.addr,
+                family = family
+            );
+            return;
+        }
+        let peer = self.cfg.addr;
+        match subtype {
+            RefreshSubtype::Request => self.rib_send(RibMsg::RouteRefresh { peer, family }),
+            RefreshSubtype::BeginOfRefresh => self.rib_send(RibMsg::RefreshBegin { peer, family }),
+            RefreshSubtype::EndOfRefresh => self.rib_send(RibMsg::RefreshEnd { peer, family }),
+            // RFC 7313 §5: "it MUST ignore the received ROUTE-REFRESH
+            // message. It SHOULD log an error for further analysis."
+            RefreshSubtype::Unknown(subtype) => bgpfc_log::error!(
+                "route refresh with an unknown message subtype ignored",
+                peer = peer,
+                family = family,
+                subtype = subtype
+            ),
         }
     }
 
@@ -836,6 +1124,21 @@ impl Peer {
                         use bgpfc_prof::metrics::{PREFIXES_ANNOUNCED, PREFIXES_WITHDRAWN};
                         PREFIXES_ANNOUNCED.add(decoded.announcements().count());
                         PREFIXES_WITHDRAWN.add(decoded.withdrawals().count());
+                    }
+                    // RFC 4724 §2: an UPDATE that announces and withdraws
+                    // nothing ends the initial update of a family. It
+                    // carries no routes, and the RIB wants it as what it
+                    // is. A damaged one (RFC 7606) is no marker.
+                    let marker = decoded.message.end_of_rib_family().filter(|_| {
+                        decoded.disabled.is_empty() && decoded.treated_as_withdraw.is_none()
+                    });
+                    if let Some(family) = marker {
+                        bgpfc_log::debug!("end-of-rib", peer = self.cfg.addr, family = family);
+                        self.rib_send(RibMsg::EndOfRib {
+                            peer: self.cfg.addr,
+                            family,
+                        });
+                        return;
                     }
                     self.rib_send(RibMsg::Update {
                         peer: self.cfg.addr,
@@ -899,17 +1202,49 @@ impl Peer {
 
 /// What the FSM is fed for `bgpfcctl clear neighbor`: a `ManualStop` with
 /// RFC 4486 §4 Administrative Reset, carrying the RFC 9003 communication
-/// when one was given, then a `ManualStart`. The stop is the operator's,
-/// not a failure of the peer, so it is neither damped nor counted toward
-/// the restart limit, and the start is the "administrative intervention"
-/// that ends a run of failures (RFC 4486 §4).
-fn reset_events(message: Option<&str>) -> [Event; 2] {
+/// when one was given, then a `ManualStart`. With `hard_reset` the Cease is
+/// the data of a Hard Reset (RFC 8538 §3.1, §5.2), which has both sides
+/// delete the other's routes instead of keeping them as stale ones. The stop
+/// is the operator's, not a failure of the peer, so it is neither damped nor
+/// counted toward the restart limit, and the start is the "administrative
+/// intervention" that ends a run of failures (RFC 4486 §4).
+fn reset_events(message: Option<&str>, hard_reset: bool) -> [Event; 2] {
     let cease = match message {
         Some(m) => NotificationMessage::shutdown(CeaseSubcode::AdministrativeReset, m)
             .unwrap_or_else(|_| NotificationMessage::cease(CeaseSubcode::AdministrativeReset)),
         None => NotificationMessage::cease(CeaseSubcode::AdministrativeReset),
     };
+    let cease = if hard_reset {
+        NotificationMessage::hard_reset(&cease)
+    } else {
+        cease
+    };
     [Event::ManualStop(cease), Event::ManualStart]
+}
+
+/// `cease` wrapped in a Hard Reset where RFC 8538 §5.1 suggests one and
+/// `exchanged` says the peer can read it: Maximum Number of Prefixes
+/// Reached, Administrative Shutdown and Peer De-configured end a session
+/// for good, or for long, so "there is no realistic hope that forwarding
+/// can continue or that the session will be re-established within the
+/// deadline". The others (Other Configuration Change, Collision
+/// Resolution, Out of Resources, Administrative Reset) stay graceful
+/// Ceases; Administrative Reset is the operator's choice.
+fn suggested_hard_reset(cease: NotificationMessage, exchanged: bool) -> NotificationMessage {
+    let hard = exchanged
+        && cease.code == ErrorCode::Cease
+        && [
+            CeaseSubcode::MaxPrefixesReached,
+            CeaseSubcode::AdministrativeShutdown,
+            CeaseSubcode::PeerDeconfigured,
+        ]
+        .iter()
+        .any(|s| *s as u8 == cease.subcode);
+    if hard {
+        NotificationMessage::hard_reset(&cease)
+    } else {
+        cease
+    }
 }
 
 /// What the FSM is fed when the connection it runs on loses a collision
@@ -953,12 +1288,16 @@ fn decode_context(session: Option<&Session>, allow_as_set: bool) -> DecodeContex
             extended_next_hop: s
                 .extended_next_hop_receive
                 .contains(&AddressFamily::IPV4_UNICAST),
+            // RFC 7911 §5: the peer sends Path Identifiers for the
+            // families we advertised Receive for and it advertised Send.
+            add_path: bgpfc_wire::update::AddPathFamilies::of(&s.add_path_receive),
         },
         None => DecodeContext {
             four_octet_as: false,
             peer: PeerKind::External,
             allow_as_set,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         },
     }
 }
@@ -1074,7 +1413,7 @@ mod tests {
             fsm.handle(Event::ManualStart, now);
             fsm.handle(Event::TcpCrAcked, now);
             assert_eq!(fsm.state(), State::OpenSent);
-            let actions: Vec<Action> = reset_events(message)
+            let actions: Vec<Action> = reset_events(message, false)
                 .into_iter()
                 .flat_map(|e| fsm.handle(e, now))
                 .collect();
@@ -1106,6 +1445,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hard_clear_carries_the_reset_in_a_hard_reset() {
+        // RFC 8538 §3.1: the Hard Reset encapsulates the NOTIFICATION that
+        // says why; §5.2: a Shutdown Communication goes inside, with the
+        // Administrative Reset.
+        let [stop, start] = reset_events(Some("maintenance"), true);
+        let Event::ManualStop(n) = stop else {
+            panic!("{stop:?}");
+        };
+        assert!(n.is_hard_reset());
+        let inner = n.hard_reset_inner().unwrap();
+        assert_eq!(
+            (inner.code, inner.subcode),
+            (ErrorCode::Cease, CeaseSubcode::AdministrativeReset as u8)
+        );
+        assert_eq!(
+            n.shutdown_communication().and_then(Result::ok),
+            Some("maintenance")
+        );
+        assert_eq!(start, Event::ManualStart);
+        let [stop, _] = reset_events(None, true);
+        assert!(matches!(stop, Event::ManualStop(n) if n.is_hard_reset()));
+    }
+
+    #[test]
+    fn hard_resets_are_suggested_for_the_reasons_rfc_8538_gives() {
+        // RFC 8538 §5.1, the table: Hard Reset for Maximum Number of
+        // Prefixes Reached, Administrative Shutdown and Peer De-configured,
+        // a graceful Cease for the others.
+        for (subcode, hard) in [
+            (CeaseSubcode::MaxPrefixesReached, true),
+            (CeaseSubcode::AdministrativeShutdown, true),
+            (CeaseSubcode::PeerDeconfigured, true),
+            (CeaseSubcode::AdministrativeReset, false),
+            (CeaseSubcode::ConnectionRejected, false),
+            (CeaseSubcode::OtherConfigurationChange, false),
+            (CeaseSubcode::ConnectionCollisionResolution, false),
+            (CeaseSubcode::OutOfResources, false),
+        ] {
+            let cease = NotificationMessage::cease(subcode);
+            let sent = suggested_hard_reset(cease.clone(), true);
+            assert_eq!(sent.is_hard_reset(), hard, "{subcode:?}");
+            if hard {
+                assert_eq!(sent.hard_reset_inner(), Some(cease.clone()));
+            } else {
+                assert_eq!(sent, cease);
+            }
+            // RFC 8538 §4: a peer that did not send the bit gets the
+            // Cease as it was, which ends the session for it all the same.
+            assert_eq!(suggested_hard_reset(cease.clone(), false), cease);
+        }
+        // The data of a Maximum Number of Prefixes Reached goes along.
+        let max = NotificationMessage::max_prefixes_reached(AddressFamily::IPV4_UNICAST, 9);
+        assert_eq!(
+            suggested_hard_reset(max.clone(), true).hard_reset_inner(),
+            Some(max)
+        );
+        // No other code, and no Hard Reset already, is touched.
+        let hold = NotificationMessage::hold_timer_expired();
+        assert_eq!(suggested_hard_reset(hold.clone(), true), hold);
+        let already = NotificationMessage::hard_reset(&NotificationMessage::cease(
+            CeaseSubcode::AdministrativeShutdown,
+        ));
+        assert_eq!(suggested_hard_reset(already.clone(), true), already);
+    }
+
     /// The session an FSM advertising `ours` negotiates with a peer
     /// advertising `theirs`.
     fn negotiated(ours: Vec<Capability>, theirs: Vec<Capability>) -> Session {
@@ -1124,6 +1529,382 @@ mod tests {
         );
         fsm.handle(Event::BgpOpen(open), now);
         fsm.session().cloned().unwrap()
+    }
+
+    /// A peer thread's state, not running, whose neighbor is `listener`.
+    fn idle_peer(graceful_restart: bool) -> (Peer, std::net::TcpListener) {
+        use bgpfc_wire::types::{Asn, RestartTime, RouterId};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        if graceful_restart {
+            fsm.graceful_restart = Some(bgpfc_fsm::GracefulRestart {
+                restart_time: RestartTime::new(120).unwrap(),
+            });
+        }
+        let cfg = PeerConfig {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+            stale_time: None,
+            refresh_stale_time: None,
+        };
+        let (rib, _) = sync_channel(4);
+        let (_, peer) = prepare(cfg, rib, Arc::default());
+        (peer, listener)
+    }
+
+    /// Give `peer` a connection to `listener` as the FSM's, with the
+    /// neighbor's end of it.
+    fn connect(peer: &mut Peer, listener: &std::net::TcpListener) -> (ConnId, TcpStream) {
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (theirs, _) = listener.accept().unwrap();
+        let conn = peer.new_conn(ours, Initiator::Local);
+        let id = conn.id;
+        peer.conn = Some(conn);
+        (id, theirs)
+    }
+
+    /// Whether `theirs` has been closed by the other end (EOF or reset)
+    /// within `wait`, whatever was sent before.
+    fn closed_within(theirs: &mut TcpStream, wait: Duration) -> bool {
+        use std::io::Read;
+        theirs.set_read_timeout(Some(wait)).unwrap();
+        loop {
+            match theirs.read(&mut [0; 64]) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) => {
+                    return !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lingering_connection_stays_open_until_the_neighbor_closes_it() {
+        let (mut peer, listener) = idle_peer(true);
+        let (id, mut theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        assert!(peer.conn.is_none());
+        assert!(peer.lingering.as_ref().is_some_and(|l| l.id == id));
+        assert!(!closed_within(&mut theirs, Duration::from_millis(200)));
+        // The reader thread reports the neighbor's close, which ends the
+        // wait, and the connection goes with it.
+        drop(theirs);
+        let closed = peer.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(closed, PeerInput::Closed { conn } if conn == id));
+        assert!(peer.input(closed));
+        assert!(peer.lingering.is_none());
+    }
+
+    #[test]
+    fn a_lingering_connection_is_closed_when_its_time_is_up() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, mut theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        let until = peer.lingering.as_ref().unwrap().until;
+        peer.expire_linger(Instant::now());
+        assert!(peer.lingering.is_some());
+        assert!(!closed_within(&mut theirs, Duration::from_millis(100)));
+        peer.expire_linger(until);
+        assert!(peer.lingering.is_none());
+        assert!(closed_within(&mut theirs, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_connection_is_made_after_the_lingering_one_is_gone() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, _theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        // RFC 4271 §8.2.2: the start brings the FSM to Connect and asks for
+        // a connection, which waits for the neighbor to close the old one.
+        peer.event(Event::ManualStart, Instant::now());
+        assert_eq!(peer.fsm.state(), State::Connect);
+        assert!(peer.connect_waits);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err());
+        peer.end_linger();
+        assert!(!peer.connect_waits);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.accept().is_err() {
+            assert!(Instant::now() < deadline, "no connection was made");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn no_connection_is_made_after_the_fsm_has_gone_idle() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, _theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        peer.event(Event::ManualStart, Instant::now());
+        let stop = NotificationMessage::cease(CeaseSubcode::AdministrativeShutdown);
+        peer.event(Event::ManualStop(stop), Instant::now());
+        assert_eq!(peer.fsm.state(), State::Idle);
+        assert!(peer.connect_waits);
+        peer.end_linger();
+        assert!(!peer.connect_waits);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn only_a_notification_that_ends_an_established_session_of_a_gr_neighbor_lingers() {
+        use bgpfc_wire::capability::Capability;
+        let session = negotiated(
+            vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)],
+            vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)],
+        );
+        let stop = || NotificationMessage::cease(CeaseSubcode::AdministrativeReset);
+        // (graceful restart on, session up, NOTIFICATION sent, lingers)
+        for (gr, up, notified, lingers) in [
+            (true, true, true, true),
+            // RFC 4724 §4.2: without the capability a NOTIFICATION and a
+            // failure of the transport are the same to the neighbor.
+            (false, true, true, false),
+            // Nothing is kept of a session that never came up.
+            (true, false, true, false),
+            // A failure of the transport has no NOTIFICATION to deliver.
+            (true, true, false, false),
+        ] {
+            let (mut peer, listener) = idle_peer(gr);
+            let (_, mut theirs) = connect(&mut peer, &listener);
+            peer.session = up.then(|| session.clone());
+            let mut actions = Vec::new();
+            if notified {
+                actions.push(Action::SendNotification(stop()));
+            }
+            actions.push(Action::SessionDown { retain: None });
+            actions.push(Action::DropConnection);
+            peer.apply(actions, Instant::now());
+            let case = (gr, up, notified);
+            assert_eq!(peer.lingering.is_some(), lingers, "{case:?}");
+            assert_eq!(
+                closed_within(&mut theirs, Duration::from_millis(200)),
+                !lingers,
+                "{case:?}"
+            );
+        }
+    }
+
+    /// A peer thread with its session Established, whatever `ours` and
+    /// `theirs` advertise, the RIB messages it sent so far read, and the
+    /// neighbor's end of the connection.
+    fn established(
+        ours: &[Capability],
+        theirs: &[Capability],
+    ) -> (Peer, Receiver<RibMsg>, TcpStream) {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        fsm.capabilities = ours.to_vec();
+        let cfg = PeerConfig {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+            stale_time: None,
+            refresh_stale_time: None,
+        };
+        let (rib_tx, rib) = sync_channel(16);
+        let (_, mut peer) = prepare(cfg, rib_tx, Arc::default());
+        let (_, stream) = connect(&mut peer, &listener);
+        let now = Instant::now();
+        peer.event(Event::ManualStart, now);
+        peer.event(Event::TcpCrAcked, now);
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            theirs.to_vec(),
+        );
+        peer.event(Event::BgpOpen(open), now);
+        peer.event(Event::KeepAliveMsg, now);
+        assert_eq!(peer.fsm.state(), State::Established);
+        assert!(matches!(rib.try_recv(), Ok(RibMsg::PeerUp { .. })));
+        (peer, rib, stream)
+    }
+
+    /// The messages `theirs` has been sent, as (type, body), read until the
+    /// connection is quiet or closed.
+    fn received(theirs: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        use std::io::Read;
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut all = Vec::new();
+        loop {
+            let mut header = [0u8; 19];
+            if theirs.read_exact(&mut header).is_err() {
+                return all;
+            }
+            let mut body = vec![0; usize::from(u16::from_be_bytes([header[16], header[17]])) - 19];
+            if theirs.read_exact(&mut body).is_err() {
+                return all;
+            }
+            all.push((header[18], body));
+        }
+    }
+
+    fn refresh_caps(enhanced: bool) -> Vec<Capability> {
+        let mut caps = vec![
+            Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+            Capability::RouteRefresh,
+        ];
+        if enhanced {
+            caps.push(Capability::EnhancedRouteRefresh);
+        }
+        caps
+    }
+
+    #[test]
+    fn the_subtypes_of_a_route_refresh_reach_the_rib_when_both_sides_have_the_capability() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let caps = refresh_caps(true);
+        let (mut peer, rib, _theirs) = established(&caps, &caps);
+        assert!(peer.session.as_ref().unwrap().route_refresh.enhanced());
+        let now = Instant::now();
+        let mut sent = |body: &[u8]| {
+            peer.primary_message(Ok(Inbound::RouteRefresh(body.to_vec())), now);
+            rib.try_iter().collect::<Vec<_>>()
+        };
+        // RFC 7313 §3.2: 0 request, 1 BoRR, 2 EoRR.
+        assert!(matches!(
+            sent(&[0, 1, 0, 1])[..],
+            [RibMsg::RouteRefresh { family, .. }] if family == v4
+        ));
+        assert!(matches!(
+            sent(&[0, 1, 1, 1])[..],
+            [RibMsg::RefreshBegin { family, .. }] if family == v4
+        ));
+        assert!(matches!(
+            sent(&[0, 1, 2, 1])[..],
+            [RibMsg::RefreshEnd { family, .. }] if family == v4
+        ));
+        // RFC 7313 §5: any other subtype is ignored (and logged), and the
+        // session goes on.
+        for subtype in [3, 100, 255] {
+            assert!(sent(&[0, 1, subtype, 1]).is_empty());
+        }
+        // RFC 2918 §4: a request for a family we did not negotiate, and the
+        // brackets of one we do not take routes of, are ignored.
+        for subtype in [0, 1, 2] {
+            assert!(sent(&[0, 2, subtype, 1]).is_empty());
+        }
+        assert_eq!(peer.fsm.state(), State::Established);
+    }
+
+    #[test]
+    fn without_the_capability_on_both_sides_the_subtype_is_ignored_and_it_is_a_request() {
+        // RFC 2918 §3: the receiver ignores the Reserved octet.
+        for (ours, theirs) in [
+            (refresh_caps(true), refresh_caps(false)),
+            (refresh_caps(false), refresh_caps(true)),
+            (refresh_caps(false), refresh_caps(false)),
+        ] {
+            let (mut peer, rib, _theirs) = established(&ours, &theirs);
+            assert!(!peer.session.as_ref().unwrap().route_refresh.enhanced());
+            for subtype in [0, 1, 2, 77] {
+                peer.primary_message(
+                    Ok(Inbound::RouteRefresh(vec![0, 1, subtype, 1])),
+                    Instant::now(),
+                );
+                assert!(
+                    matches!(
+                        rib.try_iter().collect::<Vec<_>>()[..],
+                        [RibMsg::RouteRefresh { .. }]
+                    ),
+                    "subtype {subtype}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_borr_or_eorr_of_the_wrong_length_is_answered_with_a_route_refresh_message_error() {
+        let caps = refresh_caps(true);
+        for subtype in [1u8, 2] {
+            let (mut peer, rib, mut theirs) = established(&caps, &caps);
+            let body = vec![0, 1, subtype, 1, 0];
+            peer.primary_message(Ok(Inbound::RouteRefresh(body.clone())), Instant::now());
+            // RFC 7313 §5: code 7, subcode 1, "the complete ROUTE-REFRESH
+            // message" as data, and the session ends.
+            let notification = received(&mut theirs)
+                .into_iter()
+                .find(|(kind, _)| *kind == 3)
+                .expect("a NOTIFICATION")
+                .1;
+            let mut whole = vec![0xff; 16];
+            whole.extend_from_slice(&[0, 24, 5]);
+            whole.extend_from_slice(&body);
+            assert_eq!(notification[..2], [7, 1]);
+            assert_eq!(notification[2..], whole[..]);
+            assert_ne!(peer.fsm.state(), State::Established);
+            assert!(matches!(
+                rib.try_iter().collect::<Vec<_>>()[..],
+                [RibMsg::PeerDown { .. }]
+            ));
+        }
+        // A request of the wrong length, or the same where the capability is
+        // not in use, is the header error it always was.
+        for (caps, body) in [
+            (refresh_caps(true), vec![0, 1, 0, 1, 0]),
+            (refresh_caps(false), vec![0, 1, 1, 1, 0]),
+        ] {
+            let (mut peer, _rib, mut theirs) = established(&caps, &caps);
+            peer.primary_message(Ok(Inbound::RouteRefresh(body)), Instant::now());
+            let notification = received(&mut theirs)
+                .into_iter()
+                .find(|(kind, _)| *kind == 3)
+                .expect("a NOTIFICATION")
+                .1;
+            // Message Header Error / Bad Message Length, with the Length
+            // field as data.
+            assert_eq!(notification, [1, 2, 0, 24]);
+        }
+    }
+
+    #[test]
+    fn path_identifiers_are_decoded_where_we_receive_them_and_only_there() {
+        // RFC 7911 §5: for IPv4 unicast both sides agreed, so the NLRI
+        // field carries an identifier before each prefix; for IPv6 unicast
+        // the peer advertised Send but we never advertised Receive.
+        use bgpfc_wire::capability::{AddPathMode, AddPathTuple};
+        use bgpfc_wire::types::PathId;
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let tuple = |family, mode| AddPathTuple { family, mode };
+        let ours = vec![
+            Capability::Multiprotocol(v4),
+            Capability::Multiprotocol(v6),
+            Capability::AddPath(vec![tuple(v4, AddPathMode::Receive)]),
+        ];
+        let theirs = vec![
+            Capability::Multiprotocol(v4),
+            Capability::Multiprotocol(v6),
+            Capability::AddPath(vec![
+                tuple(v4, AddPathMode::Send),
+                tuple(v6, AddPathMode::Send),
+            ]),
+        ];
+        let s = negotiated(ours, theirs);
+        assert_eq!(s.add_path_receive, vec![v4]);
+        let ctx = decode_context(Some(&s), false);
+        assert!(ctx.add_path.contains(v4));
+        assert!(!ctx.add_path.contains(v6));
+        // Before the session is up there are none.
+        assert!(decode_context(None, false).add_path.is_empty());
+        // 0 attributes, NLRI: id 7, 192.0.2.0/24.
+        let body = [0, 0, 0, 0, 0, 0, 0, 7, 24, 192, 0, 2];
+        let d = UpdateMessage::decode(&body, &ctx).unwrap();
+        assert_eq!(d.message.nlri, vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(d.message.path_ids.unwrap().nlri, vec![PathId(7)]);
     }
 
     #[test]
@@ -1151,12 +1932,14 @@ mod tests {
             ext_communities: Box::default(),
             large_communities: Box::default(),
             unknown: Box::default(),
+            otc: None,
         };
         let body = attrs
             .to_update(v4, vec!["192.0.2.0/24".parse().unwrap()])
             .encode(&EncodeContext {
                 four_octet_as: true,
                 extended_next_hop: true,
+                add_path: bgpfc_wire::update::AddPathFamilies::NONE,
             })
             .unwrap();
         let decode = |s: &Session| UpdateMessage::decode(&body, &decode_context(Some(s), false));

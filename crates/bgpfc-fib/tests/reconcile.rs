@@ -11,6 +11,7 @@ use bgpfc_fib::netlink::HEADER_LEN;
 use bgpfc_fib::reconcile::{Merge, Op, Routes, Table, apply, plan};
 use bgpfc_fib::route::{RT_TABLE_MAIN, RTPROT_BGP, RouteMsg};
 use bgpfc_wire::prefix::Prefix;
+use bgpfc_wire::types::Afi;
 use proptest::prelude::*;
 
 /// A gateway for an IPv4 route: IPv4, or IPv6 under RFC 8950 §3, so that a
@@ -109,6 +110,73 @@ proptest! {
         }
         prop_assert_eq!(r.gateways(), 0);
         prop_assert!(r.is_empty());
+    }
+}
+
+proptest! {
+    /// A reconcile of one family, cut in any places, plans what `plan`
+    /// plans for that family's routes alone and leaves the other family
+    /// as it is (RFC 4724 §4.1 ends the wait family by family); the two
+    /// families together give the operations of the whole table.
+    #[test]
+    fn a_family_merge_touches_only_its_family(
+        desired in table(),
+        installed in table(),
+        v6 in any::<bool>(),
+        cut in 0usize..12,
+    ) {
+        let afi = if v6 { Afi::Ipv6 } else { Afi::Ipv4 };
+        let of = |t: &Table, afi: Afi| -> Table {
+            t.iter().filter(|(p, _)| p.afi() == afi).map(|(p, g)| (*p, *g)).collect()
+        };
+        let mut r = Routes::new();
+        r.set_installed(&installed);
+        prop_assert_eq!(r.count(Afi::Ipv4), of(&installed, Afi::Ipv4).len());
+        prop_assert_eq!(r.count(Afi::Ipv6), of(&installed, Afi::Ipv6).len());
+        let want: Vec<(Prefix, IpAddr)> =
+            of(&desired, afi).into_iter().collect();
+        let cut = cut.min(want.len());
+        let mut merge = Merge::of(afi);
+        let mut ops = Vec::new();
+        r.merge(&mut merge, &want[..cut], &mut ops);
+        r.merge(&mut merge, &want[cut..], &mut ops);
+        r.merge_end(merge, &mut ops);
+        let mut expected = plan(&of(&desired, afi), &of(&installed, afi));
+        expected.sort_by_key(prefix);
+        prop_assert_eq!(&ops, &expected);
+        for op in &ops {
+            r.apply(op);
+        }
+        prop_assert_eq!(of(&r.installed_table(), afi), of(&desired, afi));
+        let other = if v6 { Afi::Ipv4 } else { Afi::Ipv6 };
+        prop_assert_eq!(of(&r.installed_table(), other), of(&installed, other));
+    }
+
+    /// Removing every family but the ones kept leaves exactly those.
+    #[test]
+    fn deleting_all_but_the_kept_families_keeps_them(
+        installed in table(),
+        keep4 in any::<bool>(),
+        keep6 in any::<bool>(),
+    ) {
+        let keep: Vec<Afi> = [(keep4, Afi::Ipv4), (keep6, Afi::Ipv6)]
+            .into_iter()
+            .filter_map(|(k, a)| k.then_some(a))
+            .collect();
+        let mut r = Routes::new();
+        r.set_installed(&installed);
+        let ops = r.delete_except(&keep);
+        prop_assert!(ops.is_sorted_by_key(prefix));
+        for op in &ops {
+            prop_assert!(!keep.contains(&prefix(op).afi()));
+            r.apply(op);
+        }
+        let left: Table = installed
+            .iter()
+            .filter(|(p, _)| keep.contains(&p.afi()))
+            .map(|(p, g)| (*p, *g))
+            .collect();
+        prop_assert_eq!(r.installed_table(), left);
     }
 }
 

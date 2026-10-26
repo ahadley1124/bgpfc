@@ -28,15 +28,15 @@ failure, 2 on a usage error.
 
 | Command | Effect |
 |---|---|
-| `show status` | version, local AS, router ID, neighbor counts, FIB mode |
+| `show status` | version, local AS, router ID, neighbor counts, FIB mode, and the families whose route selection waits for End-of-RIB markers after a restart (see [Graceful Restart](#graceful-restart)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
+| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities (Route Refresh, and Enhanced Route Refresh where both sides advertised it, RFC 7313), families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), whether the `restart-limit` left the neighbor Idle (RFC 4486 §4), and, for a neighbor with `graceful-restart yes`, what it advertised and the stale routes kept from it (see [Graceful Restart](#graceful-restart)), and the route refresh the neighbor has begun and not ended (see [Enhanced Route Refresh](#enhanced-route-refresh)) |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`, then the routes the Adj-RIB-In holds for it that are no candidate, marked `held` (see [Validation state](#validation-state)); each route with its origin validation state (`rov`); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; a route with the Only to Customer attribute has `otc ASN` next (see [Only to Customer](#only-to-customer)), then `held` where it is held; and a route kept from a session that ended, or one a route refresh of the neighbor has not sent again yet, ends in `stale` (see [Graceful Restart](#graceful-restart), [Enhanced Route Refresh](#enhanced-route-refresh)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
-| `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
+| `show rpki` | the `rpki` mode, the cache list with the cache in use, where the RTR client stands with it, and, with `mode sidecar`, the Routinator bgpfcd runs (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
-| `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
-| `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
+| `clear neighbor ADDR [soft\|hard-reset]` | without a keyword, a session reset: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle. Where the neighbor and bgpfcd exchanged the Graceful Notification bit, it is a graceful reset: both keep the other's routes as stale ones (RFC 8538 §4). `soft`: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out, which with Enhanced Route Refresh negotiated is bracketed by a BoRR and an EoRR per family (RFC 7313 §4); refused if the peer did not advertise the capability. `hard-reset`: the Administrative Reset inside a Cease / Hard Reset (RFC 8538 §3, §5.2), so that both sides delete the other's routes at once; to a neighbor that did not send the Graceful Notification bit it is the plain reset, which ends the session the same way (RFC 8538 §4) |
+| `clear neighbor ADDR [hard-reset] MESSAGE` | a reset carrying a Shutdown Communication (RFC 9003; with `hard-reset`, inside the Hard Reset, RFC 8538 §5.2); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
 | `fib mode dry-run\|install` | switch the FIB mode at runtime; switching to install performs a full reconcile |
 | `stats` | profiling builds only (`docs/PROFILING.md`): the report line of counters, histograms and memory. Not served over HTTP. |
@@ -83,13 +83,14 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/rpki` | `show rpki` |
 | `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
 | `POST /v1/reload` | `reload` |
-| `POST /v1/neighbors/{addr}/clear[?soft=1][&message=TEXT]` | `clear neighbor` |
+| `POST /v1/neighbors/{addr}/clear[?soft=1\|hard=1][&message=TEXT]` | `clear neighbor` (`400` for `soft` with `hard`, or with a message) |
 | `POST /v1/fib/mode/install`, `POST /v1/fib/mode/dry-run` | `fib mode` |
 
 Example objects:
 
 ```json
-{"version":"0.1.0","local_as":65000,"router_id":"192.0.2.1","neighbors":2,"established":2,"fib_mode":"dry-run"}
+{"version":"0.1.0","local_as":65000,"router_id":"192.0.2.1","neighbors":2,"established":2,"fib_mode":"dry-run",
+ "graceful_restart":{"deferred":[]}}
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
@@ -98,16 +99,21 @@ Example objects:
               {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
+             "enhanced_route_refresh":true,
+             "role":{"local":"customer","remote":"provider"},
              "families":["ipv4-unicast","ipv6-unicast"],
-             "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
+             "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]},
+             "add_path":{"receive":["ipv4-unicast"],
+                         "send":[{"family":"ipv4-unicast","paths":"all"}]}},
+  "graceful_restart":null,"refreshing":[]}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","best":true,"rov":"disabled","as_path":[64511],"communities":[],
-  "large_communities":[]}]
+  "otc":64511,"peer":"198.51.100.1","path_id":7,"best":true,"held":false,"stale":false,
+  "rov":"disabled","as_path":[64511],"communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
-{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
+{"mode":"external","invalid":"drop","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
  "current":true}],"running":true,"state":"idle","connected":true,"version":1,"session_id":4242,
  "serial":17,"synced_seconds_ago":12,"expires_in_seconds":7188,
  "vrps":{"ipv4":512340,"ipv6":121877,"from":{"host":"127.0.0.1","port":3323}},
@@ -116,6 +122,137 @@ Example objects:
 {"prefix":"192.0.2.0/24","origin":64496,"rov":"valid",
  "vrps":[{"prefix":"192.0.2.0/24","max_length":24,"asn":64496,"matches":true}]}
 ```
+
+## Path identifiers
+
+With ADD-PATH (RFC 7911, `add-path` in `docs/config.md`) a neighbor can
+have several routes to one prefix. Each route that came with a Path
+Identifier shows it: `show routes PREFIX` has `id N` after the neighbor
+(before any `otc N`), and `GET /v1/routes` has a `path_id` member, a
+number that is absent for a route from a neighbor, or of a family,
+without ADD-PATH. Zero is an
+identifier like any other (RFC 7911 §3), so `"path_id":0` and `id 0`
+name a path. The identifier is the neighbor's own: it is what the
+neighbor numbered its path with, and means nothing to another neighbor.
+The routes bgpfcd sends are numbered by bgpfcd (RFC 7911 §5); they are
+not listed here, which shows the Loc-RIB and its candidates. Without a
+prefix, `show routes` lists the best route of each prefix, with the
+identifier of that path.
+
+`show neighbor` and `GET /v1/neighbors/{addr}` have the ADD-PATH families
+the session negotiated. In the text, `add-path receive FAMILIES send
+FAMILY=PATHS ...` where `PATHS` is `all` or a number; in JSON,
+`add_path.receive`, a list of families, and `add_path.send`, a list of
+`{"family": ..., "paths": "all" | N}`. A session without ADD-PATH has no
+such line, and empty lists. The `advertised` counts of a neighbor that is
+sent several paths count paths, not prefixes.
+
+## Graceful Restart
+
+A neighbor with `graceful-restart yes` (`docs/config.md`) has its routes
+kept when its session ends in the ways RFC 4724 §4.2 and RFC 8538 §4 name:
+a TCP failure, a Hold Timer or Send Hold Timer expiry, and, where both sides
+sent the Graceful Notification bit, any NOTIFICATION but a Hard Reset. Such a
+route is **stale**: it is in the Loc-RIB, the FIB and what other neighbors
+were told, and nothing differs for forwarding (RFC 4724 §4.2); `show routes`
+ends its line in `stale` and `GET /v1/routes` has `"stale":true`, and `show
+neighbor` has these lines (`GET /v1/neighbors/{addr}` has them as
+`graceful_restart`, `null` without `graceful-restart yes`):
+
+```
+  graceful-restart restart-time 120s, advertised with the Graceful Notification bit
+  graceful-restart neighbor restart-time 90s notification yes restarting no forwarding ipv4-unicast without ipv6-unicast
+  stale routes ipv4-unicast=1200; awaiting end-of-rib ipv4-unicast; session due back in 98s
+```
+
+The first is our Restart Time. The second is what the neighbor's
+capability said, while its session is up: its Restart Time, whether it
+sent the Graceful Notification bit and the Restart State bit, and the
+families it set the Forwarding State bit for and those it did not. The
+third is there while routes are stale: how many per family, the families
+whose End-of-RIB marker is still awaited, and the timers. `session due
+back in` runs while the session is down: when it ends the routes go (the
+Restart Time the neighbor advertised, RFC 4724 §4.2). `stale timer` runs
+from the first session that is back until all End-of-RIB markers are in
+(`stale-time`, RFC 8538 §4.1). In JSON:
+
+```json
+"graceful_restart":{"restart_time":120,
+  "neighbor":{"restart_time":90,"restarting":false,"notification":true,
+              "families":[{"family":"ipv4-unicast","forwarding":true},
+                          {"family":"ipv6-unicast","forwarding":false}]},
+  "stale":{"session_down":false,"restart_timer_seconds":null,"stale_timer_seconds":340,
+           "awaiting_end_of_rib":["ipv4-unicast"],
+           "routes":[{"family":"ipv4-unicast","routes":1200}]}}
+```
+
+`neighbor` is `null` while the session is down or the neighbor sent no
+capability, and `stale` is `null` when no route of the neighbor is stale.
+
+A stale route is still in the Adj-RIB-In, so it is judged again like any
+other when the VRPs or the `invalid` statement change (see [Validation
+state](#validation-state)): under `invalid drop` one that turns `invalid`
+is held, out of the Loc-RIB, the kernel's table and what other neighbors
+were told, and `show routes PREFIX` ends its line in `held stale`. The
+End-of-RIB marker and the timers end it as they end the other stale routes.
+
+After a restart of bgpfcd itself with forwarding state kept (`docs/config.md`,
+"Graceful Restart"), route selection waits for the End-of-RIB markers of the
+neighbors that can send the routes again (RFC 4724 §4.1), and `show status`
+says so, one line for each family, and `GET /v1/status` in
+`graceful_restart.deferred`:
+
+```
+graceful restart: route selection for ipv4-unicast waits for 2 neighbors to send End-of-RIB, at most 95s more
+```
+
+```json
+"graceful_restart":{"deferred":[{"family":"ipv4-unicast","waiting_for":2,"seconds_left":95}]}
+```
+
+Nothing is installed in the FIB for that family or advertised for it until
+the wait is over; the routes the kernel kept from before the restart
+forward meanwhile. Then the FIB is brought in line with the Loc-RIB for
+the family, which removes the kernel routes that were not learned again.
+
+When bgpfcd ends the session of a neighbor with `graceful-restart yes`, as
+`clear neighbor`, a shutdown or a reload does, it sends the NOTIFICATION and
+leaves the TCP connection open until the neighbor has closed it, at most 3
+seconds, and connects to the neighbor again after that. A neighbor that reads
+the end of the connection along with the NOTIFICATION may take the pair for a
+failure of the transport and keep our routes (RFC 4724 §4.2), which a Hard
+Reset (RFC 8538 §3.2) is there to prevent. The session is over for bgpfcd,
+its state and its routes, at once; only the socket stays.
+
+## Enhanced Route Refresh
+
+On a session where both sides advertised Enhanced Route Refresh (RFC 7313,
+`docs/config.md`), `show neighbor` has `enhanced-route-refresh=true` among
+its capabilities (`session.enhanced_route_refresh` in JSON; `route_refresh`
+is whether the neighbor advertised plain Route Refresh). While the neighbor
+has begun a route refresh with a BoRR and not yet ended it with an EoRR,
+its routes of the family that it has not sent again are stale: `show
+routes` ends their lines in `stale`, as with Graceful Restart, and `show
+neighbor` has a line for each refresh under way (`GET
+/v1/neighbors/{addr}` has them as `refreshing`, an empty list when there
+are none):
+
+```
+  route refresh under way for ipv4-unicast: 1200 stale routes, stale timer 340s
+```
+
+```json
+"refreshing":[{"family":"ipv4-unicast","stale_routes":1200,"stale_timer_seconds":340}]
+```
+
+`stale timer` is what is left of `refresh-stale-time`; the routes still
+stale go at the EoRR, or when it has run out. `stale_timer_seconds` is
+`null` for a refresh that began with none of the neighbor's routes of the
+family to mark. The daemon logs the routes removed, at the `info` level (a
+line `msg="rib: stale routes removed"` with `why` `end-of-refresh` or
+`refresh timer`), and logs a BoRR it ignores because the neighbor, which
+advertised Graceful Restart, has not sent its End-of-RIB for the family
+(an error, as RFC 7313 §4 asks), and an EoRR with no BoRR (a warning).
 
 ## Validation state
 
@@ -133,19 +270,65 @@ member:
 `disabled` is kept apart from `not-found`, which RFC 6811 §2 suggests for
 a route that was not validated, so that a route nobody checked can be told
 from one that no VRP covers (issue #52). Every route is `disabled` until
-`rpki { mode external; ... }` (`docs/config.md`, "RPKI") gives bgpfcd the
-VRPs of an RPKI cache; from then on the states follow the cache's data.
+`rpki { mode external; ... }` or `rpki { mode sidecar; ... }`
+(`docs/config.md`, "RPKI") gives bgpfcd the VRPs of an RPKI cache; from then on the states follow the cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
-policy, and follows the validation source when it changes. It is shown
-for information only: it does not yet change whether a route is used or
-which one is chosen.
+policy, and follows the validation source when it changes. Import policy
+may match it and set another (`match rpki`, `set rpki`, RFC 6811 §3), and
+the state a route holds after that is the one `show routes` prints. What
+the RIB does with an `invalid` route by itself is the `invalid` statement
+of the `rpki` block (`docs/config.md`, "RPKI"), which `show rpki` reports:
+
+- `drop`: the route is not a candidate, so it is not in the Loc-RIB, the
+  kernel's table or any neighbor's Adj-RIB-Out. It is held: the
+  Adj-RIB-In keeps it as received, and it counts as received for the
+  neighbor's `maximum-prefix`. `show routes PREFIX` lists it after the
+  candidates, ending in `held` (`"held":true` in JSON), with its `rov`.
+  It becomes a candidate when a change of the VRPs, of the state policy
+  sets, or of `invalid` admits it, with no UPDATE from the neighbor.
+- `prefer-valid`: it is a candidate and is chosen only where no other
+  route leads to the prefix, so `show routes` shows it as the best route
+  of a prefix only when nothing else does.
+- `policy`: it is an ordinary route.
+
+A route held for a reason other than the action is listed the same way:
+import policy rejects it with the state it has but would accept it with
+another (`docs/config.md`, "Policy").
 
 `show rpki validate` answers the question for any route, held or not,
 from the same VRPs the RIB validates with.
 
 Routes also carry an ASPA verdict. Until ASPA verification exists, its
 only value is `disabled`, so it is not shown.
+
+## Only to Customer
+
+A neighbor with a `role` (`docs/config.md`, "BGP Roles") takes part in the
+RFC 9234 §5 procedures, which `show routes` and `GET /v1/routes` make
+visible. A route's `otc` member (an `otc N` suffix on its line) is the AS in
+its Only to Customer attribute, or `null` (no suffix) if it has none. It is
+the attribute as the RIB holds the route: as received, or with the
+neighbor's AS where the ingress procedure added it. The attribute that goes
+out may differ: the egress procedure adds our AS to a route without one
+that is sent to a customer, a peer or an RS-Client, when the UPDATE is
+built, and `show routes` does not show that.
+
+A neighbor's `session.role` is `null` without a `role`; otherwise `local` is
+our Role and `remote` the Role the neighbor sent, or `null` if it sent none
+(permitted unless the neighbor has `role-strict yes`). Both are named as
+in the configuration: `provider`, `rs`, `rs-client`, `customer`, `peer`.
+
+A route that is a route leak by RFC 9234 §5 never reaches the Loc-RIB or
+the neighbor's received count: it came with the attribute from a customer
+or an RS-Client, or from a peer with an AS other than the peer's in it.
+bgpfcd logs it once per UPDATE as a warning (`msg="rib: route leak, routes
+ignored"` with `peer`, `family`, `otc`, the number of `routes` and the
+`first` prefix) and keeps the session up. A route the neighbor sent before
+for the same prefix is withdrawn, as for an AS loop; with ADD-PATH, the one
+it sent under the same Path Identifier (RFC 7911 §5). A session that is
+refused for its Roles is logged with the NOTIFICATION it sent, OPEN Message
+Error / Role Mismatch (subcode 11).
 
 ## RPKI
 
@@ -160,8 +343,10 @@ replaces them, or until they expire (§10, §6).
 
 | Member | Line | Meaning |
 |---|---|---|
-| `mode` | `mode` | `disabled` or `external` |
-| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
+| `mode` | `mode` | `disabled`, `external` or `sidecar` |
+| `invalid` | `invalid` | what the RIB does with `invalid` routes by itself: `drop`, `prefer-valid` or `policy` (`docs/config.md`, "RPKI"). In `mode disabled` it is `policy` unless the block says otherwise |
+| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it). Empty with `mode sidecar`, whose one cache is the sidecar: see below |
+| `sidecar` | `sidecar` | the Routinator bgpfcd runs, while it runs one (`mode sidecar`): see [The sidecar](#the-sidecar); `null` (no `sidecar` lines) otherwise |
 | `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
 | `state` | `state` | the session with the current cache: `disconnected`, `connecting` (a connection attempt is under way), `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
 | `connected` | `connected` | whether a TCP connection to it is open |
@@ -173,8 +358,34 @@ replaces them, or until they expire (§10, §6).
 | `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
-Without a client, in `mode disabled`, every member but `mode` and
-`caches` is `null`, `false` or 0, and the text lists only those two.
+Without a client, in `mode disabled`, every member but `mode`, `invalid`
+and `caches` is `null`, `false` or 0, and the text lists only those three.
+
+### The sidecar
+
+With `mode sidecar` the cache bgpfcd reads from is a Routinator that it runs
+itself (`docs/config.md`, "RPKI"), so `show rpki` has the `sidecar` lines
+and the `sidecar` member besides the client's, whose `vrps` are `from` the
+sidecar's RTR listener on the loopback. The `sidecar` object, and the lines
+in the order given:
+
+| Member | Line | Meaning |
+|---|---|---|
+| `state` | `sidecar state` | where supervision stands: `starting` (the child is being started), `running` (with its `pid`, and `up` since when), `backing-off` (it failed, fewer times in a row than `failure-threshold`, and is started again at the next attempt), `failed` (it failed `failure-threshold` times in a row), `shutting-down` (a stop is under way) or `stopped` |
+| `failed` | | `true` in the `failed` state: the alarm. Routinator failed `failure-threshold` times in a row and is waiting for the next attempt, which comes at the longest `restart-backoff` delay; it never gives up. The VRPs already held stay in use until they expire (RFC 8210 §6), and without any every route is `disabled`. `failures` stays at or above `failure-threshold` during the short runs between the retries (state `running`), and drops when Routinator has stayed up for `stable-after` |
+| `pid`, `up_seconds` | in `state` | the child's process id and the seconds since it was started, while it runs (`sidecar state running, pid 4242, up 35s`); otherwise `null` |
+| `next_attempt_seconds` | in `state` | in `backing-off` and `failed`, the seconds until the child is started again (`next attempt in 4s after 2 failures in a row`); otherwise `null` |
+| `restarts` | `sidecar restarts` | how often the child has been started again after a failure, over the daemon's life |
+| `failures` | `sidecar restarts N failures` | failures in a row since Routinator last stayed up for `stable-after`, the figure `failure-threshold` is compared with |
+| `last_exit` | `last exit` | how the child last ended (`exited with status 1`, `killed by signal 9 (SIGKILL)`), or why it could not be started, in the operating system's words with control characters escaped; `null` (no line) before it has ended once |
+| `binary`, `version` | `routinator` | the binary that runs (the line is `sidecar routinator VERSION BINARY, rtr ADDRESS`) and the version it reported when it was last checked: at start, and again before a restart when the file has been replaced |
+| `rtr` | in `routinator` | where it serves RTR, `host` and `port`: the port bgpfcd picked, if the block named none |
+
+Routinator opens its RTR listener only after its first validation run,
+which takes minutes on an empty repository. Until then the sidecar is
+`running`, the client's `failures` count its refused connections and every
+route is `disabled`; Routinator's own output, in bgpfcd's log as lines with
+`sidecar=routinator`, says how far it is.
 
 ## Reload
 
@@ -182,7 +393,8 @@ Without a client, in `mode disabled`, every member but `mode` and
 named with `-c`. A file that fails to parse, validate or compile leaves the
 running configuration untouched and reports the errors. Otherwise, per
 `docs/config.md`: new neighbors start; removed ones stop with Cease / Peer
-De-configured; neighbors whose session parameters changed stop with Cease /
+De-configured; neighbors whose session parameters changed (a `role` and `role-strict`
+among them) stop with Cease /
 Other Configuration Change and start again; neighbors whose import or
 export policy changed get a ROUTE-REFRESH and a re-export of the
 difference; a changed `advertisement-interval` applies to the running
@@ -192,6 +404,12 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again. `router-id` and `local-as` changes are refused, and `listen`,
+again, and, with `mode sidecar`, a changed `routinator` block (or a change to
+or from that mode) stops the Routinator it ran and starts another, after the
+new binary has passed its version check (a reload with a binary that fails it
+changes nothing, and says why); a changed `invalid` statement of that block is applied to the
+running RIB alone, which judges its Invalid routes again (logged as one
+`rib: action for invalid routes` line with the counts) and leaves the
+client and the sessions alone. `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.

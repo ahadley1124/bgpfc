@@ -53,6 +53,11 @@ fn peers() -> Vec<PeerInfo> {
         extended_next_hop: if enh { vec![V4] } else { Vec::new() },
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
+        role: None,
+        restart: None,
+        enhanced_refresh: None,
     };
     vec![
         peer("10.0.0.1", "10.0.0.254", 65_001, 1, false),

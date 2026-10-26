@@ -44,6 +44,7 @@ name = "bgpfc-config"
 version = "0.1.0"
 dependencies = [
  "bgpfc-log",
+ "bgpfc-rpki",
  "bgpfc-wire",
 ]
 
@@ -158,6 +159,7 @@ dependencies = [
  "bgpfc-rib",
  "bgpfc-rpki",
  "bgpfc-rtr",
+ "bgpfc-sidecar",
  "bgpfc-sys",
  "bgpfc-wire",
 ]

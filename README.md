@@ -11,18 +11,35 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687 and 9774. RFC 4271 has five rows
-> open. Two need the host's interfaces and routes, which bgpfc does not track,
-> so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
-> and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
-> a received next hop is checked against our own address on that session, not
-> against every address of the host (§6.3 a). Two are deliberate deviations: a
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811, 8481 and 8538.
+> RFC 4271 has six rows open. Two need the host's interfaces and routes, which
+> bgpfc does not track, so the kernel's verdict is logged instead: next-hop
+> resolvability (§9.1.2), and a next hop on a shared subnet for one-hop EBGP
+> (§6.3 b). One is partial: a received next hop is checked against our own
+> address on that session, not against every address of the host (§6.3 a).
+> Three are deliberate deviations: a
 > NOTIFICATION received in OpenSent closes the connection without an FSM error
-> in reply, as BIRD and FRR do (§8.2.2), and the MinRouteAdvertisementInterval
-> timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
+> in reply, as BIRD and FRR do (§8.2.2), the MinRouteAdvertisementInterval
+> timer paces announcements but never holds back a withdrawal (§9.2.1.1), and
+> the TCP connection of a neighbor with `graceful-restart yes` stays open for
+> up to 3 s after our NOTIFICATION, until the neighbor has closed it, so that
+> the neighbor reads a Hard Reset as one (§4.5). RFC
 > 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
 > link-local next hop, which §3 asks for where it shares a subnet with the next
-> hop and the peer. Nothing else is claimed.
+> hop and the peer. RFC 9234 has one partial row too: a route learned over a
+> session with no BGP Role carries no Only to Customer mark (§3.1). So has RFC
+> 4724: the Restart State bit is set after a restart that kept forwarding
+> state, and a restart that kept none is not told from a first start (§4.1).
+> RFC 7313 has four deviating rows, from two causes. It follows the procedures
+> on a session where both sides advertised Enhanced Route Refresh and the peer
+> advertised Route Refresh, where the RFC has them follow from the capability
+> received from the peer alone. A peer that advertised the capability gets
+> RFC 2918's refresh, with no BoRR or EoRR, from a neighbor with
+> `enhanced-refresh no;`, and so does one that advertised it without Route
+> Refresh; their BoRR and EoRR are read as requests (§4, §5). And a
+> ROUTE-REFRESH too long for the Data field of any NOTIFICATION is echoed in
+> part, as the size limits of RFC 4271 and RFC 8654 leave no room for all of
+> it (§5). Nothing else is claimed.
 
 ### What works
 
@@ -44,11 +61,69 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)).
+- ADD-PATH (RFC 7911), per neighbor and family, off unless configured:
+  `add-path receive FAMILY yes` keeps every path a neighbor sends for a prefix
+  under its Path Identifier and runs the decision process over all of them,
+  and `add-path send FAMILY N` or `all` sends a neighbor the N best paths of
+  each prefix, or every path export policy accepts, each under an identifier
+  of bgpfcd's own that stays with it while it is sent. The kernel still gets
+  the one best path. `bgpfcctl show routes PREFIX` and the HTTP API show the
+  identifier a path came with. Sessions that do not use it pay nothing for it.
+  Interop tests run it in both directions against BIRD and FRR.
+- BGP Roles and the Only to Customer attribute (RFC 9234, `role` per neighbor),
+  with the Role Mismatch NOTIFICATION and an optional strict mode; interop
+  tests against BIRD 2.14.
+- Enhanced Route Refresh (RFC 7313), advertised unless a neighbor has
+  `enhanced-refresh no;` and used on sessions where both sides advertised it
+  and the peer advertised Route Refresh as well:
+  a route refresh bgpfcd makes (the table a neighbor asked for, or `bgpfcctl
+  clear neighbor ADDR soft`) is a BoRR, the Adj-RIB-Out and an EoRR, and a
+  neighbor's marks all its routes of the family stale at the BoRR and removes
+  those it does not send again at the EoRR, or when `refresh-stale-time` has
+  run out. It reuses the stale marking of Graceful Restart and holds each
+  ADD-PATH path apart. A message of another subtype than 0, 1 or 2 is
+  ignored, and a BoRR or EoRR of the wrong length ends the session with the
+  ROUTE-REFRESH Message Error. Tested against BIRD 2.14 and FRR 8.4
+  (`interop/tests/route_refresh.rs`); sessions without the capability pay
+  nothing for it.
+- Graceful Restart (RFC 4724 with the Notification support of RFC 8538), per
+  neighbor and off unless `graceful-restart yes;` is set
+  ([`docs/config.md`](docs/config.md), "Graceful Restart"). As a Receiving
+  Speaker bgpfcd keeps the routes of a neighbor whose session ended by a TCP
+  failure, a hold timer expiry or, where both sides sent the N bit, any
+  NOTIFICATION but a Hard Reset, as stale routes in the RIB, the kernel and
+  what other neighbors were told; they are replaced as the neighbor sends
+  them again and the rest go at its End-of-RIB, at the end of its Restart
+  Time or of `stale-time`, or at once if it comes back without the
+  Forwarding State bit. After bgpfcd itself restarts in install mode with its
+  routes still in the kernel, it sets the Restart State and Forwarding State
+  bits, defers route selection until the neighbors' End-of-RIB or the longest
+  `restart-time`, and then removes from the kernel only the routes it did not
+  learn again. `bgpfcctl clear neighbor ADDR hard-reset` sends a Hard Reset.
+  A Hard Reset also goes out when bgpfcd shuts down or removes a neighbor, and
+  when a neighbor exceeds its prefix limit. A `SIGTERM` is an administrative
+  shutdown that takes its routes out of the kernel; crashes and kills are what
+  the kept routes are for. Tested against BIRD 2.14 and FRR 8.4 in both
+  directions; the IPv6 variant that installs routes runs where the kernel has
+  IPv6.
 - An RFC 6811 origin validation state on every route, from VRPs fetched over
   RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
   with failover in order of preference; `bgpfcctl show rpki` reports the
-  client, and interop tests run it against StayRTR. Nothing acts on the
-  state yet.
+  client, and interop tests run it against StayRTR. Policy matches and sets
+  the state (`match rpki invalid;`, `set rpki not-found;`), and the block's
+  `invalid` statement says what the RIB does with the Invalid routes
+  itself: `drop` them, `prefer-valid` (keep them, behind every other route),
+  or leave them to `policy`. The statement is required, since RFC 8481 §5
+  forbids acting on the state unless the operator says so. A route `drop`
+  refuses is held, shown by `show routes PREFIX`, and used again when a VRP
+  change admits it, with no UPDATE from the neighbor.
+- An optional Routinator sidecar (`rpki { mode sidecar; ... }`): bgpfcd runs
+  Routinator, an executable you install, as a supervised child process,
+  restarts it with backoff and raises a `failed` alarm when it keeps failing,
+  and reads its VRPs over RTR on the loopback. `bgpfcctl show rpki` and the
+  HTTP API report its state; a reload that changes its block runs a new
+  child, after checking that the new binary would start; a shutdown stops it
+  and a crash of bgpfcd kills it.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -86,11 +161,12 @@ against.
 | Kernel FIB | rtnetlink, a dedicated route protocol number, main table, dry-run toggle |
 | Control | `bgpfcctl` over a Unix socket, plus a read-only-by-default HTTP/JSON API on localhost |
 
-Only single best path, with no ECMP. Linux only.
+Only a single best path goes to the kernel, with no ECMP, also on sessions
+that exchange several paths (ADD-PATH, RFC 7911, added after v1). Linux only.
 
 ### Next: RPKI route origin validation
 
-In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). Every route
+([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14.) Every route
 carries its RFC 6811 origin validation state (step 11), which the RIB
 validates again in place when the VRPs change, and which `bgpfcctl show
 routes` and the HTTP API show. With an `rpki { mode external; ... }` block
@@ -102,17 +178,84 @@ cache answers, until they expire. Without the block, or with `mode
 disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
 8210 §9), so the cache belongs on loopback or a trusted network.
 
-Enforcement comes next. Nothing acts on the state yet; step 13 will drop
-Invalid routes by default, offer a non-enforcing prefer-valid mode, and let
-policy match on the validation state (RFC 6811 §3). Then bgpfcd will be
-able to start and supervise an optional Routinator as a child process.
-Routinator is a separate program; bgpfc neither bundles nor links it.
+The state is acted on (step 13), as the operator says. Import and export
+policy match it and set it (RFC 6811 §3: `match rpki invalid;`, `set rpki
+not-found;`), and the block's `invalid` statement chooses what the RIB does
+with an Invalid route on its own (RFC 6811 §5):
+
+```
+rpki {
+    mode external;
+    invalid drop;            # or prefer-valid, or policy
+    cache 127.0.0.1 port 3323;
+}
+```
+
+`drop` keeps Invalid routes out of the decision process, the kernel's table
+and the neighbors' Adj-RIBs-Out, but not out of the Adj-RIB-In: they are
+held, shown by `show routes PREFIX`, and used again as soon as a VRP change
+or a reload admits them, with no UPDATE from the neighbor and no
+ROUTE-REFRESH. `prefer-valid` is the non-enforcing choice: an Invalid route
+stays a candidate and loses to every route that is not Invalid, whatever
+the local preference, and is used only where nothing else leads to the
+prefix. `policy` does nothing of its own. There is no default: RFC 8481 §5
+says that absent specific operator configuration policy MUST NOT be
+applied, so an `external` block without `invalid` is a configuration
+error. Interop tests drive all three against StayRTR and BIRD.
+
+bgpfcd can also run and supervise a Routinator itself (step 14) and read its
+VRPs from it, instead of from caches you run and name:
+
+```
+rpki {
+    mode sidecar;
+    invalid drop;
+    routinator {
+        binary /usr/bin/routinator;       # never looked up on PATH
+        repository-dir /var/lib/bgpfc/rpki;
+        rtr-listen 127.0.0.1:3323;        # loopback only; port 0 picks one
+    }
+}
+```
+
+Routinator is a separate program; bgpfc neither bundles nor links it, and
+bgpfcd drives the 0.15 series (it asks the binary for `--version` before it
+runs it). bgpfcd starts it with a command line derived from the block, in an
+environment of two variables, without capabilities and in a process group of
+its own, and logs what it prints. A child that exits is restarted after a
+doubling delay, and after `failure-threshold` failures in a row `show rpki`
+reports the `failed` alarm while the retries go on. The RTR client connects
+to the address the sidecar serves on, which Routinator opens only after its
+first validation run, so every route is `disabled` until then. The child
+never outlives the daemon: a `SIGTERM` stops it while the sessions close,
+and a daemon that is killed takes it down through the parent-death signal.
+`invalid` is required here as it is with caches. Start the daemon as an
+unprivileged user (`contrib/bgpfcd.service` does, with `KillMode=mixed`):
+a child of root would have every capability. The tests use shell scripts
+and this repository's `rtr-stub` in Routinator's place; no real Routinator
+is run by them.
+
+### BGP roles and Only to Customer
+
+`role provider|rs|rs-client|customer|peer;` on a neighbor (RFC 9234,
+[`docs/config.md`](docs/config.md), "BGP Roles") sends the BGP Role
+capability and checks the neighbor's: a Role that does not correspond, or
+with `role-strict yes;` none at all, is refused with OPEN Message Error /
+Role Mismatch. The session then runs the Only to Customer procedures of
+§5: a route leak, one with the attribute from a customer, an RS-Client or
+a peer with another AS in it, is dropped; the attribute is added to routes
+from a provider, a peer or an RS and to those sent to a customer, a peer
+or an RS-Client; and a route that has it is never sent to a provider, a
+peer or an RS. A neighbor without a `role` is untouched. One rule is open:
+a route learned over a session with no Role carries no mark, so it is the
+operator's policy that keeps it from a provider (the `partial` row of
+[`COMPLIANCE.md`](COMPLIANCE.md), RFC 9234 §3.1). Tested against BIRD 2.14
+(`interop/tests/roles.rs`).
 
 ### Later
 
-ASPA (planned for v1.1.0), origin validation on export (RFC 8893), BGP roles
-and OTC (RFC 9234), RFC 8212 default policy, graceful restart (RFC 4724),
-ADD-PATH (RFC 7911), route reflection (RFC 4456), multipath, and
+ASPA (planned for v1.1.0), origin validation on export (RFC 8893),
+RFC 8212 default policy, route reflection (RFC 4456), multipath, and
 TCP-MD5/TCP-AO.
 
 The full reference list is in [`RESOURCES.md`](RESOURCES.md).
@@ -132,12 +275,15 @@ crates/
   bgpfc-control  Unix-socket protocol, HTTP/1.1 server, JSON writer
   bgpfc-rpki     VRP set, RFC 6811 origin validation, validation sources (no I/O)
   bgpfc-rtr      RTR (RFC 8210/6810): PDU codec, session machine, client thread
+  bgpfc-sidecar  Routinator supervision: settings, command line, version check,
+                 restart backoff, supervisor state machine, child process shell
   bgpfc-prof     profiling counters and histograms (only with --features profiling)
   bgpfc-bench    load generator, benchmark harness, micro-benchmarks (dev tooling)
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
-interop/         tests against BIRD / FRR / GoBGP and the StayRTR cache (dev-only)
+interop/         tests against BIRD / FRR / GoBGP, the StayRTR cache and a stub
+                 Routinator (dev-only)
 ```
 
 ## Build

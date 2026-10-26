@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use bgpfc_config::ast::{self, Neighbor};
 use bgpfc_fsm::{Config, Damping, SendHoldTime};
-use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_rib::PathLimit;
+use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
 use bgpfc_wire::types::{Afi, Asn, RouterId};
 
-use crate::messages::{Intervals, PrefixLimits, RibSettings};
+use crate::messages::{AddPathLimits, Intervals, PrefixLimits, RibSettings};
 use crate::peer::PeerConfig;
 
 /// The per-peer configuration for `n`.
@@ -37,6 +38,11 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         .map(|f| Capability::Multiprotocol(*f))
         .chain([Capability::RouteRefresh, Capability::ExtendedMessage])
         .collect();
+    // RFC 7313 §3.1, §4: a speaker that supports the message subtypes
+    // SHOULD advertise the capability; `enhanced-refresh no` does not.
+    if n.enhanced_refresh.is_some() {
+        fsm.capabilities.push(Capability::EnhancedRouteRefresh);
+    }
     // RFC 8950 §4: one triple per `extended-next-hop` family, each with an
     // IPv6 next hop, in one capability.
     if !n.extended_next_hop.is_empty() {
@@ -51,6 +57,22 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
                 .collect(),
         ));
     }
+    // RFC 7911 §4: one capability with a tuple per `add-path` family. The
+    // ability to receive and the ability to send are separate statements,
+    // and a family can have either or both.
+    let paths = add_path_tuples(n);
+    if !paths.is_empty() {
+        fsm.capabilities.push(Capability::AddPath(paths));
+    }
+    // RFC 9234 §4.1, §4.2: our BGP Role, advertised and checked by the FSM
+    // on an external session.
+    fsm.role = n.role;
+    // RFC 4724 §3, RFC 8538 §2: the Graceful Restart capability, with the
+    // Restart Time; the Restart State and Forwarding State bits are the
+    // peer thread's to fill in for each OPEN.
+    fsm.graceful_restart = n.graceful_restart.map(|gr| bgpfc_fsm::GracefulRestart {
+        restart_time: gr.restart_time,
+    });
     // RFC 4271 §10: jitter from something that differs per process.
     fsm.jitter_seed = jitter_seed(&n.addr);
     PeerConfig {
@@ -58,7 +80,50 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         port: n.port,
         fsm,
         allow_as_set: n.allow_as_set,
+        stale_time: n.graceful_restart.map(|gr| gr.stale_time),
+        refresh_stale_time: n.enhanced_refresh.map(|e| e.stale_time),
     }
+}
+
+/// The tuples of the ADD-PATH capability for `n` (RFC 7911 §4), in the
+/// order of its `families`: Receive for a family with `add-path receive`,
+/// Send for one with `add-path send`, Both for one with both. Validation
+/// leaves no `add-path` family outside `families`.
+fn add_path_tuples(n: &Neighbor) -> Vec<AddPathTuple> {
+    n.families
+        .iter()
+        .filter_map(|family| {
+            let receive = n.add_path_receive.contains(family);
+            let send = n.add_path_send.iter().any(|(f, _)| f == family);
+            AddPathMode::of(receive, send).map(|mode| AddPathTuple {
+                family: *family,
+                mode,
+            })
+        })
+        .collect()
+}
+
+/// Every neighbor's `add-path send` limits (RFC 7911 §5), for the RIB
+/// thread; an empty list for a neighbor that sends one path per prefix.
+pub(crate) fn add_path_limits(config: &bgpfc_config::Config) -> AddPathLimits {
+    config
+        .neighbors
+        .iter()
+        .map(|n| {
+            let limits = n
+                .add_path_send
+                .iter()
+                .map(|(family, send)| {
+                    let limit = match send {
+                        ast::AddPathSend::Best(count) => PathLimit::Best(*count),
+                        ast::AddPathSend::All => PathLimit::All,
+                    };
+                    (*family, limit)
+                })
+                .collect();
+            (n.addr, limits)
+        })
+        .collect()
 }
 
 /// Every neighbor's `advertisement-interval`, for the RIB thread.
@@ -85,6 +150,7 @@ pub(crate) fn rib_settings(config: &bgpfc_config::Config) -> RibSettings {
     RibSettings {
         intervals: advertisement_intervals(config),
         prefix_limits: prefix_limits(config),
+        add_path_send: add_path_limits(config),
     }
 }
 
@@ -146,6 +212,7 @@ mod tests {
                 Capability::Multiprotocol(AddressFamily::IPV6_UNICAST),
                 Capability::RouteRefresh,
                 Capability::ExtendedMessage,
+                Capability::EnhancedRouteRefresh,
             ]
         );
         assert_ne!(p.fsm.jitter_seed, 0);
@@ -158,7 +225,91 @@ mod tests {
         );
         assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
-        assert_eq!(q.fsm.capabilities.len(), 4);
+        assert_eq!(q.fsm.capabilities.len(), 5);
+    }
+
+    #[test]
+    fn graceful_restart_reaches_the_fsm_and_the_stale_timer_the_peer() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A;
+                 graceful-restart yes; restart-time 90; stale-time 200; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        let p = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        // RFC 4724 §3: advertised with the Restart Time configured.
+        assert_eq!(
+            p.fsm.graceful_restart.map(|g| g.restart_time.secs()),
+            Some(90)
+        );
+        assert_eq!(p.stale_time, Some(Duration::from_secs(200)));
+        // Off by default: no capability, nothing kept.
+        let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert_eq!(q.fsm.graceful_restart, None);
+        assert_eq!(q.stale_time, None);
+    }
+
+    #[test]
+    fn enhanced_route_refresh_is_advertised_unless_turned_off() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; refresh-stale-time 90; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; enhanced-refresh no; }",
+        )
+        .unwrap();
+        let on = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        // RFC 7313 §3.1: capability 70, with the stale time for the RIB.
+        assert!(
+            on.fsm
+                .capabilities
+                .contains(&Capability::EnhancedRouteRefresh)
+        );
+        assert_eq!(on.refresh_stale_time, Some(Duration::from_secs(90)));
+        let off = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert!(
+            !off.fsm
+                .capabilities
+                .contains(&Capability::EnhancedRouteRefresh)
+        );
+        assert_eq!(off.refresh_stale_time, None);
+    }
+
+    #[test]
+    fn a_role_reaches_the_fsm_with_its_strict_mode() {
+        use bgpfc_wire::role::{LocalRole, Role};
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; role customer; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; role rs; role-strict yes; }
+             neighbor 192.0.2.4 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        let roles: Vec<_> = cfg
+            .neighbors
+            .iter()
+            .map(|n| peer_config(cfg.local_as, cfg.router_id, n).fsm.role)
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                Some(LocalRole {
+                    role: Role::Customer,
+                    strict: false
+                }),
+                Some(LocalRole {
+                    role: Role::RouteServer,
+                    strict: true
+                }),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -186,6 +337,69 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Capability::ExtendedNextHop(_)))
         );
+    }
+
+    #[test]
+    fn add_path_is_advertised_per_family_and_direction_only_when_configured() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 {
+                 remote-as 65001; import A; export A;
+                 add-path receive ipv4-unicast yes;
+                 add-path send ipv4-unicast all;
+                 add-path send ipv6-unicast 2;
+             }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; add-path receive ipv6-unicast yes; }
+             neighbor 192.0.2.4 { remote-as 65001; import A; export A; }",
+        )
+        .unwrap();
+        // RFC 7911 §4: <1, 1, 3> for the family we do both for, <2, 1, 2>
+        // for the one we only send, in one capability after the others.
+        let p = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        assert_eq!(
+            p.fsm.capabilities.last(),
+            Some(&Capability::AddPath(vec![
+                AddPathTuple {
+                    family: AddressFamily::IPV4_UNICAST,
+                    mode: AddPathMode::Both
+                },
+                AddPathTuple {
+                    family: AddressFamily::IPV6_UNICAST,
+                    mode: AddPathMode::Send
+                },
+            ]))
+        );
+        let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert_eq!(
+            q.fsm.capabilities.last(),
+            Some(&Capability::AddPath(vec![AddPathTuple {
+                family: AddressFamily::IPV6_UNICAST,
+                mode: AddPathMode::Receive
+            }]))
+        );
+        // Neither: the capability is not sent at all.
+        let r = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[2]);
+        assert!(
+            !r.fsm
+                .capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::AddPath(_)))
+        );
+        let limits = add_path_limits(&cfg);
+        assert_eq!(
+            limits.get(&"192.0.2.2".parse::<IpAddr>().unwrap()),
+            Some(&vec![
+                (AddressFamily::IPV4_UNICAST, PathLimit::All),
+                (AddressFamily::IPV6_UNICAST, PathLimit::Best(2)),
+            ])
+        );
+        assert_eq!(
+            limits.get(&"192.0.2.3".parse::<IpAddr>().unwrap()),
+            Some(&Vec::new())
+        );
+        assert_eq!(rib_settings(&cfg).add_path_send, limits);
     }
 
     #[test]

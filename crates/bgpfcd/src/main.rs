@@ -5,7 +5,12 @@
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
-//! client of the `rpki` block, which feeds the RIB thread.
+//! client of the `rpki` block, which feeds the RIB thread, and since step
+//! 14 the Routinator sidecar that `mode sidecar` has it read from. Since step 16 a
+//! daemon that restarts in install mode keeps the kernel routes of its
+//! protocol number for the families of the neighbors with
+//! `graceful-restart yes` until their End-of-RIB (RFC 4724 §4.1, see
+//! [`restart`] and `start_fib`).
 #![forbid(unsafe_code)]
 
 mod args;
@@ -18,6 +23,7 @@ mod privileges;
 #[cfg(feature = "profiling")]
 mod profiling;
 mod reader;
+mod restart;
 mod rib;
 mod rpki;
 mod wiring;
@@ -26,6 +32,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
@@ -33,6 +40,7 @@ use bgpfc_wire::error::CeaseSubcode;
 use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
 use crate::messages::{FibMsg, PeerInput, RibMsg};
+use crate::restart::RestartState;
 
 /// docs/PROFILING.md: a profiling build counts every allocation.
 #[cfg(feature = "profiling")]
@@ -81,7 +89,8 @@ fn main() {
         local_as = config.local_as,
         router_id = config.router_id,
         fib_mode = config.fib.mode,
-        rpki = config.rpki.mode
+        rpki = config.rpki.mode,
+        invalid = config.rpki.invalid
     );
     // Issue #60: a cache that cannot be found stops the start, before
     // anything is opened, rather than leaving every route unvalidated.
@@ -112,6 +121,13 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
             std::process::exit(1);
         }
     };
+    // What the sidecar crate knows and the configuration crate does not: a
+    // TAL Routinator does not bundle, an argument bgpfcd reserves. No file
+    // is read and nothing is run, so `--check` can say.
+    if let Err(e) = rpki::validate(&config.rpki) {
+        eprintln!("{}: {e}", opts.config.display());
+        std::process::exit(1);
+    }
     if let Some(level) = opts.log_level {
         config.log_level = level;
     }
@@ -137,22 +153,13 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     // The netlink socket and the listeners are opened while still
     // privileged (README, "Option B"); the FIB thread flushes stale
     // routes right away.
-    let fib_tx = match fib::start(bgpfc_fib::Fib::new(
-        fib::mode_of(config.fib.mode),
-        config.fib.table,
-        config.fib.protocol,
-    )) {
-        Ok(tx) => tx,
-        Err(e) => {
-            bgpfc_log::error!("cannot start the fib", error = e);
-            std::process::exit(1);
-        }
-    };
+    let restart = Arc::new(RestartState::default());
+    let (fib_tx, kept) = start_fib(&config, &restart);
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
     let table: PeerTable = Arc::new(RwLock::new(HashMap::new()));
     let mut peers = Vec::new();
     for n in &config.neighbors {
-        peers.push(prepare_peer(&config, n, &rib_tx, &table));
+        peers.push(prepare_peer(&config, n, &rib_tx, &table, &restart));
     }
     for addr in &config.listen {
         if let Err(e) = coordinator::listen(*addr, Arc::clone(&table)) {
@@ -183,12 +190,18 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     let mut rib = bgpfc_rib::Rib::with_policies(config.local_as, Box::new(engine));
     // RFC 4271 §10: the advertisement intervals are jittered too.
     rib.set_jitter_seed(wiring::jitter_seed(&"rib"));
+    // RFC 6811 §5, RFC 8481 §5: what is done with Invalid routes is what
+    // the file says, from the first route on. No route is held yet, so
+    // there is nothing to judge again.
+    rib.set_invalid_action(config.rpki.invalid, Instant::now(), &mut Vec::new());
+    defer_selection(&config, &kept, &mut rib, &restart);
     rib::spawn(
         rib,
         wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
+        Arc::clone(&restart),
     );
     // Before the peers, so that the VRPs often arrive before the routes
     // and most routes are validated once, on arrival.
@@ -205,6 +218,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         rib_tx,
         fib_tx,
         rpki,
+        restart,
     };
     while let Ok(msg) = coord_rx.recv() {
         match msg {
@@ -234,13 +248,80 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 }
 
-/// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
-/// client cannot be started.
+/// Open the netlink socket, flush the routes of our protocol number that
+/// are in the kernel, and start the FIB thread. Except, in install mode,
+/// the routes of a family a neighbor with `graceful-restart yes` can send
+/// again: RFC 4724 §4.1 has a daemon that restarted keep its forwarding
+/// state until then (AGENTS.md §3, "FIB"). In dry-run mode nothing was
+/// installed, so nothing is kept. The families that have routes kept are
+/// returned with the thread's queue.
+fn start_fib(
+    config: &bgpfc_config::Config,
+    restart: &Arc<RestartState>,
+) -> (SyncSender<FibMsg>, Vec<bgpfc_wire::types::AddressFamily>) {
+    let keep = if config.fib.mode == bgpfc_config::ast::FibMode::Install {
+        restart::keepable(config)
+    } else {
+        Vec::new()
+    };
+    let fib = bgpfc_fib::Fib::new(
+        fib::mode_of(config.fib.mode),
+        config.fib.table,
+        config.fib.protocol,
+    );
+    match fib::start(fib, &keep, Arc::clone(restart)) {
+        Ok(started) => started,
+        Err(e) => {
+            bgpfc_log::error!("cannot start the fib", error = e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// RFC 4724 §4.1: if we restarted with forwarding state kept (`kept` are
+/// the families that have routes in the kernel), route selection waits for
+/// the End-of-RIB of the neighbors that can send the routes again, and our
+/// OPENs say that we have restarted.
+fn defer_selection(
+    config: &bgpfc_config::Config,
+    kept: &[bgpfc_wire::types::AddressFamily],
+    rib: &mut bgpfc_rib::Rib,
+    restart: &RestartState,
+) {
+    let Some(deferral) = restart::deferral(config, kept, Instant::now()) else {
+        return;
+    };
+    bgpfc_log::info!(
+        "restarted with forwarding state kept, deferring route selection",
+        families = kept
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        neighbors = deferral.waiting.len(),
+        seconds = deferral
+            .until
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+    );
+    rib.defer_selection(&deferral);
+    restart.set_restarting(true);
+}
+
+/// Run the `rpki` block, publishing to the RIB thread; exits if the
+/// sidecar or the RTR client cannot be started. A sidecar is started here,
+/// after the privileges were dropped, from the main thread that lives as
+/// long as the daemon (see [`rpki`]).
 fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpki::Rpki {
     match rpki::Rpki::start(&config.rpki, config.router_id, rib_tx.clone()) {
         Ok(r) => r,
         Err(e) => {
-            bgpfc_log::error!("cannot start the rtr client", error = e);
+            bgpfc_log::error!("cannot start", error = e);
+            // The control socket is open already; it is not left behind
+            // for a daemon that is not there.
+            if let Some(path) = &config.control.socket {
+                let _ = std::fs::remove_file(path);
+            }
             std::process::exit(1);
         }
     }
@@ -299,6 +380,7 @@ fn prepare_peer(
     n: &bgpfc_config::ast::Neighbor,
     rib_tx: &SyncSender<RibMsg>,
     table: &PeerTable,
+    restart: &Arc<RestartState>,
 ) -> peer::Peer {
     let cfg = wiring::peer_config(config.local_as, config.router_id, n);
     bgpfc_log::info!(
@@ -309,7 +391,7 @@ fn prepare_peer(
         import = n.import,
         export = n.export
     );
-    let (handle, peer) = peer::prepare(cfg, rib_tx.clone());
+    let (handle, peer) = peer::prepare(cfg, rib_tx.clone(), Arc::clone(restart));
     if let Ok(mut t) = table.write() {
         t.insert(handle.addr, handle);
     }
@@ -326,6 +408,8 @@ struct Coordinator<'a> {
     fib_tx: SyncSender<FibMsg>,
     /// The `rpki` block at work: the RTR client, if one runs.
     rpki: rpki::Rpki,
+    /// What the OPENs of new sessions say of a restart.
+    restart: Arc<RestartState>,
 }
 
 impl Coordinator<'_> {
@@ -336,6 +420,20 @@ impl Coordinator<'_> {
         }
     }
 
+    /// A neighbor the configuration no longer has: its session ends with
+    /// Cease / Peer De-configured, and, RFC 4724 §4.2 keeping the routes of
+    /// a session that ended for a neighbor that is coming back, the RIB
+    /// is told that this one is not. For one whose session is up the peer
+    /// thread says so itself, with the end of the session; this is for one
+    /// that is down.
+    fn remove_peer(&self, addr: IpAddr) {
+        self.stop_peer(addr, CeaseSubcode::PeerDeconfigured);
+        let _ = self.rib_tx.send(RibMsg::PeerDown {
+            peer: addr,
+            retain: None,
+        });
+    }
+
     /// Re-read the configuration file and apply the difference
     /// (`docs/config.md`, "Reload"). On any error nothing changes.
     fn reload(&mut self) -> Result<String, String> {
@@ -343,8 +441,11 @@ impl Coordinator<'_> {
         let diff = ConfigDiff::between(&self.config, &new);
         // Issue #60: a new cache that cannot be found fails the reload
         // before anything changes, as it fails the start.
+        // A new sidecar whose binary does not pass its version check fails
+        // it too, while the old one still runs.
         if diff.global.contains(&GlobalChange::Rpki) {
             rpki::resolve(&new.rpki)?;
+            rpki::check_reload(&self.config.rpki, &new.rpki)?;
         }
         let mut notes = Vec::new();
         for g in &diff.global {
@@ -359,33 +460,18 @@ impl Coordinator<'_> {
                     let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
                     notes.push(done.map_or_else(|e| e, str::to_owned));
                 }
+                GlobalChange::RpkiInvalid => notes.push(format!(
+                    "invalid routes: {} (was {})",
+                    new.rpki.invalid, self.config.rpki.invalid
+                )),
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
-                GlobalChange::Fib => {
-                    if new.fib.table != self.config.fib.table
-                        || new.fib.protocol != self.config.fib.protocol
-                    {
-                        notes.push(
-                            "fib table or protocol changed: takes effect at the next restart"
-                                .to_owned(),
-                        );
-                    }
-                    if new.fib.mode != self.config.fib.mode {
-                        let (tx, rx) = sync_channel(1);
-                        if self
-                            .rib_tx
-                            .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
-                            .is_ok()
-                        {
-                            let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
-                        }
-                    }
-                }
+                GlobalChange::Fib => self.reload_fib(&new, &mut notes),
             }
         }
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.
         for addr in &diff.removed {
-            self.stop_peer(*addr, CeaseSubcode::PeerDeconfigured);
+            self.remove_peer(*addr);
         }
         for addr in &diff.reset {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
@@ -396,6 +482,11 @@ impl Coordinator<'_> {
             policies: messages::NewPolicies(Box::new(engine)),
             reexport: diff.policy_changed.clone(),
         });
+        // RFC 6811 §5: so does what is done with Invalid routes. After the
+        // new policies, which the routes are judged by again.
+        if diff.global.contains(&GlobalChange::RpkiInvalid) {
+            let _ = self.rib_tx.send(RibMsg::SetInvalidAction(new.rpki.invalid));
+        }
         // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
         // file without a reset. Sent before new peers start, so their
         // sessions come up with the new values.
@@ -407,6 +498,10 @@ impl Coordinator<'_> {
         let _ = self
             .rib_tx
             .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
+        // RFC 7911 §5: and the number of paths each ADD-PATH session sends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetAddPathLimits(wiring::add_path_limits(&new)));
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -418,20 +513,27 @@ impl Coordinator<'_> {
         let mut started = Vec::new();
         for addr in diff.added.iter().chain(&diff.reset) {
             if let Some(n) = new.neighbor(*addr) {
-                started.push(prepare_peer(&new, n, &self.rib_tx, &self.table));
+                started.push(prepare_peer(
+                    &new,
+                    n,
+                    &self.rib_tx,
+                    &self.table,
+                    &self.restart,
+                ));
             }
         }
         for p in started {
             p.start();
         }
         let summary = format!(
-            "added {} removed {} reset {} policy {} interval {} limit {} unchanged {}{}",
+            "added {} removed {} reset {} policy {} interval {} limit {} paths {} unchanged {}{}",
             diff.added.len(),
             diff.removed.len(),
             diff.reset.len(),
             diff.policy_changed.len(),
             diff.interval_changed.len(),
             diff.prefix_limit_changed.len(),
+            diff.add_path_send_changed.len(),
             diff.unchanged.len(),
             if notes.is_empty() {
                 String::new()
@@ -443,17 +545,38 @@ impl Coordinator<'_> {
         Ok(summary)
     }
 
+    /// Apply a changed `fib` block: the mode at once, the table and the
+    /// protocol number at the next restart.
+    fn reload_fib(&self, new: &bgpfc_config::Config, notes: &mut Vec<String>) {
+        if new.fib.table != self.config.fib.table || new.fib.protocol != self.config.fib.protocol {
+            notes
+                .push("fib table or protocol changed: takes effect at the next restart".to_owned());
+        }
+        if new.fib.mode != self.config.fib.mode {
+            let (tx, rx) = sync_channel(1);
+            if self
+                .rib_tx
+                .send(RibMsg::FibMode(fib::mode_of(new.fib.mode), tx))
+                .is_ok()
+            {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+
     /// The running `rpki` block and its client's status.
     fn rpki_report(&self) -> messages::RpkiReport {
         messages::RpkiReport {
             config: self.config.rpki.clone(),
             status: self.rpki.status(),
+            sidecar: self.rpki.sidecar_report(),
         }
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown), remove our routes from the kernel, then stop the RTR
-    /// client.
+    /// Shutdown), remove our routes from the kernel, and stop the RTR
+    /// client and the Routinator sidecar. The sidecar is asked to stop
+    /// first, so that it stops while the rest goes on, and waited for last.
     fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
@@ -462,6 +585,9 @@ impl Coordinator<'_> {
                     .try_send(PeerInput::Stop(CeaseSubcode::AdministrativeShutdown));
             }
         }
+        // After the Ceases are on their way: stopping the client can wait
+        // for the RIB thread (see `rpki`), and the neighbors should not.
+        self.rpki.begin_stop();
         // Give the peer threads a moment to write their NOTIFICATIONs.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let (done_tx, done_rx) = sync_channel(1);
@@ -471,8 +597,7 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
-        // Last: neither the Ceases nor the FIB cleanup need it, and it may
-        // first have to hand the RIB thread a change (see `rpki`).
+        // Last: the child may still be stopping (see `rpki`).
         self.rpki.stop();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));
@@ -491,6 +616,7 @@ fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+    rpki::validate(&config.rpki).map_err(|e| format!("{}: {e}", opts.config.display()))?;
     if let Some(level) = opts.log_level {
         config.log_level = level;
     }

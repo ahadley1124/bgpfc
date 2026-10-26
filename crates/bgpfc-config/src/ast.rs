@@ -8,10 +8,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bgpfc_rpki::{InvalidAction, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::role::LocalRole;
+use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 
 use crate::error::Pos;
 
@@ -156,6 +158,18 @@ pub struct Rpki {
     pub backoff_min: Duration,
     /// The longest reconnect delay.
     pub backoff_max: Duration,
+    /// `invalid`: what the RIB does with a route whose state is Invalid,
+    /// before the policies an operator wrote (RFC 6811 §5). Required in
+    /// [`RpkiMode::External`]: RFC 8481 §5, "Absent specific operator
+    /// configuration, policy MUST NOT be applied", so no action is taken
+    /// that the operator did not name. [`InvalidAction::Policy`], which
+    /// does nothing of its own, where the block leaves it out.
+    pub invalid: InvalidAction,
+    /// `routinator { ... }`: the Routinator bgpfcd runs and supervises as
+    /// its cache. Required in [`RpkiMode::Sidecar`]; in
+    /// [`RpkiMode::Disabled`] it is kept and not used, like the cache
+    /// list.
+    pub routinator: Option<Routinator>,
 }
 
 impl Rpki {
@@ -181,6 +195,13 @@ impl Rpki {
     /// The default longest reconnect delay: the default Retry Interval of
     /// RFC 8210 §6.
     pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_mins(10);
+    /// The default longest reconnect delay with [`RpkiMode::Sidecar`].
+    /// The cache is a process on this host that binds its RTR port only
+    /// after its first validation run, which takes minutes on an empty
+    /// repository, and the default for a remote cache would leave bgpfcd
+    /// waiting up to ten minutes after it is ready. Trying a loopback port
+    /// costs nothing.
+    pub const DEFAULT_SIDECAR_BACKOFF_MAX: Duration = Duration::from_secs(30);
     /// The longest reconnect delay that may be configured: the largest
     /// Retry Interval RFC 8210 §6 allows a cache to ask for, "Maximum
     /// allowed value: 7200 seconds".
@@ -188,10 +209,13 @@ impl Rpki {
 }
 
 impl Rpki {
-    /// Whether `other` asks for what `self` does: every setting the same,
-    /// and the same caches in the same order with the same preferences,
-    /// each host however it is spelled (see [`RpkiCache::is_at`]). A
-    /// reload leaves the RTR client alone unless this is false.
+    /// Whether `other` asks the RTR client for what `self` does: every
+    /// setting the same, and the same caches in the same order with the
+    /// same preferences, each host however it is spelled (see
+    /// [`RpkiCache::is_at`]). A reload leaves the RTR client alone unless
+    /// this is false. What the RIB does with Invalid routes
+    /// ([`Rpki::invalid`]) is no concern of the client: it changes with
+    /// the client running, and has its own change in a reload.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
@@ -206,6 +230,8 @@ impl Rpki {
             max_vrps,
             backoff_min,
             backoff_max,
+            routinator,
+            invalid: _,
         } = self;
         *mode == other.mode
             && caches.len() == other.caches.len()
@@ -221,6 +247,18 @@ impl Rpki {
             && *max_vrps == other.max_vrps
             && *backoff_min == other.backoff_min
             && *backoff_max == other.backoff_max
+            && *routinator == other.routinator
+    }
+
+    /// The `routinator` block when it is the source of the VRPs, which is
+    /// `mode sidecar`. A reload leaves the running sidecar alone unless
+    /// this differs between the old block and the new.
+    #[must_use]
+    pub fn sidecar(&self) -> Option<&Routinator> {
+        match self.mode {
+            RpkiMode::Sidecar => self.routinator.as_ref(),
+            RpkiMode::Disabled | RpkiMode::External => None,
+        }
     }
 }
 
@@ -238,6 +276,8 @@ impl Default for Rpki {
             max_vrps: Rpki::DEFAULT_MAX_VRPS,
             backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
             backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
+            invalid: InvalidAction::Policy,
+            routinator: None,
         }
     }
 }
@@ -249,6 +289,9 @@ pub enum RpkiMode {
     Disabled,
     /// VRPs from the configured RTR caches (RFC 8210).
     External,
+    /// VRPs from a Routinator that bgpfcd runs and supervises as a child
+    /// process and reads over RTR on the loopback (RFC 8210).
+    Sidecar,
 }
 
 impl std::fmt::Display for RpkiMode {
@@ -256,6 +299,7 @@ impl std::fmt::Display for RpkiMode {
         f.write_str(match self {
             RpkiMode::Disabled => "disabled",
             RpkiMode::External => "external",
+            RpkiMode::Sidecar => "sidecar",
         })
     }
 }
@@ -304,6 +348,132 @@ impl std::fmt::Display for RpkiCache {
             write!(f, "[{}]:{}", self.host, self.port)
         } else {
             write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The `routinator { ... }` block of `mode sidecar`: the Routinator
+/// (an RPKI relying party) that bgpfcd runs as a child process,
+/// restarts when it fails, and reads its VRPs from over RTR on the
+/// loopback.
+///
+/// The settings are those of `bgpfc-sidecar`'s `SidecarConfig`, which
+/// this crate cannot name: the sidecar crate reaches the operating system
+/// (AGENTS.md §2) and this one must not. The daemon converts one into the
+/// other, and a test there keeps the defaults the same. What is checked
+/// here is what one statement shows, with its position: an absolute path,
+/// a loopback address, a number in range. The rest (a TAL name Routinator
+/// does not bundle, an extra argument bgpfcd reserves) the sidecar crate
+/// checks when the daemon converts the block, also for `bgpfcd --check`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routinator {
+    /// `binary`: the Routinator executable. Absolute, and never looked up
+    /// on `PATH`: a BGP daemon must not run whatever happens to be called
+    /// `routinator`.
+    pub binary: PathBuf,
+    /// `repository-dir`: Routinator's cache of RPKI data. Absolute, and
+    /// writable by the user the daemon runs as.
+    pub repository_dir: PathBuf,
+    /// `rtr-listen`: where Routinator serves RTR and where bgpfcd's RTR
+    /// client connects. A loopback address (RFC 8210 §9: unprotected TCP
+    /// only between a cache and a router on a trusted, controlled
+    /// network; the loopback is the one network nothing else can reach).
+    /// Port 0, the default, has the daemon pick a free port when it
+    /// starts the sidecar.
+    pub rtr_listen: SocketAddr,
+    /// `rir-tals`: use the TALs of the five Regional Internet Registries
+    /// that Routinator bundles, ARIN's only with
+    /// [`accept_arin_rpa`](Self::accept_arin_rpa).
+    pub rir_tals: bool,
+    /// `tal` statements: further bundled TALs by name, such as
+    /// `ripe-pilot`; with `rir-tals no`, naming RIR TALs selects some of
+    /// them.
+    pub tals: Vec<String>,
+    /// `tal-dir`: a directory of `*.tal` files (RFC 8630) used as well.
+    /// Absolute.
+    pub tal_dir: Option<PathBuf>,
+    /// `accept-arin-rpa`: that the operator accepts ARIN's Relying Party
+    /// Agreement, the terms under which ARIN publishes its TAL. Without
+    /// it the ARIN TAL is left out and routes in ARIN's address space
+    /// validate as `not-found`.
+    pub accept_arin_rpa: bool,
+    /// `refresh`: seconds between Routinator's validation runs, and the
+    /// Refresh Interval it announces to RTR clients (RFC 8210 §6); 1 to
+    /// [`Routinator::MAX_REFRESH`] seconds.
+    pub refresh: Duration,
+    /// `config-file`: a Routinator configuration file for what bgpfcd
+    /// does not model. Absolute.
+    pub config_file: Option<PathBuf>,
+    /// `global-arg` statements: options for Routinator before its
+    /// `server` command, verbatim.
+    pub global_args: Vec<String>,
+    /// `server-arg` statements: options for Routinator after its `server`
+    /// command, verbatim.
+    pub server_args: Vec<String>,
+    /// `restart-backoff INITIAL CAP`: the delay before the first restart
+    /// of a Routinator that failed, doubling with each failure in a row up
+    /// to the second.
+    pub restart_backoff_initial: Duration,
+    /// The longest restart delay.
+    pub restart_backoff_cap: Duration,
+    /// `stable-after`: how long Routinator must stay up for its next
+    /// failure to count as the first of a series again.
+    pub stable_after: Duration,
+    /// `stop-timeout`: how long Routinator may take to stop after
+    /// `SIGTERM` before it gets `SIGKILL`.
+    pub stop_timeout: Duration,
+    /// `failure-threshold`: how many failures in a row raise the `failed`
+    /// state, an alarm that stays while the restarts keep failing.
+    pub failure_threshold: u32,
+}
+
+impl Routinator {
+    /// The default `refresh`: Routinator's own.
+    pub const DEFAULT_REFRESH: Duration = Duration::from_mins(10);
+    /// The longest `refresh`. RFC 8210 §6 allows a Refresh Interval up to
+    /// 86400 seconds but requires the Expire Interval to be larger, and
+    /// Routinator's is 7200 seconds unless its configuration says otherwise.
+    pub const MAX_REFRESH: Duration = Duration::from_secs(7199);
+    /// The default first restart delay.
+    pub const DEFAULT_RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+    /// The default longest restart delay.
+    pub const DEFAULT_RESTART_BACKOFF_CAP: Duration = Duration::from_mins(5);
+    /// The longest restart delay and stop timeout that may be configured:
+    /// a validator retried less often than hourly, or stopped more slowly,
+    /// is not supervised in any useful sense.
+    pub const MAX_DELAY: Duration = Duration::from_hours(1);
+    /// The default `stable-after`.
+    pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_mins(5);
+    /// The longest `stable-after`.
+    pub const MAX_STABLE_AFTER: Duration = Duration::from_hours(24);
+    /// The default `stop-timeout`.
+    pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The default `failure-threshold`.
+    pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+    /// A block with the two statements it needs and every default for the
+    /// rest: RTR on `127.0.0.1` with a port picked at start, the RIR TALs
+    /// without ARIN's, a ten minute refresh, no configuration file or
+    /// extra arguments.
+    #[must_use]
+    pub fn new(binary: impl Into<PathBuf>, repository_dir: impl Into<PathBuf>) -> Routinator {
+        Routinator {
+            binary: binary.into(),
+            repository_dir: repository_dir.into(),
+            rtr_listen: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            rir_tals: true,
+            tals: Vec::new(),
+            tal_dir: None,
+            accept_arin_rpa: false,
+            refresh: Self::DEFAULT_REFRESH,
+            config_file: None,
+            global_args: Vec::new(),
+            server_args: Vec::new(),
+            restart_backoff_initial: Self::DEFAULT_RESTART_BACKOFF_INITIAL,
+            restart_backoff_cap: Self::DEFAULT_RESTART_BACKOFF_CAP,
+            stable_after: Self::DEFAULT_STABLE_AFTER,
+            stop_timeout: Self::DEFAULT_STOP_TIMEOUT,
+            failure_threshold: Self::DEFAULT_FAILURE_THRESHOLD,
         }
     }
 }
@@ -379,6 +549,9 @@ pub enum Match {
     Origin(Origin),
     /// `match neighbor ADDR`.
     Neighbor(IpAddr),
+    /// `match rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state (RFC 6811 §3).
+    Rpki(RovState),
 }
 
 /// How a `set ... community` action changes the set.
@@ -409,6 +582,9 @@ pub enum SetAction {
     AsPathPrepend(Vec<Asn>),
     /// `set next-hop self`.
     NextHopSelf,
+    /// `set rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state from here on (RFC 6811 §3).
+    Rpki(RovState),
 }
 
 /// How a term ends.
@@ -433,6 +609,66 @@ pub enum SendHoldTime {
     /// Hold Time.
     Seconds(u16),
 }
+
+/// What `add-path send` sends for a family (RFC 7911 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddPathSend {
+    /// `add-path send FAMILY N`: the N best paths of each prefix by the
+    /// decision process, among those export policy accepts.
+    Best(u32),
+    /// `add-path send FAMILY all`: every path export policy accepts.
+    All,
+}
+
+/// `graceful-restart yes` and what goes with it (RFC 4724, RFC 8538).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GracefulRestart {
+    /// `restart-time`: the Restart Time we advertise (RFC 4724 §3), the
+    /// time the neighbor allows our session to come back in after a
+    /// restart, and, after our own restart, the time we wait for the
+    /// neighbors' End-of-RIB before the routes not learned again are
+    /// removed (RFC 4724 §4.1). [`DEFAULT_RESTART_TIME`] when not given.
+    pub restart_time: RestartTime,
+    /// `stale-time`: the longest the stale routes of a neighbor that
+    /// restarted are kept once its session is back, waiting for its
+    /// End-of-RIB (RFC 4724 §4.2, RFC 8538 §4.1).
+    /// [`DEFAULT_STALE_TIME`] seconds when not given.
+    pub stale_time: Duration,
+}
+
+/// The `restart-time` of a neighbor that sets none, in seconds: 120.
+///
+/// NOTE(interop): RFC 4724 §4 only suggests "a value less than or equal to
+/// the HOLDTIME carried in the OPEN". BIRD (`graceful restart time`) and FRR
+/// (`bgp graceful-restart restart-time`) both default to 120 whatever the
+/// Hold Time, and bgpfcd does too.
+pub const DEFAULT_RESTART_TIME: u16 = 120;
+
+/// The `stale-time` of a neighbor that sets none, in seconds: 360.
+///
+/// NOTE(interop): RFC 8538 §4.1 requires a stale timer and suggests 180
+/// seconds; FRR (`bgp graceful-restart stalepath-time`) defaults to 360, and
+/// bgpfcd follows it. BIRD's closest knob, `graceful restart wait`, defaults
+/// to 240.
+pub const DEFAULT_STALE_TIME: u16 = 360;
+
+/// `enhanced-refresh yes` (the default) and what goes with it (RFC 7313).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnhancedRefresh {
+    /// `refresh-stale-time`: the longest the routes of a neighbor that
+    /// began a route refresh stay stale while its end is awaited (RFC 7313
+    /// §4: "an implementation MAY impose a locally configurable upper
+    /// bound on how long it would retain any stale routes").
+    /// [`DEFAULT_REFRESH_STALE_TIME`] seconds when not given.
+    pub stale_time: Duration,
+}
+
+/// The `refresh-stale-time` of a neighbor that sets none, in seconds: 360.
+///
+/// NOTE(interop): RFC 7313 §4 names no value. FRR bounds the wait for an
+/// `EoRR` with its `bgp graceful-restart stalepath-time`, 360 seconds by
+/// default, and bgpfcd follows it. BIRD has no setting for it.
+pub const DEFAULT_REFRESH_STALE_TIME: u16 = 360;
 
 /// A `neighbor` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -487,6 +723,32 @@ pub struct Neighbor {
     /// exceeding it ends the session with Cease / Maximum Number of
     /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
     pub maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `add-path receive FAMILY yes`: the families to accept several paths
+    /// per prefix for (RFC 7911 §4, §5), in file order. Empty by default.
+    pub add_path_receive: Vec<AddressFamily>,
+    /// `add-path send FAMILY N | all`: the families to send several paths
+    /// per prefix for, and how many (RFC 7911 §5), in file order. Empty by
+    /// default: one path per prefix.
+    pub add_path_send: Vec<(AddressFamily, AddPathSend)>,
+    /// `graceful-restart yes`, with `restart-time` and `stale-time`: the
+    /// Graceful Restart capability is advertised, End-of-RIB follows the
+    /// initial update, and the neighbor's routes are kept as stale when its
+    /// session ends the way RFC 4724 §4.2 and RFC 8538 §4 describe. `None`,
+    /// the default, advertises nothing and keeps RFC 4271's rules.
+    pub graceful_restart: Option<GracefulRestart>,
+    /// `enhanced-refresh`, with `refresh-stale-time`: the Enhanced Route
+    /// Refresh capability is advertised, and where the neighbor advertised
+    /// it too a route refresh is bracketed by `BoRR` and `EoRR` and the routes
+    /// a neighbor does not send again in one are purged (RFC 7313 §3.1,
+    /// §4). On by default, as RFC 7313 §4 has a speaker that supports it
+    /// advertise it; `None` for `enhanced-refresh no`, which keeps RFC 2918's
+    /// rules.
+    pub enhanced_refresh: Option<EnhancedRefresh>,
+    /// `role` and `role-strict`: our BGP Role on the session (RFC 9234
+    /// §4), with strict mode (§4.2) if asked for. `None` by default: no
+    /// Role is advertised and the Only to Customer procedures (§5) do not
+    /// apply. Validation allows it only on an external session.
+    pub role: Option<LocalRole>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -496,9 +758,12 @@ pub const DEFAULT_RESTART_LIMIT: u32 = 10;
 impl Neighbor {
     /// Whether the session parameters, the ones a change to which needs
     /// the session reset, are the same. Description, policies, the
-    /// advertisement interval and the prefix limits are not session
-    /// parameters: the interval paces what the RIB sends and the limits
-    /// bound what it keeps, and both change without a reset.
+    /// advertisement interval, the prefix limits and how many paths
+    /// `add-path send` sends are not session parameters: the interval
+    /// paces what the RIB sends, the limits bound what it keeps and the
+    /// paths sent are what it sends, and all change without a reset. The
+    /// families `add-path` is on for are: the capability says so in the
+    /// OPEN (RFC 7911 §4).
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr
@@ -514,5 +779,20 @@ impl Neighbor {
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
+            && self.add_path_receive == other.add_path_receive
+            // RFC 4724 §3: the capability is in the OPEN with the Restart
+            // Time, and the stale time is read when a session comes up.
+            && self.graceful_restart == other.graceful_restart
+            // RFC 7313 §3.1: the capability is in the OPEN, and the stale
+            // time is read when a session comes up.
+            && self.enhanced_refresh == other.enhanced_refresh
+            && self
+                .add_path_send
+                .iter()
+                .map(|(family, _)| family)
+                .eq(other.add_path_send.iter().map(|(family, _)| family))
+            // RFC 9234 §4.1: the Role is in the OPEN, and the OTC
+            // procedures of §5 follow it for routes already held.
+            && self.role == other.role
     }
 }

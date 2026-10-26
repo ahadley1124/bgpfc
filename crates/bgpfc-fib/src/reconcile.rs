@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 use std::ops::Bound::{Excluded, Unbounded};
 
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
+use bgpfc_wire::types::Afi;
 
 /// A route: one prefix, one gateway (single best path only).
 pub type Table = BTreeMap<Prefix, IpAddr>;
@@ -164,6 +165,22 @@ pub struct Routes {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Merge {
     done: Option<Prefix>,
+    /// The one family it reconciles; `None` for all of them.
+    family: Option<Afi>,
+}
+
+impl Merge {
+    /// A reconcile of the routes of `family` alone: routes installed for
+    /// the other is left as it is. RFC 4724 §4.1 ends the wait for one
+    /// family at a time, and the routes kept across a restart of the
+    /// daemon are brought in line with the RIB's when it does.
+    #[must_use]
+    pub fn of(family: Afi) -> Merge {
+        Merge {
+            done: None,
+            family: Some(family),
+        }
+    }
 }
 
 impl Routes {
@@ -214,12 +231,34 @@ impl Routes {
     /// The operations that remove every installed route, in prefix order.
     #[must_use]
     pub fn delete_all(&self) -> Vec<Op> {
+        self.delete_where(|_| true)
+    }
+
+    /// The operations that remove the installed routes of the families
+    /// `keep` does not name, in prefix order.
+    #[must_use]
+    pub fn delete_except(&self, keep: &[Afi]) -> Vec<Op> {
+        self.delete_where(|afi| !keep.contains(&afi))
+    }
+
+    fn delete_where(&self, doomed: impl Fn(Afi) -> bool) -> Vec<Op> {
         self.after(None)
+            .filter(|(prefix, _)| doomed(prefix.afi()))
             .map(|(prefix, id)| Op::Delete {
                 prefix,
                 gateway: self.gateways.addr(id),
             })
             .collect()
+    }
+
+    /// How many routes of `afi` are installed.
+    #[must_use]
+    pub fn count(&self, afi: Afi) -> usize {
+        match afi {
+            Afi::Ipv4 => self.v4.len(),
+            Afi::Ipv6 => self.v6.len(),
+            Afi::Unknown(_) => 0,
+        }
     }
 
     /// Reconcile part of a desired table: `desired` continues, in prefix
@@ -233,7 +272,14 @@ impl Routes {
     pub fn merge(&self, merge: &mut Merge, desired: &[(Prefix, IpAddr)], ops: &mut Vec<Op>) {
         for &(prefix, gateway) in desired {
             debug_assert!(merge.done.is_none_or(|d| d < prefix), "out of order");
-            for (stale, id) in self.after(merge.done).take_while(|(p, _)| *p < prefix) {
+            debug_assert!(
+                merge.family.is_none_or(|f| f == prefix.afi()),
+                "a prefix of another family"
+            );
+            for (stale, id) in self
+                .after_in(merge.family, merge.done)
+                .take_while(|(p, _)| *p < prefix)
+            {
                 ops.push(Op::Delete {
                     prefix: stale,
                     gateway: self.gateways.addr(id),
@@ -249,7 +295,7 @@ impl Routes {
     /// End a reconcile: delete what is installed past the last desired
     /// route.
     pub fn merge_end(&self, merge: Merge, ops: &mut Vec<Op>) {
-        for (stale, id) in self.after(merge.done) {
+        for (stale, id) in self.after_in(merge.family, merge.done) {
             ops.push(Op::Delete {
                 prefix: stale,
                 gateway: self.gateways.addr(id),
@@ -280,6 +326,16 @@ impl Routes {
     /// The installed routes after `from` (all of them for `None`), in
     /// prefix order: IPv4 sorts first.
     fn after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, GwId)> + '_ {
+        self.after_in(None, from)
+    }
+
+    /// [`Routes::after`] among the routes of `family`, or of both for
+    /// `None`.
+    fn after_in(
+        &self,
+        family: Option<Afi>,
+        from: Option<Prefix>,
+    ) -> impl Iterator<Item = (Prefix, GwId)> + '_ {
         let (v4, v6) = match from {
             None => (Some(self.v4.range(..)), self.v6.range(..)),
             Some(p) => match Ipv4Key::new(p) {
@@ -290,10 +346,16 @@ impl Routes {
                 None => (None, self.v6.range((Excluded(p), Unbounded))),
             },
         };
+        let (v4, v6) = match family {
+            None => (v4, Some(v6)),
+            Some(Afi::Ipv4) => (v4, None),
+            Some(Afi::Ipv6) => (None, Some(v6)),
+            Some(Afi::Unknown(_)) => (None, None),
+        };
         v4.into_iter()
             .flatten()
             .map(|(k, id)| (k.prefix(), *id))
-            .chain(v6.map(|(p, id)| (*p, *id)))
+            .chain(v6.into_iter().flatten().map(|(p, id)| (*p, *id)))
     }
 
     fn install(&mut self, prefix: Prefix, gateway: Option<IpAddr>) {

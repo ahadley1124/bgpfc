@@ -53,6 +53,11 @@ fn info(limit: u32) -> PeerInfo {
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: vec![(V4, limit)],
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
+        role: None,
+        restart: None,
+        enhanced_refresh: None,
     }
 }
 

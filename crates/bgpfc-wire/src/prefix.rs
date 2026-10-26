@@ -2,7 +2,8 @@
 //!
 //! Implements: RFC 4271 §4.3 (Withdrawn Routes and NLRI encoding),
 //! RFC 4760 §5 (the same encoding for other address families), RFC 7606
-//! §5.3 (syntactic correctness of NLRI fields).
+//! §5.3 (syntactic correctness of NLRI fields), RFC 7911 §3 (the Path
+//! Identifier that precedes each tuple where ADD-PATH is negotiated).
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -10,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use crate::reader::{Reader, WriteBytes as _};
-use crate::types::Afi;
+use crate::types::{Afi, PathId};
 
 /// An IP prefix in canonical form: host bits are zero.
 ///
@@ -130,6 +131,24 @@ impl Prefix {
         }
     }
 
+    /// Append a Path Identifier and then the `<length, prefix>` tuple: the
+    /// extended NLRI encoding of RFC 7911 §3.
+    pub fn encode_with_id(&self, id: PathId, out: &mut Vec<u8>) {
+        out.put_u32(id.0);
+        self.encode(out);
+    }
+
+    /// Decode one extended NLRI tuple of family `afi`: a four-octet Path
+    /// Identifier and then what [`Prefix::decode`] reads (RFC 7911 §3).
+    ///
+    /// # Errors
+    /// As [`Prefix::decode`]; a Path Identifier cut short is
+    /// [`NlriError::Truncated`].
+    pub fn decode_with_id(r: &mut Reader<'_>, afi: Afi) -> Result<(PathId, Prefix), NlriError> {
+        let id = PathId(r.u32().map_err(|_| NlriError::Truncated)?);
+        Ok((id, Prefix::decode(r, afi)?))
+    }
+
     /// Decode one `<length, prefix>` tuple of family `afi`. Trailing bits
     /// beyond the prefix length are zeroed (RFC 4271 §4.3: their value is
     /// irrelevant).
@@ -209,6 +228,35 @@ pub fn decode_prefixes(bytes: &[u8], afi: Afi) -> Result<Vec<Prefix>, NlriError>
 pub fn encode_prefixes(prefixes: &[Prefix], out: &mut Vec<u8>) {
     for p in prefixes {
         p.encode(out);
+    }
+}
+
+/// Decode a whole field of extended NLRI tuples of family `afi` (RFC 7911
+/// §3): the prefixes and, beside them, their Path Identifiers.
+///
+/// # Errors
+/// As [`decode_prefixes`]; the field is all-or-nothing.
+pub fn decode_prefixes_with_ids(
+    bytes: &[u8],
+    afi: Afi,
+) -> Result<(Vec<Prefix>, Vec<PathId>), NlriError> {
+    let mut r = Reader::new(bytes);
+    let mut prefixes = Vec::new();
+    let mut ids = Vec::new();
+    while !r.is_empty() {
+        let (id, prefix) = Prefix::decode_with_id(&mut r, afi)?;
+        prefixes.push(prefix);
+        ids.push(id);
+    }
+    Ok((prefixes, ids))
+}
+
+/// Encode extended NLRI tuples back to back (RFC 7911 §3): `ids[i]` goes
+/// with `prefixes[i]`. The caller has checked that the lists are as long
+/// as each other; any tuple without an identifier is left out.
+pub fn encode_prefixes_with_ids(prefixes: &[Prefix], ids: &[PathId], out: &mut Vec<u8>) {
+    for (p, id) in prefixes.iter().zip(ids) {
+        p.encode_with_id(*id, out);
     }
 }
 
@@ -423,6 +471,65 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, field);
+    }
+
+    #[test]
+    fn extended_tuples_carry_a_path_identifier_first() {
+        // RFC 7911 §3: Path Identifier (4 octets), Length, Prefix.
+        let field = [
+            0, 0, 0, 1, 24, 192, 0, 2, // path 1, 192.0.2.0/24
+            0xde, 0xad, 0xbe, 0xef, 0, // path 0xdeadbeef, 0.0.0.0/0
+        ];
+        let (prefixes, ids) = decode_prefixes_with_ids(&field, Afi::Ipv4).unwrap();
+        assert_eq!(prefixes, vec![p("192.0.2.0/24"), p("0.0.0.0/0")]);
+        assert_eq!(ids, vec![PathId(1), PathId(0xdead_beef)]);
+        let mut out = Vec::new();
+        encode_prefixes_with_ids(&prefixes, &ids, &mut out);
+        assert_eq!(out, field);
+        // IPv6, and the same prefix with two paths: each is its own tuple.
+        let field6 = [
+            0, 0, 0, 7, 32, 0x20, 0x01, 0x0d, 0xb8, //
+            0, 0, 0, 8, 32, 0x20, 0x01, 0x0d, 0xb8,
+        ];
+        let (prefixes, ids) = decode_prefixes_with_ids(&field6, Afi::Ipv6).unwrap();
+        assert_eq!(prefixes, vec![p("2001:db8::/32"); 2]);
+        assert_eq!(ids, vec![PathId(7), PathId(8)]);
+        assert_eq!(
+            decode_prefixes_with_ids(&[], Afi::Ipv4).unwrap(),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn extended_tuples_have_the_same_syntax_errors() {
+        // RFC 7606 §5.3 with RFC 7911 §3: a cut Path Identifier, a length
+        // over the family's size and a tuple that runs past the field.
+        for cut in 1..4 {
+            assert_eq!(
+                decode_prefixes_with_ids(&[0, 0, 0, 1][..cut], Afi::Ipv4),
+                Err(NlriError::Truncated)
+            );
+        }
+        assert_eq!(
+            decode_prefixes_with_ids(&[0, 0, 0, 1], Afi::Ipv4),
+            Err(NlriError::Truncated)
+        );
+        assert_eq!(
+            decode_prefixes_with_ids(&[0, 0, 0, 1, 33, 1, 2, 3, 4, 5], Afi::Ipv4),
+            Err(NlriError::LengthTooLong { len: 33, max: 32 })
+        );
+        assert_eq!(
+            decode_prefixes_with_ids(&[0, 0, 0, 1, 24, 192, 0], Afi::Ipv4),
+            Err(NlriError::Truncated)
+        );
+        assert_eq!(
+            decode_prefixes_with_ids(&[0, 0, 0, 1, 8, 10], Afi::Unknown(25)),
+            Err(NlriError::UnsupportedAfi(Afi::Unknown(25)))
+        );
+        // Without the capability the same octets are another encoding, and
+        // here none that parses: three zero lengths, a /1, then a length of
+        // 192.
+        assert!(decode_prefixes(&[0, 0, 0, 1, 24, 192, 0, 2], Afi::Ipv4).is_err());
     }
 
     #[test]

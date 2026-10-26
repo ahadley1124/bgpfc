@@ -2,14 +2,31 @@
 //!
 //! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
-//! per-family prefix limit), §6.3 a) (our own address is no next hop).
+//! per-family prefix limit), §6.3 a) (our own address is no next hop);
+//! RFC 7911 §5 (the families sent and taken with Path Identifiers, and how
+//! many paths are sent); RFC 9234 §4 (our BGP Role on the session);
+//! RFC 4724 §4, §4.2 (Graceful Restart on the session); RFC 7313 §4
+//! (Enhanced Route Refresh on the session).
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use bgpfc_wire::mp::NextHop;
+use bgpfc_wire::role::Role;
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, RouterId};
 use bgpfc_wire::update::PeerKind;
+
+use crate::restart::Restart;
+
+/// How many paths of a prefix to send a peer with ADD-PATH (RFC 7911 §5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathLimit {
+    /// The `n` best by the decision process, among those export policy
+    /// accepts; `n` is at least one.
+    Best(u32),
+    /// Every path export policy accepts.
+    All,
+}
 
 /// The session parameters the RIB needs: who the peer is, which families
 /// it speaks, and how to encode UPDATEs for it.
@@ -53,6 +70,44 @@ pub struct PeerInfo {
     /// session (see [`Output::PrefixLimitExceeded`](crate::Output)).
     /// Families not listed have none.
     pub prefix_limits: Vec<(AddressFamily, u32)>,
+    /// The families the peer sends us routes of with a Path Identifier
+    /// before each prefix, several paths for one (RFC 7911 §5). Within
+    /// `receive_families`.
+    pub add_path_receive: Vec<AddressFamily>,
+    /// The families we send the peer routes of with Path Identifiers, and
+    /// how many paths of a prefix (RFC 7911 §5). Within `families`. The
+    /// routes of any other family go as before, one best path per prefix.
+    pub add_path_send: Vec<(AddressFamily, PathLimit)>,
+    /// Our BGP Role on the session, when one is configured and the session
+    /// external (RFC 9234 §4): the session takes part in the Only to
+    /// Customer procedures of §5 (see [`otc`](crate::otc)). `None` for a
+    /// session with no Role, which leaves the attribute alone.
+    pub role: Option<Role>,
+    /// Graceful Restart (RFC 4724), when we advertised the capability to
+    /// this peer: the End-of-RIB marker ends the initial update of each
+    /// family (§4), and if the peer advertised it too its routes are kept
+    /// as stale when the session ends (§4.2). `None` leaves the session as
+    /// RFC 4271 has it.
+    pub restart: Option<Restart>,
+    /// Enhanced Route Refresh (RFC 7313), when both sides advertised the
+    /// capability: a route refresh we make is bracketed by `BoRR` and `EoRR`
+    /// (§4), and a peer's purges the routes it does not send again. `None`
+    /// leaves ROUTE-REFRESH as RFC 2918 has it.
+    pub enhanced_refresh: Option<EnhancedRefresh>,
+}
+
+/// Enhanced Route Refresh on a session (RFC 7313 §4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnhancedRefresh {
+    /// The longest the routes a peer's refresh marked as stale wait for its
+    /// `EoRR`: "an implementation MAY impose a locally configurable upper
+    /// bound on how long it would retain any stale routes" (§4).
+    pub stale_time: Duration,
+    /// The peer advertised Graceful Restart: "A BGP speaker that has
+    /// received the Graceful Restart Capability from its neighbor MUST
+    /// ignore any `BoRR`s for an `<AFI, SAFI>` from the neighbor before the
+    /// speaker receives the `EoR` for the given `<AFI, SAFI>`" (§4).
+    pub peer_graceful_restart: bool,
 }
 
 impl PeerInfo {
@@ -78,6 +133,22 @@ impl PeerInfo {
     #[must_use]
     pub fn receives(&self, family: AddressFamily) -> bool {
         self.receive_families.contains(&family) || self.speaks(family)
+    }
+
+    /// Whether the peer sends routes of `family` with Path Identifiers.
+    #[must_use]
+    pub fn receives_paths(&self, family: AddressFamily) -> bool {
+        self.add_path_receive.contains(&family)
+    }
+
+    /// How many paths of a prefix of `family` to send the peer, if it is
+    /// sent them with Path Identifiers at all (RFC 7911 §5).
+    #[must_use]
+    pub fn path_limit(&self, family: AddressFamily) -> Option<PathLimit> {
+        self.add_path_send
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, l)| *l)
     }
 
     /// The prefix limit for `family`, if there is one (RFC 4271 §6.7).

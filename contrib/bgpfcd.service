@@ -17,6 +17,11 @@ ExecStartPre=/usr/local/bin/bgpfcd -c /etc/bgpfc/bgpfc.conf --check
 ExecStart=/usr/local/bin/bgpfcd -c /etc/bgpfc/bgpfc.conf
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
+# With `rpki { mode sidecar; }` bgpfcd runs Routinator as a child and stops it
+# itself, while the sessions close. `mixed` sends SIGTERM to bgpfcd alone, so
+# the child's exit is the stop bgpfcd asked for and not a crash it restarts
+# from; whatever is left when the timeout runs out gets SIGKILL.
+KillMode=mixed
 TimeoutStopSec=20
 Restart=on-failure
 RestartSec=5
@@ -27,6 +32,9 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 NoNewPrivileges=yes
 RuntimeDirectory=bgpfc
 ConfigurationDirectory=bgpfc
+# Routinator's repository (`repository-dir /var/lib/bgpfc/rpki;`), which
+# ProtectSystem=strict leaves read-only otherwise. Needed only with a sidecar.
+StateDirectory=bgpfc
 
 # Hardening: nothing below is needed by the daemon.
 ProtectSystem=strict

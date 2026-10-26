@@ -6,11 +6,15 @@
 //! state changed go through import policy and the decision process again,
 //! the way an UPDATE takes them.
 //!
+//! What the RIB does with the Invalid ones by itself is set here too
+//! ([`Rib::set_invalid_action`]).
+//!
 //! Implements: RFC 6811 §2 ("The validation state of the Route MUST be
 //! set to reflect the result of the lookup"), §4 ("When a mapping is added
 //! or deleted, the implementation MUST re-validate any affected prefixes
 //! and run the BGP decision process if needed"), for the routes that
-//! [`AffectedPrefixes`] names.
+//! [`AffectedPrefixes`] names; RFC 6811 §5 and RFC 8481 §5 (what is done
+//! with Invalid routes is the operator's choice, see [`InvalidAction`]).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -19,14 +23,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bgpfc_rpki::{
-    AffectedPrefixes, PrefixSet, RouteOrigin, RovState, ValidationChange, ValidationSource,
+    AffectedPrefixes, InvalidAction, PrefixSet, RouteOrigin, RovState, ValidationChange,
+    ValidationSource,
 };
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
-use crate::store::{Destination, PeerId};
+use crate::store::{Destination, PeerId, Route, Table};
 use crate::{
-    Dirty, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, decide, judge,
+    Dirty, Interner, Judged, Output, PeerState, Phase2, Policies, Rib, Scratch, Sessions, Sink,
+    decide, judge,
 };
 
 /// A table walks its affected destinations in one pass, rather than one
@@ -47,9 +53,10 @@ pub struct Revalidation {
     /// Routes held in the Adj-RIBs-In that the change affected, each
     /// validated again.
     pub routes: usize,
-    /// How many of them moved from one RFC 6811 state to another:
-    /// `(from, to, routes)` for each pair that occurred, in the order of
-    /// [`RovState::ALL`] by `from`, then by `to`.
+    /// How many of them moved from one RFC 6811 state to another, as the
+    /// lookup judged them (a state import policy sets, RFC 6811 §3, is not
+    /// the lookup's): `(from, to, routes)` for each pair that occurred, in
+    /// the order of [`RovState::ALL`] by `from`, then by `to`.
     pub changes: Vec<(RovState, RovState, usize)>,
     /// Destinations with a route whose state changed.
     pub destinations: usize,
@@ -72,6 +79,24 @@ impl Revalidation {
     }
 }
 
+/// What a change of the RIB's [`InvalidAction`] did, for the caller to log:
+/// counts, never an entry per route.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Enforcement {
+    /// Routes in the Adj-RIBs-In whose state is Invalid, held or not,
+    /// judged again.
+    pub invalid: usize,
+    /// Destinations with such a route, decided again.
+    pub destinations: usize,
+    /// Of those routes, the candidates that the action now holds back.
+    pub held: usize,
+    /// Of those routes, the held ones that are candidates now.
+    pub taken: usize,
+    /// Destinations where the decision process then chose another route,
+    /// or none: the FIB changes the report comes with.
+    pub best_changed: usize,
+}
+
 /// The counts of a [`Revalidation`] as the pass gathers them.
 #[derive(Default)]
 struct Tally {
@@ -80,6 +105,12 @@ struct Tally {
     moved: [[usize; 4]; 4],
     destinations: usize,
     sample: Vec<Prefix>,
+    /// Of the routes judged again for a change of the action for Invalid
+    /// routes ([`Cause::Action`]): those that stopped being candidates,
+    /// those that became candidates, and the destinations they are in.
+    held: usize,
+    taken: usize,
+    reviewed: usize,
 }
 
 impl Tally {
@@ -168,27 +199,14 @@ impl Rib {
         // Empty destinations to remove once a table's walk is done.
         let mut empty: Vec<Prefix> = Vec::new();
         for (family, table) in self.tables.iter_mut() {
-            let cx = &mut self.s.cx;
-            let mut pass = Pass {
+            let mut pass = Pass::new(
+                Cause::Source,
                 family,
-                local_as: cx.local_as,
-                source: &*cx.validation,
-                peers: &mut self.s.peers,
-                policies: &*cx.policies,
-                interner: &mut cx.interner,
-                tally: &mut tally,
-                scratch: &mut scratch,
-                empty: &mut empty,
-            };
+                &mut self.s,
+                (&mut tally, &mut scratch, &mut empty),
+            );
             match &ranges {
-                None => {
-                    for (k, d) in &mut table.v4 {
-                        pass.destination(k.prefix(), d);
-                    }
-                    for (p, d) in &mut table.v6 {
-                        pass.destination(*p, d);
-                    }
-                }
+                None => pass.all(table),
                 Some(ranges) => {
                     let ranges = of_family(ranges, family.afi);
                     let dense =
@@ -211,23 +229,9 @@ impl Rib {
                     }
                 }
             }
-            for prefix in empty.drain(..) {
-                match Ipv4Key::new(prefix) {
-                    Some(k) => table.v4.remove(&k),
-                    None => table.v6.remove(&prefix),
-                };
-            }
+            remove_empty(table, &mut empty);
         }
-        let best_changed = scratch
-            .dirty
-            .iter()
-            .filter(|d| match (&d.old, &d.new) {
-                (None, None) => false,
-                (Some(a), Some(b)) => !a.same(b),
-                _ => true,
-            })
-            .count();
-        if let Some(report) = tally.finish(best_changed) {
+        if let Some(report) = tally.finish(best_changed(&scratch)) {
             out.put(Output::Revalidated(report));
         }
         self.finish(&mut scratch, now, out);
@@ -235,12 +239,99 @@ impl Rib {
     }
 }
 
+/// Take the destinations in `empty` out of `table`.
+fn remove_empty(table: &mut Table, empty: &mut Vec<Prefix>) {
+    for prefix in empty.drain(..) {
+        match Ipv4Key::new(prefix) {
+            Some(k) => table.v4.remove(&k),
+            None => table.v6.remove(&prefix),
+        };
+    }
+}
+
+/// In how many of the destinations `scratch` noted did the decision
+/// process choose another route, or none: the FIB changes an input made.
+fn best_changed(scratch: &Scratch) -> usize {
+    scratch
+        .dirty
+        .iter()
+        .filter(|d| match (&d.old, &d.new) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !a.same(b),
+            _ => true,
+        })
+        .count()
+}
+
+impl Rib {
+    /// What the RIB does with Invalid routes by itself from now on, apart
+    /// from the policy an operator wrote (RFC 6811 §5, RFC 8481 §5): see
+    /// [`InvalidAction`]; the RIB starts with [`InvalidAction::Policy`],
+    /// nothing. The routes in the Adj-RIBs-In whose state is Invalid are
+    /// judged again, from the attributes they were received with, and
+    /// their destinations go through the decision process again: a route
+    /// held because the RIB refused it ([`InvalidAction::Drop`]) is a
+    /// candidate once the action allows it, and the other way round. What
+    /// follows comes out as it does for an UPDATE: FIB changes, and
+    /// UPDATEs sent or held back by the RFC 4271 §9.2.1.1 pacing. The
+    /// report counts what the change reached; it is empty when the action
+    /// is the one already in force.
+    pub fn set_invalid_action(
+        &mut self,
+        action: InvalidAction,
+        now: Instant,
+        out: &mut impl Sink,
+    ) -> Enforcement {
+        if self.s.cx.invalid == action {
+            return Enforcement::default();
+        }
+        self.s.cx.invalid = action;
+        let mut tally = Tally::default();
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let mut empty: Vec<Prefix> = Vec::new();
+        for (family, table) in self.tables.iter_mut() {
+            Pass::new(
+                Cause::Action,
+                family,
+                &mut self.s,
+                (&mut tally, &mut scratch, &mut empty),
+            )
+            .all(table);
+            remove_empty(table, &mut empty);
+        }
+        let report = Enforcement {
+            invalid: tally.routes,
+            destinations: tally.reviewed,
+            held: tally.held,
+            taken: tally.taken,
+            best_changed: best_changed(&scratch),
+        };
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
+        report
+    }
+}
+
+/// Why a [`Pass`] judges the routes it does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// The validation source changed: the routes whose lookup it answers
+    /// differently (RFC 6811 §4).
+    Source,
+    /// The action for Invalid routes changed: the routes whose state is
+    /// Invalid.
+    Action,
+}
+
 /// What validating routes again needs of the RIB, borrowed apart from
 /// the table being walked.
 struct Pass<'a> {
+    cause: Cause,
     family: AddressFamily,
     local_as: Asn,
     source: &'a dyn ValidationSource,
+    drop_invalid: bool,
+    demote_invalid: bool,
     peers: &'a mut Vec<Option<PeerState>>,
     policies: &'a dyn Policies,
     interner: &'a mut Interner,
@@ -250,91 +341,95 @@ struct Pass<'a> {
     empty: &'a mut Vec<Prefix>,
 }
 
-impl Pass<'_> {
-    /// Validate again the routes held for `prefix`, in place, and run
-    /// import policy again on those whose state changed; the scratch gets
-    /// the destination with its best route before and after if its
+impl<'a> Pass<'a> {
+    /// A pass over a table of `family` for `cause`, with the RIB's
+    /// sessions borrowed apart from the tables, and the tally, scratch
+    /// and list of empty destinations it fills.
+    fn new(
+        cause: Cause,
+        family: AddressFamily,
+        s: &'a mut Sessions,
+        (tally, scratch, empty): (&'a mut Tally, &'a mut Scratch, &'a mut Vec<Prefix>),
+    ) -> Pass<'a> {
+        let Sessions { cx, peers, .. } = s;
+        Pass {
+            cause,
+            family,
+            local_as: cx.local_as,
+            source: &*cx.validation,
+            drop_invalid: cx.invalid.drops(),
+            demote_invalid: cx.invalid.demotes(),
+            peers,
+            policies: &*cx.policies,
+            interner: &mut cx.interner,
+            tally,
+            scratch,
+            empty,
+        }
+    }
+
+    /// Every destination of `table`.
+    fn all(&mut self, table: &mut Table) {
+        for (k, d) in &mut table.v4 {
+            self.destination(k.prefix(), d);
+        }
+        for (p, d) in &mut table.v6 {
+            self.destination(*p, d);
+        }
+    }
+
+    /// Judge again the routes held for `prefix` that the pass's cause
+    /// concerns, in place: for a new validation source, validate them
+    /// again and run import policy again on those whose state changed;
+    /// for a new action, run it on those that are Invalid. The scratch
+    /// gets the destination with its best route before and after if its
     /// candidates changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
+        // A change of the action concerns the Invalid routes alone, and
+        // most destinations have none: look before cloning the best route.
+        if self.cause == Cause::Action
+            && (0..dest.len()).all(|i| dest.route(i).rov != RovState::Invalid)
+        {
+            return;
+        }
         let old = dest.best().cloned();
-        let mut changed = false;
-        let mut restated = false;
-        // Whether a route moved between the candidates and the held
-        // routes, and which ones no state admits any more.
-        let mut moved = false;
-        let mut dropped: Vec<PeerId> = Vec::new();
-        for route in dest.routes_mut() {
-            self.tally.routes += 1;
-            // RFC 6811 §2, on the route as received, as on its arrival.
-            let received = Arc::clone(route.received());
-            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
-            let rov = self.source.rov(prefix, origin);
-            let aspa = self.source.aspa(&received.as_path);
-            if rov == route.rov && aspa == route.aspa {
-                continue;
-            }
-            if rov != route.rov {
-                self.tally.moved[slot(route.rov)][slot(rov)] += 1;
-                restated = true;
-            }
-            route.rov = rov;
-            route.aspa = aspa;
-            // Always found: the Adj-RIBs-In hold routes only of peers
-            // that are up, as a peer's routes go with it.
-            let Some(peer) = self.peers[route.peer.index()].as_mut() else {
-                continue;
-            };
-            let was_held = route.held;
-            let judged = judge(
-                self.policies,
-                self.interner,
-                &peer.info,
-                (self.family, prefix),
-                &received,
-                rov,
-            );
-            let (attrs, held) = match judged {
-                Judged::Accepted(attrs) => (attrs, false),
-                Judged::Held => (Arc::clone(&received), true),
-                // Policy accepted the route with some state when it was
-                // last judged, so only a change of policy since, before
-                // the ROUTE-REFRESH that follows one, can leave none.
-                Judged::Dropped => {
-                    let n = peer.adj_in_count.or_default(self.family);
-                    *n = n.saturating_sub(1);
-                    dropped.push(route.peer);
-                    (Arc::clone(&received), true)
-                }
-            };
-            let replaced = std::mem::replace(&mut route.attrs, attrs);
-            let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
-            self.scratch.released.push(replaced);
-            route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
-            route.held = held;
-            // A candidate with a new state or new attributes, or one that
-            // came or went.
-            changed |= !(was_held && held && unchanged);
-            moved |= was_held != held;
+        let mut found = Found::default();
+        for i in 0..dest.len() {
+            let id = dest.id(i);
+            self.route(prefix, dest.route_mut(i), id, &mut found);
         }
-        if moved {
+        if found.moved {
             // Candidates first; a stable sort keeps their order.
-            dest.routes_mut().sort_by_key(|r| r.held);
+            dest.sort_candidates_first();
         }
-        for peer in dropped {
-            if let Some(i) = dest.position(peer) {
+        for (peer, id) in found.dropped {
+            if let Some(i) = dest.position(peer, id) {
                 let r = dest.remove(i);
                 self.scratch.released.push(r.attrs);
                 self.scratch.released.extend(r.received);
             }
         }
-        if restated {
+        // A route is judged again for a change of the action only if it is
+        // Invalid, and then its destination is decided again.
+        if self.cause == Cause::Action && found.changed {
+            self.tally.reviewed += 1;
+        }
+        if found.lookup_moved {
             self.tally.destinations += 1;
             if self.tally.sample.len() < Revalidation::SAMPLE {
                 self.tally.sample.push(prefix);
             }
         }
-        if changed {
-            decide(self.peers, dest);
+        // A destination with no candidate before or after has no best
+        // route to change, whatever happened to the routes it holds.
+        if found.changed && (old.is_some() || dest.candidates() > 0) {
+            decide(
+                Phase2 {
+                    peers: self.peers,
+                    demote_invalid: self.demote_invalid,
+                },
+                dest,
+            );
             self.scratch.dirty.push(Dirty {
                 family: self.family,
                 prefix,
@@ -347,6 +442,99 @@ impl Pass<'_> {
             self.empty.push(prefix);
         }
     }
+
+    /// Judge again `route`, the one of peer `id` for `prefix`, if the
+    /// pass's cause concerns it, and note in `found` what that did to its
+    /// destination.
+    fn route(&mut self, prefix: Prefix, route: &mut Route, id: u32, found: &mut Found) {
+        if self.cause == Cause::Action && route.rov != RovState::Invalid {
+            return;
+        }
+        self.tally.routes += 1;
+        let received = Arc::clone(route.received());
+        let (lookup, aspa) = if self.cause == Cause::Source {
+            // RFC 6811 §2, on the route as received, as on its arrival.
+            let origin = RouteOrigin::from_as_path(&received.as_path, self.local_as);
+            let lookup = self.source.rov(prefix, origin);
+            let aspa = self.source.aspa(&received.as_path);
+            // The lookup is compared with the lookup before it, not with
+            // the state the route holds, which policy may have set
+            // (RFC 6811 §3).
+            if lookup == route.lookup && aspa == route.aspa {
+                return;
+            }
+            if lookup != route.lookup {
+                self.tally.moved[slot(route.lookup)][slot(lookup)] += 1;
+                found.lookup_moved = true;
+            }
+            (lookup, aspa)
+        } else {
+            // The state of the route is not in question, its fate is.
+            found.changed = true;
+            (route.lookup, route.aspa)
+        };
+        route.lookup = lookup;
+        route.aspa = aspa;
+        // Always found: the Adj-RIBs-In hold routes only of peers with a
+        // slot, as a peer's routes go with it. A peer whose session ended
+        // with its routes kept as stale keeps its slot and the session's
+        // settings (RFC 4724 §4.2), so its stale routes are judged again
+        // like any other (RFC 6811 §4).
+        let Some(peer) = self.peers[route.peer.index()].as_mut() else {
+            return;
+        };
+        let was_held = route.held;
+        let judged = judge(
+            self.policies,
+            self.interner,
+            &peer.info,
+            (self.family, prefix),
+            &received,
+            (lookup, self.drop_invalid),
+        );
+        let (attrs, rov, held) = match judged {
+            Judged::Accepted(attrs, rov) => (attrs, rov, false),
+            Judged::Held(rov) => (Arc::clone(&received), rov, true),
+            // Policy accepted the route with some state when it was last
+            // judged, so only a change of policy since, before the
+            // ROUTE-REFRESH that follows one, can leave none.
+            Judged::Dropped => {
+                let n = peer.adj_in_count.or_default(self.family);
+                *n = n.saturating_sub(1);
+                found.dropped.push((route.peer, id));
+                (Arc::clone(&received), lookup, true)
+            }
+        };
+        route.rov = rov;
+        let replaced = std::mem::replace(&mut route.attrs, attrs);
+        let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
+        self.scratch.released.push(replaced);
+        route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
+        route.held = held;
+        // A candidate with a new state or new attributes, or one that came
+        // or went.
+        found.changed |= !(was_held && held && unchanged);
+        found.moved |= was_held != held;
+        match (was_held, held) {
+            (false, true) => self.tally.held += 1,
+            (true, false) => self.tally.taken += 1,
+            _ => {}
+        }
+    }
+}
+
+/// What judging the routes of one destination found.
+#[derive(Default)]
+struct Found {
+    /// A candidate got a new state or new attributes, or one came or went:
+    /// the decision process runs again.
+    changed: bool,
+    /// The lookup of a route moved from one state to another.
+    lookup_moved: bool,
+    /// A route moved between the candidates and the held routes.
+    moved: bool,
+    /// The routes no state admits any more.
+    dropped: Vec<(PeerId, u32)>,
 }
 
 /// The ranges of the prefix order that hold the prefixes some prefix of

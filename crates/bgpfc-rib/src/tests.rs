@@ -21,7 +21,15 @@ use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
+mod add_path;
 mod adj_rib_in;
+mod invalid_drop;
+mod refresh;
+mod restart;
+mod roles;
+mod roles_add_path;
+mod rov_add_path_roles;
+mod rov_restart;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
@@ -31,9 +39,8 @@ fn routes(rib: &Rib, family: AddressFamily, prefix: Prefix) -> Vec<(IpAddr, crat
         .get(family)
         .and_then(|t| t.get(prefix))
         .map(|d| {
-            d.routes()
-                .iter()
-                .map(|r| (rib.s.peer(r.peer).info.addr, r.clone()))
+            d.iter()
+                .map(|(r, _)| (rib.s.peer(r.peer).info.addr, r.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -58,7 +65,7 @@ fn p(s: &str) -> Prefix {
     s.parse().unwrap()
 }
 
-fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
+pub(crate) fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
     let next_hop = match ip(next_hop) {
         IpAddr::V4(a) => NextHop::Ipv4(a),
         IpAddr::V6(a) => NextHop::Ipv6 {
@@ -78,10 +85,11 @@ fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
         ext_communities: Box::default(),
         large_communities: Box::default(),
         unknown: Box::default(),
+        otc: None,
     }
 }
 
-fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
+pub(crate) fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     let addr = ip(addr);
     let local_addr = match addr {
         IpAddr::V4(_) => ip("10.0.0.254"),
@@ -106,6 +114,11 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         // §9.2.1.1 tests below are about when.
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
+        role: None,
+        restart: None,
+        enhanced_refresh: None,
     }
 }
 
@@ -118,6 +131,19 @@ fn best_of(routes: &[(&PeerInfo, PathAttrs)]) -> Option<usize> {
     best(routes.len(), |i| Candidate {
         from: Neighbor::of(routes[i].0),
         attrs: &routes[i].1,
+        path_id: 0,
+        demoted: false,
+    })
+}
+
+/// [`best_of`] with some routes demoted (RFC 6811 §5, prefer-valid):
+/// routes as (peer, attributes, demoted).
+fn best_of_demoted(routes: &[(&PeerInfo, PathAttrs, bool)]) -> Option<usize> {
+    best(routes.len(), |i| Candidate {
+        from: Neighbor::of(routes[i].0),
+        attrs: &routes[i].1,
+        path_id: 0,
+        demoted: routes[i].2,
     })
 }
 
@@ -157,6 +183,7 @@ fn decode_sent(messages: &[Vec<u8>], to: &PeerInfo) -> Vec<UpdateMessage> {
         peer: to.kind,
         allow_as_set: false,
         extended_next_hop: to.extended_next_hop.contains(&V4),
+        add_path: bgpfc_wire::update::AddPathFamilies::NONE,
     };
     messages
         .iter()
@@ -253,6 +280,133 @@ fn lower_origin_wins() {
     b.origin = Origin::Egp;
     let c = [(&e1, a), (&e2, b)];
     assert_eq!(best_of(&c), Some(1));
+}
+
+#[test]
+fn a_demoted_route_loses_whatever_its_preference() {
+    // RFC 6811 §5, prefer-valid: ahead of every step of RFC 4271 §9.1.2.2,
+    // a route that is not demoted beats one that is.
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    // The demoted route has the better degree of preference, the shorter
+    // path, the lower origin, the lower MED and the lower router id.
+    let mut demoted = attrs(&[65_001], "10.0.0.1");
+    demoted.local_pref = Some(500);
+    demoted.med = Some(0);
+    let plain = attrs(&[65_002, 7, 8, 9], "10.0.0.2");
+    let c = [(&e1, demoted.clone(), true), (&e2, plain.clone(), false)];
+    assert_eq!(best_of_demoted(&c), Some(1));
+    let c = [(&e2, plain.clone(), false), (&e1, demoted.clone(), true)];
+    assert_eq!(best_of_demoted(&c), Some(0));
+    // Not demoted, that route wins on the usual steps.
+    let c = [(&e1, demoted.clone(), false), (&e2, plain.clone(), false)];
+    assert_eq!(best_of_demoted(&c), Some(0));
+    // When every route is demoted the usual steps choose, and the best of
+    // them is chosen, not none.
+    let c = [(&e1, demoted, true), (&e2, plain, true)];
+    assert_eq!(best_of_demoted(&c), Some(0));
+    // One route, demoted or not, is the best.
+    assert_eq!(
+        best_of_demoted(&[(&e1, attrs(&[65_001], "10.0.0.1"), true)]),
+        Some(0)
+    );
+    assert_eq!(best_of_demoted(&[]), None);
+}
+
+#[test]
+fn the_med_of_a_demoted_route_says_nothing_of_the_others() {
+    // A demoted route with a lower MED from the same neighboring AS must
+    // not push the route that beats it down a rank: the MED step compares
+    // the routes of one kind with each other.
+    let e1 = peer("10.0.0.1", 65_001, 3);
+    let e2 = peer("10.0.0.2", 65_001, 2);
+    let e3 = peer("10.0.0.3", 65_003, 1);
+    let mut demoted = attrs(&[65_001], "10.0.0.1");
+    demoted.med = Some(1);
+    let mut kept = attrs(&[65_001], "10.0.0.2");
+    kept.med = Some(100);
+    // Another neighboring AS, so that MED does not apply to it; it loses
+    // the router-id step to nobody and wins unless `kept` is ranked down.
+    let other = attrs(&[65_003], "10.0.0.3");
+    for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [1, 0, 2]] {
+        let routes = [
+            (&e1, demoted.clone(), true),
+            (&e2, kept.clone(), false),
+            (&e3, other.clone(), false),
+        ];
+        let r: Vec<_> = order.iter().map(|i| routes[*i].clone()).collect();
+        // Both routes that are not demoted go on to the router-id step,
+        // where e3 has the lowest: in every order.
+        assert_eq!(order[best_of_demoted(&r).unwrap()], 2, "{order:?}");
+    }
+    // Without the third route `kept` is the best of the two kinds' firsts.
+    let routes = [(&e1, demoted, true), (&e2, kept, false)];
+    assert_eq!(best_of_demoted(&routes), Some(1));
+}
+
+proptest::proptest! {
+    /// Demotion splits the candidates into two kinds and the steps apply
+    /// within each alone: the best of all is the best of the kind that is
+    /// not demoted, or when there is none, of the others, in whatever
+    /// order the candidates come.
+    #[test]
+    fn demoted_routes_are_a_kind_apart(
+        routes in proptest::collection::vec(
+            (0u32..4, 1u32..4, proptest::option::of(0u32..3), proptest::option::of(50u32..53), 0u8..3, proptest::bool::ANY),
+            0..7,
+        ),
+        seed in proptest::num::u64::ANY,
+    ) {
+        // Four neighbors in two ASes, each candidate from one of them.
+        let peers: Vec<PeerInfo> = (0..4u32)
+            .map(|i| peer(&format!("10.0.0.{}", i + 1), 65_001 + i / 2, i + 1))
+            .collect();
+        let built: Vec<(usize, PathAttrs, bool)> = routes
+            .iter()
+            .enumerate()
+            .map(|(k, &(from, hops, med, pref, origin, demoted))| {
+                let from = usize::try_from(from).unwrap();
+                let mut path = vec![65_001 + u32::try_from(from).unwrap() / 2];
+                path.extend((1..hops).map(|h| 100 + h));
+                let mut a = attrs(&path, &format!("10.0.0.{}", from + 1));
+                a.med = med;
+                a.local_pref = pref;
+                a.origin = Origin::from_u8(origin).unwrap();
+                // A tag in the path makes every route distinct.
+                a.communities = vec![Community::new(1, u16::try_from(k).unwrap())].into();
+                (from, a, demoted)
+            })
+            .collect();
+        // At most one route per peer is a candidate: a destination has a
+        // route per peer.
+        let mut seen = [false; 4];
+        let built: Vec<_> = built
+            .into_iter()
+            .filter(|(from, _, _)| !std::mem::replace(&mut seen[*from], true))
+            .collect();
+        let tag = |a: &PathAttrs| a.communities[0];
+        let run = |list: &[(usize, PathAttrs, bool)]| {
+            let r: Vec<(&PeerInfo, PathAttrs, bool)> =
+                list.iter().map(|(f, a, d)| (&peers[*f], a.clone(), *d)).collect();
+            best_of_demoted(&r).map(|i| tag(&list[i].1))
+        };
+        let all = run(&built);
+        // The best of the kind that is not demoted, when there is one.
+        let plain: Vec<_> = built.iter().filter(|r| !r.2).cloned().collect();
+        let demoted: Vec<_> = built.iter().filter(|r| r.2).cloned().collect();
+        let expected = if plain.is_empty() { run(&demoted) } else { run(&plain) };
+        proptest::prop_assert_eq!(all, expected);
+        // And in another order.
+        let mut shuffled = built.clone();
+        let mut x = seed | 1;
+        for i in (1..shuffled.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            shuffled.swap(i, usize::try_from(x % (i as u64 + 1)).unwrap());
+        }
+        proptest::prop_assert_eq!(run(&shuffled), all);
+    }
 }
 
 #[test]
@@ -1382,7 +1536,7 @@ fn attributes_round_trip_through_an_update() {
     let d = announce(&["192.0.2.0/24"], &a);
     let parts: Vec<_> = announced(&d).collect();
     assert_eq!(parts.len(), 1);
-    let (family, next_hop, prefixes) = parts[0];
+    let (family, next_hop, prefixes, _) = parts[0];
     assert_eq!((family, prefixes), (V4, &[p("192.0.2.0/24")][..]));
     let back = PathAttrs::from_update(&d.message, next_hop);
     assert_eq!(
@@ -1397,6 +1551,55 @@ fn attributes_round_trip_through_an_update() {
     assert_eq!(announced(&withdraw(&["192.0.2.0/24"])).count(), 0);
     assert!(a.has_community(Community::new(65_001, 2)));
     assert_eq!(a.next_hop_afi(), bgpfc_wire::types::Afi::Ipv4);
+}
+
+#[test]
+fn only_to_customer_is_part_of_the_attribute_set() {
+    // RFC 9234 §5: kept as received and "preserved unchanged".
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.otc = Some(Asn(65_001));
+    let d = announce(&["192.0.2.0/24"], &a);
+    assert_eq!(
+        d.message.attribute(35),
+        Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+    );
+    let (_, next_hop, _, _) = announced(&d).next().unwrap();
+    assert_eq!(PathAttrs::from_update(&d.message, next_hop), a);
+    // A route without it, or with another value, is another set.
+    let mut i = crate::attrs::Interner::default();
+    let with = i.intern(a.clone());
+    let without = i.intern(attrs(&[65_001], "10.0.0.1"));
+    let other = {
+        let mut b = a.clone();
+        b.otc = Some(Asn(65_002));
+        i.intern(b)
+    };
+    assert_eq!(i.len(), 3);
+    assert!(Arc::ptr_eq(&with, &i.intern(a)));
+    assert!(!Arc::ptr_eq(&with, &without) && !Arc::ptr_eq(&with, &other));
+}
+
+#[test]
+fn only_to_customer_is_passed_on_unchanged_without_roles() {
+    // A session with no BGP Role takes no part in RFC 9234 §5 procedures,
+    // but the attribute is still transitive: it reaches the next peer
+    // exactly as received, without the Partial bit an unknown attribute
+    // would get.
+    let from = peer("10.0.0.1", 65_001, 1);
+    let to = peer("10.0.0.2", 65_002, 2);
+    let mut a = attrs(&[65_001], "10.0.0.1");
+    a.otc = Some(Asn(65_009));
+    let mut rib = Rib::new(LOCAL_AS);
+    let mut out = Vec::new();
+    rib.peer_up(from.clone(), now(), &mut out);
+    rib.peer_up(to.clone(), now(), &mut out);
+    out.clear();
+    rib.update(from.addr, &announce(&["192.0.2.0/24"], &a), now(), &mut out);
+    let sent = decode_sent(sends(&out, to.addr)[0], &to);
+    assert_eq!(
+        sent[0].attribute(35),
+        Some(&PathAttribute::OnlyToCustomer(Asn(65_009)))
+    );
 }
 
 #[test]

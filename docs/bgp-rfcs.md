@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 20 are `done`, 6 `partial`,
-20 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 24 are `done`, 8 `partial`,
+14 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 6811, 7606, 7607, 7911, 8092, 8212, 8481, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -38,13 +38,32 @@ Of the 154 RFCs below, 20 are `done`, 6 `partial`,
   §9.2.1.1); its row below says how.
 - RFC 2545: bgpfc never sends a link-local next hop (§3, MUST), as it
   cannot tell when it shares a subnet with the next hop and the peer.
-- RFC 6811: every route carries its validation state, from VRPs fetched
-  over RTR (§2, §4). Missing: a policy match on the state (§3, MUST) and
-  acting on it, AGENTS.md §9 step 13.
+- RFC 4724: Graceful Restart, as a Receiving Speaker and as a Restarting
+  Speaker with forwarding state kept in the kernel (AGENTS.md §9 step 16).
+  The one MUST row not `done` is §4.1's Restart State bit: it is set after
+  a restart that kept forwarding state, and a restart that kept none is not
+  told from a first start. Open SHOULD rows: the Restart Time default is
+  120 s, not at most the Hold Time (§4), and the End-of-RIB marker goes only
+  to neighbors with `graceful-restart yes` (§2).
 - RFC 6286: §2.2 (our own identifier from an internal peer is Bad BGP
   Identifier) and §2.3 (equal identifiers in a collision: the larger AS
   keeps its connection).
+- RFC 7313: Enhanced Route Refresh is done as a sender and receiver on a
+  session where both sides advertised the capability and the peer advertised
+  Route Refresh (AGENTS.md §9 step 17). Four MUST rows deviate. RFC 7313 §4
+  and §5 make the procedures follow from the capability received from the
+  peer alone; bgpfc also needs ours (`enhanced-refresh no;` turns it off) and
+  the peer's Route Refresh (RFC 2918 §4 allows a ROUTE-REFRESH only to a peer
+  that advertised it), so a peer that advertised the capability gets RFC
+  2918's refresh, with no BoRR or EoRR, on those two kinds of session. And a
+  ROUTE-REFRESH too long for the Data field of any NOTIFICATION (over 4075
+  octets, or 65514 with Extended Message) is echoed cut to what fits (§5).
 - RFC 7454 (BCP 194): GTSM (RFC 5082).
+- RFC 9234: the Role capability and the Only to Customer procedures are
+  done (§4, §5). The one MUST row left is §3.1: a Customer, RS-Client or
+  Peer must send only routes learned from a customer, and bgpfc enforces
+  that through the attribute, so a route learned over a session with no
+  Role is the operator's policy to keep from a provider.
 - RFC 8326: an option to tag our announcements with `GRACEFUL_SHUTDOWN`.
 
 **Smaller items found in the review:**
@@ -56,10 +75,11 @@ Of the 154 RFCs below, 20 are `done`, 6 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7911, 7947, 8097, 8481, 8538, 8893, 9234, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 5065, 6514, 7432, 7705, 7947, 8097, 8893, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
-`bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
+`bgpfc-rtr` speaks to fetch VRPs, also from the Routinator sidecar on the
+loopback), RFC 6483 and RFC 9319 (tracked in
 COMPLIANCE.md beside RFC 6811), RFC 6396 (MRT, read by `bgpfc-bench`),
 and for the control plane RFC 8259 (JSON), RFC 9112 (HTTP/1.1) and
 RFC 6750 (bearer tokens).
@@ -107,7 +127,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [2842](https://datatracker.ietf.org/doc/html/rfc2842) | Capabilities Advertisement with BGP-4 | PS; obsoleted by 3392 | `n/a` |  |
 | [8810](https://datatracker.ietf.org/doc/html/rfc8810) | Revision to Capability Codes Registration Procedures | PS | `n/a` | IANA procedure. |
 | [2918](https://datatracker.ietf.org/doc/html/rfc2918) | Route Refresh Capability for BGP-4 | PS; updated by 7313 | `done` |  |
-| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `later` | RESOURCES.md, "Later: features". |
+| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `partial` | AGENTS.md §9 step 17. Four MUST rows deviate (see above). The stale routes of a refresh wait for the EoRR for `refresh-stale-time`, 360 s (a MAY in §4). |
 | [4486](https://datatracker.ietf.org/doc/html/rfc4486) | Subcodes for BGP Cease Notification Message | PS; updated by 8203, 9003 | `done` |  |
 | [8203](https://datatracker.ietf.org/doc/html/rfc8203) | BGP Administrative Shutdown Communication | PS; obsoleted by 9003 | `n/a` |  |
 | [9003](https://datatracker.ietf.org/doc/html/rfc9003) | Extended BGP Administrative Shutdown Communication | PS | `done` |  |
@@ -126,7 +146,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [9774](https://datatracker.ietf.org/doc/html/rfc9774) | Deprecation of AS_SET and AS_CONFED_SET in BGP | PS | `done` | `allow-as-set yes` per neighbor accepts `AS_SET` against §3. |
 | [6938](https://datatracker.ietf.org/doc/html/rfc6938) | Deprecation of BGP Path Attributes: DPA, ADVERTISER, and RCID_PATH / CLUSTER_ID | PS | `n/a` | IANA only. Received ones are unrecognised optional attributes (RFC 4271 §5). |
 | [8093](https://datatracker.ietf.org/doc/html/rfc8093) | Deprecation of BGP Path Attribute Values 30, 31, 129, 241, 242, and 243 | PS | `n/a` | IANA only. Received ones are unrecognised optional attributes (RFC 4271 §5). |
-| [9234](https://datatracker.ietf.org/doc/html/rfc9234) | Route Leak Prevention and Detection Using Roles in UPDATE and OPEN Messages | PS | `later` | AGENTS.md §9. |
+| [9234](https://datatracker.ietf.org/doc/html/rfc9234) | Route Leak Prevention and Detection Using Roles in UPDATE and OPEN Messages | PS | `partial` | `role` and `role-strict` per neighbor: the Role capability, the Role Mismatch NOTIFICATION, and the OTC attribute set and checked on ingress and egress (§4, §5), tested against BIRD. Open in [COMPLIANCE.md](../COMPLIANCE.md): routes learned over a session with no Role are not marked and are the operator's policy to keep from a provider (§3.1, MUST NOT, partial). |
 
 ## Attributes, communities and AS numbers
 
@@ -174,15 +194,15 @@ RFC 4360 is being replaced by rfc4360-bis, which is in the RFC Editor queue.
 | [5065](https://datatracker.ietf.org/doc/html/rfc5065) | Autonomous System Confederations for BGP | DS; updated by 9774 | `later` | AGENTS.md §9. The codec already knows the confederation segment types and counts them as §5.3 says. |
 | [5291](https://datatracker.ietf.org/doc/html/rfc5291) | Outbound Route Filtering Capability for BGP-4 | PS | `no` |  |
 | [5292](https://datatracker.ietf.org/doc/html/rfc5292) | Address-Prefix-Based Outbound Route Filter for BGP-4 | PS | `no` |  |
-| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `later` | AGENTS.md §9. |
+| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `done` | Send and receive, per neighbor and family, for IPv4 and IPv6 unicast (AGENTS.md §9 step 15); every path received takes part in the decision process and the FIB still gets the one best path. Path Identifiers need not be stable across a restart: stale paths are replaced by prefix and identifier and the rest go at the End-of-RIB (§5, with graceful restart). |
 | [5004](https://datatracker.ietf.org/doc/html/rfc5004) | Avoid BGP Best Path Transitions from One External to Another | PS | `no` | Would make the Loc-RIB depend on arrival order, against the RIB invariant in AGENTS.md §5. |
 | [7947](https://datatracker.ietf.org/doc/html/rfc7947) | Internet Exchange BGP Route Server | PS | `later` | RESOURCES.md, "Later: features". |
 | [1863](https://datatracker.ietf.org/doc/html/rfc1863) | A BGP/IDRP Route Server alternative to a full mesh routing | Historic; obsoleted by 4223 | `n/a` |  |
 | [4223](https://datatracker.ietf.org/doc/html/rfc4223) | Reclassification of RFC 1863 to Historic | Informational | `n/a` |  |
 | [2439](https://datatracker.ietf.org/doc/html/rfc2439) | BGP Route Flap Damping | PS | `no` |  |
 | [7196](https://datatracker.ietf.org/doc/html/rfc7196) | Making Route Flap Damping Usable | PS | `no` |  |
-| [4724](https://datatracker.ietf.org/doc/html/rfc4724) | Graceful Restart Mechanism for BGP | PS; updated by 8538 | `later` | AGENTS.md §9. Only the profiling build and `bgpfc-bench` recognise End-of-RIB. |
-| [8538](https://datatracker.ietf.org/doc/html/rfc8538) | Notification Message Support for BGP Graceful Restart | PS | `later` | Comes with graceful restart. |
+| [4724](https://datatracker.ietf.org/doc/html/rfc4724) | Graceful Restart Mechanism for BGP | PS; updated by 8538 | `partial` | Per neighbor with `graceful-restart yes` (AGENTS.md §9 step 16): the Receiving Speaker procedures (§4.2) and, in install mode with routes of our protocol number left in the kernel, the Restarting Speaker's (§4.1). Open in [COMPLIANCE.md](../COMPLIANCE.md): the Restart State bit after a restart that kept no forwarding state (§4.1, MUST, partial); the default Restart Time (§4) and the End-of-RIB marker for neighbors without the option (§2) deviate (SHOULD). |
+| [8538](https://datatracker.ietf.org/doc/html/rfc8538) | Notification Message Support for BGP Graceful Restart | PS | `done` | The N bit, graceful NOTIFICATIONs, the Hard Reset (Cease subcode 9) sent by `bgpfcctl clear neighbor ADDR hard-reset` and as RFC 8538 §5.1 suggests, and the stale timer (`stale-time`). Open SHOULD: the Forwarding State bit is clear in dry-run mode, where nothing is installed (§4). |
 | [9494](https://datatracker.ietf.org/doc/html/rfc9494) | Long-Lived Graceful Restart for BGP | PS | `later` | RESOURCES.md, "Later: features". |
 | [3345](https://datatracker.ietf.org/doc/html/rfc3345) | Border Gateway Protocol (BGP) Persistent Route Oscillation Condition | Informational | `n/a` |  |
 | [7964](https://datatracker.ietf.org/doc/html/rfc7964) | Solutions for BGP Persistent Route Oscillation | PS | `no` | The fixes rely on ADD-PATH or route reflection. |
@@ -241,9 +261,9 @@ These come from GROW, SIDR/SIDROPS, L3VPN/BESS, IDR-adjacent work and BCPs. This
 | [9736](https://datatracker.ietf.org/doc/html/rfc9736) | The BGP Monitoring Protocol (BMP) Peer Up Message Namespace | PS | `no` |  |
 | [9972](https://datatracker.ietf.org/doc/html/rfc9972) | Advanced BGP Monitoring Protocol (BMP) Statistics Types | PS | `no` |  |
 | [6397](https://datatracker.ietf.org/doc/html/rfc6397) | Multi-Threaded Routing Toolkit (MRT) Border Gateway Protocol (BGP) Routing Information Export Format with Geo-Location Extensions | PS | `no` | `bgpfc-bench` reads RFC 6396 `TABLE_DUMP_V2` dumps for benchmarks; the daemon has no MRT export. |
-| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `partial` | Every route is validated on arrival and again when the VRPs change (§2, §4), against VRPs fetched over RTR (RFC 8210). Missing: route policy matching the validation state (§3, MUST) and dropping Invalid by default, AGENTS.md §9 step 13. |
+| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `done` | Every route is validated on arrival and again when the VRPs change (§2, §4), against VRPs fetched over RTR (RFC 8210) from external caches or from a Routinator that bgpfcd runs and supervises (`mode sidecar`). Policy matches and sets the state (§3), and the `invalid` statement of the `rpki` block drops Invalid routes or lets them lose in the decision process (§5). The SHOULD that an unvalidated route start as NotFound deviates: it is `disabled`. |
 | [8097](https://datatracker.ietf.org/doc/html/rfc8097) | BGP Prefix Origin Validation State Extended Community | PS | `later` | RPKI. Matchable today as a hex extended community. |
-| [8481](https://datatracker.ietf.org/doc/html/rfc8481) | Clarifications to BGP Origin Validation Based on Resource Public Key Infrastructure (RPKI) | PS; updated by 9324 | `later` | RPKI, AGENTS.md §9. |
+| [8481](https://datatracker.ietf.org/doc/html/rfc8481) | Clarifications to BGP Origin Validation Based on Resource Public Key Infrastructure (RPKI) | PS; updated by 9324 | `done` | Every route is evaluated whatever its source (§4); the RIB acts on the state only as the operator's `invalid` statement says, which an `external` or `sidecar` `rpki` block must give (§5, "Set State, Don't Act"). |
 | [8893](https://datatracker.ietf.org/doc/html/rfc8893) | Resource Public Key Infrastructure (RPKI) Origin Validation for BGP Export | PS | `later` | RPKI, AGENTS.md §9. |
 | [8205](https://datatracker.ietf.org/doc/html/rfc8205) | BGPsec Protocol Specification | PS; updated by 8206 | `no` |  |
 | [8206](https://datatracker.ietf.org/doc/html/rfc8206) | BGPsec Considerations for Autonomous System (AS) Migration | PS | `no` |  |

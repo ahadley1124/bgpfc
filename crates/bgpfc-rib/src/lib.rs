@@ -19,13 +19,34 @@
 //! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
 //! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
 //! that ends the session, see [`Output::PrefixLimitExceeded`]);
+//! RFC 7911 §2, §3, §5 (the Adj-RIB-In keeps each path a peer sends under
+//! its Path Identifier and every one takes part in the decision process;
+//! a peer that takes several paths is sent the `n` best or all of them,
+//! each with an identifier of ours, see the private `addpath` module);
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
-//! alone is kept), §3 (policy sees
-//! the validation state, see [`Policies`]), §4 (the affected routes are
-//! validated again when the validation source changes, see
-//! [`Rib::validation_changed`]).
+//! alone, or the RIB refuses for being Invalid, is kept), §3 (policy sees
+//! the validation state and may set it, see [`Policies`] and
+//! [`Verdict`]), §4 (the affected routes are validated again when the
+//! validation source changes, see [`Rib::validation_changed`]), §5 (the
+//! Invalid are dropped or lose in the decision process when the operator
+//! says so, see [`Rib::set_invalid_action`]); RFC 8481 §5 (no action on
+//! the state unless the operator names it: the RIB starts with
+//! `InvalidAction::Policy`, nothing);
+//! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
+//! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
+//! attribute is added and checked on the way out, see [`otc`] and
+//! [`export`]);
+//! RFC 4724 §2, §4, §4.1, §4.2 and RFC 8538 §4.1, §9 (the routes of a
+//! session that ended gracefully stay as stale ones until the peer sends
+//! them again, its End-of-RIB comes or a timer runs out, see
+//! [`Rib::peer_retain`]; a Restarting Speaker defers route selection, see
+//! [`Rib::defer_selection`]; each initial update ends with the End-of-RIB
+//! marker, see [`export::end_of_rib`]); RFC 7313 §4 (a route refresh we
+//! make is bracketed by `BoRR` and `EoRR`, see [`Rib::refresh`]; the routes
+//! a peer's route refresh does not send again are removed at its `EoRR`,
+//! see [`Rib::refresh_begin`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -36,13 +57,17 @@
 //! size and how much its attributes repeat (`docs/PROFILING.md`).
 #![forbid(unsafe_code)]
 
+mod addpath;
 pub mod attrs;
 pub mod decision;
 pub mod export;
+pub mod otc;
 pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod refresh;
+mod restart;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -55,37 +80,69 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rpki::{NullSource, ValidationSource};
+use bgpfc_rpki::{InvalidAction, NullSource, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
-use bgpfc_wire::types::{AddressFamily, Asn};
+use bgpfc_wire::route_refresh::RouteRefreshMessage;
+use bgpfc_wire::types::{AddressFamily, Asn, PathId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
 pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
-pub use peer::PeerInfo;
-pub use validation::Revalidation;
+pub use peer::{EnhancedRefresh, PathLimit, PeerInfo};
+pub use refresh::{RefreshIgnored, RefreshReport};
+pub use restart::{Deferral, PeerRestart, Restart, Retention, StaleEnd, StalePeer};
+pub use validation::{Enforcement, Revalidation};
 
+use addpath::{Sent, Sync};
 use pacing::{Clock, Held, Jitter, Now, Offer, Pace, Pacing, Tick};
-use store::{Destination, FamilyMap, PeerId, Route, Table};
+use store::{Destination, FamilyMap, Member, PeerId, Route, Table};
 
 /// What a policy decided about a route.
+///
+/// RFC 6811 §3 asks that policy can "match and set the validation state of
+/// routes". Matching needs only the state a policy is told; setting is
+/// what [`Verdict::Restated`] and [`Verdict::ModifiedRestated`] carry back
+/// to the RIB, which then holds the route with that state, as its
+/// validation state, in place of the one the lookup gave. A state is
+/// local to the speaker (RFC 6811 §2: "a local property or attribute of
+/// the Route"), so it only means something on import; export policy may
+/// set it for the terms that follow in its own run, and the RIB ignores
+/// what an export verdict restates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Keep the route with its attributes as they are.
     Accept,
     /// Keep the route with these attributes instead.
     Modified(PathAttrs),
+    /// Keep the route with its attributes as they are, and this
+    /// validation state in place of the one it was given (RFC 6811 §3).
+    Restated(RovState),
+    /// Keep the route with these attributes and this validation state.
+    ModifiedRestated(PathAttrs, RovState),
     /// Drop the route.
     Reject,
+}
+
+impl Verdict {
+    /// The validation state this verdict gives the route, if it sets one.
+    #[must_use]
+    pub fn rov(&self) -> Option<RovState> {
+        match self {
+            Verdict::Restated(rov) | Verdict::ModifiedRestated(_, rov) => Some(*rov),
+            Verdict::Accept | Verdict::Modified(_) | Verdict::Reject => None,
+        }
+    }
 }
 
 /// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
 /// policy, §9.1.3 export policy). `peer` is the peer the route came from
 /// on import and the peer it is going to on export. `rov` is the route's
-/// validation state, which policy must be able to match (RFC 6811 §3).
+/// validation state: on import the one the lookup gave it, on export the
+/// one it holds, which import policy may have set. Policy must be able to
+/// match and set it (RFC 6811 §3, see [`Verdict`]).
 pub trait Policies: Send {
     /// Decide whether and how a route held in the Adj-RIB-In becomes a
     /// candidate for the decision process.
@@ -196,12 +253,62 @@ pub enum Output {
         /// The routes.
         prefixes: Vec<Prefix>,
     },
+    /// Routes ignored because they are route leaks by RFC 9234 §5: they
+    /// came with the Only to Customer attribute from a customer or an
+    /// RS-Client, or from a peer with another AS in it. Such a route "MUST
+    /// be considered ineligible", so it is not kept and one the peer sent
+    /// before for the prefix is withdrawn. The caller logs it; no
+    /// NOTIFICATION is sent and the session stays up.
+    RouteLeak {
+        /// The peer that sent them.
+        peer: IpAddr,
+        /// Their family.
+        family: AddressFamily,
+        /// The AS in the attribute.
+        otc: Asn,
+        /// How many routes of the UPDATE were leaks.
+        routes: usize,
+        /// The first of them.
+        first: Prefix,
+    },
     /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
     /// the validation source (see [`Rib::validation_changed`]): one report
     /// per change of the source, counted rather than listed, however many
     /// routes it moved. The caller logs it. The state a route gets on
     /// arrival is its first, not a change, and is not reported.
     Revalidated(Revalidation),
+    /// Stale routes of a peer were removed (RFC 4724 §4.2): the caller
+    /// logs it. The FIB and the other peers have been told through the
+    /// outputs that came with it.
+    StaleRemoved {
+        /// The peer.
+        peer: IpAddr,
+        /// The family, or `None` for all the peer had.
+        family: Option<AddressFamily>,
+        /// How many routes.
+        routes: usize,
+        /// Why.
+        why: StaleEnd,
+    },
+    /// A message of a route refresh from the peer was ignored (RFC 7313
+    /// §4): the caller logs it, as the RFC asks.
+    RefreshIgnored {
+        /// The peer.
+        peer: IpAddr,
+        /// The family.
+        family: AddressFamily,
+        /// Why.
+        why: RefreshIgnored,
+    },
+    /// Route selection for `family` is no longer deferred (RFC 4724
+    /// §4.1): the Loc-RIB is complete for it. The RIB has kept the FIB
+    /// and the peers out of it until now; the caller brings the FIB in
+    /// line with [`Rib::fib_routes_of`] (the routes it holds that the
+    /// Loc-RIB does not go), and the peers are sent their tables after it.
+    SelectionDone {
+        /// The family.
+        family: AddressFamily,
+    },
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -227,10 +334,17 @@ pub struct RouteRef<'a> {
     pub peer: IpAddr,
     /// Its attributes.
     pub attrs: &'a Arc<PathAttrs>,
-    /// Its RFC 6811 §2 validation state.
+    /// Its RFC 6811 §2 validation state: the lookup's, unless import
+    /// policy set another (RFC 6811 §3).
     pub rov: RovState,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
+    /// The Path Identifier its peer sent it with (RFC 7911 §3): `Some` for
+    /// a route of a family the peer sends with them, zero included.
+    pub path_id: Option<PathId>,
+    /// The session it came over ended and it is kept until its peer sends
+    /// it again (RFC 4724 §4.2).
+    pub stale: bool,
 }
 
 struct PeerState {
@@ -254,15 +368,37 @@ struct PeerState {
     adj_in_count: FamilyMap<usize>,
     /// The RFC 4271 §9.2.1.1 pacing state per family.
     pacing: FamilyMap<Pacing>,
+    /// What the peer has been sent of each prefix, for the families it is
+    /// sent several paths of (RFC 7911 §5); empty for any other.
+    sent: FamilyMap<Sent>,
     /// The session is going down: its routes are being removed, and it is
-    /// sent nothing more.
+    /// sent nothing more. Stays set for a session that is down while its
+    /// routes are kept as stale (RFC 4724 §4.2).
     leaving: bool,
+    /// The routes of the peer kept as stale, and the timers that end it
+    /// (RFC 4724 §4.2); `None` for a peer none of whose routes are.
+    stale: Option<restart::Stale>,
+    /// The route refreshes the peer has begun and not ended: the routes of
+    /// those families it has not sent again are stale (RFC 7313 §4). Empty
+    /// for a session without Enhanced Route Refresh.
+    refreshing: Vec<refresh::Refreshing>,
+    /// For a peer that advertised Graceful Restart on a session with
+    /// Enhanced Route Refresh: the families whose End-of-RIB has not come,
+    /// for which a `BoRR` is ignored (RFC 7313 §4). Empty otherwise.
+    awaiting_end_of_rib: Vec<AddressFamily>,
 }
 
 impl PeerState {
     /// Routes of `family` in the Adj-RIB-In.
     fn received(&self, family: AddressFamily) -> usize {
         self.adj_in_count.get(family).copied().unwrap_or(0)
+    }
+
+    /// [`received`](Self::received) with the routes added minus those
+    /// removed by an UPDATE being applied, `delta`, not yet counted.
+    fn received_with(&self, family: AddressFamily, delta: &FamilyMap<isize>) -> usize {
+        self.received(family)
+            .saturating_add_signed(delta.get(family).copied().unwrap_or(0))
     }
 }
 
@@ -306,6 +442,10 @@ struct Sessions {
     peers: Vec<Option<PeerState>>,
     /// The slot of each peer that is up.
     by_addr: HashMap<IpAddr, PeerId>,
+    /// How many peers that are up are sent several paths of some family
+    /// (RFC 7911 §5), so that a change to a destination looks for them
+    /// only if there are any.
+    path_senders: usize,
     /// Pending wake-ups, earliest first. Each `Pacing` knows the one live
     /// entry per destination; an entry an earlier one replaced stays
     /// until due and is then ignored, and those of a peer that went down
@@ -314,6 +454,14 @@ struct Sessions {
     /// Pending sweeps of a peer's pacing for a family, earliest first,
     /// one live entry each likewise.
     sweeps: BinaryHeap<Reverse<(Tick, PeerId, AddressFamily)>>,
+    /// Wake-ups for Graceful Restart (RFC 4724 §4): the time a session has
+    /// to come back in, the time stale routes are kept, and the time route
+    /// selection is deferred, earliest first. An entry that no longer
+    /// matches what it wakes is ignored when due, as with `deadlines`.
+    restart_timers: BinaryHeap<Reverse<restart::Timer>>,
+    /// The families whose route selection is deferred while we are
+    /// restarting (RFC 4724 §4.1), and for what.
+    deferral: FamilyMap<restart::Waiting>,
     /// Pacing time, counted from the first instant the RIB was given.
     clock: Option<Clock>,
     /// The time of the input being handled ([`Sessions::tick`]).
@@ -331,6 +479,9 @@ struct Context {
     /// every route `Disabled`, until [`Rib::validation_changed`] says
     /// otherwise.
     validation: Arc<dyn ValidationSource>,
+    /// What the RIB does with Invalid routes by itself, apart from policy
+    /// ([`Rib::set_invalid_action`]).
+    invalid: InvalidAction,
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -380,7 +531,8 @@ struct Scratch {
     /// Routes added minus routes removed, per family.
     delta: FamilyMap<isize>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
-    /// §6.3), reported before what the UPDATE changed.
+    /// §6.3) or as route leaks (RFC 9234 §5), reported before what the
+    /// UPDATE changed.
     ignored: Vec<Output>,
     batches: Batches,
 }
@@ -426,11 +578,15 @@ impl Rib {
                     policies,
                     interner: Interner::default(),
                     validation: Arc::new(NullSource),
+                    invalid: InvalidAction::Policy,
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
+                path_senders: 0,
                 deadlines: BinaryHeap::new(),
                 sweeps: BinaryHeap::new(),
+                restart_timers: BinaryHeap::new(),
+                deferral: FamilyMap::default(),
                 clock: None,
                 at: Now::default(),
                 jitter: Jitter::new(0),
@@ -460,7 +616,7 @@ impl Rib {
     ) {
         let old = std::mem::replace(&mut self.s.cx.policies, policies);
         for addr in reexport {
-            let Some(id) = self.s.id(*addr) else {
+            let Some(id) = self.s.up_id(*addr) else {
                 continue;
             };
             let families = self.s.peer(id).info.families.clone();
@@ -478,22 +634,55 @@ impl Rib {
 
     /// A session reached Established: remember the peer and send it the
     /// Loc-RIB for every negotiated family (RFC 4271 §9.2: the initial
-    /// Adj-RIB-Out). These first advertisements are not held back.
+    /// Adj-RIB-Out). These first advertisements are not held back. With
+    /// Graceful Restart on, each family's table is followed by the
+    /// End-of-RIB marker (RFC 4724 §4), and the routes kept from the
+    /// peer's earlier session go on as stale where it says it preserved
+    /// forwarding state, and are deleted where it does not (RFC 4724
+    /// §4.2).
     pub fn peer_up(&mut self, info: PeerInfo, now: Instant, out: &mut impl Sink) {
         let addr = info.addr;
         let families = info.families.clone();
-        self.s.add(PeerState {
+        // RFC 7313 §4: a peer that advertised Graceful Restart sends the
+        // End-of-RIB of every family it exchanges (RFC 4724 §2), and a
+        // `BoRR` for a family waits for it.
+        let awaiting_end_of_rib = if info
+            .enhanced_refresh
+            .as_ref()
+            .is_some_and(|e| e.peer_graceful_restart)
+        {
+            families.clone()
+        } else {
+            Vec::new()
+        };
+        let mut state = PeerState {
             neighbor: Neighbor::of(&info),
             info,
             disabled: Vec::new(),
             advertised: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
             pacing: FamilyMap::default(),
+            sent: FamilyMap::default(),
             leaving: false,
-        });
-        for family in families {
-            self.refresh(addr, family, now, out);
+            stale: None,
+            refreshing: Vec::new(),
+            awaiting_end_of_rib,
+        };
+        // The routes the peer sent before stay in the tables under its
+        // slot, which the new session takes over with their count.
+        let retained = self.s.take_retained(addr);
+        if let Some(old) = retained {
+            state.adj_in_count = old.adj_in_count;
+            state.stale = old.stale;
         }
+        self.s.add(state);
+        self.resume_stale(addr, now, out);
+        for family in families {
+            if !self.s.deferred(family) {
+                self.start_family(addr, family, now, out);
+            }
+        }
+        self.note_peer_up(addr, now, out);
     }
 
     /// The session left Established: forget the peer and its routes.
@@ -504,6 +693,9 @@ impl Rib {
         #[cfg(feature = "profiling")]
         let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_PEER_DOWN);
         let Some(id) = self.s.id(addr) else {
+            // RFC 4724 §4.1: nothing waits for a peer that is gone, whether
+            // or not its session ever came up.
+            self.forget_waiting(addr, now, out);
             return;
         };
         self.s.tick(now);
@@ -520,6 +712,7 @@ impl Rib {
         }
         self.s.emit(&mut batches, out);
         self.s.remove(addr);
+        self.forget_waiting(addr, now, out);
     }
 
     /// Change the prefix limits of peer `addr` (RFC 4271 §6.7), as a reload
@@ -532,7 +725,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let state = self.s.peer_mut(id);
@@ -566,7 +759,7 @@ impl Rib {
         let addr = self.s.peer(id).info.addr;
         self.s.peer_mut(id).leaving = true;
         for (f, table) in self.tables.iter_mut() {
-            drop_routes(&self.s.peers, table, f, id, scratch);
+            drop_routes(self.s.phase2(), table, f, id, scratch);
         }
         // The peer goes with its counts: what the removals added up to
         // must not carry over to the next UPDATE's peer.
@@ -586,9 +779,16 @@ impl Rib {
         }
     }
 
-    /// The peer asked for `family` again (RFC 2918 §4): resend the
-    /// Adj-RIB-Out in full, held destinations as they are now. Also used
-    /// to build the initial one. Every destination's interval restarts.
+    /// A route refresh of `family` to `addr`, because the peer asked for it
+    /// (RFC 2918 §4) or the operator did: resend the Adj-RIB-Out in full,
+    /// held destinations as they are now. Every destination's interval
+    /// restarts. On a session with Enhanced Route Refresh the routes are
+    /// bracketed: a `BoRR` first, the whole Adj-RIB-Out, then an `EoRR`
+    /// (RFC 7313 §4), which the peer takes to purge the routes of ours it
+    /// has and we no longer send. A family that is not sent to the peer, or
+    /// whose route selection is deferred (RFC 4724 §4.1), gets neither,
+    /// which also keeps a `BoRR` from going before our End-of-RIB (RFC 7313
+    /// §4).
     pub fn refresh(
         &mut self,
         addr: IpAddr,
@@ -596,14 +796,66 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
-        if !self.s.peer(id).info.speaks(family) {
+        if !self.can_advertise(id, family) {
             return;
         }
+        // RFC 7313 §4: "Before the speaker starts a route refresh that is
+        // either initiated locally, or in response to a "normal route
+        // refresh request" from the peer, the speaker MUST send a BoRR
+        // message. After the speaker completes the re-advertisement of the
+        // entire Adj-RIB-Out to the peer, it MUST send an EoRR message."
+        let enhanced = self.s.peer(id).info.enhanced_refresh.is_some();
+        if enhanced {
+            refresh::mark(addr, RouteRefreshMessage::begin(family), out);
+        }
+        self.advertise(id, family, now, out);
+        if enhanced {
+            refresh::mark(addr, RouteRefreshMessage::end(family), out);
+        }
+    }
+
+    /// Whether routes of `family` may be advertised to `id` now: it was
+    /// negotiated, and (RFC 4724 §4.1) route selection is not deferred for
+    /// it; the end of the deferral sends it all.
+    fn can_advertise(&self, id: PeerId, family: AddressFamily) -> bool {
+        self.s.peer(id).info.speaks(family) && !self.s.deferred(family)
+    }
+
+    /// Send peer `id` the Adj-RIB-Out of `family` in full, held
+    /// destinations as they are now: the initial update (RFC 4271 §9.2) or
+    /// a route refresh (RFC 2918 §4). Every destination's interval
+    /// restarts.
+    pub(crate) fn advertise(
+        &mut self,
+        id: PeerId,
+        family: AddressFamily,
+        now: Instant,
+        out: &mut impl Sink,
+    ) {
         let now = self.s.tick(now);
         let mut batch = Batch::default();
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // RFC 7911 §5 with RFC 2918 §4: every path again, under the
+            // identifiers it has, and those it should not have withdrawn.
+            let held = self
+                .s
+                .peer_mut(id)
+                .pacing
+                .or_default(family)
+                .readvertise(now);
+            debug_assert!(held.iter().all(|(_, h)| h.has.is_none()));
+            if let Some(table) = self.tables.get(family) {
+                for (prefix, dest) in table.iter() {
+                    self.s
+                        .sync_paths(id, family, prefix, Some(dest), Sync::Full, &mut batch);
+                }
+            }
+            self.s.send(id, family, batch, out);
+            return;
+        }
         let held = self
             .s
             .peer_mut(id)
@@ -649,11 +901,17 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        if !self.s.peer(id).info.speaks(family) {
+        if !self.s.peer(id).info.speaks(family) || self.s.deferred(family) {
             return;
         }
         self.s.tick(now);
         let mut batch = Batch::default();
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // What the peer has been sent is kept, so the new policies are
+            // compared with that, not with the old policies.
+            self.resync_paths(id, family, out);
+            return;
+        }
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
                 let before = self.s.exported(Some(old), family, prefix, dest.best(), id);
@@ -662,6 +920,54 @@ impl Rib {
             }
         }
         self.s.send(id, family, batch, out);
+    }
+
+    /// Bring the paths peer `id` has of `family` up to date with the
+    /// Loc-RIB, every destination, paced like any other change (RFC 7911
+    /// §5, RFC 4271 §9.2.1.1).
+    fn resync_paths(&mut self, id: PeerId, family: AddressFamily, out: &mut impl Sink) {
+        // RFC 4724 §4.1: nothing is sent while route selection is deferred.
+        if self.s.deferred(family) {
+            return;
+        }
+        let mut batch = Batch::default();
+        if let Some(table) = self.tables.get(family) {
+            for (prefix, dest) in table.iter() {
+                self.s
+                    .sync_paths(id, family, prefix, Some(dest), Sync::Change, &mut batch);
+            }
+        }
+        self.s.send(id, family, batch, out);
+    }
+
+    /// Change how many paths of a prefix peer `addr` is sent, per family
+    /// (RFC 7911 §5), as a reload does: what the change adds is announced
+    /// and what it takes away withdrawn. Only the number can change on a
+    /// running session; the families were negotiated in the OPEN, so a
+    /// family not sent paths of already is left alone.
+    pub fn set_add_path_limits(
+        &mut self,
+        addr: IpAddr,
+        limits: &[(AddressFamily, PathLimit)],
+        now: Instant,
+        out: &mut impl Sink,
+    ) {
+        let Some(id) = self.s.up_id(addr) else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for (family, current) in &mut self.s.peer_mut(id).info.add_path_send {
+            if let Some((_, new)) = limits.iter().find(|(f, _)| f == family)
+                && new != current
+            {
+                *current = *new;
+                changed.push(*family);
+            }
+        }
+        self.s.tick(now);
+        for family in changed {
+            self.resync_paths(id, family, out);
+        }
     }
 
     /// Change the `MinRouteAdvertisementIntervalTimer` of peer `addr`
@@ -674,7 +980,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let pace_now = self.s.tick(now);
@@ -715,10 +1021,13 @@ impl Rib {
     /// calls it then. Stale wake-ups make this early at worst, never late.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        let clock = self.s.clock?;
-        let release = self.s.deadlines.peek().map(|Reverse(d)| d.at);
-        let sweep = self.s.sweeps.peek().map(|Reverse((at, ..))| *at);
-        clock.instant(release.into_iter().chain(sweep).min()?)
+        let restart = self.s.restart_timers.peek().map(|Reverse(t)| t.at);
+        let pacing = self.s.clock.and_then(|clock| {
+            let release = self.s.deadlines.peek().map(|Reverse(d)| d.at);
+            let sweep = self.s.sweeps.peek().map(|Reverse((at, ..))| *at);
+            clock.instant(release.into_iter().chain(sweep).min()?)
+        });
+        restart.into_iter().chain(pacing).min()
     }
 
     /// Send what the interval held back and may go out by `now`: for each
@@ -727,6 +1036,9 @@ impl Rib {
     /// caused it, is offered to each peer's pacing; what it holds back
     /// comes out here.
     pub fn flush(&mut self, now: Instant, out: &mut impl Sink) {
+        // RFC 4724 §4: the time a session has to come back in, the time
+        // stale routes are kept and the time route selection is deferred.
+        self.expire_restart(now, out);
         if self.s.clock.is_none() {
             return;
         }
@@ -759,10 +1071,18 @@ impl Rib {
                 continue;
             }
             let mut batch = Batch::default();
+            let paths = self.s.peer(id).info.path_limit(family).is_some();
             for d in group {
                 let Some(held) = self.s.wake(id, family, d.prefix, d.at) else {
                     continue;
                 };
+                if paths {
+                    // RFC 7911 §5: the paths the destination has now.
+                    let dest = self.tables.get(family).and_then(|t| t.get(d.prefix));
+                    self.s
+                        .sync_paths(id, family, d.prefix, dest, Sync::Release, &mut batch);
+                    continue;
+                }
                 let best = self
                     .tables
                     .get(family)
@@ -782,7 +1102,7 @@ impl Rib {
     /// What the RIB knows about peer `addr`, if it is up.
     #[must_use]
     pub fn peer(&self, addr: IpAddr) -> Option<&PeerInfo> {
-        self.s.id(addr).map(|id| &self.s.peer(id).info)
+        self.s.up_id(addr).map(|id| &self.s.peer(id).info)
     }
 
     /// An UPDATE from `addr`: disable the families its incorrect MP
@@ -799,7 +1119,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -809,7 +1129,13 @@ impl Rib {
             for o in scratch.ignored.drain(..) {
                 out.put(o);
             }
-            merge_repeats(&mut scratch.dirty, scratch.withdrawn, &mut scratch.order);
+            if update.message.path_ids.is_some() {
+                // RFC 7911 §3: several paths of one prefix may be in one
+                // UPDATE, and so a destination may change more than twice.
+                merge_all(&mut scratch.dirty, &mut scratch.order);
+            } else {
+                merge_repeats(&mut scratch.dirty, scratch.withdrawn, &mut scratch.order);
+            }
             self.finish(&mut scratch, now, out);
         }
         self.scratch = scratch;
@@ -833,6 +1159,7 @@ impl Rib {
             self.disable_family(id, d.family, scratch);
         }
         let Sessions { cx, peers, .. } = &mut self.s;
+        let p2 = Phase2::new(peers, cx.invalid);
         // invariant: ids are only handed out for occupied slots.
         let state = peers[id.index()].as_ref().unwrap();
         let info = &state.info;
@@ -844,19 +1171,24 @@ impl Rib {
         // by RFC 4760 §7.
         let unused =
             |family: AddressFamily| state.disabled.contains(&family) || !info.receives(family);
-        for (family, prefix) in update.withdrawals() {
+        // RFC 7911 §5: a withdrawal names a path by its prefix and
+        // identifier (zero where the family has none); "If a BGP speaker
+        // receives a message to withdraw a prefix with a Path Identifier
+        // not seen before, it SHOULD silently ignore it", which finding no
+        // such route does.
+        for (family, prefix, path) in update.withdrawn_paths() {
             #[cfg(feature = "profiling")]
             let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_REMOVE);
             if unused(family) {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(peers, table, family, prefix, id, scratch);
+                withdraw(p2, table, family, prefix, (id, path.0), scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
         let mut exceeded = None;
-        'parts: for (family, next_hop, prefixes) in attrs::announced(update) {
+        'parts: for (family, next_hop, prefixes, path_ids) in attrs::announced(update) {
             if unused(family) {
                 continue;
             }
@@ -871,9 +1203,7 @@ impl Rib {
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
                 if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.ignored.push(Output::InvalidNextHop {
                     peer: info.addr,
@@ -883,9 +1213,19 @@ impl Rib {
                 });
                 continue;
             }
-            let attrs = cx
-                .interner
-                .intern(PathAttrs::from_update(&update.message, next_hop));
+            let mut built = PathAttrs::from_update(&update.message, next_hop);
+            // RFC 9234 §5 ingress, once for this part of the UPDATE. A
+            // leak is not kept, as for the checks below: no import policy
+            // may make it eligible ("The operator MUST NOT have the
+            // ability to modify the procedures").
+            if let Err(otc) = otc::receive(info, &mut built) {
+                if let Some(table) = self.tables.get_mut(family) {
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
+                }
+                report_leak(scratch, info, family, otc, prefixes);
+                continue;
+            }
+            let attrs = cx.interner.intern(built);
             // RFC 4271 §9.1.2: a route whose AS_PATH contains our AS is an
             // AS loop and is excluded from Phase 2. RFC 4271 §6.3 and RFC
             // 7606 §7.2: on an external session the leftmost AS must be the
@@ -896,9 +1236,7 @@ impl Rib {
                 || attrs.as_path.first_asn() == Some(info.remote_as);
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
                 if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
-                    }
+                    withdraw_all(p2, table, family, (prefixes, path_ids), id, scratch);
                 }
                 scratch.released.push(attrs);
                 continue;
@@ -915,28 +1253,32 @@ impl Rib {
             let origin = RouteOrigin::from_as_path(&attrs.as_path, cx.local_as);
             let aspa = cx.validation.aspa(&attrs.as_path);
             let limit = info.prefix_limit(family);
-            for &prefix in prefixes {
+            let drop_invalid = cx.invalid.drops();
+            for (k, &prefix) in prefixes.iter().enumerate() {
                 #[cfg(feature = "profiling")]
                 let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_INSERT);
-                let rov = cx.validation.rov(prefix, origin);
+                // RFC 7911 §5: the route is the prefix with its Path
+                // Identifier; a newer one for both replaces the older.
+                let path = path_at(path_ids, k);
+                let lookup = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
                     &mut cx.interner,
                     info,
                     (family, prefix),
                     &attrs,
-                    rov,
+                    (lookup, drop_invalid),
                 );
-                match judged.into_route(&attrs, id, rov, aspa) {
+                match judged.into_route(&attrs, id, lookup, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
-                        announce(peers, table, family, prefix, route, scratch);
+                        announce(p2, table, family, prefix, route, path, scratch);
                     }
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it.
                     None => {
                         if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(peers, table, family, prefix, id, scratch);
+                            withdraw(p2, table, family, prefix, (id, path), scratch);
                         }
                     }
                 }
@@ -953,15 +1295,12 @@ impl Rib {
                 // never moves the count.
                 // NOTE(interop): FRR's `maximum-prefix` without `force`
                 // and BIRD's `import limit` count accepted routes too.
-                if let Some(limit) = limit {
-                    let n = state
-                        .received(family)
-                        .saturating_add_signed(scratch.delta.get(family).copied().unwrap_or(0));
-                    if n > limit as usize {
-                        exceeded = Some((family, limit));
-                        scratch.released.push(attrs);
-                        break 'parts;
-                    }
+                if let Some(limit) = limit
+                    && state.received_with(family, &scratch.delta) > limit as usize
+                {
+                    exceeded = Some((family, limit));
+                    scratch.released.push(attrs);
+                    break 'parts;
                 }
             }
             scratch.released.push(attrs);
@@ -989,10 +1328,24 @@ impl Rib {
         state.disabled.push(family);
         state.adj_in_count.insert(family, 0);
         if let Some(table) = self.tables.get_mut(family) {
-            drop_routes(&self.s.peers, table, family, id, scratch);
+            drop_routes(self.s.phase2(), table, family, id, scratch);
         }
         // The count is zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
+        // RFC 7313 §4: a refresh of the family begun earlier has no stale
+        // routes left to remove, so the time allowed for its `EoRR` has
+        // nothing to wait for. The refresh itself stays begun: its `EoRR`
+        // is not one without a `BoRR`.
+        if let Some(r) = self
+            .s
+            .peer_mut(id)
+            .refreshing
+            .iter_mut()
+            .find(|r| r.family == family)
+        {
+            r.expires = None;
+            self.s.cancel_refresh_timers(id, Some(family));
+        }
     }
 
     /// Phase 3 for every destination whose best route an input changed,
@@ -1001,11 +1354,18 @@ impl Rib {
         self.s.tick(now);
         for d in &scratch.dirty {
             if !d.merged {
+                // The destination as it is now, for the peers sent several
+                // paths of it; nothing to look up if there are none.
+                let dest = if self.s.path_senders > 0 {
+                    self.tables.get(d.family).and_then(|t| t.get(d.prefix))
+                } else {
+                    None
+                };
                 self.s.changed(
                     d.family,
                     d.prefix,
-                    d.old.as_ref(),
-                    d.new.as_ref(),
+                    (d.old.as_ref(), d.new.as_ref()),
+                    dest,
                     &mut scratch.batches,
                     out,
                 );
@@ -1035,7 +1395,7 @@ impl Rib {
             .get(family)
             .into_iter()
             .flat_map(move |t| t.after(from))
-            .filter_map(|(p, d)| d.best().map(|r| (p, self.s.route_ref(r))))
+            .filter_map(move |(p, d)| d.best().map(|r| (p, self.s.route_ref(family, r, d.id(0)))))
     }
 
     /// The candidate routes to `prefix`, the best first: those import
@@ -1044,12 +1404,28 @@ impl Rib {
     /// them.
     #[must_use]
     pub fn candidates(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
-        self.tables
-            .get(family)
-            .and_then(|t| t.get(prefix))
-            .map_or(&[][..], |d| &d.routes()[..d.candidates()])
-            .iter()
-            .map(|r| self.s.route_ref(r))
+        let Some(dest) = self.tables.get(family).and_then(|t| t.get(prefix)) else {
+            return Vec::new();
+        };
+        dest.iter()
+            .take(dest.candidates())
+            .map(|(r, id)| self.s.route_ref(family, r, id))
+            .collect()
+    }
+
+    /// The routes to `prefix` that the Adj-RIBs-In hold and that are no
+    /// candidates: import policy rejects them with the state they have and
+    /// would accept them with another, or the RIB refuses them for being
+    /// Invalid ([`InvalidAction::Drop`]) (RFC 6811 §2). Attributes as
+    /// received.
+    #[must_use]
+    pub fn held(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
+        let Some(dest) = self.tables.get(family).and_then(|t| t.get(prefix)) else {
+            return Vec::new();
+        };
+        dest.iter()
+            .skip(dest.candidates())
+            .map(|(r, id)| self.s.route_ref(family, r, id))
             .collect()
     }
 
@@ -1080,9 +1456,19 @@ impl Rib {
         addr: IpAddr,
         family: AddressFamily,
     ) -> std::vec::IntoIter<(Prefix, Arc<PathAttrs>)> {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return Vec::new().into_iter();
         };
+        if self.s.peer(id).info.path_limit(family).is_some() {
+            // RFC 7911 §5: every path it has been sent, a prefix more than
+            // once if it has several.
+            let paths = self.sent_paths(addr, family);
+            return paths
+                .into_iter()
+                .map(|(prefix, _, attrs)| (prefix, attrs))
+                .collect::<Vec<_>>()
+                .into_iter();
+        }
         let pacing = self.s.peer(id).pacing.get(family);
         let mut out = Vec::new();
         if let Some(table) = self.tables.get(family) {
@@ -1108,10 +1494,39 @@ impl Rib {
         out.into_iter()
     }
 
+    /// The paths peer `addr` has been sent of `family`, in prefix order,
+    /// each with the Path Identifier it was sent with (RFC 7911 §5) and
+    /// the attributes as the export policy left them, before the session
+    /// rewrite (RFC 4271 §5.1). Empty unless the peer is sent several
+    /// paths of the family: what any other peer has is [`Rib::adj_rib_out`].
+    #[must_use]
+    pub fn sent_paths(
+        &self,
+        addr: IpAddr,
+        family: AddressFamily,
+    ) -> Vec<(Prefix, PathId, Arc<PathAttrs>)> {
+        let Some(id) = self.s.up_id(addr) else {
+            return Vec::new();
+        };
+        let Some(sent) = self.s.peer(id).sent.get(family) else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = sent
+            .iter()
+            .flat_map(|(prefix, paths)| {
+                paths
+                    .iter()
+                    .map(move |p| (prefix, PathId(p.tx), Arc::clone(&p.attrs)))
+            })
+            .collect();
+        out.sort_by_key(|(prefix, id, _)| (*prefix, *id));
+        out
+    }
+
     /// Route counts for `addr`.
     #[must_use]
     pub fn peer_stats(&self, addr: IpAddr) -> Option<PeerStats> {
-        let p = self.s.peer(self.s.id(addr)?);
+        let p = self.s.peer(self.s.up_id(addr)?);
         let mut stats = PeerStats::default();
         let mut taken: Vec<AddressFamily> = p
             .info
@@ -1135,7 +1550,12 @@ impl Rib {
 
     /// Peers currently up.
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
-        self.s.peers.iter().flatten().map(|p| &p.info)
+        self.s
+            .peers
+            .iter()
+            .flatten()
+            .filter(|p| !p.leaving)
+            .map(|p| &p.info)
     }
 
     /// Distinct attribute sets held.
@@ -1146,8 +1566,22 @@ impl Rib {
 }
 
 impl Sessions {
+    /// What Phase 2 reads, as the RIB is set up now.
+    fn phase2(&self) -> Phase2<'_> {
+        Phase2::new(&self.peers, self.cx.invalid)
+    }
+
+    /// The slot of `addr`, whether its session is up or only its routes
+    /// are kept (RFC 4724 §4.2).
     fn id(&self, addr: IpAddr) -> Option<PeerId> {
         self.by_addr.get(&addr).copied()
+    }
+
+    /// The slot of `addr` if its session is up: the one inputs about a
+    /// session are for.
+    fn up_id(&self, addr: IpAddr) -> Option<PeerId> {
+        let id = self.id(addr)?;
+        (!self.peer(id).leaving).then_some(id)
     }
 
     fn peer(&self, id: PeerId) -> &PeerState {
@@ -1184,6 +1618,7 @@ impl Sessions {
             self.by_addr.insert(state.info.addr, id);
             id
         };
+        self.path_senders += usize::from(!state.info.add_path_send.is_empty());
         self.peers[id.index()] = Some(state);
     }
 
@@ -1193,15 +1628,33 @@ impl Sessions {
         let Some(id) = self.by_addr.remove(&addr) else {
             return;
         };
-        if let Some(state) = self.peers[id.index()].take() {
-            for pacing in state.pacing.into_values() {
-                for h in pacing.into_held() {
-                    if let Some(has) = h.has {
-                        self.cx.interner.release(has);
-                    }
+        if let Some(mut state) = self.peers[id.index()].take() {
+            self.release_session(&mut state, id);
+        }
+        self.cancel_peer_timers(id);
+    }
+
+    /// Give back what a session of peer `id` holds, so that the peer has
+    /// none of it: the attribute sets of the paths it was sent and of the
+    /// destinations pacing holds for it, and the wake-ups for them.
+    fn release_session(&mut self, state: &mut PeerState, id: PeerId) {
+        self.path_senders -= usize::from(!state.info.add_path_send.is_empty());
+        // The attribute sets of the paths it was sent.
+        for sent in std::mem::take(&mut state.sent).into_values() {
+            for (_, paths) in sent.into_entries() {
+                for p in paths.into_vec() {
+                    self.cx.interner.release(p.attrs);
                 }
             }
         }
+        for pacing in std::mem::take(&mut state.pacing).into_values() {
+            for h in pacing.into_held() {
+                if let Some(has) = h.has {
+                    self.cx.interner.release(has);
+                }
+            }
+        }
+        state.advertised = FamilyMap::default();
         self.deadlines.retain(|Reverse(d)| d.peer != id);
         shrink_heap(&mut self.deadlines);
         self.sweeps.retain(|Reverse((_, peer, _))| *peer != id);
@@ -1238,17 +1691,23 @@ impl Sessions {
         }
     }
 
-    fn route_ref<'a>(&self, r: &'a Route) -> RouteRef<'a> {
+    /// A route of `family` as the control plane sees it, which has the Path
+    /// Identifier `id` it came with if its peer sends them (RFC 7911 §3).
+    fn route_ref<'a>(&self, family: AddressFamily, r: &'a Route, id: u32) -> RouteRef<'a> {
+        let peer = self.peer(r.peer);
         RouteRef {
-            peer: self.peer(r.peer).neighbor.addr,
+            peer: peer.neighbor.addr,
             attrs: &r.attrs,
             rov: r.rov,
             aspa: r.aspa,
+            path_id: peer.info.receives_paths(family).then_some(PathId(id)),
+            stale: r.stale,
         }
     }
 
-    /// Remove `id`'s route from `dest`, if it has one, and settle the
-    /// destination. Whether it still has routes.
+    /// Remove `id`'s routes from `dest`, if it has any, and settle the
+    /// destination. Whether it still has routes. A peer sent with ADD-PATH
+    /// has a route for each path (RFC 7911 §5).
     fn remove_route(
         &mut self,
         family: AddressFamily,
@@ -1258,15 +1717,33 @@ impl Sessions {
         batches: &mut Batches,
         out: &mut impl Sink,
     ) -> bool {
-        let Some(i) = dest.position(id) else {
+        let Some(i) = dest.position_of_peer(id) else {
             return true;
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
-        decide(&self.peers, dest);
-        self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
+        // More only for a peer sent with ADD-PATH, so nothing is allocated
+        // for any other.
+        let mut more: Vec<Route> = Vec::new();
+        while !dest.is_empty()
+            && let Some(next) = dest.position_of_peer(id)
+        {
+            more.push(dest.remove(next));
+        }
+        decide(self.phase2(), dest);
+        self.changed(
+            family,
+            prefix,
+            (old.as_ref(), dest.best()),
+            Some(dest),
+            batches,
+            out,
+        );
         drop(old);
         self.release_route(removed);
+        for r in more {
+            self.release_route(r);
+        }
         !dest.is_empty()
     }
 
@@ -1287,11 +1764,18 @@ impl Sessions {
         &mut self,
         family: AddressFamily,
         prefix: Prefix,
-        old: Option<&Route>,
-        new: Option<&Route>,
+        (old, new): (Option<&Route>, Option<&Route>),
+        dest: Option<&Destination>,
         batches: &mut Batches,
         out: &mut impl Sink,
     ) {
+        // RFC 4724 §4.1: while route selection for the family is deferred
+        // the speaker "has no routes to advertise to its peers and no
+        // routes to update the forwarding state"; the end of the deferral
+        // brings both up to date from the tables as they are then.
+        if self.deferred(family) {
+            return;
+        }
         let (route_changed, state_changed) = match (old, new) {
             (None, None) => (false, false),
             (Some(a), Some(b)) => (!a.same(b), !a.same_state(b)),
@@ -1309,6 +1793,11 @@ impl Sessions {
         }
         if route_changed || state_changed {
             self.disseminate(family, prefix, old, new, batches);
+        }
+        // RFC 7911 §5: a peer sent several paths hears of a change to any
+        // of them, not only to the best.
+        if self.path_senders > 0 {
+            self.sync_senders(family, prefix, dest, batches);
         }
     }
 
@@ -1328,7 +1817,9 @@ impl Sessions {
             let Some(to) = &self.peers[i] else {
                 continue;
             };
-            if to.leaving || !to.info.speaks(family) {
+            // A peer sent several paths is brought up to date with the
+            // destination as a whole (`sync_senders`).
+            if to.leaving || !to.info.speaks(family) || to.info.path_limit(family).is_some() {
                 continue;
             }
             // invariant: fewer than 2^32 peers.
@@ -1375,9 +1866,16 @@ impl Sessions {
         let policies = policies.unwrap_or(&*self.cx.policies);
         match policies.export(to, family, prefix, &best.attrs, best.rov) {
             Verdict::Reject => None,
-            Verdict::Accept => export::permitted(family, &best.attrs, to)
+            // RFC 6811 §2: the state is local to the speaker and does not
+            // go to the peer, so a state export policy set is no change.
+            Verdict::Accept | Verdict::Restated(_) => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
-            Verdict::Modified(a) => {
+            Verdict::Modified(mut a) | Verdict::ModifiedRestated(mut a, _) => {
+                // RFC 9234 §5: "The operator MUST NOT have the ability to
+                // modify the procedures", and a set attribute "MUST be
+                // preserved unchanged": whatever a policy made of the
+                // route, the attribute is the route's own.
+                a.otc = best.attrs.otc;
                 export::permitted(family, &a, to).then_some(Exported::Changed(a))
             }
         }
@@ -1431,7 +1929,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (before, Some(a)) => {
                 let had = before.is_some();
                 let pacing = state.pacing.or_default(family);
@@ -1523,7 +2028,14 @@ impl Sessions {
                 state.pacing.or_default(family).withdrew(prefix, &pace);
             }
             (Some(b), Some(a))
-                if b.is(&a) || export::same_rewrite(family, b.attrs(), a.attrs(), &state.info) => {}
+                if b.is(&a)
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &state.info,
+                    ) => {}
             (_, Some(a)) => {
                 state.pacing.or_default(family).advertised(prefix, &pace);
                 if !had {
@@ -1557,7 +2069,13 @@ impl Sessions {
             (Some(_), None) => batch.withdraw.push(prefix),
             (Some(b), Some(a))
                 if b.is(&a)
-                    || export::same_rewrite(family, b.attrs(), a.attrs(), &self.peer(id).info) => {}
+                    || export::same_rewrite(
+                        self.cx.local_as,
+                        family,
+                        b.attrs(),
+                        a.attrs(),
+                        &self.peer(id).info,
+                    ) => {}
             (_, Some(a)) => {
                 let a = a.intern(&mut self.cx.interner);
                 batch.announce(&a, prefix);
@@ -1665,36 +2183,84 @@ fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
     }
 }
 
+/// What Phase 2 reads besides the routes of a destination.
+#[derive(Clone, Copy)]
+struct Phase2<'a> {
+    peers: &'a [Option<PeerState>],
+    /// Invalid routes lose to the others ([`InvalidAction::PreferValid`]).
+    demote_invalid: bool,
+}
+
+impl<'a> Phase2<'a> {
+    /// Phase 2 over `peers`, with the RIB's `invalid` action in force.
+    fn new(peers: &'a [Option<PeerState>], invalid: InvalidAction) -> Self {
+        Phase2 {
+            peers,
+            demote_invalid: invalid.demotes(),
+        }
+    }
+
+    /// Whether Phase 2 puts `route` below the routes that are not Invalid
+    /// (RFC 6811 §5).
+    fn demotes(self, route: &Route) -> bool {
+        self.demote_invalid && route.rov == RovState::Invalid
+    }
+}
+
 /// Phase 2: put the best of `dest`'s candidates first.
-fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
-    let routes = dest.routes();
-    let best = decision::best(dest.candidates(), |i| Candidate {
-        // invariant: a route's peer slot is occupied (Sessions::peer).
-        from: peers[routes[i].peer.index()].as_ref().unwrap().neighbor,
-        attrs: &routes[i].attrs,
-    });
+fn decide(p2: Phase2<'_>, dest: &mut Destination) {
+    let n = dest.candidates();
+    let best = match &*dest {
+        Destination::One(r) => pick(p2, std::slice::from_ref(r), n),
+        Destination::Many(v) => pick(p2, v, n),
+        Destination::Paths(v) => pick(p2, v, n),
+    };
     if let Some(i) = best {
         dest.promote(i);
     }
 }
 
+/// The best of the first `n` of `routes`.
+fn pick<T: Member>(p2: Phase2<'_>, routes: &[T], n: usize) -> Option<usize> {
+    decision::best(n, |i| Candidate {
+        // invariant: a route's peer slot is occupied (Sessions::peer).
+        from: p2.peers[routes[i].route().peer.index()]
+            .as_ref()
+            .unwrap()
+            .neighbor,
+        attrs: &routes[i].route().attrs,
+        path_id: routes[i].id(),
+        demoted: p2.demotes(routes[i].route()),
+    })
+}
+
 /// Remove every route `id` sent from `table`, a table of `family`, noting
 /// each destination's best route before and after.
 fn drop_routes(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     id: PeerId,
     scratch: &mut Scratch,
 ) {
     table.retain(|prefix, dest| {
-        if let Some(i) = dest.position(id) {
+        if let Some(mut i) = dest.position_of_peer(id) {
             let old = dest.best().cloned();
-            let removed = dest.remove(i);
-            scratch.released.push(removed.attrs);
-            scratch.released.extend(removed.received);
-            decide(peers, dest);
-            *scratch.delta.or_default(family) -= 1;
+            // A peer sent with ADD-PATH has a route for each path.
+            loop {
+                let removed = dest.remove(i);
+                scratch.released.push(removed.attrs);
+                scratch.released.extend(removed.received);
+                *scratch.delta.or_default(family) -= 1;
+                if dest.is_empty() {
+                    break;
+                }
+                match dest.position_of_peer(id) {
+                    Some(next) => i = next,
+                    None => break,
+                }
+            }
+            decide(p2, dest);
             scratch.dirty.push(Dirty {
                 family,
                 prefix,
@@ -1707,43 +2273,87 @@ fn drop_routes(
     });
 }
 
-/// Remove peer `id`'s route to `prefix`, if there is one, and note the
-/// destination's best route before and after.
-fn withdraw(
-    peers: &[Option<PeerState>],
+/// The Path Identifier of the `k`th prefix of a part of an UPDATE, whose
+/// `ids` are as many as its prefixes or none (RFC 7911 §3).
+fn path_at(ids: &[PathId], k: usize) -> u32 {
+    ids.get(k).map_or(0, |i| i.0)
+}
+
+/// Remove what peer `id` sent for each of the `prefixes` of one part of an
+/// UPDATE, with the Path Identifiers `ids` that go with them: the routes of
+/// an announcement that is not kept replace the peer's earlier ones for
+/// them (RFC 7911 §5: the same prefix and identifier).
+fn withdraw_all(
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
-    prefix: Prefix,
+    (prefixes, ids): (&[Prefix], &[PathId]),
     id: PeerId,
     scratch: &mut Scratch,
 ) {
+    for (k, &prefix) in prefixes.iter().enumerate() {
+        withdraw(p2, table, family, prefix, (id, path_at(ids, k)), scratch);
+    }
+}
+
+/// Report `prefixes` of `family` from the peer `from` as route leaks with
+/// `otc` (RFC 9234 §5), if there is any prefix to report.
+fn report_leak(
+    scratch: &mut Scratch,
+    from: &PeerInfo,
+    family: AddressFamily,
+    otc: Asn,
+    prefixes: &[Prefix],
+) {
+    if let Some(&first) = prefixes.first() {
+        scratch.ignored.push(Output::RouteLeak {
+            peer: from.addr,
+            family,
+            otc,
+            routes: prefixes.len(),
+            first,
+        });
+    }
+}
+
+/// Remove the route peer `id` sent for `prefix` with Path Identifier
+/// `path` (zero where it sends none), if there is one, and note the
+/// destination's best route before and after.
+fn withdraw(
+    p2: Phase2<'_>,
+    table: &mut Table,
+    family: AddressFamily,
+    prefix: Prefix,
+    from: (PeerId, u32),
+    scratch: &mut Scratch,
+) {
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, id, scratch),
-        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, id, scratch),
+        Some(k) => withdraw_in(p2, &mut table.v4, k, family, prefix, from, scratch),
+        None => withdraw_in(p2, &mut table.v6, prefix, family, prefix, from, scratch),
     }
 }
 
 fn withdraw_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
     prefix: Prefix,
-    id: PeerId,
+    (id, path): (PeerId, u32),
     scratch: &mut Scratch,
 ) {
     let Slot::Occupied(mut slot) = map.entry(key) else {
         return;
     };
     let dest = slot.get_mut();
-    let Some(i) = dest.position(id) else {
+    let Some(i) = dest.position(id, path) else {
         return;
     };
     let old = dest.best().cloned();
     let removed = dest.remove(i);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
-    decide(peers, dest);
+    decide(p2, dest);
     let new = dest.best().cloned();
     if dest.is_empty() {
         slot.remove();
@@ -1758,29 +2368,39 @@ fn withdraw_in<K: Ord>(
     });
 }
 
-/// Add or replace `route`'s peer's route to `prefix` and note the
-/// destination's best route before and after.
+/// Add or replace the route `route`'s peer sent for `prefix` with Path
+/// Identifier `path` (zero where it sends none), and note the destination's
+/// best route before and after.
 fn announce(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     route: Route,
+    path: u32,
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(peers, &mut table.v4, k, family, prefix, route, scratch),
-        None => announce_in(peers, &mut table.v6, prefix, family, prefix, route, scratch),
+        Some(k) => announce_in(p2, &mut table.v4, k, family, prefix, (route, path), scratch),
+        None => announce_in(
+            p2,
+            &mut table.v6,
+            prefix,
+            family,
+            prefix,
+            (route, path),
+            scratch,
+        ),
     }
 }
 
 fn announce_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    p2: Phase2<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
     prefix: Prefix,
-    route: Route,
+    (route, path): (Route, u32),
     scratch: &mut Scratch,
 ) {
     let (old, new) = match map.entry(key) {
@@ -1788,20 +2408,23 @@ fn announce_in<K: Ord>(
             // A new destination: its one route is the best, unless it is
             // held.
             let new = (!route.held).then(|| route.clone());
-            slot.insert(Destination::One(route));
+            slot.insert(Destination::single(route, path));
             *scratch.delta.or_default(family) += 1;
             (None, new)
         }
         Slot::Occupied(mut slot) => {
             let dest = slot.get_mut();
             let old = dest.best().cloned();
-            if let Some(i) = dest.position(route.peer) {
-                let r = &dest.routes()[i];
+            if let Some(i) = dest.position(route.peer, path) {
+                let r = dest.route(i);
                 if Arc::ptr_eq(&r.attrs, &route.attrs)
                     && r.received.as_ref().map(Arc::as_ptr)
                         == route.received.as_ref().map(Arc::as_ptr)
                     && r.same_state(&route)
                     && r.held == route.held
+                    // A stale route the peer sends again is no longer
+                    // stale, though it is the same route (RFC 4724 §4.2).
+                    && !r.stale
                 {
                     // An implicit re-announcement of the same route.
                     return;
@@ -1810,10 +2433,10 @@ fn announce_in<K: Ord>(
                 scratch.released.push(replaced.attrs);
                 scratch.released.extend(replaced.received);
             } else {
-                dest.push(route);
+                dest.push(route, path);
                 *scratch.delta.or_default(family) += 1;
             }
-            decide(peers, dest);
+            decide(p2, dest);
             (old, dest.best().cloned())
         }
     };
@@ -1884,29 +2507,36 @@ fn merge_all(dirty: &mut [Dirty], order: &mut Vec<u32>) {
 
 /// What import policy makes of a route (see [`judge`]).
 enum Judged {
-    /// A candidate for Phase 2, with these attributes.
-    Accepted(Arc<PathAttrs>),
-    /// Rejected with the route's validation state, accepted with another:
-    /// held in the Adj-RIB-In, and no candidate.
-    Held,
+    /// A candidate for Phase 2, with these attributes and this validation
+    /// state, which is the lookup's unless policy set another (RFC 6811
+    /// §3).
+    Accepted(Arc<PathAttrs>, RovState),
+    /// Not a candidate, but one the Adj-RIB-In holds (RFC 6811 §2): import
+    /// policy rejects the route with its validation state and accepts it
+    /// with another, or accepts it and the RIB itself refuses it for being
+    /// Invalid ([`InvalidAction::Drop`]). The state is the one the route
+    /// holds meanwhile: the lookup's, or the one policy set that the RIB
+    /// refused.
+    Held(RovState),
     /// Rejected whatever the route's validation state: not kept.
     Dropped,
 }
 
 impl Judged {
     /// The route `peer` sent with `received`, as import policy judged it,
-    /// with validation verdicts `rov` and `aspa`; `None` when it is not
-    /// kept.
+    /// with the verdicts of the lookup, `lookup` and `aspa`; `None` when
+    /// it is not kept. A route held for its validation state keeps the
+    /// state of the lookup: it was never given another.
     fn into_route(
         self,
         received: &Arc<PathAttrs>,
         peer: PeerId,
-        rov: RovState,
+        lookup: RovState,
         aspa: AspaState,
     ) -> Option<Route> {
-        let (attrs, held) = match self {
-            Judged::Accepted(a) => (a, false),
-            Judged::Held => (Arc::clone(received), true),
+        let (attrs, rov, held) = match self {
+            Judged::Accepted(a, rov) => (a, rov, false),
+            Judged::Held(rov) => (Arc::clone(received), rov, true),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -1915,15 +2545,22 @@ impl Judged {
             received,
             peer,
             rov,
+            lookup,
             aspa,
             held,
+            // The peer has just sent it: not a stale route (RFC 4724 §4.2).
+            stale: false,
         })
     }
 }
 
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
-/// sent for `prefix` of `family`, with `attrs` as received and validation
-/// state `rov`, is a candidate for Phase 2, and with which attributes.
+/// sent for `prefix` of `family`, with `attrs` as received and the
+/// validation state `rov` the lookup gave it, is a candidate for Phase 2,
+/// and with which attributes and validation state (RFC 6811 §3: policy
+/// may set the state). With `drop_invalid` ([`InvalidAction::Drop`]) a
+/// route that policy accepts with the state Invalid is not a candidate
+/// either (RFC 6811 §5: "rejecting all 'invalid' routes").
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -1936,6 +2573,12 @@ impl Judged {
 /// can bring it back, and holding it would let a filtered peer fill
 /// memory, past any `maximum-prefix`, with routes nothing uses.
 ///
+/// What the RIB refuses by itself is held the same way, since a change of
+/// state or of the action admits it, and it is what makes `drop_invalid`
+/// leave what is kept alone: whether a route is in the Adj-RIB-In depends
+/// on policy and never on the action, so the action can change, and a
+/// reload that changes it needs no ROUTE-REFRESH to bring routes back.
+///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
 fn judge(
@@ -1944,11 +2587,21 @@ fn judge(
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
     attrs: &Arc<PathAttrs>,
-    rov: RovState,
+    (rov, drop_invalid): (RovState, bool),
 ) -> Judged {
-    match policies.import(info, family, prefix, attrs, rov) {
-        Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+    let verdict = policies.import(info, family, prefix, attrs, rov);
+    // The state the route would hold, if accepted.
+    let state = verdict.rov().unwrap_or(rov);
+    if drop_invalid && state == RovState::Invalid && !matches!(verdict, Verdict::Reject) {
+        return Judged::Held(state);
+    }
+    match verdict {
+        Verdict::Accept => Judged::Accepted(Arc::clone(attrs), rov),
+        Verdict::Restated(state) => Judged::Accepted(Arc::clone(attrs), state),
+        Verdict::Modified(a) => Judged::Accepted(modified(interner, attrs, a), rov),
+        Verdict::ModifiedRestated(a, state) => {
+            Judged::Accepted(modified(interner, attrs, a), state)
+        }
         Verdict::Reject => {
             let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
                 !matches!(
@@ -1957,10 +2610,19 @@ fn judge(
                 )
             });
             if admitted {
-                Judged::Held
+                Judged::Held(rov)
             } else {
                 Judged::Dropped
             }
         }
     }
+}
+
+/// The interned attributes import policy made of a route that arrived with
+/// `received`.
+fn modified(interner: &mut Interner, received: &PathAttrs, mut made: PathAttrs) -> Arc<PathAttrs> {
+    // RFC 9234 §5: the ingress procedure has run, and no policy may undo it
+    // or change the attribute (see `Sessions::exported`).
+    made.otc = received.otc;
+    interner.intern(made)
 }

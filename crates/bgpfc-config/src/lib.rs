@@ -6,10 +6,15 @@
 //! neighbor), §9.2.1.1 (`advertisement-interval`); RFC 7607 §2 (AS 0 is
 //! rejected); RFC 9687 §4.4 (`send-hold-time`); RFC 9774 §3
 //! (`allow-as-set`); RFC 8950 §4 (`extended-next-hop`); RFC 4486 §4
-//! (`restart-limit`); RFC 4271 §6.7 (`maximum-prefix`); RFC 8210 §6, §7,
+//! (`restart-limit`); RFC 4271 §6.7 (`maximum-prefix`); RFC 7911 §4, §5
+//! (`add-path`); RFC 8210 §6, §7,
 //! §9 and §10 (the `rpki` block: the Expire Interval cap and the
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
-//! the cache list with preferences).
+//! the cache list with preferences); RFC 9234 §4, §4.2 (`role`,
+//! `role-strict`); RFC 6811 §3 (`match rpki` and `set rpki`), §5
+//! (`invalid`); RFC 8481 §5 (`invalid` is required with `mode external`
+//! and `mode sidecar`); RFC 8210 §9 (the sidecar's `rtr-listen` is a
+//! loopback address) and §6 (its `refresh`).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

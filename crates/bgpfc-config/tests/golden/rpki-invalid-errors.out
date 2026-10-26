@@ -1,0 +1,15 @@
+rpki-invalid-errors.conf:8:13: `reject` is not `drop`, `prefer-valid` or `policy`
+      invalid reject;
+              ^
+rpki-invalid-errors.conf:9:5: `invalid` takes one argument, found 0
+      invalid;
+      ^
+rpki-invalid-errors.conf:9:5: `invalid` is given more than once
+      invalid;
+      ^
+rpki-invalid-errors.conf:10:5: `invalid` is given more than once
+      invalid drop;
+      ^
+rpki-invalid-errors.conf:11:5: `invalid` is given more than once
+      invalid policy;
+      ^

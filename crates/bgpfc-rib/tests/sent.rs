@@ -52,6 +52,11 @@ fn peers() -> Vec<PeerInfo> {
             // only delays; tests/pacing.rs is about when.
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: None,
+            restart: None,
+            enhanced_refresh: None,
         })
         .collect()
 }
@@ -175,13 +180,14 @@ fn deliver(out: Vec<Output>, infos: &[PeerInfo], views: &mut [BTreeMap<Prefix, P
             peer: infos[i].kind,
             allow_as_set: false,
             extended_next_hop: false,
+            add_path: bgpfc_wire::update::AddPathFamilies::NONE,
         };
         for m in messages {
             let d = UpdateMessage::decode(&m[HEADER_LEN..], &ctx).unwrap();
             for (_, p) in d.withdrawals() {
                 views[i].remove(&p);
             }
-            for (_, next_hop, prefixes) in announced(&d) {
+            for (_, next_hop, prefixes, _) in announced(&d) {
                 for &p in prefixes {
                     views[i].insert(p, PathAttrs::from_update(&d.message, next_hop));
                 }

@@ -8,24 +8,34 @@
 //! `MinRouteAdvertisementIntervalTimer`), §10 (defaults); RFC 7607 §2 (AS 0
 //! is never configurable); RFC 9687 §4.4 (`send-hold-time`); RFC 8950 §4
 //! (`extended-next-hop`); RFC 4486 §4 (`restart-limit`); RFC 4271 §6.7
-//! (`maximum-prefix`); RFC 8210 §6 (`max-expire` within the Expire
+//! (`maximum-prefix`); RFC 7911 §4, §5 (`add-path`); RFC 8210 §6 (`max-expire`
+//! within the Expire
 //! Interval's range; `backoff` within the Retry Interval's), §7
 //! (`version`), §9 (port 323), §10 (`cache` and its `preference`);
-//! RFC 1123 §2.1 (cache host names).
+//! RFC 1123 §2.1 (cache host names); RFC 9234 §4 (`role`, `role-strict`);
+//! RFC 6811 §3 (`match rpki` and `set rpki`: policy matches and sets the
+//! validation state), §5 (`invalid`: filter or demote the Invalid), and
+//! RFC 8481 §5 (no action on the state unless the operator names it);
+//! RFC 8210 §6 (`refresh` within the Refresh Interval's range, and below
+//! the Expire Interval), §9 (the sidecar's `rtr-listen` is a loopback
+//! address: unprotected TCP only on a trusted, controlled network).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use bgpfc_rpki::{InvalidAction, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+use bgpfc_wire::role::{LocalRole, Role};
+use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 
 use crate::ast::{
-    Action, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http, Match,
-    Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction,
-    Term,
+    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_REFRESH_STALE_TIME,
+    DEFAULT_RESTART_LIMIT, DEFAULT_RESTART_TIME, DEFAULT_STALE_TIME, EnhancedRefresh, Fib, FibMode,
+    GracefulRestart, Http, Match, Neighbor, Policy, PrefixEntry, PrefixList, Routinator, Rpki,
+    RpkiCache, RpkiMode, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -504,6 +514,55 @@ impl Lowerer {
         })
     }
 
+    /// `routinator { ... }`: the statements are checked one by one; what
+    /// needs the sidecar crate's knowledge (TAL names, reserved
+    /// arguments) is checked by the daemon.
+    fn routinator(&mut self, s: &Statement) -> Option<Routinator> {
+        let mut b = RoutinatorBuilder::new();
+        for t in self.block(s, 0)? {
+            b.statement(self, t);
+        }
+        b.finish(self, s.pos)
+    }
+
+    /// An absolute path, as one argument.
+    fn absolute_path(&mut self, s: &Statement) -> Option<PathBuf> {
+        let a = self.arg(s)?;
+        if !PathBuf::from(&a.value).is_absolute() {
+            self.err(
+                a.pos,
+                format!(
+                    "{} must be an absolute path, found `{}`",
+                    s.keyword, a.value
+                ),
+            );
+            return None;
+        }
+        if a.value.contains('\0') {
+            self.err(a.pos, format!("{} must not contain a NUL byte", s.keyword));
+            return None;
+        }
+        Some(PathBuf::from(&a.value))
+    }
+
+    /// A whole number of seconds from `min` to `max`, as one argument.
+    fn secs_within(&mut self, s: &Statement, min: Duration, max: Duration) -> Option<Duration> {
+        let d = self.secs(s)?;
+        if !(min..=max).contains(&d) {
+            self.err(
+                s.args[0].pos,
+                format!(
+                    "{} must be between {} and {} seconds",
+                    s.keyword,
+                    min.as_secs(),
+                    max.as_secs()
+                ),
+            );
+            return None;
+        }
+        Some(d)
+    }
+
     /// `max-expire N` within the range RFC 8210 §6 gives the Expire
     /// Interval it caps.
     fn max_expire(&mut self, s: &Statement) -> Option<Duration> {
@@ -789,11 +848,31 @@ impl Lowerer {
                 let a = one(self)?;
                 self.parse(a, "an IP address").map(Match::Neighbor)
             }
+            "rpki" => {
+                let a = one(self)?;
+                self.rov_state(a).map(Match::Rpki)
+            }
             _ => {
                 self.err(kind.pos, format!("unknown match clause `{}`", kind.value));
                 None
             }
         }
+    }
+
+    /// An origin validation state: the spelling every log line, control
+    /// reply and `show routes` already uses.
+    fn rov_state(&mut self, a: &Arg) -> Option<RovState> {
+        let state = a.value.parse::<RovState>().ok();
+        if state.is_none() {
+            self.err(
+                a.pos,
+                format!(
+                    "`{}` is not `valid`, `invalid`, `not-found` or `disabled`",
+                    a.value
+                ),
+            );
+        }
+        state
     }
 
     fn community_op(&mut self, a: &Arg) -> Option<CommunityOp> {
@@ -895,6 +974,10 @@ impl Lowerer {
                     None
                 }
             }
+            "rpki" => {
+                let a = one(self)?;
+                self.rov_state(a).map(SetAction::Rpki)
+            }
             _ => {
                 self.err(kind.pos, format!("unknown set action `{}`", kind.value));
                 None
@@ -994,6 +1077,12 @@ struct RpkiBuilder {
     max_expire: Once<Duration>,
     max_vrps: Once<u32>,
     backoff: Once<(Duration, Duration)>,
+    invalid: Once<InvalidAction>,
+    routinator: Once<Routinator>,
+    /// Where the `routinator` block and the first `cache` statement are,
+    /// for the modes that exclude them.
+    routinator_pos: Option<Pos>,
+    cache_pos: Option<Pos>,
 }
 
 impl RpkiBuilder {
@@ -1009,6 +1098,10 @@ impl RpkiBuilder {
             max_expire: Once::new("max-expire"),
             max_vrps: Once::new("max-vrps"),
             backoff: Once::new("backoff"),
+            invalid: Once::new("invalid"),
+            routinator: Once::new("routinator"),
+            routinator_pos: None,
+            cache_pos: None,
         }
     }
 
@@ -1018,10 +1111,11 @@ impl RpkiBuilder {
                 let v = l.arg(t).and_then(|a| match a.value.as_str() {
                     "disabled" => Some(RpkiMode::Disabled),
                     "external" => Some(RpkiMode::External),
+                    "sidecar" => Some(RpkiMode::Sidecar),
                     _ => {
                         l.err(
                             a.pos,
-                            format!("`{}` is not `disabled` or `external`", a.value),
+                            format!("`{}` is not `disabled`, `external` or `sidecar`", a.value),
                         );
                         None
                     }
@@ -1030,6 +1124,7 @@ impl RpkiBuilder {
             }
             "cache" => {
                 self.cache_seen = true;
+                self.cache_pos.get_or_insert(t.pos);
                 let Some(cache) = l.rpki_cache(t) else {
                     return;
                 };
@@ -1085,6 +1180,24 @@ impl RpkiBuilder {
                 let v = l.backoff(t);
                 self.backoff.set(l, t.pos, v);
             }
+            "invalid" => {
+                // RFC 6811 §5, RFC 8481 §5: the operator names what is done.
+                let v = l.arg(t).and_then(|a| {
+                    a.value.parse::<InvalidAction>().ok().or_else(|| {
+                        l.err(
+                            a.pos,
+                            format!("`{}` is not `drop`, `prefer-valid` or `policy`", a.value),
+                        );
+                        None
+                    })
+                });
+                self.invalid.set(l, t.pos, v);
+            }
+            "routinator" => {
+                self.routinator_pos.get_or_insert(t.pos);
+                let v = l.routinator(t);
+                self.routinator.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`rpki`"),
         }
     }
@@ -1093,13 +1206,27 @@ impl RpkiBuilder {
         // Issue #60: where validation data comes from is one setting the
         // operator states, never something implied by what else is there.
         if !self.mode.seen {
-            l.err(pos, "`rpki` needs a `mode` (`disabled` or `external`)");
+            l.err(
+                pos,
+                "`rpki` needs a `mode` (`disabled`, `external` or `sidecar`)",
+            );
         }
         let d = Rpki::default();
-        let (backoff_min, backoff_max) =
-            self.backoff.value.unwrap_or((d.backoff_min, d.backoff_max));
+        let mode = self.mode.value?;
+        // RFC 8210 §6 sets the Retry Interval of a cache that is up; here
+        // the cache is a child that may not be up yet, so the default
+        // waits less between attempts than for a remote cache.
+        let default_backoff = (
+            d.backoff_min,
+            if mode == RpkiMode::Sidecar {
+                Rpki::DEFAULT_SIDECAR_BACKOFF_MAX
+            } else {
+                d.backoff_max
+            },
+        );
+        let (backoff_min, backoff_max) = self.backoff.value.unwrap_or(default_backoff);
         let rpki = Rpki {
-            mode: self.mode.value?,
+            mode,
             caches: self.caches,
             version: self.version.value.unwrap_or(d.version),
             connect_timeout: self.connect_timeout.value.unwrap_or(d.connect_timeout),
@@ -1109,9 +1236,48 @@ impl RpkiBuilder {
             max_vrps: self.max_vrps.value.unwrap_or(d.max_vrps),
             backoff_min,
             backoff_max,
+            invalid: self.invalid.value.unwrap_or(d.invalid),
+            routinator: self.routinator.value,
         };
         if rpki.mode == RpkiMode::External && !self.cache_seen {
             l.err(pos, "`mode external` needs at least one `cache`");
+        }
+        // The two sources of VRPs are alternatives, and the one in use is
+        // the one the mode names. A statement for the other would be
+        // quietly ignored, so it is an error, except under `mode disabled`,
+        // which keeps whatever is written and uses none of it (so that a
+        // block can be switched off and on again by its mode alone).
+        if rpki.mode == RpkiMode::Sidecar {
+            if !self.routinator.seen {
+                l.err(pos, "`mode sidecar` needs a `routinator` block");
+            }
+            if let Some(at) = self.cache_pos {
+                l.err(
+                    at,
+                    "`cache` is not used with `mode sidecar`: the RTR client connects to the sidecar's own listener (`rtr-listen`)",
+                );
+            }
+        }
+        if rpki.mode == RpkiMode::External
+            && let Some(at) = self.routinator_pos
+        {
+            l.err(
+                at,
+                "`routinator` is used only with `mode sidecar`; `mode external` takes its VRPs from the `cache` list",
+            );
+        }
+        // RFC 8481 §5: "Absent specific operator configuration, policy
+        // MUST NOT be applied." What becomes of Invalid routes is stated,
+        // as where the VRPs come from is (issue #60), not implied by a
+        // cache being there, or by a validator the daemon runs itself.
+        if matches!(rpki.mode, RpkiMode::External | RpkiMode::Sidecar) && !self.invalid.seen {
+            l.err(
+                pos,
+                format!(
+                    "`mode {}` needs an `invalid` statement: `drop`, `prefer-valid` or `policy`",
+                    rpki.mode
+                ),
+            );
         }
         // The client would quietly cut the one to the other; say so instead.
         if rpki.connect_timeout > rpki.response_timeout {
@@ -1138,6 +1304,211 @@ impl RpkiBuilder {
     }
 }
 
+/// `restart-backoff INITIAL CAP`, each within 1 s and an hour.
+fn restart_backoff_of(l: &mut Lowerer, s: &Statement) -> Option<(Duration, Duration)> {
+    let [initial, cap] = l.args(s, 2)? else {
+        return None;
+    };
+    let bound = |l: &mut Lowerer, a: &Arg| {
+        let n: u32 = l.parse(a, "a number of seconds")?;
+        let d = Duration::from_secs(u64::from(n));
+        if d.is_zero() || d > Routinator::MAX_DELAY {
+            l.err(
+                a.pos,
+                format!(
+                    "a restart delay must be between 1 and {} seconds",
+                    Routinator::MAX_DELAY.as_secs()
+                ),
+            );
+            return None;
+        }
+        Some(d)
+    };
+    let initial = bound(l, initial);
+    let cap = bound(l, cap);
+    let (initial, cap) = (initial?, cap?);
+    if cap < initial {
+        l.err(
+            s.pos,
+            format!(
+                "restart-backoff cap {}s is below its initial delay {}s",
+                cap.as_secs(),
+                initial.as_secs()
+            ),
+        );
+        return None;
+    }
+    Some((initial, cap))
+}
+
+/// The statements of the `routinator` block, each at most once but `tal`,
+/// `global-arg` and `server-arg`.
+struct RoutinatorBuilder {
+    binary: Once<PathBuf>,
+    repository_dir: Once<PathBuf>,
+    rtr_listen: Once<SocketAddr>,
+    rir_tals: Once<bool>,
+    tals: Vec<String>,
+    tal_dir: Once<PathBuf>,
+    accept_arin_rpa: Once<bool>,
+    refresh: Once<Duration>,
+    config_file: Once<PathBuf>,
+    global_args: Vec<String>,
+    server_args: Vec<String>,
+    restart_backoff: Once<(Duration, Duration)>,
+    stable_after: Once<Duration>,
+    stop_timeout: Once<Duration>,
+    failure_threshold: Once<u32>,
+}
+
+impl RoutinatorBuilder {
+    fn new() -> Self {
+        RoutinatorBuilder {
+            binary: Once::new("binary"),
+            repository_dir: Once::new("repository-dir"),
+            rtr_listen: Once::new("rtr-listen"),
+            rir_tals: Once::new("rir-tals"),
+            tals: Vec::new(),
+            tal_dir: Once::new("tal-dir"),
+            accept_arin_rpa: Once::new("accept-arin-rpa"),
+            refresh: Once::new("refresh"),
+            config_file: Once::new("config-file"),
+            global_args: Vec::new(),
+            server_args: Vec::new(),
+            restart_backoff: Once::new("restart-backoff"),
+            stable_after: Once::new("stable-after"),
+            stop_timeout: Once::new("stop-timeout"),
+            failure_threshold: Once::new("failure-threshold"),
+        }
+    }
+
+    fn statement(&mut self, l: &mut Lowerer, t: &Statement) {
+        match t.keyword.as_str() {
+            "binary" => {
+                let v = l.absolute_path(t);
+                self.binary.set(l, t.pos, v);
+            }
+            "repository-dir" => {
+                let v = l.absolute_path(t);
+                self.repository_dir.set(l, t.pos, v);
+            }
+            "rtr-listen" => {
+                // RFC 8210 §9: unprotected TCP only between a cache and a
+                // router on a trusted, controlled network; the sidecar's
+                // cache is on the router itself, and nothing else may
+                // reach it.
+                let v = l
+                    .parse_arg::<SocketAddr>(t, "an `address:port`")
+                    .filter(|a| {
+                        let ok = a.ip().is_loopback();
+                        if !ok {
+                            l.err(
+                                t.pos,
+                                format!(
+                                    "rtr-listen address {a} is not a loopback address (RFC 8210 §9)"
+                                ),
+                            );
+                        }
+                        ok
+                    });
+                self.rtr_listen.set(l, t.pos, v);
+            }
+            "rir-tals" => {
+                let v = l.yes_no(t);
+                self.rir_tals.set(l, t.pos, v);
+            }
+            "tal" => {
+                if let Some(a) = l.arg(t) {
+                    if self.tals.contains(&a.value) {
+                        l.err(a.pos, format!("tal `{}` is listed twice", a.value));
+                    } else {
+                        self.tals.push(a.value.clone());
+                    }
+                }
+            }
+            "tal-dir" => {
+                let v = l.absolute_path(t);
+                self.tal_dir.set(l, t.pos, v);
+            }
+            "accept-arin-rpa" => {
+                let v = l.yes_no(t);
+                self.accept_arin_rpa.set(l, t.pos, v);
+            }
+            "refresh" => {
+                // RFC 8210 §6: the Refresh Interval is at least 1 s, and
+                // the Expire Interval must be larger than it.
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_REFRESH);
+                self.refresh.set(l, t.pos, v);
+            }
+            "config-file" => {
+                let v = l.absolute_path(t);
+                self.config_file.set(l, t.pos, v);
+            }
+            "global-arg" => {
+                if let Some(a) = l.arg(t) {
+                    self.global_args.push(a.value.clone());
+                }
+            }
+            "server-arg" => {
+                if let Some(a) = l.arg(t) {
+                    self.server_args.push(a.value.clone());
+                }
+            }
+            "restart-backoff" => {
+                let v = restart_backoff_of(l, t);
+                self.restart_backoff.set(l, t.pos, v);
+            }
+            "stable-after" => {
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_STABLE_AFTER);
+                self.stable_after.set(l, t.pos, v);
+            }
+            "stop-timeout" => {
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_DELAY);
+                self.stop_timeout.set(l, t.pos, v);
+            }
+            "failure-threshold" => {
+                let v = l.arg(t).and_then(|a| {
+                    let n: u32 = l.parse(a, "a number of failures (1-4294967295)")?;
+                    if n == 0 {
+                        l.err(a.pos, "failure-threshold must be at least 1");
+                        return None;
+                    }
+                    Some(n)
+                });
+                self.failure_threshold.set(l, t.pos, v);
+            }
+            _ => l.unknown(t, "`routinator`"),
+        }
+    }
+
+    fn finish(self, l: &mut Lowerer, pos: Pos) -> Option<Routinator> {
+        if !self.binary.seen {
+            l.err(pos, "`routinator` needs a `binary`");
+        }
+        if !self.repository_dir.seen {
+            l.err(pos, "`routinator` needs a `repository-dir`");
+        }
+        let mut r = Routinator::new(self.binary.value?, self.repository_dir.value?);
+        r.rtr_listen = self.rtr_listen.value.unwrap_or(r.rtr_listen);
+        r.rir_tals = self.rir_tals.value.unwrap_or(r.rir_tals);
+        r.tals = self.tals;
+        r.tal_dir = self.tal_dir.value;
+        r.accept_arin_rpa = self.accept_arin_rpa.value.unwrap_or(r.accept_arin_rpa);
+        r.refresh = self.refresh.value.unwrap_or(r.refresh);
+        r.config_file = self.config_file.value;
+        r.global_args = self.global_args;
+        r.server_args = self.server_args;
+        if let Some((initial, cap)) = self.restart_backoff.value {
+            r.restart_backoff_initial = initial;
+            r.restart_backoff_cap = cap;
+        }
+        r.stable_after = self.stable_after.value.unwrap_or(r.stable_after);
+        r.stop_timeout = self.stop_timeout.value.unwrap_or(r.stop_timeout);
+        r.failure_threshold = self.failure_threshold.value.unwrap_or(r.failure_threshold);
+        Some(r)
+    }
+}
+
 /// The statements of one `neighbor` block, each at most once.
 struct NeighborBuilder {
     remote_as: Once<Asn>,
@@ -1157,6 +1528,26 @@ struct NeighborBuilder {
     extended_next_hop: Once<bool>,
     restart_limit: Once<Option<u32>>,
     maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `add-path receive FAMILY yes|no`, each family once, whichever way.
+    add_path_receive: Vec<(AddressFamily, bool)>,
+    /// `add-path send FAMILY ...`, each family once; `off` is kept out.
+    add_path_send: Vec<(AddressFamily, Option<AddPathSend>)>,
+    role: Once<Role>,
+    role_strict: Once<bool>,
+    /// Where `role-strict yes` stands, for the error when there is no
+    /// `role` to be strict about.
+    role_strict_at: Option<Pos>,
+    graceful_restart: Once<bool>,
+    restart_time: Once<RestartTime>,
+    stale_time: Once<Duration>,
+    /// Where `restart-time` and `stale-time` stand, for the error when
+    /// Graceful Restart is not on for them to tune.
+    restart_options_at: Option<Pos>,
+    enhanced_refresh: Once<bool>,
+    refresh_stale_time: Once<Duration>,
+    /// Where `refresh-stale-time` stands, for the error when Enhanced Route
+    /// Refresh is off.
+    refresh_options_at: Option<Pos>,
 }
 
 impl NeighborBuilder {
@@ -1179,6 +1570,18 @@ impl NeighborBuilder {
             extended_next_hop: Once::new("extended-next-hop"),
             restart_limit: Once::new("restart-limit"),
             maximum_prefix: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: Once::new("role"),
+            role_strict: Once::new("role-strict"),
+            role_strict_at: None,
+            graceful_restart: Once::new("graceful-restart"),
+            restart_time: Once::new("restart-time"),
+            stale_time: Once::new("stale-time"),
+            restart_options_at: None,
+            enhanced_refresh: Once::new("enhanced-refresh"),
+            refresh_stale_time: Once::new("refresh-stale-time"),
+            refresh_options_at: None,
         }
     }
 
@@ -1264,21 +1667,201 @@ impl NeighborBuilder {
                 let v = l.yes_no(t);
                 self.extended_next_hop.set(l, t.pos, v);
             }
-            "restart-limit" => {
-                // RFC 4486 §4: an upper bound on consecutive automatic
-                // retries; `off` for none.
-                let v = l.arg(t).and_then(|a| {
-                    if a.value == "off" {
-                        Some(None)
-                    } else {
-                        l.parse::<u32>(a, "a number of restarts or `off`").map(Some)
-                    }
-                });
-                self.restart_limit.set(l, t.pos, v);
-            }
+            "restart-limit" => self.restart_limit(l, t),
             "maximum-prefix" => self.maximum_prefix(l, t),
+            "add-path" => self.add_path(l, t),
+            "graceful-restart" | "restart-time" | "stale-time" => self.graceful_restart(l, t),
+            "enhanced-refresh" | "refresh-stale-time" => self.enhanced_refresh(l, t),
+            "role" => self.role(l, t),
+            "role-strict" => {
+                let v = l.yes_no(t);
+                if v == Some(true) {
+                    self.role_strict_at.get_or_insert(t.pos);
+                }
+                self.role_strict.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
+    }
+
+    /// `restart-limit N|off`: RFC 4486 §4's upper bound on consecutive
+    /// automatic retries; `off` for none.
+    fn restart_limit(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            if a.value == "off" {
+                Some(None)
+            } else {
+                l.parse::<u32>(a, "a number of restarts or `off`").map(Some)
+            }
+        });
+        self.restart_limit.set(l, t.pos, v);
+    }
+
+    /// `add-path receive FAMILY yes|no` or `add-path send FAMILY N|all|off`,
+    /// each at most once per family (RFC 7911 §4, §5).
+    fn add_path(&mut self, l: &mut Lowerer, t: &Statement) {
+        let Some([direction, family, value]) = l.args(t, 3) else {
+            return;
+        };
+        let family = l.family(family);
+        match direction.value.as_str() {
+            "receive" => {
+                let on = match value.value.as_str() {
+                    "yes" | "on" | "true" => Some(true),
+                    "no" | "off" | "false" => Some(false),
+                    _ => {
+                        l.err(value.pos, format!("`{}` is not `yes` or `no`", value.value));
+                        None
+                    }
+                };
+                let (Some(family), Some(on)) = (family, on) else {
+                    return;
+                };
+                if self.add_path_receive.iter().any(|(f, _)| *f == family) {
+                    l.err(
+                        t.pos,
+                        format!("`add-path receive` is given more than once for {family}"),
+                    );
+                } else {
+                    self.add_path_receive.push((family, on));
+                }
+            }
+            "send" => {
+                let send = match value.value.as_str() {
+                    "all" => Some(Some(AddPathSend::All)),
+                    "off" => Some(None),
+                    _ => match value.value.parse::<u32>() {
+                        Ok(0) => {
+                            l.err(
+                                value.pos,
+                                "`add-path send` must send at least one path; \
+                                 use `off` to send one per prefix",
+                            );
+                            None
+                        }
+                        Ok(n) => Some(Some(AddPathSend::Best(n))),
+                        Err(_) => {
+                            l.err(
+                                value.pos,
+                                format!(
+                                    "`{}` is not a number of paths (1-4294967295), `all` or `off`",
+                                    value.value
+                                ),
+                            );
+                            None
+                        }
+                    },
+                };
+                let (Some(family), Some(send)) = (family, send) else {
+                    return;
+                };
+                if self.add_path_send.iter().any(|(f, _)| *f == family) {
+                    l.err(
+                        t.pos,
+                        format!("`add-path send` is given more than once for {family}"),
+                    );
+                } else {
+                    self.add_path_send.push((family, send));
+                }
+            }
+            other => l.err(
+                direction.pos,
+                format!("`{other}` is not `receive` or `send`"),
+            ),
+        }
+    }
+
+    /// `graceful-restart yes|no`, and the `restart-time` and `stale-time`
+    /// that tune it (RFC 4724, RFC 8538).
+    fn graceful_restart(&mut self, l: &mut Lowerer, t: &Statement) {
+        match t.keyword.as_str() {
+            "restart-time" => self.restart_time(l, t),
+            "stale-time" => self.stale_time(l, t),
+            _ => {
+                let v = l.yes_no(t);
+                self.graceful_restart.set(l, t.pos, v);
+            }
+        }
+    }
+
+    /// `restart-time N`: the Restart Time to advertise, "in seconds (12
+    /// bits)" (RFC 4724 §3).
+    fn restart_time(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            let secs: u16 = l.parse(a, "a number of seconds (0-4095)")?;
+            let time = RestartTime::new(secs);
+            if time.is_none() {
+                l.err(
+                    a.pos,
+                    "restart-time is at most 4095, what twelve bits hold (RFC 4724 §3)",
+                );
+            }
+            time
+        });
+        self.restart_options_at.get_or_insert(t.pos);
+        self.restart_time.set(l, t.pos, v);
+    }
+
+    /// `stale-time N`: how long a restarted neighbor's stale routes are
+    /// kept once its session is back. RFC 8538 §4.1 makes the timer
+    /// mandatory and keeping the routes for ever not the default; zero would
+    /// delete the routes of a neighbor the moment its session is back.
+    fn stale_time(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            let secs: u16 = l.parse(a, "a number of seconds (1-65535)")?;
+            if secs == 0 {
+                l.err(a.pos, "stale-time must be at least 1 (RFC 8538 §4.1)");
+                return None;
+            }
+            Some(Duration::from_secs(u64::from(secs)))
+        });
+        self.restart_options_at.get_or_insert(t.pos);
+        self.stale_time.set(l, t.pos, v);
+    }
+
+    /// `enhanced-refresh yes|no`, and the `refresh-stale-time` that tunes it
+    /// (RFC 7313).
+    fn enhanced_refresh(&mut self, l: &mut Lowerer, t: &Statement) {
+        if t.keyword == "refresh-stale-time" {
+            // RFC 7313 §4 lets an implementation bound the wait for an
+            // EoRR; zero would purge the routes the moment the refresh
+            // began.
+            let v = l.arg(t).and_then(|a| {
+                let secs: u16 = l.parse(a, "a number of seconds (1-65535)")?;
+                if secs == 0 {
+                    l.err(a.pos, "refresh-stale-time must be at least 1 (RFC 7313 §4)");
+                    return None;
+                }
+                Some(Duration::from_secs(u64::from(secs)))
+            });
+            self.refresh_options_at.get_or_insert(t.pos);
+            self.refresh_stale_time.set(l, t.pos, v);
+        } else {
+            let v = l.yes_no(t);
+            self.enhanced_refresh.set(l, t.pos, v);
+        }
+    }
+
+    /// `role NAME`: one of the five Roles of RFC 9234 §4.1, Table 1, by the
+    /// names the RFC uses. It is ours, not the neighbor's.
+    fn role(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| match a.value.as_str() {
+            "provider" => Some(Role::Provider),
+            "rs" => Some(Role::RouteServer),
+            "rs-client" => Some(Role::RouteServerClient),
+            "customer" => Some(Role::Customer),
+            "peer" => Some(Role::Peer),
+            other => {
+                l.err(
+                    a.pos,
+                    format!(
+                        "`{other}` is not a BGP role: expected provider, rs, rs-client, customer or peer"
+                    ),
+                );
+                None
+            }
+        });
+        self.role.set(l, t.pos, v);
     }
 
     /// `maximum-prefix FAMILY N`, at most once per family (RFC 4271 §6.7).
@@ -1306,6 +1889,54 @@ impl NeighborBuilder {
         }
     }
 
+    /// The options that tune a statement which is off: `role-strict yes`
+    /// without a `role`, `restart-time` and `stale-time` without
+    /// `graceful-restart yes`, `refresh-stale-time` with `enhanced-refresh
+    /// no`. Alone they would silently do nothing.
+    fn check_options(
+        &self,
+        l: &mut Lowerer,
+        addr: IpAddr,
+        (graceful_restart, enhanced_refresh): (bool, bool),
+    ) {
+        // RFC 9234 §4.2: strict mode is about the Role capability we sent,
+        // and one is sent only for a configured Role.
+        if let Some(at) = self.role_strict_at
+            && !self.role.seen
+        {
+            l.err(
+                at,
+                format!("neighbor {addr}: `role-strict yes` needs a `role` (RFC 9234 §4.2)"),
+            );
+        }
+        // `restart-time` and `stale-time` tune what `graceful-restart yes`
+        // turns on: alone they would silently do nothing.
+        // A `graceful-restart` that was given but is bad has been reported.
+        if let Some(at) = self.restart_options_at
+            && !graceful_restart
+            && (self.graceful_restart.value.is_some() || !self.graceful_restart.seen)
+        {
+            l.err(
+                at,
+                format!(
+                    "neighbor {addr}: `restart-time` and `stale-time` need `graceful-restart yes`"
+                ),
+            );
+        }
+        // `refresh-stale-time` tunes what `enhanced-refresh yes`, the
+        // default, has on: with `no` stated it would silently do nothing.
+        if let Some(at) = self.refresh_options_at
+            && !enhanced_refresh
+        {
+            l.err(
+                at,
+                format!(
+                    "neighbor {addr}: `refresh-stale-time` needs `enhanced-refresh yes`, the default"
+                ),
+            );
+        }
+    }
+
     fn finish(self, l: &mut Lowerer, pos: Pos, addr: IpAddr) -> Option<Neighbor> {
         for (present, kw) in [
             (self.remote_as.seen, "remote-as"),
@@ -1316,6 +1947,9 @@ impl NeighborBuilder {
                 l.err(pos, format!("neighbor {addr} has no `{kw}`"));
             }
         }
+        let graceful_restart = self.graceful_restart.value.unwrap_or(false);
+        let enhanced_refresh = self.enhanced_refresh.value.unwrap_or(true);
+        self.check_options(l, addr, (graceful_restart, enhanced_refresh));
         Some(Neighbor {
             pos,
             addr,
@@ -1355,6 +1989,36 @@ impl NeighborBuilder {
                 .value
                 .unwrap_or(Some(DEFAULT_RESTART_LIMIT)),
             maximum_prefix: self.maximum_prefix,
+            add_path_receive: self
+                .add_path_receive
+                .into_iter()
+                .filter_map(|(family, on)| on.then_some(family))
+                .collect(),
+            add_path_send: self
+                .add_path_send
+                .into_iter()
+                .filter_map(|(family, send)| send.map(|send| (family, send)))
+                .collect(),
+            graceful_restart: graceful_restart.then(|| GracefulRestart {
+                restart_time: self.restart_time.value.unwrap_or(
+                    // invariant: the default is below the 12-bit maximum.
+                    RestartTime::new(DEFAULT_RESTART_TIME).unwrap_or(RestartTime::MAX),
+                ),
+                stale_time: self
+                    .stale_time
+                    .value
+                    .unwrap_or(Duration::from_secs(u64::from(DEFAULT_STALE_TIME))),
+            }),
+            enhanced_refresh: enhanced_refresh.then(|| EnhancedRefresh {
+                stale_time: self
+                    .refresh_stale_time
+                    .value
+                    .unwrap_or(Duration::from_secs(u64::from(DEFAULT_REFRESH_STALE_TIME))),
+            }),
+            role: self.role.value.map(|role| LocalRole {
+                role,
+                strict: self.role_strict.value.unwrap_or(false),
+            }),
         })
     }
 }

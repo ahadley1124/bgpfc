@@ -1,0 +1,9 @@
+sidecar-modes.conf:6:1: `mode sidecar` needs a `routinator` block
+  rpki {
+  ^
+sidecar-modes.conf:6:1: `mode sidecar` needs an `invalid` statement: `drop`, `prefer-valid` or `policy`
+  rpki {
+  ^
+sidecar-modes.conf:8:5: `cache` is not used with `mode sidecar`: the RTR client connects to the sidecar's own listener (`rtr-listen`)
+      cache 127.0.0.1 port 3323;
+      ^

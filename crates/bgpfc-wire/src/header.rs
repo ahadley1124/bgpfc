@@ -1,8 +1,9 @@
 //! The fixed-size message header and message framing.
 //!
 //! Implements: RFC 4271 §4.1 (header format), §6.1 (header error handling),
-//! RFC 2918 §3 (ROUTE-REFRESH type code), RFC 8654 §4 and §6 (65535-octet
-//! messages when negotiated, except OPEN and KEEPALIVE).
+//! RFC 2918 §3 (ROUTE-REFRESH type code), RFC 7313 §5 (the length of a
+//! ROUTE-REFRESH is checked with its body), RFC 8654 §4 and §6
+//! (65535-octet messages when negotiated, except OPEN and KEEPALIVE).
 
 use crate::error::{DecodeError, EncodeError, HeaderSubcode};
 use crate::reader::{Reader, WriteBytes as _};
@@ -51,14 +52,19 @@ impl MessageType {
     }
 
     /// Smallest legal value of the Length field for this type, header
-    /// included (RFC 4271 §6.1; RFC 2918 §3 for ROUTE-REFRESH).
+    /// included (RFC 4271 §6.1).
+    ///
+    /// A ROUTE-REFRESH has a body of four octets (RFC 2918 §3), but which
+    /// error a different length is depends on its subtype and on whether
+    /// Enhanced Route Refresh was negotiated (RFC 7313 §5), so the header
+    /// accepts any and `RouteRefreshMessage::decode` answers.
     #[must_use]
     pub const fn min_len(self) -> u16 {
         match self {
             MessageType::Open => 29,
-            MessageType::Update | MessageType::RouteRefresh => 23,
+            MessageType::Update => 23,
             MessageType::Notification => 21,
-            MessageType::Keepalive => 19,
+            MessageType::Keepalive | MessageType::RouteRefresh => 19,
         }
     }
 
@@ -223,15 +229,7 @@ mod tests {
 
     #[test]
     fn length_bounds_carry_the_length_field_as_data() {
-        for (len, kind) in [
-            (18, 4),
-            (4097, 2),
-            (20, 4),
-            (28, 1),
-            (22, 2),
-            (20, 3),
-            (22, 5),
-        ] {
+        for (len, kind) in [(18, 4), (4097, 2), (20, 4), (28, 1), (22, 2), (20, 3)] {
             let e = Header::decode(&hdr(len, kind), false).unwrap_err();
             assert_eq!(
                 e,
@@ -239,7 +237,18 @@ mod tests {
                 "len {len} kind {kind}"
             );
         }
-        for (len, kind) in [(29, 1), (23, 2), (21, 3), (19, 4), (23, 5), (4096, 2)] {
+        // A ROUTE-REFRESH of any length gets as far as its body, where RFC
+        // 7313 §5 decides the error.
+        for (len, kind) in [
+            (29, 1),
+            (23, 2),
+            (21, 3),
+            (19, 4),
+            (19, 5),
+            (22, 5),
+            (23, 5),
+            (4096, 2),
+        ] {
             assert!(
                 Header::decode(&hdr(len, kind), false).is_ok(),
                 "len {len} kind {kind}"

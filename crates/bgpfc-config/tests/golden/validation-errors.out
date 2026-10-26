@@ -19,3 +19,9 @@ validation-errors.conf:12:1: neighbor 2001:db8::4: extended-next-hop needs the i
 validation-errors.conf:12:1: neighbor 2001:db8::4: maximum-prefix for ipv4-unicast, which is not in its families
   neighbor 2001:db8::4 {
   ^
+validation-errors.conf:17:1: neighbor 192.0.2.5: role peer needs an external session, but remote-as 65000 is our own AS (RFC 9234 §4)
+  neighbor 192.0.2.5 { remote-as 65000; import A; export A; role peer; }
+  ^
+validation-errors.conf:18:1: neighbor 192.0.2.6: role customer needs an external session, but remote-as 65000 is our own AS (RFC 9234 §4)
+  neighbor 192.0.2.6 { remote-as 65000; import A; export A; role customer; role-strict yes; }
+  ^

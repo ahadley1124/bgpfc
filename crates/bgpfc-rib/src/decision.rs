@@ -45,6 +45,16 @@ pub struct Candidate<'a> {
     pub from: Neighbor,
     /// The route's attributes.
     pub attrs: &'a PathAttrs,
+    /// The Path Identifier the peer sent it with (RFC 7911 §3), zero if the
+    /// session has none. Only ever the last tie-break.
+    pub path_id: u32,
+    /// The route is demoted: its validation state is Invalid and the RIB is
+    /// to prefer the routes that are not ([`InvalidAction::PreferValid`]).
+    /// A demoted route loses to every route that is not, and competes
+    /// with the others like them on the usual steps.
+    ///
+    /// [`InvalidAction::PreferValid`]: bgpfc_rpki::InvalidAction::PreferValid
+    pub demoted: bool,
 }
 
 /// The `LOCAL_PREF` assumed for routes without one (external routes the
@@ -85,11 +95,21 @@ pub fn path_length(attrs: &PathAttrs) -> usize {
 /// `candidate(i)` is the `i`th, for `i` in `0..n`; the RIB keeps routes
 /// apart from the peers they name, so it assembles each on demand.
 ///
+/// A demoted route (see [`Candidate::demoted`]) comes last: it is chosen
+/// only when every candidate is demoted. RFC 6811 §5 calls the use of
+/// Invalid routes "a purely local policy matter", and this is the
+/// non-enforcing choice the operator asked for: it is ahead of the steps
+/// below so that no degree of preference an import policy sets can lift an
+/// Invalid route over a route that is not Invalid. The steps then apply
+/// within each kind alone, the MED step included.
+///
 /// Steps, in order (RFC 4271 §9.1.2.2): highest degree of preference;
 /// shortest `AS_PATH`; lowest ORIGIN; lowest MED among routes from the
 /// same neighboring AS (a missing MED is the lowest value); external over
 /// internal; (interior cost: not applicable, no IGP); lowest BGP
-/// Identifier; lowest peer address.
+/// Identifier; lowest peer address; and then, for the several paths one
+/// peer may send with ADD-PATH (RFC 7911 §3), which every step before
+/// finds equal, the lowest Path Identifier.
 #[must_use]
 pub fn best<'a>(n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> Option<usize> {
     #[cfg(feature = "profiling")]
@@ -131,9 +151,12 @@ pub fn best<'a>(n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> Option<
 
 /// The steps before MED: `Greater` when `a` is preferred over `b`.
 fn before_med(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
-    // §9.1.2.2 (before a): highest degree of preference.
-    a.degree_of_preference()
-        .cmp(&b.degree_of_preference())
+    // RFC 6811 §5, local rule: a route that is not demoted beats one that
+    // is (`false` sorts before `true`, so `b` against `a`).
+    b.demoted
+        .cmp(&a.demoted)
+        // §9.1.2.2 (before a): highest degree of preference.
+        .then_with(|| a.degree_of_preference().cmp(&b.degree_of_preference()))
         // a) shortest AS_PATH.
         .then_with(|| path_length(b.attrs).cmp(&path_length(a.attrs)))
         // b) lowest ORIGIN: IGP < EGP < INCOMPLETE.
@@ -152,18 +175,27 @@ fn after_med(a: &Candidate<'_>, b: &Candidate<'_>) -> Ordering {
         .then_with(|| b.from.router_id.cmp(&a.from.router_id))
         // g) lowest peer address.
         .then_with(|| b.from.addr.cmp(&a.from.addr))
+        // RFC 4271 §9.1.2.2 ends here, and RFC 7911 adds no step: two paths
+        // of one peer are equal to every step above, so without one more
+        // the choice between them would depend on which arrived first.
+        // The lowest Path Identifier, a local rule, keeps the Loc-RIB
+        // independent of arrival order. For a session without ADD-PATH it
+        // is zero on both sides.
+        .then_with(|| b.path_id.cmp(&a.path_id))
 }
 
 /// 0 when the route has the lowest MED of its neighboring AS among the
-/// `n` candidates (a missing MED is the lowest value), 1 otherwise. A
-/// scan: destinations have a route per peer, a handful, and a map would
-/// cost an allocation on every run.
+/// `n` candidates of its kind, demoted or not (a missing MED is the lowest
+/// value), 1 otherwise. A scan: destinations have a route per peer, a
+/// handful, and a map would cost an allocation on every run. A demoted
+/// route's MED says nothing of a route that is not, which beats it
+/// whatever the MEDs.
 fn med_rank<'a>(c: &Candidate<'_>, n: usize, candidate: impl Fn(usize) -> Candidate<'a>) -> u8 {
     let asn = c.neighbor_as();
     let med = c.attrs.med.unwrap_or(0);
     u8::from((0..n).any(|j| {
         let o = candidate(j);
-        o.attrs.med.unwrap_or(0) < med && o.neighbor_as() == asn
+        o.demoted == c.demoted && o.attrs.med.unwrap_or(0) < med && o.neighbor_as() == asn
     }))
 }
 

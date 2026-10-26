@@ -3,7 +3,8 @@
 //!
 //! Implements: RFC 4271 §4.2 (Hold Time, BGP Identifier), RFC 6793 §3
 //! (four-octet AS numbers, `AS_TRANS`), RFC 4760 §3 (AFI/SAFI values),
-//! RFC 6286 §2.1 (BGP Identifier is any non-zero 4-octet value).
+//! RFC 6286 §2.1 (BGP Identifier is any non-zero 4-octet value), RFC 7911
+//! §3 (Path Identifier).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -44,6 +45,20 @@ impl From<u16> for Asn {
 impl fmt::Display for Asn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AS{}", self.0)
+    }
+}
+
+/// Path Identifier (RFC 7911 §3): four octets that tell apart the paths one
+/// speaker advertises for a prefix. Assigning one is "purely a local
+/// matter" and the receiver "should not assume that the identifier
+/// carries any particular semantics" (§2), so it is only ever compared for
+/// equality and printed. Zero is a valid identifier like any other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathId(pub u32);
+
+impl fmt::Display for PathId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -116,6 +131,39 @@ impl HoldTime {
 }
 
 impl fmt::Display for HoldTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s", self.0)
+    }
+}
+
+/// Restart Time in seconds: the 12-bit field of the Graceful Restart
+/// capability (RFC 4724 §3), so at most 4095.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RestartTime(u16);
+
+impl RestartTime {
+    /// The largest Restart Time the 12-bit field holds (RFC 4724 §3).
+    pub const MAX: RestartTime = RestartTime(0x0fff);
+
+    /// Validate a Restart Time: at most 4095 seconds, the most twelve bits
+    /// hold (RFC 4724 §3).
+    #[must_use]
+    pub const fn new(secs: u16) -> Option<RestartTime> {
+        if secs <= RestartTime::MAX.0 {
+            Some(RestartTime(secs))
+        } else {
+            None
+        }
+    }
+
+    /// Seconds.
+    #[must_use]
+    pub const fn secs(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for RestartTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}s", self.0)
     }
@@ -242,6 +290,14 @@ mod tests {
     }
 
     #[test]
+    fn path_id_is_a_plain_number() {
+        // RFC 7911 §2: no semantics; zero is as good as any other.
+        assert_eq!(PathId::default(), PathId(0));
+        assert!(PathId(1) < PathId(2));
+        assert_eq!(PathId(4_294_967_295).to_string(), "4294967295");
+    }
+
+    #[test]
     fn router_id_rejects_zero_only() {
         assert_eq!(RouterId::new(0), None);
         let id = RouterId::new(0xc000_0201).unwrap();
@@ -258,6 +314,16 @@ mod tests {
         assert_eq!(HoldTime::new(2), None);
         assert_eq!(HoldTime::new(3).unwrap().secs(), 3);
         assert_eq!(HoldTime::new(90).unwrap().to_string(), "90s");
+    }
+
+    #[test]
+    fn restart_time_is_twelve_bits() {
+        // RFC 4724 §3: "Restart Time in seconds (12 bits)".
+        assert_eq!(RestartTime::new(0).unwrap().secs(), 0);
+        assert_eq!(RestartTime::new(120).unwrap().to_string(), "120s");
+        assert_eq!(RestartTime::new(4095), Some(RestartTime::MAX));
+        assert_eq!(RestartTime::new(4096), None);
+        assert_eq!(RestartTime::new(u16::MAX), None);
     }
 
     #[test]

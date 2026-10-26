@@ -7,8 +7,10 @@ use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::{Community, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::Asn;
-use bgpfc_wire::update::{DecodeContext, EncodeContext, PeerKind, UpdateMessage};
+use bgpfc_wire::types::{AddressFamily, Asn, PathId};
+use bgpfc_wire::update::{
+    AddPathFamilies, DecodeContext, EncodeContext, PathIds, PeerKind, UpdateMessage,
+};
 use criterion::Criterion;
 
 /// A typical full-table UPDATE: a handful of attributes and many prefixes.
@@ -37,7 +39,20 @@ fn message(prefixes: u32) -> UpdateMessage {
                 local2: 2,
             }]),
         ],
+        path_ids: None,
     }
+}
+
+/// The same UPDATE on a session with ADD-PATH (RFC 7911 §3): a Path
+/// Identifier before each prefix, as a route server sending every path of
+/// a prefix would number them.
+fn message_with_paths(prefixes: u32) -> UpdateMessage {
+    let mut m = message(prefixes);
+    m.path_ids = Some(Box::new(PathIds {
+        nlri: (0..prefixes).map(|i| PathId(i % 4 + 1)).collect(),
+        ..PathIds::default()
+    }));
+    m
 }
 
 fn bench(c: &mut Criterion) {
@@ -46,14 +61,37 @@ fn bench(c: &mut Criterion) {
         peer: PeerKind::External,
         allow_as_set: false,
         extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
     };
     let ectx = EncodeContext {
         four_octet_as: true,
         extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
     };
     let mut group = c.benchmark_group("update");
     for prefixes in [1u32, 50, 500] {
         let m = message(prefixes);
+        let body = m.encode(&ectx).unwrap();
+        group.bench_function(
+            format!("decode_{prefixes}_prefixes_{}_bytes", body.len()),
+            |b| {
+                b.iter(|| UpdateMessage::decode(black_box(&body), &ctx).unwrap());
+            },
+        );
+        group.bench_function(format!("encode_{prefixes}_prefixes"), |b| {
+            b.iter(|| black_box(&m).encode(&ectx).unwrap());
+        });
+    }
+    group.finish();
+
+    // The extended NLRI encoding on a session with ADD-PATH for IPv4
+    // unicast: what the receive and the send side pay for it.
+    let add_path = AddPathFamilies::of(&[AddressFamily::IPV4_UNICAST]);
+    let ctx = DecodeContext { add_path, ..ctx };
+    let ectx = EncodeContext { add_path, ..ectx };
+    let mut group = c.benchmark_group("update_add_path");
+    for prefixes in [1u32, 50, 500] {
+        let m = message_with_paths(prefixes);
         let body = m.encode(&ectx).unwrap();
         group.bench_function(
             format!("decode_{prefixes}_prefixes_{}_bytes", body.len()),

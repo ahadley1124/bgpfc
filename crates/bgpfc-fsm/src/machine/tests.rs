@@ -3,14 +3,15 @@
 
 use std::time::{Duration, Instant};
 
-use bgpfc_wire::capability::{Capability, NextHopEncoding};
+use bgpfc_wire::capability::{AddPathMode, AddPathTuple, Capability, NextHopEncoding};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, HeaderSubcode, OpenSubcode, UpdateSubcode};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RouterId};
+use bgpfc_wire::role::{LocalRole, Role};
+use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RestartTime, RouterId};
 
 use super::*;
-use crate::{Damping, PeerKind};
+use crate::{Damping, PeerKind, RouteRefresh};
 
 const LOCAL_AS: Asn = Asn(65_000);
 const PEER_AS: Asn = Asn(65_001);
@@ -113,7 +114,8 @@ fn tags(actions: &[Action]) -> Vec<String> {
             Action::SendKeepalive => "keepalive".to_owned(),
             Action::SendNotification(n) => format!("notif {}/{}", n.code.to_u8(), n.subcode),
             Action::SessionUp(_) => "up".to_owned(),
-            Action::SessionDown => "down".to_owned(),
+            Action::SessionDown { retain: None } => "down".to_owned(),
+            Action::SessionDown { retain: Some(_) } => "down-retain".to_owned(),
             Action::LogError(_) => "log".to_owned(),
             Action::RestartLimitReached { failures } => format!("limit {failures}"),
         })
@@ -444,7 +446,9 @@ fn open_negotiation() {
     assert!(s.four_octet_as);
     // RFC 8654 §4: only we advertised Extended Message.
     assert!(!s.extended_messages);
-    assert!(s.route_refresh);
+    // RFC 2918 §2: the peer advertised Route Refresh. RFC 7313 §4: only
+    // we advertised Enhanced Route Refresh, if either.
+    assert_eq!(s.route_refresh, RouteRefresh::Supported);
     // RFC 4760 §8: only IPv4 unicast on both sides; we take IPv6 unicast
     // routes too, since we advertised it.
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
@@ -455,6 +459,9 @@ fn open_negotiation() {
     // RFC 8950 §4: neither side advertised Extended Next Hop Encoding.
     assert_eq!(s.extended_next_hop_receive, vec![]);
     assert_eq!(s.extended_next_hop_send, vec![]);
+    // RFC 7911 §5: nobody advertised ADD-PATH.
+    assert_eq!(s.add_path_receive, vec![]);
+    assert_eq!(s.add_path_send, vec![]);
     // Timers: KeepaliveTimer and HoldTimer as negotiated.
     assert_eq!(
         f.timer(TimerKind::Keepalive).deadline(),
@@ -473,6 +480,94 @@ fn open_negotiation() {
 }
 
 #[test]
+fn enhanced_route_refresh_needs_both_sides() {
+    // RFC 7313 §4: the procedures apply to a speaker that has received the
+    // capability, and a peer applies them to a speaker it received it from:
+    // negotiated when both advertised it, whichever way they are.
+    let with_err = |c: &mut Config| c.capabilities.push(Capability::EnhancedRouteRefresh);
+    let peer_with_err = || {
+        let mut open = peer_open();
+        open.capabilities.push(Capability::EnhancedRouteRefresh);
+        open
+    };
+    for (ours, theirs, negotiated) in [
+        (false, false, RouteRefresh::Supported),
+        (true, false, RouteRefresh::Supported),
+        (false, true, RouteRefresh::Supported),
+        (true, true, RouteRefresh::Enhanced),
+    ] {
+        let mut cfg = config();
+        if ours {
+            with_err(&mut cfg);
+        }
+        let (mut f, now) = fsm_at(State::OpenSent, cfg);
+        let open = if theirs { peer_with_err() } else { peer_open() };
+        f.handle(Event::BgpOpen(open), now);
+        let s = f.session().unwrap();
+        assert_eq!(s.route_refresh, negotiated, "ours {ours} theirs {theirs}");
+        assert_eq!(negotiated.enhanced(), ours && theirs);
+        assert!(s.route_refresh.peer_advertised());
+    }
+    // The procedures refresh a Route Refresh: a peer with the enhanced
+    // capability alone is sent no ROUTE-REFRESH at all.
+    let mut cfg = config();
+    with_err(&mut cfg);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(
+            PEER_AS,
+            hold(30),
+            rid(2),
+            vec![
+                Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+                Capability::EnhancedRouteRefresh,
+            ],
+        )),
+        now,
+    );
+    assert_eq!(
+        f.session().unwrap().route_refresh,
+        RouteRefresh::Unsupported
+    );
+}
+
+#[test]
+fn our_open_carries_enhanced_route_refresh_when_configured() {
+    // RFC 7313 §4: a speaker that supports the subtypes SHOULD advertise
+    // the capability, once (RFC 5492 §4).
+    let mut cfg = config();
+    cfg.capabilities.push(Capability::EnhancedRouteRefresh);
+    let (mut f, now) = fsm_at(State::Idle, cfg);
+    let sent = f
+        .handle(Event::ManualStart, now)
+        .into_iter()
+        .chain(f.handle(Event::TcpCrAcked, now))
+        .find_map(|a| match a {
+            Action::SendOpen(open) => Some(open),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        sent.capabilities
+            .iter()
+            .filter(|c| **c == Capability::EnhancedRouteRefresh)
+            .count(),
+        1
+    );
+    let (mut f, now) = fsm_at(State::Idle, config());
+    let sent = f
+        .handle(Event::ManualStart, now)
+        .into_iter()
+        .chain(f.handle(Event::TcpCrAcked, now))
+        .find_map(|a| match a {
+            Action::SendOpen(open) => Some(open),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!sent.has(&Capability::EnhancedRouteRefresh));
+}
+
+#[test]
 fn internal_session_and_old_speaker() {
     let mut cfg = config();
     cfg.remote_as = LOCAL_AS;
@@ -488,7 +583,7 @@ fn internal_session_and_old_speaker() {
     let s = f.session().unwrap();
     assert_eq!(s.peer, PeerKind::Internal);
     assert!(!s.four_octet_as);
-    assert!(!s.route_refresh);
+    assert_eq!(s.route_refresh, RouteRefresh::Unsupported);
     assert_eq!(s.hold_time, hold(90));
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
 }
@@ -667,6 +762,165 @@ fn extended_next_hop_follows_the_ipv4_unicast_family() {
     );
 }
 
+fn add_path(tuples: &[(AddressFamily, AddPathMode)]) -> Capability {
+    Capability::AddPath(
+        tuples
+            .iter()
+            .map(|(family, mode)| AddPathTuple {
+                family: *family,
+                mode: *mode,
+            })
+            .collect(),
+    )
+}
+
+/// RFC 7911 §5 between `config()` with `ours` added and a peer advertising
+/// IPv4 and IPv6 unicast and `theirs`: (families received with Path
+/// Identifiers, families sent with them).
+fn negotiated_add_path(
+    ours: Vec<Capability>,
+    theirs: Vec<Capability>,
+) -> (Vec<AddressFamily>, Vec<AddressFamily>) {
+    let mut cfg = config();
+    cfg.capabilities.extend(ours);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let mut caps = vec![
+        Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+        Capability::Multiprotocol(AddressFamily::IPV6_UNICAST),
+    ];
+    caps.extend(theirs);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+        now,
+    );
+    let s = f.session().unwrap();
+    (s.add_path_receive.clone(), s.add_path_send.clone())
+}
+
+#[test]
+fn add_path_is_negotiated_per_family_and_direction() {
+    use AddPathMode::{Both, Receive, Send};
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    let negotiated = negotiated_add_path;
+    // RFC 7911 §5: we send once we advertised Send (2 or 3) and the peer
+    // Receive (1 or 3); we receive once we advertised Receive and the peer
+    // Send. Every combination of the three values for one family.
+    let cases = [
+        // (ours, theirs, we receive, we send)
+        (Receive, Receive, false, false),
+        (Receive, Send, true, false),
+        (Receive, Both, true, false),
+        (Send, Receive, false, true),
+        (Send, Send, false, false),
+        (Send, Both, false, true),
+        (Both, Receive, false, true),
+        (Both, Send, true, false),
+        (Both, Both, true, true),
+    ];
+    for (ours, theirs, receive, send) in cases {
+        assert_eq!(
+            negotiated(
+                vec![add_path(&[(v4, ours)])],
+                vec![add_path(&[(v4, theirs)])]
+            ),
+            (
+                if receive { vec![v4] } else { vec![] },
+                if send { vec![v4] } else { vec![] }
+            ),
+            "ours {ours:?}, theirs {theirs:?}"
+        );
+    }
+    // Per family: IPv4 both ways, IPv6 we only send.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Both), (v6, Send)])],
+            vec![add_path(&[(v4, Both), (v6, Receive)])]
+        ),
+        (vec![v4], vec![v4, v6])
+    );
+    // One side silent: the RFC 4271 procedures hold, both ways.
+    assert_eq!(
+        negotiated(vec![add_path(&[(v4, Both)])], vec![]),
+        (vec![], vec![])
+    );
+    assert_eq!(
+        negotiated(vec![], vec![add_path(&[(v4, Both)])]),
+        (vec![], vec![])
+    );
+    // A family only one side lists is not negotiated.
+    assert_eq!(
+        negotiated(vec![add_path(&[(v6, Both)])], vec![add_path(&[(v4, Both)])]),
+        (vec![], vec![])
+    );
+    // RFC 7911 §4 asks for one instance, RFC 5492 §4 allows several: the
+    // tuples of both count, and a family listed twice has either ability.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Receive)]), add_path(&[(v4, Send)])],
+            vec![add_path(&[(v4, Both)]), add_path(&[(v6, Both)])]
+        ),
+        (vec![v4], vec![v4])
+    );
+    // A tuple the peer sent with a value other than 1 to 3 made its
+    // capability one that is not understood, and nothing was negotiated.
+    assert_eq!(
+        negotiated(
+            vec![add_path(&[(v4, Both)])],
+            vec![Capability::Unknown {
+                code: 69,
+                value: vec![0, 1, 1, 0],
+            }]
+        ),
+        (vec![], vec![])
+    );
+}
+
+#[test]
+fn add_path_needs_the_family_negotiated() {
+    use AddPathMode::Both;
+    let v4 = AddressFamily::IPV4_UNICAST;
+    let v6 = AddressFamily::IPV6_UNICAST;
+    // RFC 4760 §8 first: a family the peer did not advertise is not
+    // exchanged, so ADD-PATH for it has nothing to apply to.
+    let mut cfg = config();
+    cfg.capabilities.push(add_path(&[(v4, Both), (v6, Both)]));
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let theirs = vec![
+        Capability::Multiprotocol(v4),
+        add_path(&[(v4, Both), (v6, Both)]),
+    ];
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), theirs)),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(s.families, vec![v4]);
+    assert_eq!(
+        (&s.add_path_receive, &s.add_path_send),
+        (&vec![v4], &vec![v4])
+    );
+    // IPv4 unicast alone without any Multiprotocol capability is implicit
+    // (RFC 4760 §8), and ADD-PATH for it applies.
+    let mut cfg = Config::new(LOCAL_AS, rid(1), PEER_AS);
+    cfg.capabilities = vec![add_path(&[(v4, Both)])];
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(
+            PEER_AS,
+            hold(30),
+            rid(2),
+            vec![add_path(&[(v4, Both)])],
+        )),
+        now,
+    );
+    let s = f.session().unwrap();
+    assert_eq!(
+        (&s.add_path_receive, &s.add_path_send),
+        (&vec![v4], &vec![v4])
+    );
+}
+
 #[test]
 fn bad_peer_as_and_unsupported_capability() {
     // RFC 4271 §6.2: Bad Peer AS.
@@ -687,6 +941,257 @@ fn bad_peer_as_and_unsupported_capability() {
         panic!()
     };
     assert_eq!(n.data, vec![1, 4, 0, 2, 0, 1]);
+}
+
+/// An OPEN from the peer with the given Role capabilities (RFC 9234 §4.1)
+/// next to its IPv4 unicast family.
+fn open_with_roles(values: &[u8]) -> OpenMessage {
+    let mut caps = vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)];
+    caps.extend(values.iter().map(|v| Capability::Role(Role::from_u8(*v))));
+    OpenMessage::new(PEER_AS, hold(30), rid(2), caps)
+}
+
+/// What `config()` with `role` and `strict` makes of `open` in `OpenSent`:
+/// the tags of the actions and the Role of the session, if it came up.
+fn role_outcome(
+    role: Option<Role>,
+    strict: bool,
+    remote_as: Asn,
+    open: OpenMessage,
+) -> (Vec<String>, Option<Role>) {
+    let mut cfg = config();
+    cfg.role = role.map(|role| LocalRole { role, strict });
+    cfg.remote_as = remote_as;
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let a = f.handle(Event::BgpOpen(open), now);
+    (tags(&a), f.session().and_then(|s| s.role))
+}
+
+#[test]
+fn our_role_is_advertised_on_external_sessions_only() {
+    // RFC 9234 §4.1: "If the BGP Role is locally configured, the eBGP
+    // speaker MUST advertise the BGP Role Capability in the BGP OPEN".
+    let sent = |role: Option<Role>, remote_as: Asn| {
+        let mut cfg = config();
+        cfg.role = role.map(|role| LocalRole {
+            role,
+            strict: false,
+        });
+        cfg.remote_as = remote_as;
+        let (mut f, now) = fsm_at(State::Connect, cfg);
+        let a = f.handle(Event::TcpCrAcked, now);
+        let Action::SendOpen(open) = &a[0] else {
+            panic!("{a:?}");
+        };
+        bgpfc_wire::capability::roles(&open.capabilities).collect::<Vec<_>>()
+    };
+    for role in [
+        Role::Provider,
+        Role::RouteServer,
+        Role::RouteServerClient,
+        Role::Customer,
+        Role::Peer,
+    ] {
+        assert_eq!(sent(Some(role), PEER_AS), [role], "{role}");
+        // RFC 9234 §4: Roles are for eBGP; an internal session has none.
+        assert_eq!(sent(Some(role), LOCAL_AS), [], "{role} internal");
+    }
+    assert_eq!(sent(None, PEER_AS), []);
+    // "MUST NOT advertise multiple versions of the BGP Role Capability".
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::Peer,
+        strict: false,
+    });
+    cfg.capabilities.push(Capability::Role(Role::Peer));
+    let (mut f, now) = fsm_at(State::Connect, cfg);
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert_eq!(bgpfc_wire::capability::roles(&open.capabilities).count(), 1);
+}
+
+#[test]
+fn allowed_role_pairs_come_up_and_others_are_a_role_mismatch() {
+    // RFC 9234 §4.2, Table 2, against every role the peer might send:
+    // the session comes up with our role when they correspond, and
+    // otherwise Role Mismatch (OPEN Message Error, subcode 11) goes out
+    // before the connection is dropped.
+    use Role::{Customer, Peer, Provider, RouteServer, RouteServerClient};
+    let all = [Provider, RouteServer, RouteServerClient, Customer, Peer];
+    let allowed = [
+        (Provider, Customer),
+        (Customer, Provider),
+        (RouteServer, RouteServerClient),
+        (RouteServerClient, RouteServer),
+        (Peer, Peer),
+    ];
+    for ours in all {
+        for theirs in all {
+            let (tags, role) = role_outcome(
+                Some(ours),
+                false,
+                PEER_AS,
+                open_with_roles(&[theirs.to_u8()]),
+            );
+            if allowed.contains(&(ours, theirs)) {
+                assert_eq!(tags, ["keepalive"], "{ours} with {theirs}");
+                assert_eq!(role, Some(ours));
+            } else {
+                assert_eq!(tags, ["notif 2/11", "drop"], "{ours} with {theirs}");
+                assert_eq!(role, None);
+            }
+        }
+    }
+    // An unassigned Role Value corresponds to nothing.
+    for v in [5u8, 100, 255] {
+        let (tags, _) = role_outcome(Some(Peer), false, PEER_AS, open_with_roles(&[v]));
+        assert_eq!(tags, ["notif 2/11", "drop"], "value {v}");
+    }
+}
+
+#[test]
+fn a_role_mismatch_carries_no_data_and_counts_as_a_failure() {
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::Customer,
+        strict: false,
+    });
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let a = f.handle(Event::BgpOpen(open_with_roles(&[Role::Peer.to_u8()])), now);
+    let Action::SendNotification(n) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert_eq!(
+        (n.code, n.subcode, &n.data[..]),
+        (ErrorCode::Open, 11, &[][..])
+    );
+    // RFC 4271 §8.2.2 OpenSent, event 19 with an unacceptable OPEN: the
+    // common path of events 21 and 22, with damping.
+    assert_eq!(f.state(), State::Idle);
+    assert_eq!(f.connect_retry_counter(), 1);
+    assert!(f.session().is_none());
+}
+
+#[test]
+fn a_missing_role_is_ignored_unless_strict() {
+    // RFC 9234 §4.2: "the BGP Speaker SHOULD ignore the absence of the BGP
+    // Role Capability and proceed with session establishment. The locally
+    // configured BGP Role is used for the procedures described in
+    // Section 5."
+    let (tags, role) = role_outcome(Some(Role::Customer), false, PEER_AS, open_with_roles(&[]));
+    assert_eq!(
+        (tags, role),
+        (vec!["keepalive".to_owned()], Some(Role::Customer))
+    );
+    // Strict mode: "if the BGP Role Capability is sent but one is not
+    // received, the connection is rejected using the Role Mismatch".
+    let (tags, role) = role_outcome(Some(Role::Customer), true, PEER_AS, open_with_roles(&[]));
+    assert_eq!(
+        (tags, role),
+        (vec!["notif 2/11".to_owned(), "drop".to_owned()], None)
+    );
+    // Strict mode accepts a corresponding Role.
+    let (tags, role) = role_outcome(
+        Some(Role::Customer),
+        true,
+        PEER_AS,
+        open_with_roles(&[Role::Provider.to_u8()]),
+    );
+    assert_eq!(
+        (tags, role),
+        (vec!["keepalive".to_owned()], Some(Role::Customer))
+    );
+}
+
+#[test]
+fn without_a_role_of_ours_the_peers_is_not_checked() {
+    // Nothing was sent, so there is nothing to correspond to (RFC 9234
+    // §4.2: "If the BGP Role Capability is advertised, and one is also
+    // received"), and strict mode, which needs a Role sent, does nothing.
+    for strict in [false, true] {
+        for theirs in [&[][..], &[3][..], &[200][..]] {
+            let (tags, role) = role_outcome(None, strict, PEER_AS, open_with_roles(theirs));
+            assert_eq!(
+                (tags, role),
+                (vec!["keepalive".to_owned()], None),
+                "{theirs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn several_role_capabilities_must_agree() {
+    // RFC 9234 §4.2: identical ones are a single capability; "If multiple
+    // BGP Role Capabilities are received and not all of them have the same
+    // value, then the BGP speaker MUST reject the connection using the Role
+    // Mismatch Notification", whatever our own Role is.
+    for ours in [None, Some(Role::Provider), Some(Role::Customer)] {
+        let (tags, role) = role_outcome(ours, false, PEER_AS, open_with_roles(&[3, 3, 3]));
+        let ok = ours.is_none_or(|o| o.pairs_with(Role::Customer));
+        assert_eq!(
+            tags,
+            if ok {
+                vec!["keepalive"]
+            } else {
+                vec!["notif 2/11", "drop"]
+            },
+            "{ours:?}"
+        );
+        assert_eq!(role.is_some(), ours.is_some() && ok);
+        for values in [&[3, 0][..], &[0, 3][..], &[3, 3, 4][..], &[4, 4, 4, 5][..]] {
+            let (tags, role) = role_outcome(ours, false, PEER_AS, open_with_roles(values));
+            assert_eq!(tags, ["notif 2/11", "drop"], "{ours:?} with {values:?}");
+            assert_eq!(role, None);
+        }
+    }
+}
+
+#[test]
+fn roles_are_for_external_sessions() {
+    // RFC 9234 §4: Roles characterise eBGP sessions. An internal session
+    // ignores our configured Role and the peer's capabilities alike (even
+    // one that would not correspond), and has no Role.
+    let (tags, role) = role_outcome(
+        Some(Role::Customer),
+        true,
+        LOCAL_AS,
+        OpenMessage::new(
+            LOCAL_AS,
+            hold(30),
+            rid(2),
+            vec![
+                Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+                Capability::Role(Role::Peer),
+            ],
+        ),
+    );
+    assert_eq!((tags, role), (vec!["keepalive".to_owned()], None));
+}
+
+#[test]
+fn the_role_survives_into_the_established_session() {
+    let mut cfg = config();
+    cfg.role = Some(LocalRole {
+        role: Role::RouteServer,
+        strict: false,
+    });
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(open_with_roles(&[Role::RouteServerClient.to_u8()])),
+        now,
+    );
+    let up = f.handle(Event::KeepAliveMsg, now);
+    let Action::SessionUp(s) = &up[0] else {
+        panic!("{up:?}");
+    };
+    assert_eq!(s.role, Some(Role::RouteServer));
+    assert_eq!(
+        bgpfc_wire::capability::roles(&s.peer_capabilities).collect::<Vec<_>>(),
+        [Role::RouteServerClient]
+    );
 }
 
 #[test]
@@ -1365,4 +1870,455 @@ fn received_ceases_damp_as_rfc4486_recommends() {
         now,
     );
     assert_eq!(f.damped_failures(), 0);
+}
+
+// ------------------------------------------------------ Graceful Restart
+
+fn gr_config() -> Config {
+    let mut c = config();
+    c.graceful_restart = Some(crate::GracefulRestart {
+        restart_time: RestartTime::new(120).unwrap(),
+    });
+    c
+}
+
+fn restart_time(secs: u16) -> RestartTime {
+    RestartTime::new(secs).unwrap()
+}
+
+/// The peer's Graceful Restart capability (RFC 4724 §3, RFC 8538 §2) with
+/// IPv4 unicast listed, unless `families` says otherwise.
+fn peer_gr(
+    restarting: bool,
+    notification: bool,
+    secs: u16,
+    families: &[(AddressFamily, bool)],
+) -> Capability {
+    Capability::GracefulRestart(bgpfc_wire::capability::GracefulRestart {
+        restarting,
+        notification,
+        restart_time: restart_time(secs),
+        families: families
+            .iter()
+            .map(
+                |&(family, forwarding)| bgpfc_wire::capability::GracefulRestartFamily {
+                    family,
+                    forwarding,
+                },
+            )
+            .collect(),
+    })
+}
+
+/// An Established FSM with `cfg` against a peer that advertised `extra`
+/// besides IPv4 unicast.
+fn established_with(cfg: Config, extra: Vec<Capability>) -> (Fsm, Instant) {
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    let mut caps = vec![
+        Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+        Capability::RouteRefresh,
+    ];
+    caps.extend(extra);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(PEER_AS, hold(30), rid(2), caps)),
+        now,
+    );
+    f.handle(Event::KeepAliveMsg, now);
+    assert_eq!(f.state(), State::Established);
+    (f, now)
+}
+
+fn v4() -> AddressFamily {
+    AddressFamily::IPV4_UNICAST
+}
+
+fn v6() -> AddressFamily {
+    AddressFamily::IPV6_UNICAST
+}
+
+fn hard_reset() -> NotificationMessage {
+    NotificationMessage::hard_reset(&NotificationMessage::cease(
+        CeaseSubcode::AdministrativeReset,
+    ))
+}
+
+/// The action that ends the session, among `actions`.
+fn session_end(actions: &[Action]) -> Option<&Option<Retain>> {
+    actions.iter().find_map(|a| match a {
+        Action::SessionDown { retain } => Some(retain),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_capability_is_advertised_only_when_configured() {
+    // RFC 4724 §3: absent from a neighbor that did not ask for it, so that
+    // without it nothing changes.
+    let (mut f, now) = fsm_at(State::Connect, config());
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert!(bgpfc_wire::capability::graceful_restart(&open.capabilities).is_none());
+    // Configured: the Graceful Notification bit, our Restart Time, no
+    // Restart State bit and no Forwarding State bit on a fresh start
+    // (RFC 4724 §4.1: only "if the forwarding state has indeed been
+    // preserved"), and a tuple for each family we advertise.
+    let (mut f, now) = fsm_at(State::Connect, gr_config());
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert!(!gr.restarting && gr.notification);
+    assert_eq!(gr.restart_time, restart_time(120));
+    assert_eq!(
+        gr.families
+            .iter()
+            .map(|t| (t.family, t.forwarding))
+            .collect::<Vec<_>>(),
+        vec![(v4(), false), (v6(), false)]
+    );
+    assert_eq!(
+        open.capabilities
+            .iter()
+            .filter(|c| matches!(c, Capability::GracefulRestart(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn the_restart_state_and_forwarding_bits_follow_what_the_owner_sets() {
+    // RFC 4724 §4.1: the Restarting Speaker "MUST set the Restart State
+    // bit", and the Forwarding State bit of a family "can be set only if
+    // the forwarding state has indeed been preserved for that address
+    // family".
+    let (mut f, now) = fsm_at(State::Connect, gr_config());
+    f.set_restart_advert(RestartAdvert {
+        restarting: true,
+        forwarding: vec![v4()],
+    });
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert!(gr.restarting);
+    assert_eq!(
+        gr.families
+            .iter()
+            .map(|t| (t.family, t.forwarding))
+            .collect::<Vec<_>>(),
+        vec![(v4(), true), (v6(), false)]
+    );
+    // Without the configuration the advert is not sent at all.
+    let (mut f, now) = fsm_at(State::Connect, config());
+    f.set_restart_advert(RestartAdvert {
+        restarting: true,
+        forwarding: vec![v4()],
+    });
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    assert!(bgpfc_wire::capability::graceful_restart(&open.capabilities).is_none());
+}
+
+#[test]
+fn a_speaker_with_no_multiprotocol_capability_lists_ipv4_unicast() {
+    // RFC 4724 §3: "implicitly associated with <AFI=IPv4, SAFI=Unicast>
+    // if using the encoding of [BGP-4]".
+    let mut cfg = gr_config();
+    cfg.capabilities.clear();
+    let (mut f, now) = fsm_at(State::Connect, cfg);
+    let a = f.handle(Event::TcpCrAcked, now);
+    let Action::SendOpen(open) = &a[0] else {
+        panic!("{a:?}");
+    };
+    let gr = bgpfc_wire::capability::graceful_restart(&open.capabilities).unwrap();
+    assert_eq!(gr.families.len(), 1);
+    assert_eq!(gr.families[0].family, v4());
+}
+
+#[test]
+fn the_session_remembers_the_peers_capability() {
+    // Ours off: the peer's capability is not acted on, whatever it says.
+    let theirs = peer_gr(false, true, 90, &[(v4(), true)]);
+    let (f, _) = established_with(config(), vec![theirs.clone()]);
+    let s = f.session().unwrap();
+    assert_eq!(s.peer_restart(), None);
+    assert!(!s.sends_end_of_rib());
+    // Ours on, the peer's absent: End-of-RIB is still sent (RFC 4724 §4),
+    // and nothing is kept for the peer.
+    let (f, _) = established_with(gr_config(), vec![]);
+    let s = f.session().unwrap();
+    assert_eq!(s.peer_restart(), None);
+    assert!(s.sends_end_of_rib());
+    // Both on: its Restart Time, its bits, and the families we take routes
+    // of, each with its Forwarding State bit (RFC 4724 §3).
+    let (f, _) = established_with(gr_config(), vec![theirs]);
+    let s = f.session().unwrap();
+    assert_eq!(
+        s.peer_restart(),
+        Some(&PeerRestart {
+            restart_time: restart_time(90),
+            restarting: false,
+            notification: true,
+            families: vec![(v4(), true)],
+        })
+    );
+    // A family of its capability that we take no routes of is left out;
+    // the Restart State bit is carried (RFC 4724 §3).
+    let odd = AddressFamily {
+        afi: Afi::Unknown(25),
+        safi: bgpfc_wire::types::Safi::Unknown(65),
+    };
+    let theirs = peer_gr(true, false, 5, &[(v6(), false), (odd, true), (v4(), true)]);
+    let (f, _) = established_with(gr_config(), vec![theirs]);
+    let restart = f.session().unwrap().peer_restart().unwrap().clone();
+    assert!(restart.restarting && !restart.notification);
+    assert_eq!(restart.families, vec![(v6(), false), (v4(), true)]);
+    // RFC 4724 §3: "ignore all but the last instance".
+    let (f, _) = established_with(
+        gr_config(),
+        vec![
+            peer_gr(true, true, 10, &[(v4(), true)]),
+            peer_gr(false, false, 20, &[(v6(), false)]),
+        ],
+    );
+    let restart = f.session().unwrap().peer_restart().unwrap().clone();
+    assert_eq!(restart.restart_time, restart_time(20));
+    assert_eq!(restart.families, vec![(v6(), false)]);
+    assert!(!restart.notification && !restart.restarting);
+}
+
+/// How a session may end, for the tables below.
+fn endings() -> Vec<(&'static str, Event)> {
+    vec![
+        ("tcp failure", Event::TcpConnectionFails),
+        ("hold timer", Event::HoldTimerExpires),
+        ("send hold timer", Event::SendHoldTimerExpires),
+        (
+            "notification received",
+            Event::NotifMsg(NotificationMessage::cease(
+                CeaseSubcode::AdministrativeShutdown,
+            )),
+        ),
+        (
+            "other notification received",
+            Event::NotifMsg(NotificationMessage::hold_timer_expired()),
+        ),
+        ("hard reset received", Event::NotifMsg(hard_reset())),
+        ("version error received", Event::NotifMsgVerErr),
+        (
+            "manual stop",
+            Event::ManualStop(NotificationMessage::cease(
+                CeaseSubcode::AdministrativeReset,
+            )),
+        ),
+        (
+            "manual stop with a hard reset",
+            Event::ManualStop(hard_reset()),
+        ),
+        (
+            "automatic stop",
+            Event::AutomaticStop(NotificationMessage::cease(CeaseSubcode::OutOfResources)),
+        ),
+        (
+            "automatic stop with a hard reset",
+            Event::AutomaticStop(NotificationMessage::hard_reset(
+                &NotificationMessage::max_prefixes_reached(v4(), 10),
+            )),
+        ),
+        ("update error", Event::UpdateMsgErr(update_err())),
+        ("header error", Event::BgpHeaderErr(header_err())),
+        ("fsm error", Event::ConnectRetryTimerExpires),
+    ]
+}
+
+#[test]
+fn which_endings_keep_the_routes() {
+    // (ending, kept without the N bit, kept with it)
+    let table = [
+        // RFC 4724 §5: a TCP failure; RFC 8538 §4: a Hold Timer expiry,
+        // and the Send Hold Timer of RFC 9687 as one more failure of the
+        // transport.
+        ("tcp failure", true, true),
+        ("hold timer", true, true),
+        ("send hold timer", true, true),
+        // RFC 4724 §4: "the normal BGP procedures MUST be followed" for a
+        // NOTIFICATION, sent or received; RFC 8538 §4: unless both sides
+        // set the N bit, and then not for a Hard Reset.
+        ("notification received", false, true),
+        ("other notification received", false, true),
+        ("hard reset received", false, false),
+        ("version error received", false, true),
+        ("manual stop", false, true),
+        ("manual stop with a hard reset", false, false),
+        ("automatic stop", false, true),
+        ("automatic stop with a hard reset", false, false),
+        ("update error", false, true),
+        ("header error", false, true),
+        ("fsm error", false, true),
+    ];
+    assert_eq!(table.len(), endings().len());
+    for (n_bit, column) in [(false, 1), (true, 2)] {
+        for (name, event) in endings() {
+            let theirs = peer_gr(false, n_bit, 90, &[(v4(), false)]);
+            let (mut f, now) = established_with(gr_config(), vec![theirs]);
+            let actions = f.handle(event, now);
+            let row = table.iter().find(|r| r.0 == name).unwrap();
+            let kept = [row.1, row.2][column - 1];
+            let end = session_end(&actions).unwrap_or_else(|| panic!("{name}: {actions:?}"));
+            assert_eq!(end.is_some(), kept, "{name}, N bit {n_bit}: {actions:?}");
+            assert_eq!(f.state(), State::Idle, "{name}");
+            if let Some(retain) = end {
+                assert_eq!(retain.families, vec![v4()], "{name}");
+                assert_eq!(retain.restart_time, restart_time(90), "{name}");
+                assert_eq!(retain.notification, n_bit, "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn nothing_is_kept_without_both_capabilities_and_a_family() {
+    // The same endings with a peer that cannot preserve forwarding state
+    // (no family: RFC 4724 §3), a peer that did not advertise the
+    // capability, and a neighbor of ours with Graceful Restart off: the
+    // routes go as RFC 4271 §8.2.2 has it.
+    let none = || vec![peer_gr(false, true, 90, &[])];
+    let absent = Vec::new;
+    let cases: Vec<(&str, Config, Vec<Capability>)> = vec![
+        ("no family", gr_config(), none()),
+        ("peer without the capability", gr_config(), absent()),
+        (
+            "ours off",
+            config(),
+            vec![peer_gr(false, true, 90, &[(v4(), true)])],
+        ),
+        (
+            "family we take nothing of",
+            gr_config(),
+            vec![peer_gr(
+                false,
+                true,
+                90,
+                &[(
+                    AddressFamily {
+                        afi: Afi::Unknown(25),
+                        safi: bgpfc_wire::types::Safi::Unknown(65),
+                    },
+                    true,
+                )],
+            )],
+        ),
+    ];
+    for (label, cfg, theirs) in cases {
+        for (name, event) in endings() {
+            let (mut f, now) = established_with(cfg.clone(), theirs.clone());
+            let actions = f.handle(event, now);
+            assert_eq!(
+                session_end(&actions),
+                Some(&None),
+                "{label}, {name}: {actions:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_families_kept_are_those_of_the_peers_capability_that_we_take() {
+    // RFC 4724 §4.2: "all the address families that were previously
+    // received in the Graceful Restart Capability".
+    let theirs = peer_gr(false, false, 300, &[(v4(), true), (v6(), false)]);
+    let (mut f, now) = established_with(gr_config(), vec![theirs]);
+    let actions = f.handle(Event::TcpConnectionFails, now);
+    assert_eq!(
+        session_end(&actions),
+        Some(&Some(Retain {
+            families: vec![v4(), v6()],
+            restart_time: restart_time(300),
+            notification: false,
+        }))
+    );
+    // The retained session's end is no failure to damp, as before.
+    assert_eq!(f.damped_failures(), 0);
+    assert_eq!(f.state(), State::Idle);
+}
+
+#[test]
+fn a_hard_reset_is_damped_as_the_reason_it_carries() {
+    // RFC 8538 §3.1: the NOTIFICATION inside is the one RFC 4486 §4 judges.
+    for (inner, damped) in [
+        (CeaseSubcode::AdministrativeShutdown, true),
+        (CeaseSubcode::PeerDeconfigured, true),
+        (CeaseSubcode::OutOfResources, true),
+        (CeaseSubcode::AdministrativeReset, false),
+        (CeaseSubcode::OtherConfigurationChange, false),
+    ] {
+        let (mut f, now) = fsm_at(State::Established, config());
+        let n = NotificationMessage::hard_reset(&NotificationMessage::cease(inner));
+        f.handle(Event::NotifMsg(n), now);
+        assert_eq!(f.damped_failures(), u32::from(damped), "{inner:?}");
+    }
+}
+
+#[test]
+fn a_new_connection_from_a_restarting_peer_ends_the_old_session() {
+    // RFC 4724 §4.2: with the capability received, "the subsequent open
+    // connection from the peer" is "an indication of the termination of the
+    // old TCP session": it is closed with no NOTIFICATION, the routes are
+    // kept, and §5: the ConnectRetryCounter goes to zero, the
+    // ConnectRetryTimer starts and the state is Connect, whence the new
+    // connection goes on as in Connect (event 17 → OpenSent).
+    for event in [Event::TcpConnectionConfirmed, Event::TcpCrAcked] {
+        let theirs = peer_gr(false, false, 90, &[(v4(), true)]);
+        let (mut f, now) = established_with(gr_config(), vec![theirs]);
+        assert!(f.takes_over_on_connection());
+        let actions = f.handle(event, now);
+        assert_eq!(tags(&actions), ["down-retain", "drop"]);
+        assert!(!f.takes_over_on_connection());
+        assert_eq!(f.state(), State::Connect);
+        assert_eq!(f.connect_retry_counter(), 0);
+        assert!(f.timer(TimerKind::ConnectRetry).is_running());
+        assert!(!f.timer(TimerKind::Hold).is_running());
+        assert!(!f.timer(TimerKind::Keepalive).is_running());
+        assert!(f.session().is_none());
+        // And no automatic restart is armed: the peer is connecting.
+        assert!(!f.timer(TimerKind::IdleHold).is_running());
+        let actions = f.handle(Event::TcpConnectionConfirmed, now);
+        assert_eq!(tags(&actions), ["open"]);
+        assert_eq!(f.state(), State::OpenSent);
+    }
+    // Without a family in the capability, the capability not received, or
+    // ours off, a second connection is the coordinator's to track
+    // (RFC 4271 §6.8): the event is ignored.
+    for (cfg, extra) in [
+        (gr_config(), vec![peer_gr(false, true, 90, &[])]),
+        (gr_config(), vec![]),
+        (config(), vec![peer_gr(false, true, 90, &[(v4(), true)])]),
+    ] {
+        let (mut f, now) = established_with(cfg, extra);
+        assert!(!f.takes_over_on_connection());
+        let actions = f.handle(Event::TcpConnectionConfirmed, now);
+        assert_eq!(tags(&actions), Vec::<String>::new());
+        assert_eq!(f.state(), State::Established);
+    }
+}
+
+#[test]
+fn the_notification_of_a_graceful_reset_is_still_sent() {
+    // RFC 8538 §4: the sender "MUST also follow the rules for the Receiving
+    // Speaker": it sends the NOTIFICATION as before, and keeps the routes.
+    let theirs = peer_gr(false, true, 90, &[(v4(), true)]);
+    let (mut f, now) = established_with(gr_config(), vec![theirs]);
+    let actions = f.handle(
+        Event::ManualStop(NotificationMessage::cease(
+            CeaseSubcode::AdministrativeReset,
+        )),
+        now,
+    );
+    assert_eq!(tags(&actions), ["notif 6/4", "down-retain", "drop"]);
 }

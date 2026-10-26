@@ -3,7 +3,8 @@
 //!
 //! Implements: RFC 4271 §4.5 (error codes and subcodes), §6.1 and §6.2,
 //! RFC 5492 §5 (Unsupported Capability), RFC 6608 §3 (FSM subcodes),
-//! RFC 4486 §3 (Cease subcodes).
+//! RFC 4486 §3 (Cease subcodes), RFC 9234 §4.2 and §7 (Role Mismatch),
+//! RFC 7313 §5 (ROUTE-REFRESH Message Error).
 
 use std::fmt;
 
@@ -93,6 +94,10 @@ pub enum OpenSubcode {
     UnacceptableHoldTime = 6,
     /// The peer lacks a capability this speaker requires (RFC 5492 §5).
     UnsupportedCapability = 7,
+    /// The BGP Roles of the two speakers do not correspond, or the peer
+    /// sent no Role capability where one is required (RFC 9234 §4.2).
+    /// Values 8 to 10 are deprecated (RFC 9234 §7) and never sent.
+    RoleMismatch = 11,
 }
 
 /// UPDATE Message Error subcodes (RFC 4271 §4.5, §6.3). Subcode 7 is
@@ -122,6 +127,15 @@ pub enum UpdateSubcode {
     MalformedAsPath = 11,
 }
 
+/// ROUTE-REFRESH Message Error subcodes (RFC 7313 §5). Subcode 0 is
+/// reserved and never sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RouteRefreshSubcode {
+    /// Invalid Message Length.
+    InvalidMessageLength = 1,
+}
+
 /// Finite State Machine Error subcodes (RFC 6608 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -136,7 +150,7 @@ pub enum FsmSubcode {
     UnexpectedInEstablished = 3,
 }
 
-/// Cease subcodes (RFC 4486 §3).
+/// Cease subcodes (RFC 4486 §3, RFC 8538 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum CeaseSubcode {
@@ -156,10 +170,15 @@ pub enum CeaseSubcode {
     ConnectionCollisionResolution = 7,
     /// Out of Resources.
     OutOfResources = 8,
+    /// Hard Reset: the session is to be fully terminated, none of the
+    /// Graceful Restart procedures applying; the Data field encapsulates
+    /// the NOTIFICATION that says why (RFC 8538 §3, §3.1).
+    HardReset = 9,
 }
 
 /// Human-readable name of a `(code, subcode)` pair for logs, from the
-/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3 and RFC 4486 §3 tables.
+/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3, RFC 4486 §3, RFC 8538 §8 and
+/// RFC 7313 §5 tables.
 /// `None` when the subcode is not defined for that code.
 #[must_use]
 pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
@@ -174,6 +193,7 @@ pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
         (ErrorCode::Open, 4) => "Unsupported Optional Parameter",
         (ErrorCode::Open, 6) => "Unacceptable Hold Time",
         (ErrorCode::Open, 7) => "Unsupported Capability",
+        (ErrorCode::Open, 11) => "Role Mismatch",
         (ErrorCode::Update, 1) => "Malformed Attribute List",
         (ErrorCode::Update, 2) => "Unrecognized Well-known Attribute",
         (ErrorCode::Update, 3) => "Missing Well-known Attribute",
@@ -197,6 +217,8 @@ pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
         (ErrorCode::Cease, 6) => "Other Configuration Change",
         (ErrorCode::Cease, 7) => "Connection Collision Resolution",
         (ErrorCode::Cease, 8) => "Out of Resources",
+        (ErrorCode::Cease, 9) => "Hard Reset",
+        (ErrorCode::RouteRefresh, 1) => "Invalid Message Length",
         _ => return None,
     })
 }
@@ -246,6 +268,16 @@ impl DecodeError {
             data,
         }
     }
+
+    /// A ROUTE-REFRESH Message Error (RFC 7313 §5).
+    #[must_use]
+    pub fn route_refresh(subcode: RouteRefreshSubcode, data: Vec<u8>) -> Self {
+        DecodeError {
+            code: ErrorCode::RouteRefresh,
+            subcode: subcode as u8,
+            data,
+        }
+    }
 }
 
 impl fmt::Display for DecodeError {
@@ -275,6 +307,12 @@ pub enum EncodeError {
     /// NLRI of this family with an IPv6 next hop, for a peer with which
     /// Extended Next Hop Encoding was not negotiated (RFC 8950 §4).
     NextHopNotNegotiated(AddressFamily),
+    /// Path Identifiers on NLRI of a family with which ADD-PATH was not
+    /// negotiated for sending (RFC 7911 §5).
+    PathIdsNotNegotiated(AddressFamily),
+    /// NLRI of a family with which ADD-PATH was negotiated for sending,
+    /// without a Path Identifier for each prefix (RFC 7911 §3, §5).
+    PathIdsMissing(AddressFamily),
     /// A field or message does not fit its length field.
     TooLong {
         /// What was too long.
@@ -296,6 +334,13 @@ impl fmt::Display for EncodeError {
             EncodeError::NextHopNotNegotiated(family) => write!(
                 f,
                 "IPv6 next hop for {family} without the Extended Next Hop Encoding capability"
+            ),
+            EncodeError::PathIdsNotNegotiated(family) => {
+                write!(f, "Path Identifiers for {family} without ADD-PATH")
+            }
+            EncodeError::PathIdsMissing(family) => write!(
+                f,
+                "{family} NLRI without a Path Identifier for every prefix, with ADD-PATH"
             ),
             EncodeError::TooLong { what, len, max } => {
                 write!(
@@ -331,6 +376,15 @@ mod tests {
         assert!(e.to_string().contains("subcode 7"));
         let e = DecodeError::update(UpdateSubcode::MalformedAsPath, vec![]);
         assert_eq!((e.code, e.subcode), (ErrorCode::Update, 11));
+        // RFC 9234 §4.2: Role Mismatch is OPEN Message Error subcode 11.
+        let e = DecodeError::open(OpenSubcode::RoleMismatch, vec![]);
+        assert_eq!((e.code, e.subcode), (ErrorCode::Open, 11));
+        // RFC 7313 §5: code 7, subcode 1.
+        let e = DecodeError::route_refresh(RouteRefreshSubcode::InvalidMessageLength, vec![9]);
+        assert_eq!(
+            (e.code, e.subcode, e.data),
+            (ErrorCode::RouteRefresh, 1, vec![9])
+        );
     }
 
     #[test]
@@ -344,8 +398,12 @@ mod tests {
         for s in [1u8, 2, 3] {
             assert!(subcode_name(ErrorCode::MessageHeader, s).is_some());
         }
-        for s in [0u8, 1, 2, 3, 4, 6, 7] {
+        for s in [0u8, 1, 2, 3, 4, 6, 7, 11] {
             assert!(subcode_name(ErrorCode::Open, s).is_some());
+        }
+        // RFC 9234 §7: 8 to 10 are deprecated, 5 was never defined.
+        for s in [5u8, 8, 9, 10] {
+            assert_eq!(subcode_name(ErrorCode::Open, s), None);
         }
         for s in [1u8, 2, 3, 4, 5, 6, 8, 9, 10, 11] {
             assert!(subcode_name(ErrorCode::Update, s).is_some());
@@ -356,5 +414,12 @@ mod tests {
         for s in 1..=8u8 {
             assert!(subcode_name(ErrorCode::Cease, s).is_some());
         }
+        // RFC 7313 §5 / §6: 0 is reserved, 1 is Invalid Message Length.
+        assert_eq!(
+            subcode_name(ErrorCode::RouteRefresh, 1),
+            Some("Invalid Message Length")
+        );
+        assert_eq!(subcode_name(ErrorCode::RouteRefresh, 0), None);
+        assert_eq!(subcode_name(ErrorCode::RouteRefresh, 2), None);
     }
 }

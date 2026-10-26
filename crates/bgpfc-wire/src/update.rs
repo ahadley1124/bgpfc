@@ -19,7 +19,12 @@
 //! hop rules hold for `MP_REACH_NLRI`), §4, §7; RFC 6793 §4.2.2, §4.2.3,
 //! §6; RFC 7607 §2;
 //! RFC 9774 §3; RFC 8092 §6; RFC 8950 §3, §4 (IPv6 next hops for IPv4
-//! NLRI, only when negotiated).
+//! NLRI, only when negotiated); RFC 7911 §3, §5 (a Path Identifier before
+//! each NLRI tuple of the Withdrawn Routes field, the NLRI field,
+//! `MP_REACH_NLRI` and `MP_UNREACH_NLRI`, only for the families and the
+//! direction ADD-PATH was negotiated for); RFC 9234 §5 (a malformed Only to
+//! Customer attribute is treat-as-withdraw); RFC 4724 §2 (the End-of-RIB
+//! marker, built and recognised).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -32,9 +37,11 @@ use crate::attribute::{
 use crate::community::{decode_communities, decode_extended_communities, decode_large_communities};
 use crate::error::{DecodeError, EncodeError, UpdateSubcode};
 use crate::mp::{MpReach, MpUnreach, NextHop, family_of, is_host_ipv4};
-use crate::prefix::{Prefix, decode_prefixes, encode_prefixes};
+use crate::prefix::{
+    Prefix, decode_prefixes, decode_prefixes_with_ids, encode_prefixes, encode_prefixes_with_ids,
+};
 use crate::reader::{Reader, WriteBytes as _};
-use crate::types::{AddressFamily, Afi, Asn};
+use crate::types::{AddressFamily, Afi, Asn, PathId};
 
 /// Whether the peer is in the local AS (RFC 4271 §5: it changes which
 /// attributes are expected and which are ignored).
@@ -44,6 +51,56 @@ pub enum PeerKind {
     Internal,
     /// External BGP: different AS.
     External,
+}
+
+/// The families of a session whose NLRI carries a Path Identifier ahead of
+/// each prefix, in one direction (RFC 7911 §3, §5). Only IPv4 and IPv6
+/// unicast, the families this implementation parses; the NLRI field and
+/// `MP_REACH_NLRI` of IPv4 unicast alike follow the IPv4 entry.
+///
+/// NOTE(interop): RFC 7911 §3 extends "the NLRI encoding" of RFC 4271,
+/// which RFC 4760 §5 reuses in both multiprotocol attributes, and §5 does
+/// not list the fields. BIRD and FRR extend them all for a family with
+/// ADD-PATH and none for any other (`tests/captures.rs` has BIRD's NLRI
+/// and Withdrawn Routes fields and `MP_UNREACH_NLRI`), and so does this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AddPathFamilies {
+    ipv4_unicast: bool,
+    ipv6_unicast: bool,
+}
+
+impl AddPathFamilies {
+    /// No family: the encoding of RFC 4271 §4.3 throughout.
+    pub const NONE: AddPathFamilies = AddPathFamilies {
+        ipv4_unicast: false,
+        ipv6_unicast: false,
+    };
+
+    /// Exactly the families of `families` that this implementation
+    /// parses.
+    #[must_use]
+    pub fn of(families: &[AddressFamily]) -> AddPathFamilies {
+        AddPathFamilies {
+            ipv4_unicast: families.contains(&AddressFamily::IPV4_UNICAST),
+            ipv6_unicast: families.contains(&AddressFamily::IPV6_UNICAST),
+        }
+    }
+
+    /// Whether NLRI of `family` carries Path Identifiers.
+    #[must_use]
+    pub const fn contains(self, family: AddressFamily) -> bool {
+        match family {
+            AddressFamily::IPV4_UNICAST => self.ipv4_unicast,
+            AddressFamily::IPV6_UNICAST => self.ipv6_unicast,
+            _ => false,
+        }
+    }
+
+    /// Whether no family does.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.ipv4_unicast && !self.ipv6_unicast
+    }
 }
 
 /// What the decoder needs to know about the session.
@@ -65,6 +122,12 @@ pub struct DecodeContext {
     /// Without it four octets are the only length expected, and any other
     /// makes the attribute malformed (RFC 7606 §7.11).
     pub extended_next_hop: bool,
+    /// The families the peer sends us routes of with Path Identifiers: we
+    /// advertised the ADD-PATH capability to receive them and the peer to
+    /// send them (RFC 7911 §5). Their Withdrawn Routes, NLRI and
+    /// `MP_REACH_NLRI` / `MP_UNREACH_NLRI` use the extended NLRI encoding
+    /// (§3); the NLRI of any other family does not.
+    pub add_path: AddPathFamilies,
 }
 
 /// What the encoder needs to know about the session.
@@ -79,6 +142,12 @@ pub struct EncodeContext {
     /// When false, such NLRI is an [`EncodeError`], so the peer is never
     /// sent what it did not agree to take.
     pub extended_next_hop: bool,
+    /// The families we send the peer routes of with Path Identifiers: we
+    /// advertised the ADD-PATH capability to send them and the peer to
+    /// receive them (RFC 7911 §5). The message must carry an identifier
+    /// for every prefix of these families and none for any other, so that
+    /// the peer is never sent an encoding it did not agree to take.
+    pub add_path: AddPathFamilies,
 }
 
 /// An UPDATE message body.
@@ -99,9 +168,74 @@ pub struct UpdateMessage {
     pub mp_unreach: Option<MpUnreach>,
     /// All other path attributes, at most one per type code.
     pub attributes: Vec<PathAttribute>,
+    /// The Path Identifiers that go with the prefixes of the four lists
+    /// above (RFC 7911 §3); `None` on a session, or for a message, with no
+    /// ADD-PATH family, so that no UPDATE costs anything for the feature
+    /// unless it is in use.
+    pub path_ids: Option<Box<PathIds>>,
+}
+
+/// The Path Identifiers of an UPDATE's NLRI, beside the lists they belong
+/// to (RFC 7911 §3): each list is either empty, for a field without
+/// identifiers, or as long as its prefix list, `[i]` being the identifier
+/// of prefix `i`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathIds {
+    /// Of [`UpdateMessage::withdrawn`].
+    pub withdrawn: Vec<PathId>,
+    /// Of [`UpdateMessage::nlri`].
+    pub nlri: Vec<PathId>,
+    /// Of [`MpReach::nlri`].
+    pub mp_reach: Vec<PathId>,
+    /// Of [`MpUnreach::withdrawn`].
+    pub mp_unreach: Vec<PathId>,
+}
+
+impl PathIds {
+    /// Whether no list holds an identifier.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.withdrawn.is_empty()
+            && self.nlri.is_empty()
+            && self.mp_reach.is_empty()
+            && self.mp_unreach.is_empty()
+    }
+}
+
+/// Identifiers `ids` holds for a prefix list, if it holds any.
+fn ids_of(ids: Option<&PathIds>, list: impl FnOnce(&PathIds) -> &[PathId]) -> &[PathId] {
+    ids.map_or(&[], list)
 }
 
 impl UpdateMessage {
+    /// The Path Identifiers of [`UpdateMessage::withdrawn`]; empty when it
+    /// has none (RFC 7911 §3).
+    #[must_use]
+    pub fn withdrawn_ids(&self) -> &[PathId] {
+        ids_of(self.path_ids.as_deref(), |i| &i.withdrawn)
+    }
+
+    /// The Path Identifiers of [`UpdateMessage::nlri`]; empty when it has
+    /// none.
+    #[must_use]
+    pub fn nlri_ids(&self) -> &[PathId] {
+        ids_of(self.path_ids.as_deref(), |i| &i.nlri)
+    }
+
+    /// The Path Identifiers of the `MP_REACH_NLRI` prefixes; empty when
+    /// they have none.
+    #[must_use]
+    pub fn mp_reach_ids(&self) -> &[PathId] {
+        ids_of(self.path_ids.as_deref(), |i| &i.mp_reach)
+    }
+
+    /// The Path Identifiers of the `MP_UNREACH_NLRI` prefixes; empty when
+    /// they have none.
+    #[must_use]
+    pub fn mp_unreach_ids(&self) -> &[PathId] {
+        ids_of(self.path_ids.as_deref(), |i| &i.mp_unreach)
+    }
+
     /// The attribute with type `code`, if present.
     #[must_use]
     pub fn attribute(&self, code: u8) -> Option<&PathAttribute> {
@@ -135,6 +269,52 @@ impl UpdateMessage {
         }
     }
 
+    /// The End-of-RIB marker for `family` (RFC 4724 §2): for IPv4 unicast
+    /// "an UPDATE message with the minimum length", with no withdrawn
+    /// routes, attributes or NLRI; for any other family "an UPDATE message
+    /// that contains only the `MP_UNREACH_NLRI` attribute with no withdrawn
+    /// routes for that <AFI, SAFI>".
+    #[must_use]
+    pub fn end_of_rib(family: AddressFamily) -> UpdateMessage {
+        if family == AddressFamily::IPV4_UNICAST {
+            return UpdateMessage::default();
+        }
+        UpdateMessage {
+            mp_unreach: Some(MpUnreach {
+                family,
+                withdrawn: Vec::new(),
+            }),
+            ..UpdateMessage::default()
+        }
+    }
+
+    /// The family this UPDATE is the End-of-RIB marker of, if it is one
+    /// (RFC 4724 §2): it withdraws and announces nothing. The empty UPDATE
+    /// is IPv4 unicast's; one with only an empty `MP_UNREACH_NLRI` is that
+    /// attribute's family's.
+    ///
+    /// NOTE(interop): an empty `MP_UNREACH_NLRI` for IPv4 unicast is taken
+    /// as IPv4 unicast's marker too, as RFC 4724 §2 names none but the
+    /// minimum-length UPDATE for it and a sender using the attribute for
+    /// every family means the same.
+    #[must_use]
+    pub fn end_of_rib_family(&self) -> Option<AddressFamily> {
+        // The cheap tests first: an UPDATE with NLRI, the usual one, is out
+        // after the first.
+        if !self.nlri.is_empty()
+            || !self.withdrawn.is_empty()
+            || self.mp_reach.is_some()
+            || !self.attributes.is_empty()
+        {
+            return None;
+        }
+        match &self.mp_unreach {
+            None => Some(AddressFamily::IPV4_UNICAST),
+            Some(u) if u.withdrawn.is_empty() => Some(u.family),
+            Some(_) => None,
+        }
+    }
+
     /// Whether the message announces anything (RFC 4271 §5: only then are
     /// the mandatory attributes required).
     #[must_use]
@@ -155,8 +335,18 @@ impl UpdateMessage {
     /// segment cannot be encoded, or IPv4 NLRI has an IPv6 next hop for a
     /// peer that did not advertise RFC 8950 Extended Next Hop Encoding.
     pub fn encode(&self, ctx: &EncodeContext) -> Result<Vec<u8>, EncodeError> {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        // RFC 7911 §5: the extended encoding for the families negotiated
+        // for it and the plain one for the rest, never a mixture.
+        check_ids(ctx.add_path, v4, &self.withdrawn, self.withdrawn_ids())?;
+        check_ids(ctx.add_path, v4, &self.nlri, self.nlri_ids())?;
         let mut withdrawn = Vec::new();
-        encode_prefixes(&self.withdrawn, &mut withdrawn);
+        encode_field(
+            ctx.add_path.contains(v4),
+            &self.withdrawn,
+            self.withdrawn_ids(),
+            &mut withdrawn,
+        );
         let withdrawn_len = u16::try_from(withdrawn.len()).map_err(|_| EncodeError::TooLong {
             what: "withdrawn routes",
             len: withdrawn.len(),
@@ -173,13 +363,19 @@ impl UpdateMessage {
             {
                 return Err(EncodeError::NextHopNotNegotiated(m.family));
             }
+            check_ids(ctx.add_path, m.family, &m.nlri, self.mp_reach_ids())?;
+            let mut value = Vec::new();
+            m.encode_with(self.mp_reach_ids(), &mut value);
             let mut buf = Vec::new();
-            PathAttribute::MpReach(m.clone()).encode(ctx.four_octet_as, &mut buf)?;
+            encode_attribute(flags::OPTIONAL, code::MP_REACH_NLRI, &value, &mut buf)?;
             encoded.push((0, buf));
         }
         if let Some(m) = &self.mp_unreach {
+            check_ids(ctx.add_path, m.family, &m.withdrawn, self.mp_unreach_ids())?;
+            let mut value = Vec::new();
+            m.encode_with(self.mp_unreach_ids(), &mut value);
             let mut buf = Vec::new();
-            PathAttribute::MpUnreach(m.clone()).encode(ctx.four_octet_as, &mut buf)?;
+            encode_attribute(flags::OPTIONAL, code::MP_UNREACH_NLRI, &value, &mut buf)?;
             encoded.push((0, buf));
         }
         for attr in &self.attributes {
@@ -207,7 +403,12 @@ impl UpdateMessage {
         for (_, b) in &encoded {
             out.put_bytes(b);
         }
-        encode_prefixes(&self.nlri, &mut out);
+        encode_field(
+            ctx.add_path.contains(v4),
+            &self.nlri,
+            self.nlri_ids(),
+            &mut out,
+        );
         Ok(out)
     }
 
@@ -224,22 +425,32 @@ impl UpdateMessage {
         // RFC 7606 §3 i) and §5.3: both prefix fields are checked for syntax,
         // and RFC 7606 §3 j): if the NLRI cannot be parsed, treat-as-withdraw
         // is impossible, so RFC 4271 §6.3 Invalid Network Field resets.
-        let withdrawn = decode_prefixes(withdrawn_bytes, Afi::Ipv4)
-            .map_err(|_| UpdateError::reset(UpdateSubcode::InvalidNetworkField, Vec::new()))?;
-        let nlri = decode_prefixes(nlri_bytes, Afi::Ipv4)
-            .map_err(|_| UpdateError::reset(UpdateSubcode::InvalidNetworkField, Vec::new()))?;
+        // RFC 7911 §5: both fields of IPv4 unicast carry Path Identifiers
+        // when it was negotiated for it.
+        let with_ids = ctx.add_path.contains(AddressFamily::IPV4_UNICAST);
+        let invalid = |_| UpdateError::reset(UpdateSubcode::InvalidNetworkField, Vec::new());
+        let (withdrawn, withdrawn_ids) =
+            decode_field(withdrawn_bytes, with_ids).map_err(invalid)?;
+        let (nlri, nlri_ids) = decode_field(nlri_bytes, with_ids).map_err(invalid)?;
         let mut st = State::default();
         decode_attributes(attr_bytes, *ctx, !nlri.is_empty(), &mut st)?;
         apply_as4(&mut st, *ctx);
         // RFC 4271 §5: any order is accepted; ascending type order is the
         // canonical form, so equal messages compare equal.
         st.attributes.sort_by_key(PathAttribute::code);
+        let ids = PathIds {
+            withdrawn: withdrawn_ids,
+            nlri: nlri_ids,
+            mp_reach: std::mem::take(&mut st.mp_reach_ids),
+            mp_unreach: std::mem::take(&mut st.mp_unreach_ids),
+        };
         let message = UpdateMessage {
             withdrawn,
             nlri,
             mp_reach: st.mp_reach.take(),
             mp_unreach: st.mp_unreach.take(),
             attributes: std::mem::take(&mut st.attributes),
+            path_ids: (!ids.is_empty()).then(|| Box::new(ids)),
         };
         check_mandatory(&message, &mut st);
         // RFC 7606 §5.2: an UPDATE that "does contain path attributes other
@@ -264,6 +475,52 @@ impl UpdateMessage {
             discarded: st.discarded,
             disabled: st.disabled,
         })
+    }
+}
+
+/// RFC 7911 §5: whether the Path Identifiers `ids` of a list of `family`
+/// prefixes are what the session negotiated: one per prefix for a family
+/// with ADD-PATH, none for any other.
+fn check_ids(
+    add_path: AddPathFamilies,
+    family: AddressFamily,
+    prefixes: &[Prefix],
+    ids: &[PathId],
+) -> Result<(), EncodeError> {
+    if add_path.contains(family) {
+        if ids.len() == prefixes.len() {
+            Ok(())
+        } else {
+            Err(EncodeError::PathIdsMissing(family))
+        }
+    } else if ids.is_empty() {
+        Ok(())
+    } else {
+        Err(EncodeError::PathIdsNotNegotiated(family))
+    }
+}
+
+/// Append a Withdrawn Routes or NLRI field, in the extended encoding when
+/// `with_ids` (RFC 7911 §3).
+fn encode_field(with_ids: bool, prefixes: &[Prefix], ids: &[PathId], out: &mut Vec<u8>) {
+    if with_ids {
+        encode_prefixes_with_ids(prefixes, ids, out);
+    } else {
+        encode_prefixes(prefixes, out);
+    }
+}
+
+/// Decode a Withdrawn Routes or NLRI field of IPv4 unicast, in the
+/// extended encoding when `with_ids` (RFC 7911 §3); the identifiers are
+/// empty without it.
+fn decode_field(
+    bytes: &[u8],
+    with_ids: bool,
+) -> Result<(Vec<Prefix>, Vec<PathId>), crate::prefix::NlriError> {
+    if with_ids {
+        decode_prefixes_with_ids(bytes, Afi::Ipv4)
+    } else {
+        Ok((decode_prefixes(bytes, Afi::Ipv4)?, Vec::new()))
     }
 }
 
@@ -313,6 +570,9 @@ struct State {
     attributes: Vec<PathAttribute>,
     mp_reach: Option<MpReach>,
     mp_unreach: Option<MpUnreach>,
+    /// The Path Identifiers of those two (RFC 7911 §3).
+    mp_reach_ids: Vec<PathId>,
+    mp_unreach_ids: Vec<PathId>,
     as4_path: Option<AsPath>,
     as4_aggregator: Option<Aggregator>,
     /// Bitset of attribute type codes already seen.
@@ -344,6 +604,25 @@ impl State {
         self.withdraw.get_or_insert(e);
     }
 
+    /// Keep a decoded attribute: the MP ones apart, with their Path
+    /// Identifiers `ids`.
+    fn keep(&mut self, a: PathAttribute, ids: Vec<PathId>, raw: &RawAttribute<'_>, nlri: bool) {
+        if let Some(e) = invalid_next_hop(&a, raw, nlri) {
+            self.withdraw(e);
+        }
+        match a {
+            PathAttribute::MpReach(m) => {
+                self.mp_reach = Some(m);
+                self.mp_reach_ids = ids;
+            }
+            PathAttribute::MpUnreach(m) => {
+                self.mp_unreach = Some(m);
+                self.mp_unreach_ids = ids;
+            }
+            a => self.attributes.push(a),
+        }
+    }
+
     fn discard(&mut self, code: u8, reason: DiscardReason) {
         self.discarded.push(DiscardedAttribute { code, reason });
     }
@@ -358,6 +637,9 @@ impl State {
 /// What one attribute turned out to be.
 enum Outcome {
     Keep(PathAttribute),
+    /// An MP attribute, with the Path Identifiers of its NLRI (RFC 7911
+    /// §3), which are empty for a family without ADD-PATH.
+    KeepMp(PathAttribute, Vec<PathId>),
     As4Path(AsPath),
     As4Aggregator(Aggregator),
     /// Unrecognised optional non-transitive: quietly ignored (RFC 4271 §5).
@@ -406,16 +688,8 @@ fn decode_attributes(
             continue;
         }
         match decode_one(&raw, ctx)? {
-            Outcome::Keep(a) => {
-                if let Some(e) = invalid_next_hop(&a, &raw, nlri_field) {
-                    st.withdraw(e);
-                }
-                match a {
-                    PathAttribute::MpReach(m) => st.mp_reach = Some(m),
-                    PathAttribute::MpUnreach(m) => st.mp_unreach = Some(m),
-                    a => st.attributes.push(a),
-                }
-            }
+            Outcome::Keep(a) => st.keep(a, Vec::new(), &raw, nlri_field),
+            Outcome::KeepMp(a, ids) => st.keep(a, ids, &raw, nlri_field),
             Outcome::As4Path(p) => st.as4_path = Some(p),
             Outcome::As4Aggregator(a) => st.as4_aggregator = Some(a),
             Outcome::Ignore => {}
@@ -504,12 +778,12 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
             Ok(cs) => Outcome::Keep(PathAttribute::Communities(cs)),
             Err(_) => length_error(),
         },
-        code::MP_REACH_NLRI => match MpReach::decode(v, ctx.extended_next_hop) {
-            Ok(m) => Outcome::Keep(PathAttribute::MpReach(m)),
+        code::MP_REACH_NLRI => match MpReach::decode_with(v, ctx.extended_next_hop, ctx.add_path) {
+            Ok((m, ids)) => Outcome::KeepMp(PathAttribute::MpReach(m), ids),
             Err(e) => mp_failure(raw, e.family())?,
         },
-        code::MP_UNREACH_NLRI => match MpUnreach::decode(v) {
-            Ok(m) => Outcome::Keep(PathAttribute::MpUnreach(m)),
+        code::MP_UNREACH_NLRI => match MpUnreach::decode_with(v, ctx.add_path) {
+            Ok((m, ids)) => Outcome::KeepMp(PathAttribute::MpUnreach(m), ids),
             Err(e) => mp_failure(raw, e.family())?,
         },
         // RFC 7606 §7.14.
@@ -521,6 +795,21 @@ fn decode_one(raw: &RawAttribute<'_>, ctx: DecodeContext) -> Result<Outcome, Upd
         code::LARGE_COMMUNITIES => match decode_large_communities(v) {
             Ok(cs) => Outcome::Keep(PathAttribute::LargeCommunities(cs)),
             Err(_) => length_error(),
+        },
+        // RFC 9234 §5: "The OTC Attribute is considered malformed if the
+        // length value is not 4. An UPDATE message with a malformed OTC
+        // Attribute SHALL be handled using the approach of
+        // 'treat-as-withdraw'", with RFC 7606 §7's Attribute Length Error.
+        // The value is an AS number and kept whatever it is: the RFC names
+        // no check on it, and "once the OTC Attribute has been set, it MUST
+        // be preserved unchanged".
+        // NOTE(interop): FRR 8.4 treats a value of 0 as malformed
+        // (treat-as-withdraw); BIRD 2.14 and RFC 9234 §5 do not. Following
+        // the RFC, it is kept; from a peer it is a leak anyway, as no AS 0
+        // is a peer's.
+        code::ONLY_TO_CUSTOMER => match u32_value(v) {
+            Some(a) => Outcome::Keep(PathAttribute::OnlyToCustomer(Asn(a))),
+            None => length_error(),
         },
         // RFC 6793 §6: AS4_* from a NEW speaker are discarded; otherwise a
         // malformed one is discarded too.
@@ -797,6 +1086,18 @@ pub struct DecodedUpdate {
     pub disabled: Vec<DisabledFamily>,
 }
 
+/// The prefixes with their Path Identifiers `ids`, which are as many or
+/// none; none are zero.
+fn with_ids<'a>(
+    prefixes: &'a [Prefix],
+    ids: &'a [PathId],
+) -> impl Iterator<Item = (Prefix, PathId)> + 'a {
+    prefixes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (*p, ids.get(i).copied().unwrap_or_default()))
+}
+
 impl DecodedUpdate {
     /// Whether this UPDATE disabled `family` (RFC 4760 §7).
     #[must_use]
@@ -808,25 +1109,33 @@ impl DecodedUpdate {
     /// the announced routes when treated as withdraw; none of a disabled
     /// family, which goes as a whole.
     pub fn withdrawals(&self) -> impl Iterator<Item = (AddressFamily, Prefix)> + '_ {
+        self.withdrawn_paths()
+            .map(|(family, prefix, _)| (family, prefix))
+    }
+
+    /// [`DecodedUpdate::withdrawals`] with the Path Identifier of each
+    /// route (RFC 7911 §3), which is zero for a family without ADD-PATH.
+    /// A route treated as withdrawn is withdrawn by the identifier it was
+    /// announced with, as RFC 7606 §2 has it "treated as though the
+    /// corresponding NLRI had been withdrawn".
+    pub fn withdrawn_paths(&self) -> impl Iterator<Item = (AddressFamily, Prefix, PathId)> + '_ {
         let m = &self.message;
         let v4 = AddressFamily::IPV4_UNICAST;
         let taw = self.treated_as_withdraw.is_some();
-        m.withdrawn
-            .iter()
-            .map(move |p| (v4, *p))
+        with_ids(&m.withdrawn, m.withdrawn_ids())
+            .map(move |(p, id)| (v4, p, id))
+            .chain(m.mp_unreach.iter().flat_map(|u| {
+                with_ids(&u.withdrawn, m.mp_unreach_ids()).map(move |(p, id)| (u.family, p, id))
+            }))
             .chain(
-                m.mp_unreach
-                    .iter()
-                    .flat_map(|u| u.withdrawn.iter().map(move |p| (u.family, *p))),
-            )
-            .chain(m.nlri.iter().filter(move |_| taw).map(move |p| (v4, *p)))
-            .chain(
-                m.mp_reach
-                    .iter()
+                with_ids(&m.nlri, m.nlri_ids())
                     .filter(move |_| taw)
-                    .flat_map(|r| r.nlri.iter().map(move |p| (r.family, *p))),
+                    .map(move |(p, id)| (v4, p, id)),
             )
-            .filter(move |(f, _)| !self.disables(*f))
+            .chain(m.mp_reach.iter().filter(move |_| taw).flat_map(|r| {
+                with_ids(&r.nlri, m.mp_reach_ids()).map(move |(p, id)| (r.family, p, id))
+            }))
+            .filter(move |(f, ..)| !self.disables(*f))
     }
 
     /// Every route the receiver may install with `message.attributes`;
@@ -865,6 +1174,7 @@ mod tests {
         peer: PeerKind::External,
         allow_as_set: false,
         extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
     };
     const EBGP4: DecodeContext = DecodeContext {
         four_octet_as: true,
@@ -877,10 +1187,12 @@ mod tests {
     const ENC2: EncodeContext = EncodeContext {
         four_octet_as: false,
         extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
     };
     const ENC4: EncodeContext = EncodeContext {
         four_octet_as: true,
         extended_next_hop: false,
+        add_path: AddPathFamilies::NONE,
     };
 
     /// 10.0.0.0/8 via 192.0.2.1, path 65001 65002, origin IGP, MED 50, from
@@ -928,6 +1240,78 @@ mod tests {
         let mut shuffled = ANNOUNCE.to_vec();
         shuffled[4..31].rotate_left(4);
         assert_eq!(UpdateMessage::decode(&shuffled, &EBGP2).unwrap().message, m);
+    }
+
+    #[test]
+    fn end_of_rib_markers_follow_rfc_4724_section_2() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // IPv4 unicast: the UPDATE of minimum length, four octets of body
+        // (the two length fields), 23 with the header.
+        let eor4 = UpdateMessage::end_of_rib(v4);
+        assert_eq!(eor4.encode(&ENC4).unwrap(), [0, 0, 0, 0]);
+        let d = UpdateMessage::decode(&[0, 0, 0, 0], &EBGP4).unwrap();
+        assert_eq!(d.message.end_of_rib_family(), Some(v4));
+        // Any other family: only an MP_UNREACH_NLRI (optional,
+        // non-transitive, type 15) holding the AFI and SAFI.
+        let eor6 = UpdateMessage::end_of_rib(v6);
+        let wire6 = [0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1];
+        assert_eq!(eor6.encode(&ENC4).unwrap(), wire6);
+        let d = UpdateMessage::decode(&wire6, &EBGP4).unwrap();
+        assert_eq!(d.message, eor6);
+        assert_eq!(d.message.end_of_rib_family(), Some(v6));
+        // A family the decoder does not speak is still a marker of its
+        // own; it round-trips and names its family.
+        let other = AddressFamily {
+            afi: Afi::Unknown(25),
+            safi: Safi::Unknown(65),
+        };
+        let m = UpdateMessage::end_of_rib(other);
+        assert_eq!(m.end_of_rib_family(), Some(other));
+        // NOTE(interop): an empty MP_UNREACH_NLRI for IPv4 unicast counts.
+        let m = UpdateMessage {
+            mp_unreach: Some(MpUnreach {
+                family: v4,
+                withdrawn: vec![],
+            }),
+            ..UpdateMessage::default()
+        };
+        assert_eq!(m.end_of_rib_family(), Some(v4));
+        // Anything announced or withdrawn is no marker.
+        assert_eq!(announce().end_of_rib_family(), None);
+        let withdraw = |m: UpdateMessage| m.end_of_rib_family();
+        assert_eq!(
+            withdraw(UpdateMessage {
+                withdrawn: vec![p("10.0.0.0/8")],
+                ..UpdateMessage::default()
+            }),
+            None
+        );
+        assert_eq!(
+            withdraw(UpdateMessage {
+                mp_unreach: Some(MpUnreach {
+                    family: v6,
+                    withdrawn: vec![p("2001:db8::/32")],
+                }),
+                ..UpdateMessage::default()
+            }),
+            None
+        );
+        // Attributes beside the attribute make it something else.
+        assert_eq!(
+            withdraw(UpdateMessage {
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                ..eor6.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            withdraw(UpdateMessage {
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                ..UpdateMessage::default()
+            }),
+            None
+        );
     }
 
     #[test]
@@ -1107,10 +1491,12 @@ mod tests {
         };
         let enc = EncodeContext {
             extended_next_hop: true,
+            add_path: AddPathFamilies::NONE,
             ..ENC4
         };
         let ctx = DecodeContext {
             extended_next_hop: true,
+            add_path: AddPathFamilies::NONE,
             ..EBGP4
         };
         let v4 = AddressFamily::IPV4_UNICAST;
@@ -1506,6 +1892,142 @@ mod tests {
         );
     }
 
+    /// `announce()` as a four-octet session sends it, with `attr` added
+    /// to its path attributes.
+    fn announce_with(attr: &[u8]) -> Vec<u8> {
+        let mut wire = announce().encode(&ENC4).unwrap();
+        let at = wire.len() - 2;
+        wire.splice(at..at, attr.iter().copied());
+        wire[3] += u8::try_from(attr.len()).unwrap();
+        wire
+    }
+
+    #[test]
+    fn only_to_customer_round_trips() {
+        // RFC 9234 §5: optional transitive, type code 35, four octets.
+        let mut m = announce();
+        m.attributes
+            .push(PathAttribute::OnlyToCustomer(Asn(65_001)));
+        m.attributes.sort_by_key(PathAttribute::code);
+        let wire = m.encode(&ENC4).unwrap();
+        let attr = [0xc0, 35, 4, 0, 0, 0xfd, 0xe9];
+        assert!(wire.windows(attr.len()).any(|w| w == attr), "{wire:?}");
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(d.message, m);
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.discarded, vec![]);
+        // It is an AS number of four octets also towards a two-octet
+        // speaker: RFC 9234 §5 has no two-octet form and no AS4_ twin.
+        let wire = m.encode(&ENC2).unwrap();
+        assert!(wire.windows(attr.len()).any(|w| w == attr), "{wire:?}");
+        assert_eq!(UpdateMessage::decode(&wire, &EBGP2).unwrap().message, m);
+        // Internal sessions carry it too ("once set, preserved").
+        let wire = m.encode(&ENC4).unwrap();
+        assert_eq!(UpdateMessage::decode(&wire, &IBGP4).unwrap().message, m);
+        // The value is whatever the AS put there, AS 0 included.
+        for asn in [0, 1, 4_200_000_000, u32::MAX] {
+            let mut wire = vec![0xc0, 35, 4];
+            wire.extend_from_slice(&asn.to_be_bytes());
+            let d = UpdateMessage::decode(&announce_with(&wire), &EBGP4).unwrap();
+            assert_eq!(
+                d.message.attribute(code::ONLY_TO_CUSTOMER),
+                Some(&PathAttribute::OnlyToCustomer(Asn(asn)))
+            );
+        }
+        // A Partial bit set by a speaker that did not know it is dropped
+        // with the rest of the flags we re-derive, and the value is kept.
+        let d = UpdateMessage::decode(&announce_with(&[0xe0, 35, 4, 0, 0, 0xfd, 0xe9]), &EBGP4)
+            .unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+    }
+
+    #[test]
+    fn bird_update_with_otc_is_read_and_written_back() {
+        // Captured from BIRD 2.14, AS 65001, `local role provider`, sending
+        // a static route to its customer: ORIGIN, AS_PATH 65001, NEXT_HOP,
+        // and the Only to Customer attribute (RFC 9234 §5: 0xc0, type 35,
+        // length 4) set to its own AS, as §5 egress 1 has it.
+        let wire = [
+            0, 0, // withdrawn routes length
+            0, 27, // total path attribute length
+            0x40, 1, 1, 0, // ORIGIN igp
+            0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9, // AS_PATH seq 65001
+            0x40, 3, 4, 10, 77, 0, 2, // NEXT_HOP
+            0xc0, 35, 4, 0, 0, 0xfd, 0xe9, // OTC 65001
+            24, 192, 0, 2, // NLRI 192.0.2.0/24
+        ];
+        let d = UpdateMessage::decode(&wire, &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(d.discarded, vec![]);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+        assert_eq!(d.message.nlri, vec![p("192.0.2.0/24")]);
+        // The canonical form: the encoder writes the same octets.
+        assert_eq!(d.message.encode(&ENC4).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_malformed_only_to_customer_is_treat_as_withdraw() {
+        // RFC 9234 §5: "considered malformed if the length value is not 4";
+        // the UPDATE "SHALL be handled using the approach of
+        // 'treat-as-withdraw'" (RFC 7606 §2), without a session reset.
+        for len in [0usize, 1, 3, 5, 8] {
+            let mut attr = vec![0xc0, 35, u8::try_from(len).unwrap()];
+            attr.extend(std::iter::repeat_n(7, len));
+            let d = UpdateMessage::decode(&announce_with(&attr), &EBGP4).unwrap();
+            let e = d.treated_as_withdraw.clone().unwrap();
+            assert_eq!(e.code, ErrorCode::Update, "length {len}");
+            assert_eq!(e.subcode, UpdateSubcode::AttributeLengthError as u8);
+            // RFC 4271 §6.3: the Data field is the attribute.
+            assert_eq!(e.data, attr);
+            assert_eq!(d.announcements().count(), 0);
+            assert_eq!(
+                d.withdrawals().collect::<Vec<_>>(),
+                vec![(AddressFamily::IPV4_UNICAST, p("10.0.0.0/8"))]
+            );
+        }
+    }
+
+    #[test]
+    fn only_to_customer_flags_must_be_optional_transitive() {
+        // RFC 7606 §3 c): the category bits in conflict with the registry
+        // are treat-as-withdraw for an attribute with no milder rule.
+        for flags in [0x40, 0x80, 0x00] {
+            let attr = [flags, 35, 4, 0, 0, 0xfd, 0xe9];
+            let d = UpdateMessage::decode(&announce_with(&attr), &EBGP4).unwrap();
+            let e = d.treated_as_withdraw.clone().unwrap();
+            assert_eq!(e.subcode, UpdateSubcode::AttributeFlagsError as u8);
+            assert_eq!(e.data, attr);
+            assert_eq!(d.message.attribute(code::ONLY_TO_CUSTOMER), None);
+        }
+    }
+
+    #[test]
+    fn a_repeated_only_to_customer_is_discarded() {
+        // RFC 7606 §3 g): the first occurrence is kept.
+        let mut attrs = vec![0xc0, 35, 4, 0, 0, 0xfd, 0xe9];
+        attrs.extend_from_slice(&[0xc0, 35, 4, 0, 0, 0xfd, 0xea]);
+        let d = UpdateMessage::decode(&announce_with(&attrs), &EBGP4).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        assert_eq!(
+            d.message.attribute(code::ONLY_TO_CUSTOMER),
+            Some(&PathAttribute::OnlyToCustomer(Asn(65_001)))
+        );
+        assert_eq!(
+            d.discarded,
+            vec![DiscardedAttribute {
+                code: 35,
+                reason: DiscardReason::Duplicate
+            }]
+        );
+    }
+
     #[test]
     fn mp_attribute_errors_disable_the_family() {
         // RFC 4760 §7 + RFC 7606 §7.11.
@@ -1751,6 +2273,7 @@ mod tests {
         );
         let enc = EncodeContext {
             extended_next_hop: true,
+            add_path: AddPathFamilies::NONE,
             ..ENC4
         };
         let wire = m.encode(&enc).unwrap();
@@ -1761,6 +2284,7 @@ mod tests {
         // Negotiated: an ordinary announcement.
         let ctx = DecodeContext {
             extended_next_hop: true,
+            add_path: AddPathFamilies::NONE,
             ..EBGP4
         };
         let d = UpdateMessage::decode(&wire, &ctx).unwrap();
@@ -1794,6 +2318,233 @@ mod tests {
             EncodeError::NextHopNotNegotiated(AddressFamily::IPV4_UNICAST).to_string(),
             "IPv6 next hop for ipv4-unicast without the Extended Next Hop Encoding capability"
         );
+    }
+
+    const V4: AddressFamily = AddressFamily::IPV4_UNICAST;
+    const V6: AddressFamily = AddressFamily::IPV6_UNICAST;
+
+    fn add_path(families: &[AddressFamily]) -> (DecodeContext, EncodeContext) {
+        let add_path = AddPathFamilies::of(families);
+        (
+            DecodeContext { add_path, ..EBGP4 },
+            EncodeContext { add_path, ..ENC4 },
+        )
+    }
+
+    /// The attributes of `ANNOUNCE`, four-octet.
+    const ATTRS4: [u8; 30] = [
+        0x40, 1, 1, 0, // ORIGIN igp
+        0x40, 2, 10, 2, 2, 0, 0, 0xfd, 0xe9, 0, 0, 0xfd, 0xea, // AS_PATH seq
+        0x40, 3, 4, 192, 0, 2, 1, // NEXT_HOP
+        0x80, 4, 4, 0, 0, 0, // MED, completed below
+    ];
+
+    fn announce4(nlri: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0, 0, 0, 31];
+        wire.extend_from_slice(&ATTRS4);
+        wire.push(50);
+        wire.extend_from_slice(nlri);
+        wire
+    }
+
+    #[test]
+    fn nlri_field_carries_a_path_identifier_for_each_prefix() {
+        // RFC 7911 §3: Path Identifier (4 octets), Length, Prefix; two
+        // paths for one prefix, which a plain UPDATE could not carry.
+        let nlri = [0, 0, 0, 1, 8, 10, 0, 0, 0, 2, 8, 10];
+        let wire = announce4(&nlri);
+        let (dec, enc) = add_path(&[V4]);
+        let d = UpdateMessage::decode(&wire, &dec).unwrap();
+        assert_eq!(d.treated_as_withdraw, None);
+        let m = &d.message;
+        assert_eq!(m.nlri, vec![p("10.0.0.0/8"); 2]);
+        assert_eq!(m.nlri_ids(), [PathId(1), PathId(2)]);
+        assert!(m.withdrawn_ids().is_empty() && m.mp_reach_ids().is_empty());
+        assert_eq!(m.encode(&enc).unwrap(), wire);
+        assert_eq!(d.announcements().count(), 2);
+        // The same octets on a session without it are no NLRI at all.
+        assert!(UpdateMessage::decode(&wire, &EBGP4).is_err());
+        // A message with no ids at all has no id lists: nothing is
+        // allocated for a family without ADD-PATH.
+        let plain = UpdateMessage::decode(&ANNOUNCE, &EBGP2).unwrap();
+        assert_eq!(plain.message.path_ids, None);
+    }
+
+    #[test]
+    fn withdrawn_routes_name_the_path_to_withdraw() {
+        // RFC 7911 §5: a withdrawal is for a prefix and a Path Identifier.
+        let wire = [
+            0, 14, // withdrawn routes length
+            0, 0, 0, 1, 8, 10, // path 1 of 10.0.0.0/8
+            0, 0, 0, 7, 24, 192, 0, 2, // path 7 of 192.0.2.0/24
+            0, 0, // no attributes
+        ];
+        let (dec, enc) = add_path(&[V4]);
+        let d = UpdateMessage::decode(&wire, &dec).unwrap();
+        assert_eq!(
+            d.withdrawn_paths().collect::<Vec<_>>(),
+            vec![
+                (V4, p("10.0.0.0/8"), PathId(1)),
+                (V4, p("192.0.2.0/24"), PathId(7))
+            ]
+        );
+        assert_eq!(
+            d.withdrawals().collect::<Vec<_>>(),
+            vec![(V4, p("10.0.0.0/8")), (V4, p("192.0.2.0/24"))]
+        );
+        assert_eq!(d.message.encode(&enc).unwrap(), wire);
+    }
+
+    #[test]
+    fn multiprotocol_attributes_carry_path_identifiers_per_family() {
+        // RFC 7911 §3, §5: MP_REACH_NLRI and MP_UNREACH_NLRI of IPv6
+        // unicast, while IPv4 unicast stays plain.
+        let wire = vec![
+            0, 2, 8, 10, // withdrawn routes: 10.0.0.0/8, plain
+            0, 61, // total path attribute length
+            0x80, 14, 30, 0, 2, 1, 16, // MP_REACH_NLRI, IPv6 unicast, next hop length
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // 2001:db8::1
+            0, // reserved
+            0, 0, 0, 9, 32, 0x20, 0x01, 0x0d, 0xb8, // path 9, 2001:db8::/32
+            0x80, 15, 12, 0, 2, 1, // MP_UNREACH_NLRI, IPv6 unicast
+            0, 0, 0, 3, 32, 0x20, 0x01, 0x0d, 0xb9, // path 3, 2001:db9::/32
+            0x40, 1, 1, 0, // ORIGIN igp
+            0x40, 2, 6, 2, 1, 0, 0, 0xfd, 0xe9, // AS_PATH 65001
+        ];
+        assert_eq!(wire.len(), 6 + 61);
+        let (dec, enc) = add_path(&[V6]);
+        let d = UpdateMessage::decode(&wire, &dec).unwrap();
+        assert_eq!(d.treated_as_withdraw, None, "{:?}", d.discarded);
+        assert_eq!(d.disabled, vec![]);
+        let m = &d.message;
+        assert_eq!(m.withdrawn, vec![p("10.0.0.0/8")]);
+        assert!(m.withdrawn_ids().is_empty(), "IPv4 has no ADD-PATH here");
+        assert_eq!(m.mp_reach.as_ref().unwrap().nlri, vec![p("2001:db8::/32")]);
+        assert_eq!(m.mp_reach_ids(), [PathId(9)]);
+        assert_eq!(
+            m.mp_unreach.as_ref().unwrap().withdrawn,
+            vec![p("2001:db9::/32")]
+        );
+        assert_eq!(m.mp_unreach_ids(), [PathId(3)]);
+        assert_eq!(
+            d.withdrawn_paths().collect::<Vec<_>>(),
+            vec![
+                (V4, p("10.0.0.0/8"), PathId(0)),
+                (V6, p("2001:db9::/32"), PathId(3)),
+            ]
+        );
+        assert_eq!(m.encode(&enc).unwrap(), wire);
+    }
+
+    #[test]
+    fn ipv4_in_mp_reach_follows_the_ipv4_entry() {
+        // RFC 8950 §3 carries IPv4 unicast NLRI in MP_REACH_NLRI: the
+        // <IPv4, unicast> tuple of RFC 7911 §4 is what governs them.
+        let m = UpdateMessage {
+            mp_reach: Some(MpReach {
+                family: V4,
+                next_hop: NextHop::Ipv4(Ipv4Addr::new(192, 0, 2, 1)),
+                nlri: vec![p("10.0.0.0/8")],
+            }),
+            attributes: vec![
+                PathAttribute::Origin(Origin::Igp),
+                PathAttribute::AsPath(AsPath::sequence(&[Asn(65_001)])),
+            ],
+            path_ids: Some(Box::new(PathIds {
+                mp_reach: vec![PathId(5)],
+                ..PathIds::default()
+            })),
+            ..UpdateMessage::default()
+        };
+        let (dec, enc) = add_path(&[V4]);
+        let wire = m.encode(&enc).unwrap();
+        assert_eq!(UpdateMessage::decode(&wire, &dec).unwrap().message, m);
+        // IPv6 alone does not cover it.
+        let (_, enc6) = add_path(&[V6]);
+        assert_eq!(m.encode(&enc6), Err(EncodeError::PathIdsNotNegotiated(V4)));
+    }
+
+    #[test]
+    fn a_broken_path_identifier_is_a_broken_nlri() {
+        // RFC 7606 §5.3 with RFC 7911 §3: a tuple cut short in the NLRI or
+        // Withdrawn Routes field resets the session, one in an MP
+        // attribute disables its family (RFC 4760 §7).
+        let (dec4, _) = add_path(&[V4]);
+        let (dec6, _) = add_path(&[V6]);
+        for wire in [
+            announce4(&[0, 0, 0, 1, 8]),
+            announce4(&[0, 0, 0]),
+            vec![0, 5, 0, 0, 0, 1, 8, 0, 0],
+        ] {
+            let e = UpdateMessage::decode(&wire, &dec4).unwrap_err();
+            assert_eq!(
+                e.notification.subcode,
+                UpdateSubcode::InvalidNetworkField as u8,
+                "{wire:?}"
+            );
+        }
+        // MP_UNREACH_NLRI for IPv6 with a length of 129 after the id.
+        let wire = [
+            0, 0, 0, 12, 0x80, 15, 9, 0, 2, 1, 0, 0, 0, 1, 129, 0, //
+        ];
+        let d = UpdateMessage::decode(&wire, &dec6).unwrap();
+        assert_eq!(
+            d.disabled.iter().map(|x| x.family).collect::<Vec<_>>(),
+            vec![V6]
+        );
+    }
+
+    #[test]
+    fn encoding_checks_the_identifiers_against_the_negotiation() {
+        // RFC 7911 §5: an identifier per prefix for a family with ADD-PATH,
+        // none for any other.
+        let (_, enc) = add_path(&[V4]);
+        let plain = UpdateMessage {
+            withdrawn: vec![p("10.0.0.0/8")],
+            ..UpdateMessage::default()
+        };
+        assert_eq!(plain.encode(&enc), Err(EncodeError::PathIdsMissing(V4)));
+        let with = UpdateMessage {
+            path_ids: Some(Box::new(PathIds {
+                withdrawn: vec![PathId(1)],
+                ..PathIds::default()
+            })),
+            ..plain.clone()
+        };
+        assert!(with.encode(&enc).is_ok());
+        assert_eq!(
+            with.encode(&ENC4),
+            Err(EncodeError::PathIdsNotNegotiated(V4))
+        );
+        let two = UpdateMessage {
+            withdrawn: vec![p("10.0.0.0/8"), p("11.0.0.0/8")],
+            ..with
+        };
+        assert_eq!(two.encode(&enc), Err(EncodeError::PathIdsMissing(V4)));
+        // Empty lists need no identifiers either way.
+        assert!(UpdateMessage::default().encode(&enc).is_ok());
+        assert_eq!(
+            EncodeError::PathIdsMissing(V4).to_string(),
+            "ipv4-unicast NLRI without a Path Identifier for every prefix, with ADD-PATH"
+        );
+        assert_eq!(
+            EncodeError::PathIdsNotNegotiated(V6).to_string(),
+            "Path Identifiers for ipv6-unicast without ADD-PATH"
+        );
+    }
+
+    #[test]
+    fn add_path_families_are_the_ones_this_implementation_parses() {
+        let both = AddPathFamilies::of(&[V4, V6]);
+        assert!(both.contains(V4) && both.contains(V6) && !both.is_empty());
+        let odd = AddressFamily {
+            afi: Afi::Ipv4,
+            safi: crate::types::Safi::Multicast,
+        };
+        assert!(!AddPathFamilies::of(&[odd]).contains(odd));
+        assert!(AddPathFamilies::of(&[odd]).is_empty());
+        assert_eq!(AddPathFamilies::of(&[]), AddPathFamilies::NONE);
+        assert!(!AddPathFamilies::of(&[V6]).contains(V4));
     }
 
     #[test]

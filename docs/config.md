@@ -57,17 +57,42 @@ control-item = "socket" path ";"
                        [ "writes" yes-no ";" ]        (* default no *)
                        [ "token-file" path ";" ] "}" ;
 
-rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
-             | "cache" host { cache-option } ";"       (* repeatable; options once each *)
+rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"    (* required *)
+             | "cache" host { cache-option } ";"       (* repeatable; options once each;
+                                                          not with mode sidecar *)
+             | "routinator" "{" { routinator-item } "}"    (* required with mode sidecar;
+                                                              not with mode external *)
              | "version" ( "0" | "1" ) ";"             (* default 1 *)
              | "connect-timeout" u32 ";"              (* default 10 *)
              | "response-timeout" u32 ";"             (* default 60 *)
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
              | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
-             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
+             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX;
+                                                          default 1 600, 1 30 with mode sidecar *)
+             | "invalid" ( "drop" | "prefer-valid" | "policy" ) ";" ;
+                                                      (* required with mode external and sidecar;
+                                                          default policy *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
+
+routinator-item
+             = "binary" path ";"                       (* required; absolute *)
+             | "repository-dir" path ";"               (* required; absolute *)
+             | "rtr-listen" ip ":" u16 ";"             (* loopback only; default 127.0.0.1:0 *)
+             | "rir-tals" yes-no ";"                   (* default yes *)
+             | "tal" name ";"                          (* repeatable; a TAL Routinator bundles *)
+             | "tal-dir" path ";"                      (* absolute *)
+             | "accept-arin-rpa" yes-no ";"            (* default no *)
+             | "refresh" u32 ";"                       (* 1-7199; default 600 *)
+             | "config-file" path ";"                  (* absolute *)
+             | "global-arg" argument ";"               (* repeatable *)
+             | "server-arg" argument ";"               (* repeatable *)
+             | "restart-backoff" u32 u32 ";"           (* INITIAL CAP: 1-3600 each, INITIAL <= CAP;
+                                                          default 1 300 *)
+             | "stable-after" u32 ";"                  (* 1-86400; default 300 *)
+             | "stop-timeout" u32 ";"                  (* 1-3600; default 10 *)
+             | "failure-threshold" u32 ";" ;           (* at least 1; default 5 *)
 
 prefix-list  = "prefix-list" name "{" { prefix-entry ";" } "}" ;
 prefix-entry = prefix [ "ge" u8 ] [ "le" u8 ] ;
@@ -81,14 +106,17 @@ match        = "prefix" prefix-entry
              | "ext-community" ext-community
              | "large-community" large-community
              | "origin" ( "igp" | "egp" | "incomplete" )
-             | "neighbor" ip ;
+             | "neighbor" ip
+             | "rpki" rov-state ;
 set          = "local-pref" u32
              | "med" u32
              | "community" op community { community }
              | "ext-community" op ext-community { ext-community }
              | "large-community" op large-community { large-community }
              | "as-path" "prepend" asn { asn }
-             | "next-hop" "self" ;
+             | "next-hop" "self"
+             | "rpki" rov-state ;
+rov-state    = "valid" | "invalid" | "not-found" | "disabled" ;
 op           = "add" | "remove" | "replace" ;
 action       = "accept" | "reject" | "next" ;
 
@@ -108,10 +136,20 @@ neighbor-item
              | "extended-next-hop" yes-no ";"        (* default no *)
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
+             | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
+             | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
+             | "graceful-restart" yes-no ";"         (* default no *)
+             | "restart-time" u16 ";"                (* 0-4095; default 120; needs graceful-restart yes *)
+             | "stale-time" u16 ";"                  (* 1-65535; default 360; needs graceful-restart yes *)
+             | "enhanced-refresh" yes-no ";"         (* default yes *)
+             | "refresh-stale-time" u16 ";"          (* 1-65535; default 360; not with enhanced-refresh no *)
+             | "role" role ";"                       (* default none; external sessions only *)
+             | "role-strict" yes-no ";"              (* default no; needs a role *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
 family       = "ipv4-unicast" | "ipv6-unicast" ;
+role         = "provider" | "rs" | "rs-client" | "customer" | "peer" ;
 ```
 
 Value syntax:
@@ -146,7 +184,8 @@ Match clauses: `prefix` and `prefix-list` compare the route's NLRI;
 `as-path` is a regular expression over AS numbers (below); the three
 community clauses hold when the route carries the value; `origin` compares
 the ORIGIN attribute; `neighbor` compares the peer the route was received
-from (import) or is being sent to (export).
+from (import) or is being sent to (export); `rpki` compares the route's
+origin validation state (below).
 
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
@@ -156,6 +195,51 @@ address on the session, see `extended-next-hop` below for IPv4 routes on an
 IPv6 session). `next-hop self` is therefore only meaningful in export
 policies towards internal peers. A policy cannot advertise a route to the
 peer it came from, nor an internal route to another internal peer.
+
+**Origin validation state in policy.** `match rpki STATE` holds when the
+route's RFC 6811 origin validation state is `valid`, `invalid`,
+`not-found` or `disabled`, the spelling `show routes` uses (RFC 6811 §3:
+"match and set the validation state of routes as part of its route policy
+filtering function"). `disabled` is not an RFC state: it is the state of a
+route nobody validated (`rpki` without a block, with `mode disabled`, or
+before a cache has sent its VRPs), kept apart from `not-found`, which
+means that no VRP covers the route (`docs/control.md`, "Validation
+state"). A policy that treats the two alike matches both, in two terms.
+In an import policy the state is the one the lookup gave the route; in an
+export policy, the one the route holds in the Loc-RIB. A policy can filter
+by the state or set a preference from it (RFC 6811 §5):
+
+```
+policy FROM-TRANSIT {
+    term bad       { match rpki invalid;   action reject; }
+    term good      { match rpki valid;     set local-pref 200; action accept; }
+    term unknown   { match rpki not-found; set local-pref 100; action accept; }
+}
+```
+
+`set rpki STATE` gives the route that state from there on: the terms
+after it match it, and an import policy that accepts the route leaves it
+with that state, in the decision process, in export policy, and in `show
+routes`. It is for a state that did not come from a lookup (RFC 6811
+§5: where a property that is not passed on to internal peers decides which
+route is chosen, "it could be necessary for routing correctness to
+propagate the validation state to the IBGP peer", by a community on the
+sending side that "the receiving side" matches before "setting the
+validation state"):
+
+```
+policy FROM-IBGP {
+    term said-invalid { match community 65000:666; set rpki invalid; action next; }
+    term said-valid   { match community 65000:200; set rpki valid;   action next; }
+    term rest         { action accept; }
+}
+```
+
+When the VRPs change, a route whose lookup changed runs through its import
+policy again from the route as received, so a state a policy set is set
+again or no longer set according to the new lookup. The state is local to
+the speaker: it is never sent, so what an export policy sets only matters
+to its own later terms.
 
 **AS-path regular expressions.** The pattern is matched against the
 route's `AS_PATH` as a sequence of AS numbers; every operator acts on
@@ -233,6 +317,59 @@ neighbor then restarts like after any other damped failure, so a peer
 that keeps sending too many routes is retried `restart-limit` times and
 then left Idle; `restart-limit 0` leaves it Idle at once.
 
+`add-path receive FAMILY yes` and `add-path send FAMILY N` or `all`
+advertise the ADD-PATH capability of RFC 7911 for the family and use it
+once the neighbor advertises the other half: bgpfcd sends the capability
+with Receive for a family it takes several paths for and with Send for
+one it sends several for, both in one capability. A family is exchanged
+with Path Identifiers in a direction only when the two sides agree
+(RFC 7911 §5): we receive them when we advertised Receive and the
+neighbor Send, and send them when we advertised Send and the neighbor
+Receive; otherwise the family is exchanged as without ADD-PATH in that
+direction. Neither is on unless configured, and a session without it
+costs nothing for it. The family must be one of the neighbor's
+`families`; `no` and `off` say nothing and may be left out. `N` is a
+number from 1 to 4294967295; `0` is refused, since sending no more than
+the one best path is what `off` is for: it advertises no Send for the
+family, where `1` still sends Path Identifiers to a neighbor that takes
+them.
+
+With `add-path receive`, each path the neighbor sends for a prefix is
+kept under the Path Identifier it came with, and every one of them takes
+part in the decision process (RFC 4271 §9.1) next to the paths of other
+neighbors; import policy runs on each, and `maximum-prefix` counts each.
+The kernel still gets the one best path per prefix. A withdrawal names a
+path, and one for a Path Identifier bgpfcd does not hold is ignored
+(RFC 7911 §5). Several paths from one neighbor to one prefix tie-break
+like paths from different neighbors, and then on the lowest Path
+Identifier, so the choice does not depend on arrival order.
+
+With `add-path send FAMILY N`, bgpfcd sends the neighbor the `N` best
+paths for each prefix, in the order of the decision process, among those
+its export policy accepts and that RFC 4271 §9.2 allows it to send to
+that neighbor (a path is never sent back to the neighbor it came from).
+`all` sends every such path. RFC 7911 §5 asks that the best path be
+among them unless it came from that neighbor, which both do: the best
+path that can be sent is always the first. A path keeps the Path
+Identifier bgpfcd gave it while it is sent, through changes to its
+attributes, and when it is withdrawn the withdrawal names that
+identifier; a path that drops out of the `N` best and comes back may be
+numbered anew. The identifiers are local to the neighbor and mean
+nothing: a new path takes the smallest number from 1 that no other path
+sent to the neighbor for that prefix has, counting those a withdrawal in
+the same step frees, so that an identifier is not reused while its
+withdrawal may still be on the way. The `advertisement-interval` paces
+all the paths of a prefix as one destination: when it holds a prefix
+back, the neighbor keeps what it was sent and gets the paths the prefix
+has when the interval ends. A path that is gone is withdrawn at once, as
+for any prefix; one that only dropped out of the `N` best is withdrawn
+with the announcements that displace it, so the neighbor keeps it until
+its replacement can go. `show routes` and the
+HTTP API show a path's identifier where it has one (`docs/control.md`).
+A reload that only changes `N`, or `N` to `all`, applies at once to the
+running session, without a reset, sending or withdrawing the paths the
+change adds or takes away.
+
 `restart-limit` bounds the automatic restarts after failures, as RFC 4486
 §4 asks. Some failures damp the restart (RFC 4271 §8.2.2): a NOTIFICATION
 we send for an error, an expired timer or a local stop such as an output
@@ -253,6 +390,158 @@ loses a collision (RFC 4271 §6.8), after which the session goes on with the
 other one; neither counts toward the limit or ends a run. `0` never
 restarts after a damped failure; `off` always does.
 
+**Graceful Restart.** `graceful-restart yes;` makes the neighbor take part
+in Graceful Restart (RFC 4724) with the Graceful Notification of RFC 8538:
+bgpfcd advertises the capability with the N bit, a Restart Time and a
+tuple for each of the neighbor's `families`, and follows the Receiving
+Speaker procedures for a neighbor that advertised it too. It is off by
+default, and a neighbor without it is treated as RFC 4271 has it: no
+capability, no End-of-RIB, and the routes of a session that ended are
+deleted. `restart-time` is the Restart Time advertised, the time in
+seconds the neighbor should allow our session to come back in after we
+restart (RFC 4724 §3): 0 to 4095, the most its twelve bits hold, 120 by
+default as BIRD and FRR have it. `stale-time` is how long the stale
+routes of a neighbor that restarted are kept once its session is back,
+waiting for its End-of-RIB (RFC 8538 §4.1): 1 to 65535 seconds, 360 by
+default as FRR has it (`bgp graceful-restart stalepath-time`). Both need
+`graceful-restart yes`; stating `graceful-restart no` is the default.
+
+As a Receiving Speaker bgpfcd keeps the routes of the neighbor as stale
+ones when its session ends by a TCP failure (RFC 4724 §4.2), by a Hold
+Timer or Send Hold Timer expiry (RFC 8538 §4; bgpfcd does so also when the
+neighbor sent no N bit, as the text reads), and, where both sides sent
+the N bit, after any NOTIFICATION but a Hard Reset (RFC 8538 §4). A stale
+route is in the RIB, the kernel and what other neighbors were told like any
+other. It is replaced when the neighbor sends the route again, and deleted
+when the neighbor's End-of-RIB for the family comes, when the neighbor's
+Restart Time from before has run out with the session still down, when the
+`stale-time` has run out with the session back but the End-of-RIB not
+there, and at once when the session comes back without the capability or
+without the Forwarding State bit for the family. The `stale-time` starts
+with the first session that is back, and a session that ends again does not
+start it afresh (RFC 8538 §9). Routes still stale when a session ends again
+are deleted, unless both sides sent the N bit (RFC 8538 §4.1). A neighbor
+that a reload removes loses its stale routes at once. `bgpfcctl show
+neighbor` and `show routes` show what is stale ([`docs/control.md`](control.md),
+"Graceful Restart"). With ADD-PATH each path is kept and replaced under its
+own Path Identifier, which need not be the same after the neighbor restarts
+(RFC 7911 §5).
+
+The End-of-RIB marker (RFC 4724 §2) follows the initial update of each
+family sent to a neighbor with `graceful-restart yes`; one received from
+any neighbor is recognised.
+
+As a Restarting Speaker bgpfcd acts in install mode only. At the start, the
+routes of the `fib` protocol number it finds in the kernel, for the families
+of the neighbors with `graceful-restart yes`, are the forwarding state that
+a restart kept (RFC 4724 §4.1), and are left where they are instead of being
+removed as stale. Until every such neighbor has sent its End-of-RIB for a
+family, or the longest `restart-time` among them has passed since the start
+(the Selection_Deferral_Timer, which `restart-time` also configures; FRR
+and BIRD have a setting of their own for it), bgpfcd selects no route of that
+family: it installs and advertises nothing for it, and the kernel's routes
+forward meanwhile. A neighbor whose capability has the Restart State bit is
+not waited for, nor is one that advertised no capability (RFC 4724 §4.1);
+FRR without zebra sets the bit for as long as its own startup lasts. Then
+the kernel is brought in line with the RIB for the family, which removes
+only the routes not learned again and replaces those with another next hop,
+and every neighbor is sent its table and the End-of-RIB marker. While route
+selection is deferred, and until it is done for every family, the OPENs set
+the Restart State bit. The Forwarding State bit of a family is set while the
+kernel holds routes of it in install mode, so never in dry-run mode, where
+nothing is installed; a neighbor that gets it clear from a restarted bgpfcd
+removes the routes it kept at once (RFC 4724 §4.2). A `SIGTERM` is an
+administrative shutdown, not a restart: bgpfcd sends the neighbors a Hard
+Reset, where they sent the N bit, and takes its routes out of the kernel.
+
+bgpfcd sends a Hard Reset (RFC 8538 §3), a Cease whose data is another
+NOTIFICATION, to a neighbor that sent the N bit when it shuts down, when a
+reload removes the neighbor, when the neighbor exceeds its `maximum-prefix`,
+and when `bgpfcctl clear neighbor ADDR hard-reset` asks for one; RFC 8538 §5.1
+suggests a Hard Reset for those reasons. Other Ceases, such as the Other
+Configuration Change of a reload that resets a session, and a plain `clear
+neighbor`, are graceful ones: both sides keep the other's routes as stale
+ones.
+
+**Enhanced Route Refresh.** `enhanced-refresh yes;`, the default, has bgpfcd
+advertise the Enhanced Route Refresh capability (RFC 7313 §3.1, code 70),
+as RFC 7313 §4 has a speaker that supports it do; `enhanced-refresh no;`
+turns it off. Its procedures apply to a session on which both sides
+advertised it, and the Route Refresh capability of RFC 2918 as well.
+
+When the neighbor asks for our routes with a ROUTE-REFRESH, or `bgpfcctl
+clear neighbor ADDR soft` has us send them again, bgpfcd sends a BoRR, the
+Adj-RIB-Out of the family, and an EoRR (§4). When the neighbor begins a
+refresh with a BoRR, whether in answer to the ROUTE-REFRESH that a `soft`
+reset or the reload of an import policy sends it, or on its own, bgpfcd
+marks the neighbor's routes of the family as stale. Each route the
+neighbor sends again replaces its stale one, and the routes still stale at
+its EoRR are removed (§4). They are routes the neighbor no longer
+advertises that it never withdrew, so a refresh also clears up a
+disagreement between the two Adj-RIBs. Until then they are in the RIB,
+the kernel and what other neighbors were told like any other route, as
+the stale routes of Graceful Restart are, and `bgpfcctl show routes`
+marks them. With ADD-PATH each path is replaced under its own Path
+Identifier, and those not sent again go.
+
+`refresh-stale-time` is how long the stale routes of a refresh wait for
+the EoRR: 1 to 65535 seconds, 360 by default as FRR has it (its `bgp
+graceful-restart stalepath-time` bounds the wait for an EoRR too; BIRD has
+no setting for it). Past it the routes still stale are removed without the
+EoRR (RFC 7313 §4 lets an implementation do that). It cannot be stated with
+`enhanced-refresh no`.
+
+A neighbor that did not advertise the capability gets RFC 2918's refresh,
+which replaces routes but removes none, and the Message Subtype of its
+ROUTE-REFRESH messages is ignored (RFC 2918 §3). So does one that advertised
+the capability while `enhanced-refresh no;` is set, or without the Route
+Refresh capability, though RFC 7313 §4 would have bgpfcd send it a BoRR and
+an EoRR: a neighbor that was told nothing of our capability reads a BoRR as a
+request and would send its table again, and RFC 2918 §4 allows a
+ROUTE-REFRESH only to a neighbor that advertised Route Refresh.
+COMPLIANCE.md lists these as deviations.
+
+A BoRR from a neighbor that advertised Graceful Restart, for a family whose
+End-of-RIB has not come, is ignored and logged (RFC 7313 §4); so is an EoRR
+with no BoRR before it, and a message of a Message Subtype other than 0, 1
+or 2 (§5). A BoRR or EoRR that is not four octets long is answered with a
+NOTIFICATION, ROUTE-REFRESH Message Error / Invalid Message Length,
+carrying the message, or as much of it as a NOTIFICATION can hold (§5).
+
+**BGP Roles.** `role customer;` says that our Role on the session is
+Customer: the neighbor is our transit provider (RFC 9234 §4). The names
+are those of RFC 9234 §4.1, and the Role is ours, the one the OPEN
+carries in the BGP Role capability, not the neighbor's. `provider` makes
+the neighbor our customer, `rs` and `rs-client` a route server and its
+client, `peer` a lateral peer. The neighbor must state the matching Role
+(Provider with Customer, RS with RS-Client, Peer with Peer, RFC 9234
+§4.2, Table 2); if it states another, or several that differ, the
+session is refused with OPEN Message Error / Role Mismatch (subcode 11).
+A neighbor that states none is accepted, with our Role, unless
+`role-strict yes;` asks for the receipt of its capability (RFC 9234 §4.2,
+"strict mode"), in which case the session is refused with Role Mismatch
+too. Strict mode is off by default, as RFC 9234 §8 asks, and needs a
+`role`.
+
+With a `role` the neighbor takes part in the Only to Customer procedures
+of RFC 9234 §5 (`docs/control.md`, "Only to Customer"): a route received
+with the OTC attribute from a customer or an RS-Client, or from a peer
+with an OTC other than the peer's AS, is a route leak and is dropped; a
+route received from a provider, a peer or an RS without the attribute
+gets it, set to the neighbor's AS; a route that carries the attribute is
+not sent to a provider, a peer or an RS; and a route sent to a customer,
+a peer or an RS-Client without it gets it, set to our AS. The procedures
+cannot be changed by policy. A neighbor without a `role` is not subject to
+them, and the attribute passes through it unchanged. With `add-path`, each
+path is a route of its own (RFC 7911 §5): a leak takes the one path the
+neighbor sent it under, by its Path Identifier, and leaves the others to
+the prefix, and each path sent goes through the procedures on its own, so
+a neighbor sent several may be sent some of a prefix's paths and not
+others. The procedures apply to IPv4 unicast and IPv6 unicast, the only
+families bgpfc speaks.
+Roles are for external sessions: a `role` on a neighbor whose `remote-as`
+is our own is an error (RFC 9234 §4).
+
 **RPKI.** The `rpki` block says where the Validated ROA Payloads (VRPs)
 come from that give every route its RFC 6811 origin validation state
 (`docs/control.md`, "Validation state"). Without the block, or with `mode
@@ -260,8 +549,9 @@ disabled`, there are none and every route is `disabled`. The block must
 state its `mode`; nothing else implies one. `mode external` takes the VRPs
 over the RPKI-to-Router protocol (RTR) from the caches listed with `cache`,
 of which there must be at least one; `mode disabled` keeps the cache list
-but uses none of it. The state is not yet acted on: it does not decide
-whether a route is accepted or which one is chosen.
+but uses none of it. `mode sidecar` has bgpfcd run Routinator itself and take
+the VRPs from it over RTR on the loopback ("The sidecar", below). What the
+speaker does with the state is the `invalid` statement, below.
 
 > **Keep the cache on the router or on a trusted network.** RTR runs over
 > plain TCP to port 323: nothing authenticates the cache to bgpfcd or
@@ -287,6 +577,72 @@ back (RFC 8210 §4). The VRPs from the last cache stay in use until another
 cache has sent a full set, which replaces them, or until they expire (RFC
 8210 §10, §6). A cache listed twice, by the same address or the same name
 in any case, and the same port, is an error.
+
+**Invalid routes (`invalid`).** The block states what the RIB does by
+itself with a route whose state is `invalid`, before and apart from the
+policies you wrote. It is required with `mode external` and `mode
+sidecar` and has no default: RFC 8481 §5 ("Set State, Don't Act") says that once routes are
+evaluated "the operator should be in complete control of any policy
+applied based on the evaluation state. Absent specific operator
+configuration, policy MUST NOT be applied", and RFC 6811 §2 that a route
+must not be excluded from consideration "as a side effect of its
+validation state, unless explicitly configured to do so", so a cache
+named in the file is not taken to say how to treat the routes it judges.
+Without the statement, an `external` or a `sidecar` block is an error that
+names the three choices; a validator that bgpfcd runs itself is no more
+the operator's word on what to do with its verdicts than a cache is. With `mode disabled` it is optional and defaults to
+`policy`, and one given there acts on the states import policy sets with
+`set rpki`, since no lookup gives any.
+
+| `invalid` | An Invalid route is | RFC |
+|---|---|---|
+| `drop` | no candidate for the decision process: not used, not installed, not passed on | 6811 §5: "rejecting all 'invalid' routes" |
+| `prefer-valid` | a candidate that loses to every route that is not Invalid, whatever the rest of the decision process says; used only where nothing else leads to the prefix | 6811 §5: "adjusting a route's degree of preference in the selection algorithm based on its validation state"; "a purely local policy matter and should be done with utmost care" |
+| `policy` | treated like any other route; only your policies act on the state | 8481 §5 |
+
+The action acts on the state a route holds after import policy (above), so
+a policy that gives a route another state with `set rpki` overrules the
+lookup either way: a route taken as `valid` is used under `drop`, and one
+taken as `invalid` is refused. An import policy still runs on an Invalid
+route, which is how `set rpki` reaches it:
+
+```
+policy FROM-CUSTOMER {
+    # Their ROA is wrong and they know: take their route as unvalidated.
+    term known-bad { match neighbor 192.0.2.77; match rpki invalid;
+                     set rpki not-found; action next; }
+    term rest      { action accept; }
+}
+```
+
+**What `drop` keeps.** A route `drop` refuses stays in the Adj-RIB-In as
+received, and counts towards `maximum-prefix`: whether a route is kept
+never depends on its state or on the action (RFC 6811 §2, §4). It is used
+at once, without an UPDATE from the neighbor or a ROUTE-REFRESH, when
+the VRPs change so that it is `valid` or `not-found` (RFC 6811 §4), when
+an import policy now gives it another state, or when a reload changes
+`invalid`; and it goes again, off the kernel's table and out of the
+neighbors' Adj-RIBs-Out, when the VRPs change the other way. `show routes
+PREFIX` lists the candidates, so it does not show a refused route; `show
+rpki validate PREFIX ASN` gives the state of any route.
+
+`prefer-valid` works within the decision process, ahead of the steps of
+RFC 4271 §9.1.2.2: the Invalid routes to a prefix are compared with one
+another by those steps, the MED step included, and the others likewise,
+and the best of the others wins; the best Invalid route wins only where
+there is no other. A `local-pref` an import policy sets cannot lift an
+Invalid route over another. With `add-path send N` the N best paths are
+taken in the same order, so an Invalid path is sent last. An Invalid route
+that is chosen is passed on like any other; keep it from a neighbor with
+`match rpki invalid; action reject;` in its export policy.
+
+No route is Invalid before a cache has sent its first full set, and with
+`mode disabled` (every route is `disabled`), nor once the VRPs have
+expired (RFC 8210 §6; every route is `not-found`). So `drop` and
+`prefer-valid` act on nothing in those times: the routes `drop` refused
+are used when validation is lost, and refused again when it returns. The
+router fails open, as a router without validation does, rather than
+refusing routes on the strength of data it no longer trusts.
 
 A cache that restarts usually starts a new session, with a new Session ID
 (RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
@@ -344,23 +700,116 @@ so that a validator that restarts is picked up within seconds (issue #57),
 and reaches 600 seconds by the eleventh failure in a row. `backoff 600
 600` keeps to the RFC's default.
 
+**The sidecar (`mode sidecar`).** Routinator is NLnet Labs' RPKI relying
+party: it fetches the RPKI repositories, validates them and serves the
+VRPs over RTR. With `mode sidecar` bgpfcd runs it as a child process,
+restarts it when it fails, and points its RTR client at it. Routinator is
+a separate program that you install: bgpfc neither bundles nor links it.
+The `routinator` block is required, and `cache` statements are an error:
+the one cache is the sidecar.
+
+```
+rpki {
+    mode sidecar;
+    invalid drop;                         # or prefer-valid, or policy
+    routinator {
+        binary /usr/bin/routinator;       # never looked up on PATH
+        repository-dir /var/lib/bgpfc/rpki;
+        rtr-listen 127.0.0.1:3323;        # loopback only; port 0 picks one
+    }
+}
+```
+
+`binary` and `repository-dir` are required, absolute paths. The binary is
+never searched for on `PATH`: a BGP daemon must not run whatever happens
+to be called `routinator`. Before it runs the binary bgpfcd asks it for
+`--version` (ten seconds at most), and refuses a Routinator of any release
+series but the one its command line was written for, 0.15; the daemon does
+not start, or a reload fails, with the reason. The check is made again before
+a restart whenever the file has been replaced, as by a package upgrade.
+`repository-dir` is Routinator's cache of RPKI data and must be writable by
+the user the daemon runs as; it is also the child's home directory, so that
+no file in the service user's own home can change the validator.
+
+The statements of the block:
+
+| Statement | Meaning |
+|---|---|
+| `rtr-listen ADDR:PORT` | where Routinator serves RTR, and where bgpfcd's RTR client connects. A loopback address only (`127.0.0.1:3323`, `[::1]:3323`): RTR is plain TCP, and RFC 8210 §9 allows that only between a cache and a router on a trusted, controlled network, which the host itself is. The default is `127.0.0.1` with a port bgpfcd picks when it starts the sidecar (port 0). The child runs without capabilities, so a port below 1024 works only where `net.ipv4.ip_unprivileged_port_start` allows it; Routinator otherwise fails at every start. Something else may take a picked port before Routinator binds it; the sidecar then fails and is reported, never silently. Name a port to avoid the race |
+| `rir-tals yes\|no` | use the TALs of the five Regional Internet Registries that Routinator bundles; default `yes`. ARIN's is among them only with `accept-arin-rpa yes` |
+| `tal NAME` | a further bundled TAL by name (`apnic-testbed`, `arin-ote`, `ripe-pilot`, `nlnetlabs-testbed`); with `rir-tals no`, RIR names select some of them. Repeatable |
+| `tal-dir PATH` | a directory of `*.tal` files (RFC 8630) used as well. bgpfcd does not read it, so what is in it, ARIN's TAL included, is up to you |
+| `accept-arin-rpa yes\|no` | that you accept ARIN's Relying Party Agreement, the terms under which ARIN publishes its TAL; default `no`. Routinator itself needs no opt-in any more, but accepting an agreement is the operator's decision, so without it the ARIN TAL is left out and routes in ARIN's address space are `not-found` |
+| `refresh SECONDS` | between Routinator's validation runs, and the Refresh Interval it announces (RFC 8210 §6); 1 to 7199, default 600. RFC 8210 §6 requires the Expire Interval to be larger than the Refresh Interval, and Routinator's is 7200 |
+| `config-file PATH` | a Routinator configuration file for what bgpfcd does not model. Trusted: bgpfcd does not read it, and what it sets applies except what the command line replaces (`repository-dir`, the RTR listener, the refresh interval, the TALs when any are named). It must not set `rtr-tls-listen`, `systemd-listen`, `user` or `group`, nor TALs the settings above do not show |
+| `global-arg ARG`, `server-arg ARG` | options passed to Routinator verbatim, before and after its `server` command (`global-arg "--strict";`). Repeatable. The ones bgpfcd sets itself or that would defeat supervision or the loopback rule are refused, with the reason |
+| `restart-backoff INITIAL CAP` | seconds before the first restart of a Routinator that failed, doubling with each failure in a row up to CAP, and then up to half as long again, so that validators that failed together do not return together. Each is 1 to 3600, CAP no lower than INITIAL; default `1 300` |
+| `stable-after SECONDS` | how long Routinator must stay up for its next failure to count as the first of a series again; 1 to 86400, default 300 |
+| `stop-timeout SECONDS` | how long Routinator has to stop after `SIGTERM` before it gets `SIGKILL`; 1 to 3600, default 10 |
+| `failure-threshold N` | failures in a row that raise the `failed` state, an alarm that stays while the restarts keep failing (`show rpki`); at least 1, default 5 |
+
+What bgpfcd runs is `routinator --config=FILE --repository-dir=DIR
+--no-rir-tals --tal=NAME... --extra-tals-dir=DIR GLOBAL-ARGS server
+--rtr=ADDR:PORT --refresh=N SERVER-ARGS`, the TALs spelled out so that
+the settings above are the whole trust anchor set. The child gets no
+standard input, a process group of its own, no descriptor of bgpfcd's and no
+capabilities, and an environment of `HOME` (the repository directory) and
+`PATH` alone. Its output is logged line by line as `sidecar=routinator`
+lines, standard output at info and standard error at warn. Start the
+daemon as an unprivileged user, as `contrib/bgpfcd.service` does, or give
+`--user`: bgpfcd drops root before it starts the sidecar, and a child of
+root would have every capability.
+
+The rest follows from Routinator's own startup. It opens its RTR listener
+only after its first validation run, which takes minutes on an empty
+repository, so for that time bgpfcd's connection attempts are refused and
+every route is `disabled`; `show rpki` shows the sidecar `running` and the
+client's failures. The default `backoff` of a sidecar is `1 30` instead of
+`1 600`: the cache is a process on this host that is not up yet, not a
+remote one to leave alone, and a loopback attempt costs nothing. When
+Routinator exits, bgpfcd restarts it, and the RTR client reconnects to
+the same address; the VRPs stay in use until they expire as with any cache
+that goes away (RFC 8210 §6). The sidecar's state is in `show rpki` and
+`GET /v1/rpki` (`docs/control.md`, "RPKI"). The child dies with the daemon:
+a daemon that is killed or crashes takes it down with `SIGKILL`, and a
+`SIGTERM` or `SIGINT` to bgpfcd stops it with `SIGTERM` and then, after
+`stop-timeout`, `SIGKILL`, while the sessions are closing. Under systemd
+that needs `KillMode=mixed`, as `contrib/bgpfcd.service` has it: the default
+signals every process of the service at once, and a child that exits before
+bgpfcd has asked it to looks like a crash.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
-`ipv4-unicast` in `families`; `maximum-prefix` only for a family in
-`families`; an `rpki` block has a `mode`, at least one `cache` with `mode
-external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
+family in `families`; a `role` only on an external session, and
+`role-strict yes` only with a `role`; `restart-time` and `stale-time` only
+with `graceful-restart yes`; `refresh-stale-time` not with `enhanced-refresh
+no`; an `rpki` block has a `mode`, at least one `cache` with `mode
+external`, a `routinator` block and no `cache` with `mode sidecar` (and no
+`routinator` block with `mode external`), an `invalid` statement with
+either, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
-its MIN.
+its MIN; a `routinator` block has a `binary` and a `repository-dir`, every
+path absolute, `rtr-listen` a loopback address, every number in its range
+and no `tal` twice. `mode disabled` keeps a `cache` list and a `routinator`
+block without using them. `bgpfcd --check` also judges what the block alone
+can show and the parser cannot: a `tal` name Routinator does not bundle,
+the ARIN TAL without `accept-arin-rpa yes`, a `global-arg` or
+`server-arg` that bgpfcd reserves. It does not run the binary.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
 Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
-`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
+`advertisement-interval` and `maximum-prefix`, and the number of paths
+`add-path send` sends; `restart-limit`, `role`, `role-strict`,
+`graceful-restart`, `restart-time`, `stale-time`, `enhanced-refresh` and
+`refresh-stale-time` included, and so are the families `add-path` is on for,
+since the capability is in the OPEN)
 reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
@@ -371,7 +820,20 @@ had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 `local-as` resets every session.
 
-A changed `rpki` block restarts the RTR client with the new settings. The
+A changed `invalid` applies at once to the running RIB, which judges
+again every route it holds that is Invalid and sends the difference (route
+changes to the kernel and UPDATEs to neighbors, paced as any are): no
+session resets, no ROUTE-REFRESH is needed, and the RTR client is left
+alone. A changed `rpki` block otherwise restarts the RTR client with the
+new settings. A changed `routinator` block under `mode sidecar`, or a
+change to or from that mode, stops the sidecar and starts another, which
+the client then connects to; the new binary is checked (`--version`) and the
+new settings validated before the old sidecar is touched, so a typo fails
+the reload and leaves the running configuration and the running sidecar as
+they were. The reload waits for the old child to stop (`stop-timeout`) and
+for the check. A change to the client's own settings (`version`, the
+timeouts, `backoff`, `max-expire`, `max-vrps`) leaves a running sidecar
+alone. The
 VRPs the old client had stay in use until a cache of the new list has sent
 a full set, which then validates again only the routes it judges
 differently, or until they expire (RFC 8210 §10, §6). A change to `mode
@@ -390,7 +852,8 @@ bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
 
 `--check` parses and validates the file (policies included), prints any
 errors, and exits with status 0 or 1 without starting anything; it does not
-look up the names of `rpki` caches.
+look up the names of `rpki` caches, and does not run the Routinator binary
+of a sidecar.
 `--log-level` and `--fib` override the corresponding settings in the file
 for this run. `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user
@@ -399,4 +862,5 @@ the netlink socket are opened first, then the process drops to that user
 for `fib { mode install; }`; the daemon checks and names what is missing.
 
 `SIGTERM` and `SIGINT` shut the daemon down: every session gets a Cease
-(Administrative Shutdown) and every route it installed is removed.
+(Administrative Shutdown), every route it installed is removed, and a
+Routinator sidecar is stopped.

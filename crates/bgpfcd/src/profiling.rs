@@ -271,7 +271,15 @@ impl Loads {
                 end_of_rib: end_of_rib(update),
                 decoded: *started,
             },
-            RibMsg::PeerDown { peer } => What::PeerDown(*peer),
+            // The marker that ends a table load reaches the RIB thread as a
+            // message of its own (RFC 4724 §2), and counts as the UPDATE it
+            // is on the wire.
+            RibMsg::EndOfRib { peer, family } => What::Update {
+                peer: *peer,
+                end_of_rib: Some(*family),
+                decoded: None,
+            },
+            RibMsg::PeerDown { peer, .. } => What::PeerDown(*peer),
             _ => What::Other,
         };
         Seen {

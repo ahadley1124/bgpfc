@@ -11,7 +11,13 @@
 //! §4.2, §6; RFC 9072 §2, §3; RFC 7607 §2; RFC 6286 §2.1; RFC 4486 §3,
 //! §4; RFC 6608 §3, §4; RFC 9003 §2, §4; RFC 7606 §3–§5, §7; RFC 2545 §3;
 //! RFC 8950 §3, §4; RFC 1997; RFC 4360 §2, §3; RFC 8092 §3, §6; RFC 9774
-//! §3.
+//! §3; RFC 7911 §2–§5 (the ADD-PATH capability, the Path Identifier and its
+//! place in the NLRI of every field and attribute that carries any); RFC
+//! 9234 §4, §5 (the Role capability and the OTC attribute); RFC 4724 §3
+//! and RFC 8538 §2 (the Graceful Restart capability), RFC 4724 §2 (the
+//! End-of-RIB marker); RFC 8538 §3, §5.2 (the Hard Reset subcode); RFC
+//! 7313 §3, §5 (the Enhanced Route Refresh capability, the ROUTE-REFRESH
+//! subtypes and the ROUTE-REFRESH Message Error).
 //!
 //! With the `profiling` feature, UPDATE and attribute decoding are timed
 //! into `bgpfc-prof` histograms (`docs/PROFILING.md`); the clock is only
@@ -30,13 +36,16 @@ pub mod notification;
 pub mod open;
 pub mod prefix;
 pub mod reader;
+pub mod role;
 pub mod route_refresh;
 pub mod types;
 pub mod update;
 
 pub use as_path::{AsPath, AsPathSegment, Segment, SegmentType};
 pub use attribute::{Aggregator, Origin, PathAttribute};
-pub use capability::{Capability, NextHopEncoding};
+pub use capability::{
+    AddPathMode, AddPathTuple, Capability, GracefulRestart, GracefulRestartFamily, NextHopEncoding,
+};
 pub use community::{Community, ExtendedCommunity, LargeCommunity};
 pub use error::{
     CeaseSubcode, DecodeError, EncodeError, ErrorCode, FsmSubcode, HeaderSubcode, OpenSubcode,
@@ -48,9 +57,10 @@ pub use mp::{MpReach, MpUnreach, NextHop};
 pub use notification::{NotificationMessage, ShutdownCommunicationError};
 pub use open::OpenMessage;
 pub use prefix::Prefix;
+pub use role::{LocalRole, Role};
 pub use route_refresh::RouteRefreshMessage;
-pub use types::{AddressFamily, Afi, Asn, HoldTime, RouterId, Safi};
+pub use types::{AddressFamily, Afi, Asn, HoldTime, PathId, RestartTime, RouterId, Safi};
 pub use update::{
-    DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason, DiscardedAttribute, EncodeContext,
-    PeerKind, UpdateError, UpdateMessage,
+    AddPathFamilies, DecodeContext, DecodedUpdate, DisabledFamily, DiscardReason,
+    DiscardedAttribute, EncodeContext, PathIds, PeerKind, UpdateError, UpdateMessage,
 };

@@ -2,23 +2,36 @@
 //! peer and from two that send the same table, as a multi-homed network
 //! has it, churn
 //! under the RFC 4271 §9.2.1.1 advertisement interval, and validating
-//! routes again when the validation source changes (RFC 6811 §4). The
+//! routes again when the validation source changes (RFC 6811 §4), and the
+//! Only to Customer procedures of sessions with BGP Roles (RFC 9234 §5). The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
+//! The `add_path` group is the cost of RFC 7911: three paths to every
+//! prefix from one peer, and the same sent to a peer that takes them. The
+//! `restart` group is the cost of RFC 4724 §4.2: a session that ends with
+//! its table kept as stale routes, the table sent again, and the sweep at
+//! the End-of-RIB marker. The `refresh` group is the cost of RFC 7313 §4,
+//! the same three steps for a route refresh of a session that stays up,
+//! and the table sent to a peer that takes the brackets.
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PeerInfo, Rib};
-use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
+use bgpfc_rib::{
+    EnhancedRefresh, Output, PathLimit, PeerInfo, PeerRestart, Restart, Retention, Rib,
+};
+use bgpfc_rpki::{
+    AffectedPrefixes, InvalidAction, ValidationChange, ValidationSource, Vrp, VrpSet,
+};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
-use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
+use bgpfc_wire::role::Role;
+use bgpfc_wire::types::{AddressFamily, Asn, PathId, RouterId};
+use bgpfc_wire::update::{DecodedUpdate, PathIds, PeerKind, UpdateMessage};
 use criterion::Criterion;
 
 /// Run one RIB input and collect what it produced.
@@ -59,6 +72,11 @@ fn peer(i: u8) -> PeerInfo {
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
+        add_path_receive: Vec::new(),
+        add_path_send: Vec::new(),
+        role: None,
+        restart: None,
+        enhanced_refresh: None,
     }
 }
 
@@ -67,6 +85,7 @@ fn paced_peer(i: u8) -> PeerInfo {
     PeerInfo {
         advertisement_interval: Duration::from_secs(30),
         prefix_limits: Vec::new(),
+        role: None,
         ..peer(i)
     }
 }
@@ -233,7 +252,257 @@ fn bench(c: &mut Criterion) {
         );
     });
     group.finish();
+    roles(c, routes, &v4, &v6);
     revalidation(c, routes, &v4, &v6);
+    enforcement(c, routes, &v4, &v6);
+    add_path_receive(c, routes);
+    add_path_send(c, routes);
+    restart(c, routes, &v4, &v6);
+    refresh(c, routes, &v4, &v6);
+}
+
+/// A peer that advertised Graceful Restart for both families, with the
+/// Forwarding State bit.
+fn gr_peer(i: u8) -> PeerInfo {
+    PeerInfo {
+        restart: Some(Restart {
+            peer: Some(PeerRestart {
+                restarting: false,
+                families: vec![
+                    (AddressFamily::IPV4_UNICAST, true),
+                    (AddressFamily::IPV6_UNICAST, true),
+                ],
+            }),
+            stale_time: Duration::from_secs(360),
+        }),
+        ..peer(i)
+    }
+}
+
+/// RFC 4724 §4.2 at scale, against `insert_*_from_one_peer_to_one_peer`
+/// (the table sent again where the routes are not there) and
+/// `withdraw_*_on_peer_down` (the routes deleted): keeping the table as
+/// stale routes when the session ends, replacing each stale route as the
+/// peer sends it again, and removing what is left at its End-of-RIB.
+fn restart(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let mut group = c.benchmark_group("restart");
+    group.sample_size(10);
+    let retention = Retention {
+        families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+        restart_time: Duration::from_secs(120),
+        notification: false,
+    };
+    let loaded = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(gr_peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        (rib, now)
+    };
+    let retained = || {
+        let (mut rib, now) = loaded();
+        outputs(|o| {
+            rib.peer_retain(peer(1).addr, &retention, now, o);
+        });
+        (rib, now)
+    };
+    group.bench_function(format!("keep_{routes}_as_stale_on_session_end"), |b| {
+        b.iter_batched(
+            loaded,
+            |(mut rib, now)| {
+                black_box(outputs(|o| {
+                    rib.peer_retain(peer(1).addr, &retention, now, o);
+                }));
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("send_{routes}_again_over_stale_routes"), |b| {
+        b.iter_batched(
+            retained,
+            |(mut rib, now)| {
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(gr_peer(1), now, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("remove_{routes}_stale_at_end_of_rib"), |b| {
+        b.iter_batched(
+            || {
+                let (mut rib, now) = retained();
+                outputs(|o| rib.peer_up(gr_peer(1), now, o));
+                (rib, now)
+            },
+            |(mut rib, now)| {
+                for family in [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST] {
+                    black_box(outputs(|o| rib.end_of_rib(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+/// A peer that negotiated Enhanced Route Refresh.
+fn refresh_peer(i: u8) -> PeerInfo {
+    PeerInfo {
+        enhanced_refresh: Some(EnhancedRefresh {
+            stale_time: Duration::from_secs(360),
+            peer_graceful_restart: false,
+        }),
+        ..peer(i)
+    }
+}
+
+/// RFC 7313 §4 at scale, against the `restart` group (the same steps for a
+/// session that ended): the peer's `BoRR` marking its table as stale, the
+/// table sent again over the stale routes, its `EoRR` removing what is
+/// left (everything, and nothing); and our table sent to a peer with the
+/// capability, against a peer without it, where only two small messages
+/// differ.
+fn refresh(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let (v4_family, v6_family) = (AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST);
+    let mut group = c.benchmark_group("refresh");
+    group.sample_size(10);
+    let loaded = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(refresh_peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        (rib, now)
+    };
+    let begun = || {
+        let (mut rib, now) = loaded();
+        for family in [v4_family, v6_family] {
+            outputs(|o| {
+                rib.refresh_begin(peer(1).addr, family, now, o);
+            });
+        }
+        (rib, now)
+    };
+    group.bench_function(format!("mark_{routes}_as_stale_at_borr"), |b| {
+        b.iter_batched(
+            loaded,
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| {
+                        rib.refresh_begin(peer(1).addr, family, now, o);
+                    }));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("send_{routes}_again_over_stale_routes"), |b| {
+        b.iter_batched(
+            begun,
+            |(mut rib, now)| {
+                let mut out = Vec::new();
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("remove_{routes}_stale_at_eorr"), |b| {
+        b.iter_batched(
+            begun,
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| rib.refresh_end(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("end_with_none_of_{routes}_stale_at_eorr"), |b| {
+        b.iter_batched(
+            || {
+                let (mut rib, now) = begun();
+                let mut out = Vec::new();
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                (rib, now)
+            },
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| rib.refresh_end(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    // Our side: a refresh to a peer that asked for it, with the brackets
+    // and without.
+    for (label, to) in [("with", refresh_peer(3)), ("without", peer(3))] {
+        group.bench_function(
+            format!("send_{routes}_to_a_peer_{label}_the_brackets"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let (mut rib, now) = loaded();
+                        outputs(|o| rib.peer_up(to.clone(), now, o));
+                        (rib, now)
+                    },
+                    |(mut rib, now)| {
+                        for family in [v4_family, v6_family] {
+                            black_box(outputs(|o| rib.refresh(peer(3).addr, family, now, o)));
+                        }
+                        rib
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// RFC 9234 §5 at scale, against the first case above, which is the same
+/// load with no Roles: a table from a provider (ours Customer: every
+/// attribute set gains the attribute on the way in) sent to a customer
+/// (ours Provider: it goes out as it is), and one from a customer sent to a
+/// peer (ours Peer: every set gains ours on the way out).
+fn roles(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let with = |i: u8, role: Role| PeerInfo {
+        role: Some(role),
+        ..peer(i)
+    };
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    for (name, from, to) in [
+        (
+            "from_a_provider_to_a_customer",
+            Role::Customer,
+            Role::Provider,
+        ),
+        ("from_a_customer_to_a_peer", Role::Provider, Role::Peer),
+    ] {
+        group.bench_function(format!("insert_{routes}_{name}"), |b| {
+            b.iter(|| {
+                let now = Instant::now();
+                let mut rib = Rib::new(Asn(65_000));
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(with(1, from), now, o));
+                outputs(|o| rib.peer_up(with(2, to), now, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            });
+        });
+    }
+    group.finish();
 }
 
 /// RFC 6811 §4 at scale. Every route of a table from one peer, exported to
@@ -310,6 +579,233 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
             black_box(outputs(|o| rib.validation_changed(change, now, o)))
         });
     });
+    group.finish();
+}
+
+/// What the RIB does with Invalid routes by itself (RFC 6811 §5), against a
+/// table that two peers send, so that every destination is decided between
+/// two routes, one in twenty of them Invalid: loading it under each
+/// [`InvalidAction`], and switching the action on a loaded RIB, which
+/// decides again every destination with an Invalid route.
+fn enforcement(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let prefixes: Vec<Prefix> = v4
+        .iter()
+        .chain(v6)
+        .flat_map(|u| {
+            let m = &u.message;
+            m.nlri
+                .iter()
+                .chain(m.mp_reach.iter().flat_map(|r| &r.nlri))
+                .copied()
+        })
+        .collect();
+    // The routes originate in AS 7; every twentieth prefix has a VRP for
+    // AS 8 instead, which makes its routes Invalid.
+    let vrps: VrpSet = prefixes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Vrp::new(*p, p.prefix_len(), Asn(if i % 20 == 0 { 8 } else { 7 })).unwrap())
+        .collect();
+    let source: Arc<dyn ValidationSource> = Arc::new(vrps);
+    let on = || ValidationChange {
+        source: Arc::clone(&source),
+        affected: AffectedPrefixes::All,
+    };
+    let v4_other = updates(routes * 4 / 5, false, 65_003, 7);
+    let v6_other = updates(routes / 5, true, 65_003, 7);
+    let load = |action: InvalidAction| {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        rib.set_invalid_action(action, now, &mut out);
+        outputs(|o| rib.peer_up(peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        outputs(|o| rib.peer_up(peer(3), now, o));
+        outputs(|o| rib.validation_changed(on(), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        feed(
+            &mut rib,
+            peer(3).addr,
+            v4_other.iter().chain(&v6_other),
+            now,
+            &mut out,
+        );
+        (rib, now)
+    };
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    for action in InvalidAction::ALL {
+        group.bench_function(
+            format!("insert_{routes}_from_two_peers_validated_{action}"),
+            |b| b.iter(|| load(action)),
+        );
+    }
+    // Preferring the Valid decides each destination with an Invalid route
+    // again; dropping also moves those routes between the candidates and
+    // the held routes.
+    for to in [InvalidAction::PreferValid, InvalidAction::Drop] {
+        let (mut rib, now) = load(InvalidAction::Policy);
+        let mut flip = false;
+        group.bench_function(
+            format!(
+                "switch_the_action_to_{to}_and_back_with_{}_invalid_of_{routes}",
+                prefixes.len() / 20
+            ),
+            |b| {
+                b.iter(|| {
+                    flip = !flip;
+                    let action = if flip { to } else { InvalidAction::Policy };
+                    black_box(outputs(|o| {
+                        black_box(rib.set_invalid_action(action, now, o));
+                    }))
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// `updates` as a peer sends them with ADD-PATH: every prefix with Path
+/// Identifier `id`.
+fn with_path_id(updates: &[DecodedUpdate], id: u32) -> Vec<DecodedUpdate> {
+    updates
+        .iter()
+        .map(|u| {
+            let m = &u.message;
+            let ids = PathIds {
+                nlri: vec![PathId(id); m.nlri.len()],
+                mp_reach: vec![PathId(id); m.mp_reach.as_ref().map_or(0, |r| r.nlri.len())],
+                ..PathIds::default()
+            };
+            let mut u = u.clone();
+            u.message.path_ids = Some(Box::new(ids));
+            u
+        })
+        .collect()
+}
+
+/// A peer that sends three paths of each prefix (`receive`), or is sent up
+/// to `limit` of them.
+fn path_peer(i: u8, receive: bool, limit: Option<PathLimit>) -> PeerInfo {
+    let families = [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST];
+    PeerInfo {
+        add_path_receive: if receive {
+            families.to_vec()
+        } else {
+            Vec::new()
+        },
+        add_path_send: limit.map_or(Vec::new(), |l| families.map(|f| (f, l)).to_vec()),
+        ..peer(i)
+    }
+}
+
+/// Three plain peers' tables, each with its own origin: three paths to
+/// every prefix, as three upstreams would send them.
+fn plain_tables(routes: u32) -> Vec<Vec<DecodedUpdate>> {
+    [(65_001u32, 7), (65_003, 8), (65_004, 9)]
+        .iter()
+        .map(|(asn, origin)| {
+            let mut u = updates(routes * 4 / 5, false, *asn, *origin);
+            u.extend(updates(routes / 5, true, *asn, *origin));
+            u
+        })
+        .collect()
+}
+
+/// A RIB that has the three tables of `plain` from peers 1, 3 and 4.
+fn with_three_tables(plain: &[Vec<DecodedUpdate>]) -> (Rib, Instant) {
+    let now = Instant::now();
+    let mut rib = Rib::new(Asn(65_000));
+    let mut out = Vec::new();
+    for (i, t) in [1u8, 3, 4].iter().zip(plain) {
+        outputs(|o| rib.peer_up(peer(*i), now, o));
+        feed(&mut rib, peer(*i).addr, t, now, &mut out);
+    }
+    (rib, now)
+}
+
+/// RFC 7911 at scale: what holding three paths to every prefix costs next
+/// to holding one (`insert_*_from_one_peer_to_one_peer` above).
+fn add_path_receive(c: &mut Criterion, routes: u32) {
+    let mut group = c.benchmark_group("add_path");
+    group.sample_size(10);
+    let tables: Vec<Vec<DecodedUpdate>> = plain_tables(routes)
+        .iter()
+        .zip(1u32..)
+        .map(|(t, id)| with_path_id(t, id))
+        .collect();
+    let load = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(path_peer(1, true, None), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        for t in &tables {
+            feed(&mut rib, peer(1).addr, t, now, &mut out);
+        }
+        rib
+    };
+    group.bench_function(format!("receive_{routes}_prefixes_3_paths_each"), |b| {
+        b.iter(load);
+    });
+    group.bench_function(
+        format!("withdraw_{routes}_prefixes_3_paths_each_on_peer_down"),
+        |b| {
+            b.iter_batched(
+                load,
+                |mut rib| black_box(outputs(|o| rib.peer_down(peer(1).addr, Instant::now(), o))),
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
+/// What sending paths costs: the whole table to a peer that comes up, and
+/// a round of changes to one of the paths of every prefix, to a peer sent
+/// all the paths and to one sent the two best.
+fn add_path_send(c: &mut Criterion, routes: u32) {
+    let mut group = c.benchmark_group("add_path");
+    group.sample_size(10);
+    let plain = plain_tables(routes);
+    let changed: Vec<DecodedUpdate> = {
+        let mut u = updates(routes * 4 / 5, false, 65_003, 10);
+        u.extend(updates(routes / 5, true, 65_003, 10));
+        u
+    };
+    for (name, limit) in [("all", PathLimit::All), ("best_2", PathLimit::Best(2))] {
+        group.bench_function(
+            format!("send_{name}_of_3_paths_of_{routes}_prefixes_to_a_new_peer"),
+            |b| {
+                b.iter_batched(
+                    || with_three_tables(&plain),
+                    |(mut rib, now)| {
+                        let sender = path_peer(5, false, Some(limit));
+                        black_box(outputs(|o| rib.peer_up(sender, now, o)))
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_function(
+            format!("change_one_of_3_paths_of_{routes}_prefixes_sent_{name}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let (mut rib, now) = with_three_tables(&plain);
+                        outputs(|o| rib.peer_up(path_peer(5, false, Some(limit)), now, o));
+                        (rib, now)
+                    },
+                    |(mut rib, now)| {
+                        let mut out = Vec::new();
+                        feed(&mut rib, peer(3).addr, &changed, now, &mut out);
+                        rib
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
     group.finish();
 }
 
