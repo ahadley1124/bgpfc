@@ -482,8 +482,8 @@ impl Coordinator<'_> {
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown), remove our routes from the kernel, then stop the RTR
-    /// client and, after it, Routinator.
+    /// Shutdown), stop the RTR client and, after it, Routinator, and remove
+    /// our routes from the kernel while Routinator stops.
     fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
@@ -492,6 +492,13 @@ impl Coordinator<'_> {
                     .try_send(PeerInput::Stop(CeaseSubcode::AdministrativeShutdown));
             }
         }
+        // Issue #70: from here on no Routinator is started again, also one
+        // that exits meanwhile. Neither the Ceases nor the FIB cleanup need
+        // the block. The client stops now, which may first hand the RIB
+        // thread a change (see `rpki`), so that it neither warns about the
+        // cache it loses nor changes routes for a FIB that is going;
+        // Routinator stops meanwhile, which may take `stop-timeout`.
+        let rpki = self.rpki.begin_stop();
         // Give the peer threads a moment to write their NOTIFICATIONs.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let (done_tx, done_rx) = sync_channel(1);
@@ -501,10 +508,8 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
-        // Last: neither the Ceases nor the FIB cleanup need it, and it may
-        // first have to hand the RIB thread a change (see `rpki`). The
-        // client stops before Routinator, which may take `stop-timeout`.
-        self.rpki.stop();
+        // Routinator is gone before bgpfcd says it stopped.
+        rpki.finish();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));
         bgpfc_log::info!("bgpfcd stopped");

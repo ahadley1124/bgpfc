@@ -384,9 +384,11 @@ start rpki` naming both versions.
 - **systemd**: `contrib/bgpfcd.service` has `KillMode=mixed`, so that
   `systemctl stop` signals bgpfcd alone, which stops its RTR client and
   then Routinator itself; with the default mode systemd would signal
-  Routinator at the same moment, and bgpfcd could take that for a crash.
-  `TimeoutStopSec=40` covers the FIB cleanup, Routinator's `stop-timeout`
-  and a version check that may be running.
+  Routinator at the same moment, before the client lets go of it, and
+  bgpfcd would log a failure it did not cause (it starts no Routinator
+  again once it is stopping). `TimeoutStopSec=40` covers Routinator's
+  `stop-timeout` and a version check that may be running, during the FIB
+  cleanup.
 - **Logs.** Routinator's standard error, where it writes its messages, is
   logged at warn in bgpfcd's log, each line with `sidecar=routinator
   stream=stderr`; its standard output at info.

@@ -597,9 +597,12 @@ rpki` with the reason and exits with status 1 (issue #60: fail loudly and
 early).
 Routinator's standard output is logged at info and its standard error,
 where it writes its warnings, at warn, each line with
-`sidecar=routinator`. When bgpfcd stops, it stops its RTR client, then
-Routinator: `SIGTERM`, and `SIGKILL` after `stop-timeout`. If bgpfcd dies
-without stopping it, the kernel kills Routinator too (`PR_SET_PDEATHSIG`).
+`sidecar=routinator`. When bgpfcd stops, right after the Ceases, it
+stops its RTR client, then Routinator: `SIGTERM`, and `SIGKILL` after
+`stop-timeout`, while it removes its routes from the kernel. From then on
+it starts no Routinator again, even one that exits meanwhile (issue #70).
+If bgpfcd dies without stopping it, the kernel kills Routinator too
+(`PR_SET_PDEATHSIG`).
 Nothing else in bgpfcd reaps child processes, which is what lets the
 sidecar keep track of its own.
 

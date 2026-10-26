@@ -21,15 +21,15 @@ ExecStart=/usr/local/bin/bgpfcd -c /etc/bgpfc/bgpfc.conf
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 # bgpfcd stops Routinator itself: SIGTERM goes to bgpfcd alone, which
-# shuts down in order (Cease, FIB cleanup, RTR client, then Routinator
-# with SIGTERM and, after its stop-timeout, SIGKILL). systemd's SIGKILL
-# reaches whatever is left in the cgroup only after bgpfcd has exited.
-# With the default KillMode=control-group, Routinator would get SIGTERM
-# at the same moment as bgpfcd, and its supervisor, seeing an exit it did
-# not ask for, could start it again before the shutdown reached it.
+# shuts down in order (Cease, RTR client, then Routinator with SIGTERM
+# and, after its stop-timeout, SIGKILL, while the FIB is cleaned up).
+# systemd's SIGKILL reaches whatever is left in the cgroup only after
+# bgpfcd has exited. With the default KillMode=control-group, Routinator
+# would get SIGTERM at the same moment as bgpfcd, before the RTR client
+# lets go of it, and bgpfcd would log an exit it did not ask for.
 KillMode=mixed
-# FIB cleanup (up to 10 s), the sidecar's stop-timeout (10 s by default)
-# and a Routinator version check that may be running (up to 10 s).
+# Routinator's stop, during the FIB cleanup (up to 10 s): its stop-timeout
+# (10 s by default) and a version check that may be running (up to 10 s).
 TimeoutStopSec=40
 # Also retries a start that fails, such as one with a Routinator of
 # another release, every 5 s, with the reason in the journal.

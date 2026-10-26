@@ -48,11 +48,14 @@
 //! answer holds up neither. The thread may still be waiting for room on
 //! the RIB channel; the RIB thread makes that room, as it runs until the
 //! process exits, and waits for nothing that waits for the client. At
-//! shutdown the coordinator stops the block last, after the Ceases and
-//! the FIB cleanup, which do not need it: the client first, so that it
-//! neither warns about the cache it loses nor publishes to a RIB whose FIB
-//! is gone, then Routinator (`SIGTERM`, `SIGKILL` after `stop-timeout`;
-//! the supervisor restarts nothing during a requested stop, issue #70).
+//! shutdown the coordinator stops the block right after the Ceases, since
+//! neither they nor the FIB cleanup need it ([`Rpki::begin_stop`]): the
+//! client first, so that it neither warns about the cache it loses nor
+//! publishes to a RIB whose FIB is going, then Routinator (`SIGTERM`,
+//! `SIGKILL` after `stop-timeout`) on a thread of its own while the FIB is
+//! cleaned up. The supervisor restarts nothing once it is asked to stop,
+//! so from the start of the shutdown on no Routinator is started again
+//! (issue #70), even one that exits meanwhile.
 //!
 //! The client and the sidecar log through `bgpfc_log`, so the daemon's
 //! `log { level }` applies to them: a lost cache is a warning, its return
@@ -75,6 +78,7 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use bgpfc_config::ast::{self, RpkiMode};
@@ -383,6 +387,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Routinator on its way down, from [`Rpki::begin_stop`].
+#[must_use = "Stopping::finish waits until Routinator is gone"]
+pub(crate) struct Stopping(Option<JoinHandle<()>>);
+
+impl Stopping {
+    /// Return once Routinator is gone: reaped with its process group,
+    /// every thread of its sidecar joined.
+    pub(crate) fn finish(self) {
+        if let Some(stopping) = self.0 {
+            // `Sidecar::stop` itself reports a supervisor thread that
+            // panicked, which killed Routinator as it unwound.
+            let _ = stopping.join();
+        }
+    }
+}
+
 /// The running `rpki` block: the RTR client, if its mode has one, and
 /// Routinator, with `mode sidecar`.
 #[derive(Debug)]
@@ -633,14 +653,37 @@ impl Rpki {
             .send(RibMsg::Validation(ValidationChange::disabled()));
     }
 
-    /// Stop the block for good, at shutdown: the client first, then
-    /// Routinator, so that the client neither warns about the cache it
-    /// loses nor publishes what it would read from a Routinator on its way
-    /// down (m14 design §4.3). It returns once both are gone; see the
-    /// module documentation.
-    pub(crate) fn stop(&mut self) {
+    /// Begin to stop the block for good, at shutdown: the client, which
+    /// has stopped when this returns, then Routinator, on a thread of its
+    /// own that [`Stopping::finish`] waits for. The client goes first, so
+    /// that it neither warns about the cache it loses nor publishes what
+    /// it would read from a Routinator on its way down (m14 design §4.3).
+    /// Routinator's supervisor restarts nothing once it is asked to stop,
+    /// even a Routinator that exits by itself meanwhile, as one that an
+    /// init system signals with bgpfcd does (issue #70: "restarting the
+    /// child during our own shutdown is a bug"), and the caller goes on
+    /// with the rest of its shutdown, such as a FIB cleanup that takes
+    /// seconds, while Routinator takes up to its `stop-timeout`.
+    pub(crate) fn begin_stop(&mut self) -> Stopping {
         self.stop_client();
-        self.stop_sidecar();
+        let Some(sidecar) = self.sidecar.take() else {
+            return Stopping(None);
+        };
+        // Should no thread be had, the closure is dropped, and with it the
+        // sidecar, which stops it before this returns.
+        let stopping = thread::Builder::new()
+            .name("sidecar-stop".to_owned())
+            .spawn(move || sidecar.stop())
+            .ok();
+        Stopping(stopping)
+    }
+
+    /// Stop the block for good, and return once the client and Routinator
+    /// are gone: [`Rpki::begin_stop`], then [`Stopping::finish`]. The
+    /// daemon's shutdown does more between the two.
+    #[cfg(test)]
+    pub(crate) fn stop(&mut self) {
+        self.begin_stop().finish();
     }
 
     /// The client's status, if one runs.
@@ -1700,6 +1743,70 @@ mod tests {
             "routinator was stopped under a connected client"
         );
         assert!(!alive(pid));
+    }
+
+    /// Issue #70: "restarting the child during our own shutdown is a bug".
+    /// The coordinator's shutdown begins to stop Routinator right after the
+    /// Ceases, so that a Routinator that exits by itself during the FIB
+    /// cleanup, as one an init system signals with bgpfcd does, is not
+    /// started again. Here the cleanup takes longer than the restart
+    /// back-off, and Routinator exits during it: stopped only after the
+    /// cleanup, as it once was, it would be started again meanwhile.
+    #[test]
+    fn nothing_restarts_routinator_during_the_shutdown() {
+        let dir = Scratch::new("shutdown");
+        let (starts, exit) = (dir.join("starts"), dir.join("exit"));
+        let body = format!(
+            "echo $$ >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nexit 1",
+            starts.display(),
+            exit.display()
+        );
+        let binary = dir.routinator(&tested(), &body);
+        let cache = StubCache::new();
+        let block = sidecar_block_with(
+            &binary,
+            &dir.join("repo"),
+            cache.port(),
+            "",
+            "restart-backoff 1 1;",
+        );
+        let cfg = config(&block);
+        let (rib_tx, rib_rx) = sync_channel(4);
+        let rpki = Rpki::start(&cfg.rpki, cfg.router_id, rib_tx.clone()).unwrap();
+        let pid = routinator_pid(&rpki);
+        let _conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        next_change(&rib_rx);
+        eventually("the stub's start", || starts.exists());
+        // The FIB thread's cleanup: Routinator exits as it begins, and it
+        // lasts more than the back-off of one second, jitter included.
+        let (fib_tx, fib_rx) = sync_channel(1);
+        let fib = thread::spawn(move || {
+            let Ok(crate::messages::FibMsg::Shutdown(done)) = fib_rx.recv() else {
+                panic!("no FIB shutdown");
+            };
+            fs::write(&exit, "").unwrap();
+            thread::sleep(Duration::from_millis(2_500));
+            done.send(()).unwrap();
+        });
+        let opts = crate::args::parse(&["-c".to_owned(), "unused.conf".to_owned()]).unwrap();
+        let mut coordinator = crate::Coordinator {
+            opts: &opts,
+            config: cfg,
+            table: crate::coordinator::PeerTable::default(),
+            rib_tx,
+            fib_tx,
+            rpki,
+        };
+        coordinator.shutdown();
+        fib.join().unwrap();
+        let started = fs::read_to_string(&starts).unwrap();
+        assert_eq!(
+            started.lines().count(),
+            1,
+            "routinator was started again during the shutdown: {started}"
+        );
+        assert!(!alive(pid));
+        assert!(coordinator.rpki.sidecar.is_none());
     }
 
     /// Issue #72: a version mismatch is reported clearly at startup, and
