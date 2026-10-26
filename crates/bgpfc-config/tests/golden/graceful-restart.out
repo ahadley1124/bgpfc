@@ -29,6 +29,7 @@ Config {
         max_vrps: 4000000,
         backoff_min: 1s,
         backoff_max: 600s,
+        invalid: Policy,
     },
     prefix_lists: [],
     policies: [
