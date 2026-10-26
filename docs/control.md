@@ -207,6 +207,15 @@ the wait is over; the routes the kernel kept from before the restart
 forward meanwhile. Then the FIB is brought in line with the Loc-RIB for
 the family, which removes the kernel routes that were not learned again.
 
+When bgpfcd ends the session of a neighbor with `graceful-restart yes`, as
+`clear neighbor`, a shutdown or a reload does, it sends the NOTIFICATION and
+leaves the TCP connection open until the neighbor has closed it, at most 3
+seconds, and connects to the neighbor again after that. A neighbor that reads
+the end of the connection along with the NOTIFICATION may take the pair for a
+failure of the transport and keep our routes (RFC 4724 §4.2), which a Hard
+Reset (RFC 8538 §3.2) is there to prevent. The session is over for bgpfcd,
+its state and its routes, at once; only the socket stays.
+
 ## Validation state
 
 Every route carries its RFC 6811 origin validation state, which `show
