@@ -396,6 +396,20 @@ impl Coordinator<'_> {
         }
     }
 
+    /// A neighbor the configuration no longer has: its session ends with
+    /// Cease / Peer De-configured, and, RFC 4724 §4.2 keeping the routes of
+    /// a session that ended for a neighbor that is coming back, the RIB
+    /// is told that this one is not. For one whose session is up the peer
+    /// thread says so itself, with the end of the session; this is for one
+    /// that is down.
+    fn remove_peer(&self, addr: IpAddr) {
+        self.stop_peer(addr, CeaseSubcode::PeerDeconfigured);
+        let _ = self.rib_tx.send(RibMsg::PeerDown {
+            peer: addr,
+            retain: None,
+        });
+    }
+
     /// Re-read the configuration file and apply the difference
     /// (`docs/config.md`, "Reload"). On any error nothing changes.
     fn reload(&mut self) -> Result<String, String> {
@@ -445,7 +459,7 @@ impl Coordinator<'_> {
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.
         for addr in &diff.removed {
-            self.stop_peer(*addr, CeaseSubcode::PeerDeconfigured);
+            self.remove_peer(*addr);
         }
         for addr in &diff.reset {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);

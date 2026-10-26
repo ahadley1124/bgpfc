@@ -60,32 +60,44 @@ struct Daemon {
     dir: PathBuf,
     /// The port it listens on, at 127.0.0.2.
     listen_port: u16,
+    /// The ports of the stubs A and B.
+    ports: (u16, u16),
 }
 
 impl Daemon {
-    /// Start it with neighbor A (127.0.0.1, `graceful-restart yes`) and
-    /// neighbor B (127.0.0.3, nothing special) on the stubs' ports.
+    /// The configuration: neighbor A (127.0.0.1, `graceful-restart yes`),
+    /// unless `without_a`, and neighbor B (127.0.0.3, nothing special), on
+    /// the stubs' ports.
+    fn config(dir: &Path, listen_port: u16, ports: (u16, u16), without_a: bool) -> String {
+        let (port_a, port_b) = ports;
+        let a = if without_a {
+            String::new()
+        } else {
+            format!(
+                "neighbor 127.0.0.1 {{ remote-as 65001; port {port_a}; families ipv4-unicast;\n\
+                   import ANY; export ANY; advertisement-interval 0;\n\
+                   graceful-restart yes; restart-time 90; stale-time 60; }}\n"
+            )
+        };
+        format!(
+            "router-id 192.0.2.1;\nlocal-as 65000;\nlog {{ level warn; }}\n\
+             listen {{ address 127.0.0.2; port {listen_port}; }}\n\
+             fib {{ mode dry-run; }}\ncontrol {{ socket {}; }}\n\
+             policy ANY {{ term all {{ action accept; }} }}\n{a}\
+             neighbor 127.0.0.3 {{ remote-as 65002; port {port_b}; families ipv4-unicast;\n\
+               import ANY; export ANY; advertisement-interval 0; }}\n",
+            dir.join("ctl.sock").display()
+        )
+    }
+
+    /// Start it on the stubs' ports.
     fn start(dir: &Path, port_a: u16, port_b: u16) -> Daemon {
         let conf = dir.join("bgpfcd.conf");
         let listen = TcpListener::bind("127.0.0.2:0").unwrap();
         let listen_port = listen.local_addr().unwrap().port();
         drop(listen);
-        fs::write(
-            &conf,
-            format!(
-                "router-id 192.0.2.1;\nlocal-as 65000;\nlog {{ level warn; }}\n\
-                 listen {{ address 127.0.0.2; port {listen_port}; }}\n\
-                 fib {{ mode dry-run; }}\ncontrol {{ socket {}; }}\n\
-                 policy ANY {{ term all {{ action accept; }} }}\n\
-                 neighbor 127.0.0.1 {{ remote-as 65001; port {port_a}; families ipv4-unicast;\n\
-                   import ANY; export ANY; advertisement-interval 0;\n\
-                   graceful-restart yes; restart-time 90; stale-time 60; }}\n\
-                 neighbor 127.0.0.3 {{ remote-as 65002; port {port_b}; families ipv4-unicast;\n\
-                   import ANY; export ANY; advertisement-interval 0; }}\n",
-                dir.join("ctl.sock").display()
-            ),
-        )
-        .unwrap();
+        let ports = (port_a, port_b);
+        fs::write(&conf, Daemon::config(dir, listen_port, ports, false)).unwrap();
         let log = fs::File::create(dir.join("bgpfcd.log")).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
             .arg("-c")
@@ -98,7 +110,19 @@ impl Daemon {
             child,
             dir: dir.to_owned(),
             listen_port,
+            ports,
         }
+    }
+
+    /// Remove neighbor A from the configuration file and reload.
+    fn remove_a(&self) {
+        let conf = self.dir.join("bgpfcd.conf");
+        fs::write(
+            &conf,
+            Daemon::config(&self.dir, self.listen_port, self.ports, true),
+        )
+        .unwrap();
+        self.ask("reload");
     }
 
     fn log(&self) -> String {
@@ -662,4 +686,25 @@ fn a_connection_from_the_neighbor_replaces_the_established_session_and_keeps_its
         BTreeSet::from([prefix(ROUTES[1]), prefix(ROUTES[2])])
     );
     assert!(!d.ask("show routes").join("\n").contains("stale"));
+}
+
+#[test]
+fn the_stale_routes_of_a_neighbor_that_is_removed_go_at_once() {
+    let (d, la, lb) = lab("gr-removed");
+    let gr = Gr {
+        restart_time: 90,
+        forwarding: true,
+    };
+    let (a, mut b) = established(&d, &la, &lb, gr, &ROUTES);
+    drop(a);
+    d.wait_for("show routes", |r| r.matches(" stale").count() == 3);
+    assert!(b.is_quiet_for(Duration::from_millis(500)));
+    // RFC 4724 §4.2 keeps the routes for a neighbor that is coming back;
+    // one that is no longer configured is not.
+    d.remove_a();
+    let got = b
+        .read_until(&d, |r| r.withdrawn.len() == 3)
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(got.withdrawn.len(), 3);
+    assert!(!d.ask("show routes").join("\n").contains(" stale"));
 }
