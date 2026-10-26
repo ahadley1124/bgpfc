@@ -286,6 +286,19 @@ pub(crate) struct RpkiReport {
     /// The RTR client's status, if one runs. Its VRPs are the data the
     /// RIB validates with.
     pub(crate) status: Option<bgpfc_rtr::client::Status>,
+    /// The Routinator sidecar's status, in `mode sidecar` while it runs.
+    pub(crate) sidecar: Option<SidecarReport>,
+}
+
+/// What the coordinator reports about the Routinator sidecar.
+#[derive(Clone, Debug)]
+pub(crate) struct SidecarReport {
+    /// Where supervision stands: the state, the child, the restarts.
+    pub(crate) status: bgpfc_sidecar::SidecarStatus,
+    /// The version the binary reported when it was last checked.
+    pub(crate) version: bgpfc_sidecar::Version,
+    /// The binary it runs.
+    pub(crate) binary: std::path::PathBuf,
 }
 
 /// Each neighbor's configured `advertisement-interval` (RFC 4271

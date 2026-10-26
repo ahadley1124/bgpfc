@@ -33,7 +33,7 @@ failure, 2 on a usage error.
 | `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), whether the `restart-limit` left the neighbor Idle (RFC 4486 §4), and, for a neighbor with `graceful-restart yes`, what it advertised and the stale routes kept from it (see [Graceful Restart](#graceful-restart)) |
 | `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`, then the routes the Adj-RIB-In holds for it that are no candidate, marked `held` (see [Validation state](#validation-state)); each route with its origin validation state (`rov`); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; a route with the Only to Customer attribute has `otc ASN` next (see [Only to Customer](#only-to-customer)), then `held` where it is held; and a route kept from a session that ended ends in `stale` (see [Graceful Restart](#graceful-restart)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
-| `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
+| `show rpki` | the `rpki` mode, the cache list with the cache in use, where the RTR client stands with it, and, with `mode sidecar`, the Routinator bgpfcd runs (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
 | `clear neighbor ADDR [soft\|hard-reset]` | without a keyword, a session reset: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle. Where the neighbor and bgpfcd exchanged the Graceful Notification bit, it is a graceful reset: both keep the other's routes as stale ones (RFC 8538 §4). `soft`: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out; refused if the peer did not advertise the capability. `hard-reset`: the Administrative Reset inside a Cease / Hard Reset (RFC 8538 §3, §5.2), so that both sides delete the other's routes at once; to a neighbor that did not send the Graceful Notification bit it is the plain reset, which ends the session the same way (RFC 8538 §4) |
 | `clear neighbor ADDR [hard-reset] MESSAGE` | a reset carrying a Shutdown Communication (RFC 9003; with `hard-reset`, inside the Hard Reset, RFC 8538 §5.2); at most 128 octets (RFC 9003 §3) |
@@ -239,8 +239,8 @@ member:
 `disabled` is kept apart from `not-found`, which RFC 6811 §2 suggests for
 a route that was not validated, so that a route nobody checked can be told
 from one that no VRP covers (issue #52). Every route is `disabled` until
-`rpki { mode external; ... }` (`docs/config.md`, "RPKI") gives bgpfcd the
-VRPs of an RPKI cache; from then on the states follow the cache's data.
+`rpki { mode external; ... }` or `rpki { mode sidecar; ... }`
+(`docs/config.md`, "RPKI") gives bgpfcd the VRPs of an RPKI cache; from then on the states follow the cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
 policy, and follows the validation source when it changes. Import policy
@@ -312,9 +312,10 @@ replaces them, or until they expire (§10, §6).
 
 | Member | Line | Meaning |
 |---|---|---|
-| `mode` | `mode` | `disabled` or `external` |
+| `mode` | `mode` | `disabled`, `external` or `sidecar` |
 | `invalid` | `invalid` | what the RIB does with `invalid` routes by itself: `drop`, `prefer-valid` or `policy` (`docs/config.md`, "RPKI"). In `mode disabled` it is `policy` unless the block says otherwise |
-| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
+| `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it). Empty with `mode sidecar`, whose one cache is the sidecar: see below |
+| `sidecar` | `sidecar` | the Routinator bgpfcd runs, while it runs one (`mode sidecar`): see [The sidecar](#the-sidecar); `null` (no `sidecar` lines) otherwise |
 | `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
 | `state` | `state` | the session with the current cache: `disconnected`, `connecting` (a connection attempt is under way), `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
 | `connected` | `connected` | whether a TCP connection to it is open |
@@ -328,6 +329,32 @@ replaces them, or until they expire (§10, §6).
 
 Without a client, in `mode disabled`, every member but `mode`, `invalid`
 and `caches` is `null`, `false` or 0, and the text lists only those three.
+
+### The sidecar
+
+With `mode sidecar` the cache bgpfcd reads from is a Routinator that it runs
+itself (`docs/config.md`, "RPKI"), so `show rpki` has the `sidecar` lines
+and the `sidecar` member besides the client's, whose `vrps` are `from` the
+sidecar's RTR listener on the loopback. The `sidecar` object, and the lines
+in the order given:
+
+| Member | Line | Meaning |
+|---|---|---|
+| `state` | `sidecar state` | where supervision stands: `starting` (the child is being started), `running` (with its `pid`, and `up` since when), `backing-off` (it failed, fewer times in a row than `failure-threshold`, and is started again at the next attempt), `failed` (it failed `failure-threshold` times in a row), `shutting-down` (a stop is under way) or `stopped` |
+| `failed` | | `true` in the `failed` state: the alarm. Routinator failed `failure-threshold` times in a row and is waiting for the next attempt, which comes at the longest `restart-backoff` delay; it never gives up. The VRPs already held stay in use until they expire (RFC 8210 §6), and without any every route is `disabled`. `failures` stays at or above `failure-threshold` during the short runs between the retries (state `running`), and drops when Routinator has stayed up for `stable-after` |
+| `pid`, `up_seconds` | in `state` | the child's process id and the seconds since it was started, while it runs (`sidecar state running, pid 4242, up 35s`); otherwise `null` |
+| `next_attempt_seconds` | in `state` | in `backing-off` and `failed`, the seconds until the child is started again (`next attempt in 4s after 2 failures in a row`); otherwise `null` |
+| `restarts` | `sidecar restarts` | how often the child has been started again after a failure, over the daemon's life |
+| `failures` | `sidecar restarts N failures` | failures in a row since Routinator last stayed up for `stable-after`, the figure `failure-threshold` is compared with |
+| `last_exit` | `last exit` | how the child last ended (`exited with status 1`, `killed by signal 9 (SIGKILL)`), or why it could not be started, in the operating system's words with control characters escaped; `null` (no line) before it has ended once |
+| `binary`, `version` | `routinator` | the binary that runs (the line is `sidecar routinator VERSION BINARY, rtr ADDRESS`) and the version it reported when it was last checked: at start, and again before a restart when the file has been replaced |
+| `rtr` | in `routinator` | where it serves RTR, `host` and `port`: the port bgpfcd picked, if the block named none |
+
+Routinator opens its RTR listener only after its first validation run,
+which takes minutes on an empty repository. Until then the sidecar is
+`running`, the client's `failures` count its refused connections and every
+route is `disabled`; Routinator's own output, in bgpfcd's log as lines with
+`sidecar=routinator`, says how far it is.
 
 ## Reload
 
@@ -346,7 +373,10 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again; a changed `invalid` statement of that block is applied to the
+again, and, with `mode sidecar`, a changed `routinator` block (or a change to
+or from that mode) stops the Routinator it ran and starts another, after the
+new binary has passed its version check (a reload with a binary that fails it
+changes nothing, and says why); a changed `invalid` statement of that block is applied to the
 running RIB alone, which judges its Invalid routes again (logged as one
 `rib: action for invalid routes` line with the counts) and leaves the
 client and the sessions alone. `router-id` and `local-as` changes are refused, and `listen`,

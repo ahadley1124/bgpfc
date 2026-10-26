@@ -701,6 +701,36 @@ The statements of the block:
 | `stop-timeout SECONDS` | how long Routinator has to stop after `SIGTERM` before it gets `SIGKILL`; 1 to 3600, default 10 |
 | `failure-threshold N` | failures in a row that raise the `failed` state, an alarm that stays while the restarts keep failing (`show rpki`); at least 1, default 5 |
 
+What bgpfcd runs is `routinator --config=FILE --repository-dir=DIR
+--no-rir-tals --tal=NAME... --extra-tals-dir=DIR GLOBAL-ARGS server
+--rtr=ADDR:PORT --refresh=N SERVER-ARGS`, the TALs spelled out so that
+the settings above are the whole trust anchor set. The child gets no
+standard input, a process group of its own, no descriptor of bgpfcd's and no
+capabilities, and an environment of `HOME` (the repository directory) and
+`PATH` alone. Its output is logged line by line as `sidecar=routinator`
+lines, standard output at info and standard error at warn. Start the
+daemon as an unprivileged user, as `contrib/bgpfcd.service` does, or give
+`--user`: bgpfcd drops root before it starts the sidecar, and a child of
+root would have every capability.
+
+The rest follows from Routinator's own startup. It opens its RTR listener
+only after its first validation run, which takes minutes on an empty
+repository, so for that time bgpfcd's connection attempts are refused and
+every route is `disabled`; `show rpki` shows the sidecar `running` and the
+client's failures. The default `backoff` of a sidecar is `1 30` instead of
+`1 600`: the cache is a process on this host that is not up yet, not a
+remote one to leave alone, and a loopback attempt costs nothing. When
+Routinator exits, bgpfcd restarts it, and the RTR client reconnects to
+the same address; the VRPs stay in use until they expire as with any cache
+that goes away (RFC 8210 §6). The sidecar's state is in `show rpki` and
+`GET /v1/rpki` (`docs/control.md`, "RPKI"). The child dies with the daemon:
+a daemon that is killed or crashes takes it down with `SIGKILL`, and a
+`SIGTERM` or `SIGINT` to bgpfcd stops it with `SIGTERM` and then, after
+`stop-timeout`, `SIGKILL`, while the sessions are closing. Under systemd
+that needs `KillMode=mixed`, as `contrib/bgpfcd.service` has it: the default
+signals every process of the service at once, and a child that exits before
+bgpfcd has asked it to looks like a crash.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
@@ -717,7 +747,10 @@ statement with either, no cache twice, `connect-timeout` ≤ `response-timeout` 
 its MIN; a `routinator` block has a `binary` and a `repository-dir`, every
 path absolute, `rtr-listen` a loopback address, every number in its range
 and no `tal` twice. `mode disabled` keeps a `cache` list and a `routinator`
-block without using them.
+block without using them. `bgpfcd --check` also judges what the block alone
+can show and the parser cannot: a `tal` name Routinator does not bundle,
+the ARIN TAL without `accept-arin-rpa yes`, a `global-arg` or
+`server-arg` that bgpfcd reserves. It does not run the binary.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
@@ -743,7 +776,15 @@ again every route it holds that is Invalid and sends the difference (route
 changes to the kernel and UPDATEs to neighbors, paced as any are): no
 session resets, no ROUTE-REFRESH is needed, and the RTR client is left
 alone. A changed `rpki` block otherwise restarts the RTR client with the
-new settings. The
+new settings. A changed `routinator` block under `mode sidecar`, or a
+change to or from that mode, stops the sidecar and starts another, which
+the client then connects to; the new binary is checked (`--version`) and the
+new settings validated before the old sidecar is touched, so a typo fails
+the reload and leaves the running configuration and the running sidecar as
+they were. The reload waits for the old child to stop (`stop-timeout`) and
+for the check. A change to the client's own settings (`version`, the
+timeouts, `backoff`, `max-expire`, `max-vrps`) leaves a running sidecar
+alone. The
 VRPs the old client had stay in use until a cache of the new list has sent
 a full set, which then validates again only the routes it judges
 differently, or until they expire (RFC 8210 §10, §6). A change to `mode
@@ -762,7 +803,8 @@ bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
 
 `--check` parses and validates the file (policies included), prints any
 errors, and exits with status 0 or 1 without starting anything; it does not
-look up the names of `rpki` caches.
+look up the names of `rpki` caches, and does not run the Routinator binary
+of a sidecar.
 `--log-level` and `--fib` override the corresponding settings in the file
 for this run. `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user
@@ -771,4 +813,5 @@ the netlink socket are opened first, then the process drops to that user
 for `fib { mode install; }`; the daemon checks and names what is missing.
 
 `SIGTERM` and `SIGINT` shut the daemon down: every session gets a Cease
-(Administrative Shutdown) and every route it installed is removed.
+(Administrative Shutdown), every route it installed is removed, and a
+Routinator sidecar is stopped.

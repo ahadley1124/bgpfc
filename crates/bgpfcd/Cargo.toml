@@ -18,6 +18,7 @@ bgpfc-policy.workspace = true
 bgpfc-rib.workspace = true
 bgpfc-rpki.workspace = true
 bgpfc-rtr.workspace = true
+bgpfc-sidecar.workspace = true
 bgpfc-sys.workspace = true
 bgpfc-wire.workspace = true
 
