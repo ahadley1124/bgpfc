@@ -14,6 +14,7 @@ mod control;
 mod coordinator;
 mod fib;
 mod messages;
+mod owner;
 mod peer;
 mod privileges;
 #[cfg(feature = "profiling")]

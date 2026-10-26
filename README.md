@@ -380,7 +380,11 @@ start rpki` naming both versions.
   else, RFC 8210 §9). By default (port 0) bgpfcd picks a free one when it
   starts the sidecar and keeps it across Routinator's restarts. A port set
   explicitly must be 1024 or above, since Routinator holds no capability
-  to bind a lower one.
+  to bind a lower one. Until Routinator listens, after its first
+  validation run, another local process could bind the port; bgpfcd's RTR
+  client uses only a server that runs as bgpfcd's own user, as
+  Routinator does, so give bgpfcd a user of its own (`bgpfc`, not
+  `nobody`).
 - **systemd**: `contrib/bgpfcd.service` has `KillMode=mixed`, so that
   `systemctl stop` signals bgpfcd alone, which stops its RTR client and
   then Routinator itself; with the default mode systemd would signal

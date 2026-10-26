@@ -606,6 +606,27 @@ If bgpfcd dies without stopping it, the kernel kills Routinator too
 Nothing else in bgpfcd reaps child processes, which is what lets the
 sidecar keep track of its own.
 
+**Who serves the sidecar's port.** Loopback keeps other hosts away from
+the RTR port, not other processes on this one. Routinator binds the port
+only once its first validation run ends, minutes after a cold start and
+again after each restart, and until then any local process may bind it,
+picked or fixed alike: the port is on Routinator's command line for
+anyone to read. So bgpfcd's RTR client uses a connection to the sidecar
+only if the socket at its other end belongs to bgpfcd's own user, as
+Routinator's does, by the kernel's socket tables (`/proc/net/tcp`,
+`/proc/net/tcp6`). A process of another user that holds the port is
+refused before a byte is exchanged, each attempt logged as `rtr cache
+connection failed` with `error="127.0.0.1:PORT is served by uid N, not by
+uid M as bgpfcd is: another process holds the port"`, the last of them in
+`show rpki`; its VRPs never reach the RIB, and the routes keep the states
+they had (`disabled`, while validation waits). Routinator, finding the
+port taken, fails to start, and its failures raise the alarm (issue #70).
+A process that runs as bgpfcd's own user is not told apart: it could
+change Routinator's repository and configuration anyway. Run bgpfcd as a
+user of its own, not as one other daemons share, such as `nobody`, and
+keep untrusted code off that user. Without `/proc` no connection to the
+sidecar is used.
+
 **Startup window.** Until the RTR client's first full set arrives there
 are no VRPs, and every route is `disabled`: shown so, not as `not-found`,
 and used as received, since no `enforcement` acts on `disabled`. With an
@@ -667,7 +688,8 @@ The `sidecar` block takes these statements, each at most once:
   `::ffff:127.0.0.1` is refused, write `127.0.0.1`. Port 0, the default,
   has bgpfcd pick a free port each time it starts the sidecar; any other
   port lies in 1024–65535, since Routinator runs without capabilities and
-  could not bind a lower one. The default is `127.0.0.1 port 0`.
+  could not bind a lower one. The default is `127.0.0.1 port 0`. See
+  **Who serves the sidecar's port** below.
 - `rir-tals yes|no`: whether the production TALs of the five RIRs are
   used, ARIN's only with `accept-arin-rpa yes`; `yes` unless given.
 - `tals NAME...`: further TALs Routinator 0.15 bundles, by name:

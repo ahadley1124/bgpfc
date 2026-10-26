@@ -63,9 +63,10 @@
 //! logged at warn, and a sidecar that keeps failing at error.
 //!
 //! Implements: RFC 8210 §6 (the Expire Interval cap and the reconnect
-//! back-off configured), §7 (the version offered first), §9 (unprotected
-//! TCP to the configured port, 323 by default; the sidecar's RTR on
-//! loopback only), §10 (the cache list with preferences; the data kept
+//! back-off configured), §7 (the version offered first), §9 and §13
+//! (unprotected TCP to the configured port, 323 by default; the sidecar's
+//! RTR on loopback only, and used only from a server of bgpfcd's own
+//! user), §10 (the cache list with preferences; the data kept
 //! across a new cache list, and across a restart of Routinator); RFC 6811
 //! §4 (each change of the VRPs reaches the RIB, which validates the
 //! affected routes again).
@@ -85,13 +86,13 @@ use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_config::{ConfigError, Pos};
 use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
-use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held, Status};
+use bgpfc_rtr::client::{self, Backoff, Cache, Client, ConnectionCheck, Held, Status};
 use bgpfc_rtr::session;
 use bgpfc_sidecar::{BackoffConfig, Sidecar, SidecarConfig, TalConfig};
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::{RibMsg, RpkiReport, SidecarReport};
-use crate::privileges;
+use crate::{owner, privileges};
 
 /// The checks of the `rpki` block that need more than the configuration
 /// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
@@ -262,6 +263,12 @@ pub(crate) fn resolve(rpki: &ast::Rpki) -> Result<(), String> {
 /// `mode sidecar` is the client's one cache, at preference 0 (issue #71:
 /// wired without operator configuration); `mode external` lists its
 /// caches itself.
+///
+/// With `mode sidecar` the client uses a connection only if its other end
+/// belongs to bgpfcd's own user, as Routinator, its child, does
+/// ([`owner::same_user`]): until Routinator binds its port, after its
+/// first validation run, any local process could bind it and serve VRPs
+/// of its own (RFC 8210 §9, §13).
 pub(crate) fn client_config(
     rpki: &ast::Rpki,
     router_id: RouterId,
@@ -294,6 +301,9 @@ pub(crate) fn client_config(
         }
     };
     let mut config = client::Config::new(caches);
+    if rpki.mode == RpkiMode::Sidecar {
+        config.check = Some(ConnectionCheck::new(owner::same_user));
+    }
     config.connect_timeout = rpki.connect_timeout;
     // With `mode sidecar` the block's default is `1 30` rather than
     // `1 600` (`ast::Rpki::default_backoff`), so that the client finds
@@ -1626,6 +1636,8 @@ mod tests {
                 max_vrps: 1_000,
             }
         );
+        // RFC 8210 §9, §13: only a server of bgpfcd's own user is used.
+        assert!(c.check.is_some());
         let v6 = client_config(&cfg.rpki, router_id, Some("[::1]:3323".parse().unwrap())).unwrap();
         assert_eq!(v6.caches[0].host, "::1");
         assert_eq!(v6.caches[0].to_string(), "[::1]:3323");
@@ -1638,6 +1650,7 @@ mod tests {
         let external = config("rpki { mode external; cache 192.0.2.10; }");
         let c = client_config(&external.rpki, router_id, Some(addr)).unwrap();
         assert_eq!(c.caches, [Cache::new("192.0.2.10")]);
+        assert!(c.check.is_none(), "an external cache is another host's");
         let disabled = config("rpki { mode disabled; }");
         assert!(client_config(&disabled.rpki, router_id, Some(addr)).is_none());
     }
