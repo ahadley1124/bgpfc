@@ -18,7 +18,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use interop::{
     BgpfcdOpts, Bird, BirdOpts, Daemon, FakeRoutinator, Lab, NOBODY, NeighborOpts, RtrStub,
@@ -54,6 +55,14 @@ const VALIDATED: [(&str, &str); 4] = [
     ("192.0.2.128/25", "invalid"),
     ("198.51.100.0/24", "invalid"),
     ("203.0.113.0/24", "not-found"),
+];
+
+/// The states before the first full set, or without validation.
+const DISABLED: [(&str, &str); 4] = [
+    ("192.0.2.0/24", "disabled"),
+    ("192.0.2.128/25", "disabled"),
+    ("198.51.100.0/24", "disabled"),
+    ("203.0.113.0/24", "disabled"),
 ];
 
 /// The lines bgpfcd logs while it lost its cache: none of them may appear
@@ -95,6 +104,8 @@ struct Setup {
     bgpfcd: Daemon,
     bird: Option<Bird>,
     socket: PathBuf,
+    /// When bgpfcd was started.
+    started: Instant,
     /// Last, so that the namespaces go after the daemons in them.
     lab: Lab,
 }
@@ -116,12 +127,14 @@ impl Setup {
             true,
         );
         let ns_a = lab.a.clone();
+        let started = Instant::now();
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &config);
         Setup {
             fake,
             bgpfcd,
             bird,
             socket,
+            started,
             lab,
         }
     }
@@ -216,6 +229,20 @@ impl Setup {
             .collect();
         held.sort();
         held
+    }
+
+    /// Wait up to `timeout` for bgpfcd to log `line`.
+    fn wait_for_log(&self, timeout: Duration, line: &str) {
+        assert!(
+            wait_for(timeout, || self.bgpfcd.log_text().contains(line)),
+            "no `{line}`:\n{}",
+            self.report()
+        );
+    }
+
+    /// How often bgpfcd has logged `text`.
+    fn count(&self, text: &str) -> usize {
+        self.bgpfcd.log_text().matches(text).count()
     }
 
     /// Where bgpfcd first logged `text`, as an offset into its log.
@@ -590,4 +617,180 @@ fn sigkill_of_bgpfcd_leaves_no_orphan() {
     // The port can be bound again: a stub listens on it.
     let ns_a = s.lab.a.clone();
     let _stub = RtrStub::start(&s.lab, &ns_a, &rtr, 9, &FIRST);
+}
+
+/// Issues #26 and #70: "killing Routinator results in a restart". The
+/// supervisor starts it again with the same arguments, on the same
+/// address, so the RTR client's own reconnect finds it with no special
+/// case (#71); the restarted Routinator has a new Session ID and answers
+/// the old session's Serial Query with a Cache Reset, and the client loads
+/// its data afresh (RFC 8210 §8.3). Meanwhile the client keeps the data it
+/// had (RFC 8210 §10, §6): no route changes state at any moment.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_killed_routinator_is_restarted_and_bgpfcd_resyncs() {
+    let s = Setup::start("sd", 29, &Opts::default(), |_| {});
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    let rtr = s.rtr();
+    let pid = s.fake.pid().expect("the fake's pid");
+    let session = format!("session-id {} serial 1\n", pid % 65_535 + 1);
+    s.wait_for_rpki(Duration::ZERO, &["state idle, connected", &session]);
+    let reachable = s.count("msg=\"rtr cache reachable again\"");
+    let revalidations = s.count("msg=\"rib: validation states changed\"");
+
+    let killed = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+    // Sampled until the client is back in sync with the new Routinator:
+    // the routes keep their states, from the data the client held.
+    let want = pairs(&used);
+    let mut samples = Vec::new();
+    let resynced = wait_for(Duration::from_secs(20), || {
+        samples.push(s.states());
+        s.count("msg=\"rtr cache reachable again\"") > reachable
+            && s.fake.pid().is_some_and(|p| p != pid)
+            && s.rpki().contains("state idle, connected")
+    });
+    assert!(resynced, "{}", s.report());
+    assert!(samples.iter().all(|states| *states == want), "{samples:?}");
+
+    // Restarted once, with the same arguments, at once.
+    let starts = s.fake.invocations();
+    assert_eq!(starts.len(), 2, "{}", s.report());
+    assert_eq!(starts[1], starts[0]);
+    assert!(starts[1].contains(&format!("--rtr={rtr}")), "{starts:?}");
+    let restarted = s.first("msg=\"restarting the RPKI sidecar\"");
+    assert!(restarted.is_some(), "{}", s.report());
+
+    let new_pid = s.fake.pid().expect("the new pid");
+    let session = format!("session-id {} serial 1\n", new_pid % 65_535 + 1);
+    s.wait_for_rpki(
+        Duration::from_secs(10),
+        &[
+            &format!("sidecar running pid {new_pid} for "),
+            &format!("sidecar rtr {rtr}, restarts 1, "),
+            ", last exit: killed by signal 9 (SIGKILL)\n",
+            &format!("cache {rtr} (sidecar) preference 0, in use, current\n"),
+            "state idle, connected",
+            &session,
+            "vrps ipv4 2 ipv6 0",
+        ],
+    );
+    s.wait_for_log(
+        Duration::ZERO,
+        "msg=\"rtr cache cannot update incrementally; reloading\"",
+    );
+    assert_eq!(s.fake.serving(), [new_pid]);
+    // The same VRPs again: nothing was validated anew, nothing moved.
+    s.wait_for_states(Duration::ZERO, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    assert_eq!(
+        s.count("msg=\"rib: validation states changed\""),
+        revalidations,
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
+
+/// Issue #70: "a persistently failing binary backs off rather than
+/// spinning", and "repeated restart failures must surface as an
+/// operational error, not just a log line". A Routinator that exits at
+/// every start is started again at most every two seconds, the cap of
+/// `restart-backoff 1 2`; from the third failure in a row it is an alarm
+/// in `show rpki`, `show status` and their JSON, and an error in the log.
+/// bgpfcd keeps routing meanwhile, every route `disabled`. Once the binary
+/// starts again, the alarm clears and the routes are validated.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_routinator_that_keeps_failing_backs_off_and_raises_the_alarm() {
+    let opts = Opts {
+        rpki: "backoff 1 2;",
+        sidecar: "restart-backoff 1 2; failure-threshold 3;",
+        ..Opts::default()
+    };
+    let s = Setup::start("se", 30, &opts, |fake| fake.set_failing(true));
+    s.wait_for_states(ESTABLISH, &DISABLED);
+
+    // Backing off at the cap, which jitter may halve: at least one start
+    // every two seconds after the first three, at most one a second, and
+    // nothing like a loop.
+    let twelve = s.started + Duration::from_secs(12);
+    std::thread::sleep(twelve.saturating_duration_since(Instant::now()));
+    let starts = s.fake.invocations().len();
+    assert!((4..=15).contains(&starts), "{starts}\n{}", s.report());
+
+    let out = s.wait_for_rpki(
+        Duration::from_secs(10),
+        &[
+            "validation waiting ",
+            "sidecar FAILED after ",
+            " failures in a row, next attempt in ",
+            ", last exit: exited with status 1\n",
+        ],
+    );
+    assert!(!out.contains("sidecar running"), "{out}");
+    let mut status = String::new();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            status = s.ctl(&["show", "status"]).0;
+            status.contains("\nalarm rpki sidecar failed: ")
+        }),
+        "{status}"
+    );
+    assert!(
+        status.contains("neighbors 1 established 1\n")
+            && status.contains("rpki sidecar, validation waiting\n")
+            && status.contains(" failures in a row\n"),
+        "{status}"
+    );
+    let mut body = String::new();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            body = s.http("/v1/rpki");
+            body.contains("\"state\":\"failed\",\"alarm\":true,")
+        }),
+        "{body}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            body = s.http("/v1/status");
+            body.contains("\"alarms\":[\"rpki-sidecar-failed\"]")
+        }),
+        "{body}"
+    );
+    s.wait_for_log(
+        Duration::ZERO,
+        "ERROR msg=\"RPKI sidecar keeps failing; the validator is not running, retrying at the backoff cap\"",
+    );
+    // Still routing: the one session, its routes used as received.
+    s.wait_for_states(Duration::ZERO, &DISABLED);
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
+
+    // A binary that works again: the next attempt runs, the alarm goes,
+    // and the routes are validated.
+    s.fake.set_failing(false);
+    s.wait_for_rpki(
+        Duration::from_secs(20),
+        &[
+            "validation active\n",
+            "sidecar running pid ",
+            "state idle, connected",
+        ],
+    );
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(Duration::from_secs(10), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    let status = s.ctl(&["show", "status"]).0;
+    assert!(
+        status.contains("rpki sidecar, validation active\n") && !status.contains("alarm"),
+        "{status}"
+    );
+    let body = s.http("/v1/status");
+    assert!(body.contains("\"alarms\":[]"), "{body}");
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
 }
