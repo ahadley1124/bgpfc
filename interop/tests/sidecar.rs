@@ -1292,3 +1292,68 @@ fn a_sidecar_a_reload_could_not_start_raises_an_alarm_until_one_does() {
     );
     assert_eq!(s.count("session established"), 1, "{}", s.report());
 }
+
+/// RFC 8210 §9 and §13: loopback keeps other hosts from the sidecar's
+/// RTR port, not other processes on this one. Until Routinator listens,
+/// after its first validation run, any of them may take the port, which
+/// `show rpki` (and Routinator's command line) names. Here root does, with
+/// VRPs that make BIRD's Valid route Invalid, while the fake waits out a
+/// twenty-second first run. bgpfcd, run as `nobody` like the fake it
+/// started, uses only a server of its own user: each connection is
+/// refused with both users named, validation keeps waiting, and the routes
+/// stay `disabled`, never judged by the forged VRPs. Once the taker is gone
+/// and the fake listens, the routes are validated with its VRPs.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn another_user_on_the_sidecar_port_is_refused() {
+    let opts = Opts {
+        rpki: "backoff 1 2;",
+        ..Opts::default()
+    };
+    let s = Setup::start("sj", 35, &opts, |fake| fake.set_delay(20));
+    s.wait_for_states(ESTABLISH, &DISABLED);
+    let rtr = s.rtr();
+    let ns_a = s.lab.a.clone();
+    let taker = RtrStub::start(&s.lab, &ns_a, &rtr, 4242, &[("192.0.2.0/24", 24, 64_666)]);
+    s.wait_for_log(
+        Duration::from_secs(10),
+        "is served by uid 0, not by uid 65534 as bgpfcd is: another process holds the port",
+    );
+    // Refused at every attempt, a few seconds long: nothing committed.
+    std::thread::sleep(Duration::from_secs(3));
+    let out = s.wait_for_rpki(
+        Duration::ZERO,
+        &[
+            "validation waiting ",
+            &format!("cache {rtr} (sidecar) preference 0, current\n"),
+            "is served by uid 0",
+        ],
+    );
+    assert!(!out.contains("session-id 4242"), "{out}");
+    s.wait_for_states(Duration::ZERO, &DISABLED);
+    assert_eq!(s.count("msg=\"rtr validation data committed\""), 0);
+    assert!(
+        s.count("msg=\"rtr cache connection failed\"") >= 2,
+        "{}",
+        s.report()
+    );
+    assert!(
+        s.started.elapsed() < Duration::from_secs(18),
+        "too slow to drop the taker before the fake listens"
+    );
+    drop(taker);
+
+    // The fake, past its first run, listens; its VRPs are the ones used.
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(Duration::from_secs(30), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    let pid = s.fake.pid().expect("the fake's pid");
+    s.wait_for_rpki(
+        Duration::from_secs(5),
+        &[
+            "validation active\n",
+            &format!("session-id {} serial 1\n", pid % 65_535 + 1),
+        ],
+    );
+    assert_eq!(s.fake.invocations().len(), 1, "{}", s.report());
+}
