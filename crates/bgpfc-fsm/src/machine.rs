@@ -1171,6 +1171,14 @@ impl Fsm {
             // HOLDTIME expiry, it should generate the relevant BGP
             // NOTIFICATION message ... but subsequently MUST follow the
             // rules for the Receiving Speaker".
+            //
+            // NOTE(interop): the Hold Timer sentence of RFC 8538 §4 does
+            // not mention the N bit, and it is read so: the routes are
+            // kept after a Hold Timer or Send Hold Timer expiry also when
+            // the peer sent no N bit, as long as it advertised the
+            // capability with a family. RFC 4724 §4, which the sentence
+            // updates, leaves a session that ends with a NOTIFICATION, as
+            // this one does, to the normal procedures.
             End::Transport | End::Timeout => true,
             // RFC 4724 §4: "the normal BGP procedures MUST be followed
             // when the TCP session terminates due to the sending or
