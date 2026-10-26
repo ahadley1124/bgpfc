@@ -304,6 +304,23 @@ impl Sidecar {
         lock(&self.status).clone()
     }
 
+    /// Ask the supervisor thread to stop Routinator, and return at once.
+    ///
+    /// From here on nothing is restarted, and an exit of the child is the
+    /// stop and not a failure. A daemon that is told to shut down calls
+    /// this first, so that the child stops while the sessions close
+    /// instead of after them, and so that a child that exits by itself at
+    /// the same time, as one does when systemd signals the whole control
+    /// group, is not mistaken for a crash. [`stop`](Self::stop) then waits
+    /// for the end. Calling it after `stop`, or twice, does nothing; while
+    /// another thread is inside `stop` it waits for that to finish.
+    pub fn request_stop(&self) {
+        if let Some(control) = lock(&self.control).as_ref() {
+            // Fails only if the thread has ended already.
+            let _ = control.tx.send(Msg::Stop);
+        }
+    }
+
     /// Stop Routinator and return once it is gone: `SIGTERM`, then
     /// `SIGKILL` if it has not exited within the stop timeout, reap it and
     /// what it left in its process group, and join every thread. Nothing
@@ -352,6 +369,29 @@ impl fmt::Debug for Sidecar {
             .field("threads", &self.threads.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
+}
+
+/// Check `config` and its binary as [`Sidecar::start`] does, and start
+/// nothing: [`SidecarConfig::validate`], then `<binary> --version` (ten
+/// seconds at most, killed with its process group if it takes longer) and
+/// the release series it reports. The version is returned.
+///
+/// For a daemon that must know whether a new sidecar would start before it
+/// stops the one that runs, as a reload does. The binary runs with the
+/// child's environment, as the user the daemon runs as.
+///
+/// # Errors
+/// As [`Sidecar::start`], but for the RTR port and the thread: the
+/// [`SidecarError`] from [`SidecarConfig::validate`] or from the version
+/// check.
+pub fn check_binary(config: &SidecarConfig) -> Result<Version, SidecarError> {
+    check_binary_with(config, &Options::new())
+}
+
+/// [`check_binary`] with the shell's own settings given.
+fn check_binary_with(config: &SidecarConfig, options: &Options) -> Result<Version, SidecarError> {
+    config.validate()?;
+    check_version(config, options, &Threads::default())
 }
 
 /// A message to the supervisor thread.
@@ -1491,6 +1531,99 @@ mod tests {
         assert_eq!(sidecar.status().state, SidecarState::Stopped);
         assert_eq!(capture.find(STOPPED).len(), 1);
         assert_eq!(sidecar.threads(), 0);
+    }
+
+    /// `request_stop` returns at once and starts the stop; the child's slow
+    /// exit is a stop, not a failure, nothing is restarted, and `stop`
+    /// then waits for the end. After that both are no-ops.
+    #[test]
+    fn request_stop_starts_the_stop_and_returns_at_once() {
+        let dir = TempDir::new("request");
+        let binary = dir.stub("trap 'sleep 1; exit 0' TERM\necho ready\nsleep 30 &\nwait");
+        let capture = Capture::default();
+        let sidecar = Sidecar::start_with(config(&dir, binary), capture.options()).unwrap();
+        let pid = wait_until("a running child", || running_pid(&sidecar));
+        let start = start_time(pid);
+        capture.wait_for("ready");
+
+        let before = Instant::now();
+        sidecar.request_stop();
+        let took = before.elapsed();
+        assert!(took < ms(500), "request_stop took {took:?}");
+        wait_until("the stop to begin", || {
+            matches!(
+                sidecar.status().state,
+                SidecarState::ShuttingDown { pid: Some(p) } if p == pid
+            )
+            .then_some(())
+        });
+        assert!(exists(pid, start), "the child takes its time to exit");
+        // Twice does no harm.
+        sidecar.request_stop();
+
+        sidecar.stop();
+        let status = sidecar.status();
+        assert_eq!(status.state, SidecarState::Stopped);
+        assert_eq!(status.restarts, 0);
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(capture.find(FAILED).is_empty());
+        assert_eq!(capture.find(STOPPED).len(), 1);
+        assert!(!exists(pid, start), "the child was reaped");
+        assert_eq!(sidecar.threads(), 0);
+        // Nothing left to ask.
+        sidecar.request_stop();
+        sidecar.stop();
+    }
+
+    /// `check_binary` runs what the start checks and starts nothing.
+    #[test]
+    fn check_binary_judges_the_binary_alone() {
+        let dir = TempDir::new("check");
+        let capture = Capture::default();
+        let good = dir.stub("exit 3");
+        assert_eq!(
+            check_binary_with(&config(&dir, good), &capture.options()),
+            Ok(TESTED_VERSION)
+        );
+
+        let old = dir.versioned_stub("old", "0.14.2", "exit 3");
+        let found = Version {
+            major: 0,
+            minor: 14,
+            patch: 2,
+            pre: None,
+        };
+        assert_eq!(
+            check_binary_with(&config(&dir, old), &capture.options()),
+            Err(SidecarError::IncompatibleVersion {
+                found,
+                tested: TESTED_VERSION
+            })
+        );
+
+        // The settings come first.
+        let relative = config(&dir, PathBuf::from("routinator"));
+        assert_eq!(
+            check_binary_with(&relative, &capture.options()),
+            Err(SidecarError::BinaryNotAbsolute(PathBuf::from("routinator")))
+        );
+
+        let hung = dir.script("hung", "exec sleep 30");
+        let mut options = capture.options();
+        options.version_timeout = ms(300);
+        let started = Instant::now();
+        assert!(matches!(
+            check_binary_with(&config(&dir, hung), &options),
+            Err(SidecarError::VersionTimeout { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let missing = config(&dir, dir.join("missing"));
+        assert!(matches!(
+            check_binary(&missing),
+            Err(SidecarError::VersionCheck { .. })
+        ));
+        assert!(capture.find("found a supported Routinator").is_empty());
     }
 
     /// A process that left the child's process group escapes the group
