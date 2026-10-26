@@ -461,16 +461,20 @@ pub struct GracefulRestart {
     pub stale_time: Duration,
 }
 
-/// The `restart-time` of a neighbor that sets none, in seconds: 120, as
-/// BIRD (`graceful restart time`) and FRR (`bgp graceful-restart
-/// restart-time`) default to. RFC 4724 §4 only suggests "a value less
-/// than or equal to the HOLDTIME carried in the OPEN".
+/// The `restart-time` of a neighbor that sets none, in seconds: 120.
+///
+/// NOTE(interop): RFC 4724 §4 only suggests "a value less than or equal to
+/// the HOLDTIME carried in the OPEN". BIRD (`graceful restart time`) and FRR
+/// (`bgp graceful-restart restart-time`) both default to 120 whatever the
+/// Hold Time, and bgpfcd does too.
 pub const DEFAULT_RESTART_TIME: u16 = 120;
 
-/// The `stale-time` of a neighbor that sets none, in seconds: 360, as FRR
-/// (`bgp graceful-restart stalepath-time`) defaults to. RFC 8538 §4.1
-/// suggests 180 and requires a timer; BIRD's closest knob, `graceful
-/// restart wait`, defaults to 240.
+/// The `stale-time` of a neighbor that sets none, in seconds: 360.
+///
+/// NOTE(interop): RFC 8538 §4.1 requires a stale timer and suggests 180
+/// seconds; FRR (`bgp graceful-restart stalepath-time`) defaults to 360, and
+/// bgpfcd follows it. BIRD's closest knob, `graceful restart wait`, defaults
+/// to 240.
 pub const DEFAULT_STALE_TIME: u16 = 360;
 
 /// A `neighbor` block.
