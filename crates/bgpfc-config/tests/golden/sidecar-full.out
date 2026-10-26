@@ -1,0 +1,70 @@
+Config {
+    router_id: RouterId(
+        3221225985,
+    ),
+    local_as: Asn(
+        65000,
+    ),
+    log_level: Info,
+    listen: [
+        [::]:179,
+    ],
+    fib: Fib {
+        mode: DryRun,
+        table: 254,
+        protocol: 186,
+    },
+    control: Control {
+        socket: None,
+        http: None,
+    },
+    rpki: Rpki {
+        mode: Sidecar,
+        caches: [],
+        version: 0,
+        connect_timeout: 10s,
+        response_timeout: 60s,
+        reply_timeout: 1800s,
+        max_expire: 172800s,
+        max_vrps: 1000000,
+        backoff_min: 1s,
+        backoff_max: 30s,
+        invalid: PreferValid,
+        routinator: Some(
+            Routinator {
+                binary: "/opt/routinator/bin/routinator",
+                repository_dir: "/var/lib/bgpfc/rpki",
+                rtr_listen: [::1]:3323,
+                rir_tals: false,
+                tals: [
+                    "ripe",
+                    "apnic",
+                    "ripe-pilot",
+                ],
+                tal_dir: Some(
+                    "/etc/bgpfc/tals",
+                ),
+                accept_arin_rpa: false,
+                refresh: 300s,
+                config_file: Some(
+                    "/etc/bgpfc/routinator.conf",
+                ),
+                global_args: [
+                    "--strict",
+                ],
+                server_args: [
+                    "--http=127.0.0.1:8323",
+                    "--rrdp-timeout=30",
+                ],
+                restart_backoff_initial: 2s,
+                restart_backoff_cap: 120s,
+                stable_after: 600s,
+                stop_timeout: 20s,
+                failure_threshold: 3,
+            },
+        ),
+    },
+    prefix_lists: [],
+    policies: [],
+    neighbors: [],
+}

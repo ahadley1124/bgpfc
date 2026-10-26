@@ -165,6 +165,11 @@ pub struct Rpki {
     /// that the operator did not name. [`InvalidAction::Policy`], which
     /// does nothing of its own, where the block leaves it out.
     pub invalid: InvalidAction,
+    /// `routinator { ... }`: the Routinator bgpfcd runs and supervises as
+    /// its cache. Required in [`RpkiMode::Sidecar`]; in
+    /// [`RpkiMode::Disabled`] it is kept and not used, like the cache
+    /// list.
+    pub routinator: Option<Routinator>,
 }
 
 impl Rpki {
@@ -190,6 +195,13 @@ impl Rpki {
     /// The default longest reconnect delay: the default Retry Interval of
     /// RFC 8210 §6.
     pub const DEFAULT_BACKOFF_MAX: Duration = Duration::from_mins(10);
+    /// The default longest reconnect delay with [`RpkiMode::Sidecar`].
+    /// The cache is a process on this host that binds its RTR port only
+    /// after its first validation run, which takes minutes on an empty
+    /// repository, and the default for a remote cache would leave bgpfcd
+    /// waiting up to ten minutes after it is ready. Trying a loopback port
+    /// costs nothing.
+    pub const DEFAULT_SIDECAR_BACKOFF_MAX: Duration = Duration::from_secs(30);
     /// The longest reconnect delay that may be configured: the largest
     /// Retry Interval RFC 8210 §6 allows a cache to ask for, "Maximum
     /// allowed value: 7200 seconds".
@@ -218,6 +230,7 @@ impl Rpki {
             max_vrps,
             backoff_min,
             backoff_max,
+            routinator,
             invalid: _,
         } = self;
         *mode == other.mode
@@ -234,6 +247,18 @@ impl Rpki {
             && *max_vrps == other.max_vrps
             && *backoff_min == other.backoff_min
             && *backoff_max == other.backoff_max
+            && *routinator == other.routinator
+    }
+
+    /// The `routinator` block when it is the source of the VRPs, which is
+    /// `mode sidecar`. A reload leaves the running sidecar alone unless
+    /// this differs between the old block and the new.
+    #[must_use]
+    pub fn sidecar(&self) -> Option<&Routinator> {
+        match self.mode {
+            RpkiMode::Sidecar => self.routinator.as_ref(),
+            RpkiMode::Disabled | RpkiMode::External => None,
+        }
     }
 }
 
@@ -252,6 +277,7 @@ impl Default for Rpki {
             backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
             backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
             invalid: InvalidAction::Policy,
+            routinator: None,
         }
     }
 }
@@ -263,6 +289,9 @@ pub enum RpkiMode {
     Disabled,
     /// VRPs from the configured RTR caches (RFC 8210).
     External,
+    /// VRPs from a Routinator that bgpfcd runs and supervises as a child
+    /// process and reads over RTR on the loopback (RFC 8210).
+    Sidecar,
 }
 
 impl std::fmt::Display for RpkiMode {
@@ -270,6 +299,7 @@ impl std::fmt::Display for RpkiMode {
         f.write_str(match self {
             RpkiMode::Disabled => "disabled",
             RpkiMode::External => "external",
+            RpkiMode::Sidecar => "sidecar",
         })
     }
 }
@@ -318,6 +348,132 @@ impl std::fmt::Display for RpkiCache {
             write!(f, "[{}]:{}", self.host, self.port)
         } else {
             write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The `routinator { ... }` block of `mode sidecar`: the Routinator
+/// (an RPKI relying party) that bgpfcd runs as a child process,
+/// restarts when it fails, and reads its VRPs from over RTR on the
+/// loopback.
+///
+/// The settings are those of `bgpfc-sidecar`'s `SidecarConfig`, which
+/// this crate cannot name: the sidecar crate reaches the operating system
+/// (AGENTS.md §2) and this one must not. The daemon converts one into the
+/// other, and a test there keeps the defaults the same. What is checked
+/// here is what one statement shows, with its position: an absolute path,
+/// a loopback address, a number in range. The rest (a TAL name Routinator
+/// does not bundle, an extra argument bgpfcd reserves) the sidecar crate
+/// checks when the daemon converts the block, also for `bgpfcd --check`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routinator {
+    /// `binary`: the Routinator executable. Absolute, and never looked up
+    /// on `PATH`: a BGP daemon must not run whatever happens to be called
+    /// `routinator`.
+    pub binary: PathBuf,
+    /// `repository-dir`: Routinator's cache of RPKI data. Absolute, and
+    /// writable by the user the daemon runs as.
+    pub repository_dir: PathBuf,
+    /// `rtr-listen`: where Routinator serves RTR and where bgpfcd's RTR
+    /// client connects. A loopback address (RFC 8210 §9: unprotected TCP
+    /// only between a cache and a router on a trusted, controlled
+    /// network; the loopback is the one network nothing else can reach).
+    /// Port 0, the default, has the daemon pick a free port when it
+    /// starts the sidecar.
+    pub rtr_listen: SocketAddr,
+    /// `rir-tals`: use the TALs of the five Regional Internet Registries
+    /// that Routinator bundles, ARIN's only with
+    /// [`accept_arin_rpa`](Self::accept_arin_rpa).
+    pub rir_tals: bool,
+    /// `tal` statements: further bundled TALs by name, such as
+    /// `ripe-pilot`; with `rir-tals no`, naming RIR TALs selects some of
+    /// them.
+    pub tals: Vec<String>,
+    /// `tal-dir`: a directory of `*.tal` files (RFC 8630) used as well.
+    /// Absolute.
+    pub tal_dir: Option<PathBuf>,
+    /// `accept-arin-rpa`: that the operator accepts ARIN's Relying Party
+    /// Agreement, the terms under which ARIN publishes its TAL. Without
+    /// it the ARIN TAL is left out and routes in ARIN's address space
+    /// validate as `not-found`.
+    pub accept_arin_rpa: bool,
+    /// `refresh`: seconds between Routinator's validation runs, and the
+    /// Refresh Interval it announces to RTR clients (RFC 8210 §6); 1 to
+    /// [`Routinator::MAX_REFRESH`] seconds.
+    pub refresh: Duration,
+    /// `config-file`: a Routinator configuration file for what bgpfcd
+    /// does not model. Absolute.
+    pub config_file: Option<PathBuf>,
+    /// `global-arg` statements: options for Routinator before its
+    /// `server` command, verbatim.
+    pub global_args: Vec<String>,
+    /// `server-arg` statements: options for Routinator after its `server`
+    /// command, verbatim.
+    pub server_args: Vec<String>,
+    /// `restart-backoff INITIAL CAP`: the delay before the first restart
+    /// of a Routinator that failed, doubling with each failure in a row up
+    /// to the second.
+    pub restart_backoff_initial: Duration,
+    /// The longest restart delay.
+    pub restart_backoff_cap: Duration,
+    /// `stable-after`: how long Routinator must stay up for its next
+    /// failure to count as the first of a series again.
+    pub stable_after: Duration,
+    /// `stop-timeout`: how long Routinator may take to stop after
+    /// `SIGTERM` before it gets `SIGKILL`.
+    pub stop_timeout: Duration,
+    /// `failure-threshold`: how many failures in a row raise the `failed`
+    /// state, an alarm that stays while the restarts keep failing.
+    pub failure_threshold: u32,
+}
+
+impl Routinator {
+    /// The default `refresh`: Routinator's own.
+    pub const DEFAULT_REFRESH: Duration = Duration::from_mins(10);
+    /// The longest `refresh`. RFC 8210 §6 allows a Refresh Interval up to
+    /// 86400 seconds but requires the Expire Interval to be larger, and
+    /// Routinator's is 7200 seconds unless its configuration says otherwise.
+    pub const MAX_REFRESH: Duration = Duration::from_secs(7199);
+    /// The default first restart delay.
+    pub const DEFAULT_RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+    /// The default longest restart delay.
+    pub const DEFAULT_RESTART_BACKOFF_CAP: Duration = Duration::from_mins(5);
+    /// The longest restart delay and stop timeout that may be configured:
+    /// a validator retried less often than hourly, or stopped more slowly,
+    /// is not supervised in any useful sense.
+    pub const MAX_DELAY: Duration = Duration::from_hours(1);
+    /// The default `stable-after`.
+    pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_mins(5);
+    /// The longest `stable-after`.
+    pub const MAX_STABLE_AFTER: Duration = Duration::from_hours(24);
+    /// The default `stop-timeout`.
+    pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The default `failure-threshold`.
+    pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+    /// A block with the two statements it needs and every default for the
+    /// rest: RTR on `127.0.0.1` with a port picked at start, the RIR TALs
+    /// without ARIN's, a ten minute refresh, no configuration file or
+    /// extra arguments.
+    #[must_use]
+    pub fn new(binary: impl Into<PathBuf>, repository_dir: impl Into<PathBuf>) -> Routinator {
+        Routinator {
+            binary: binary.into(),
+            repository_dir: repository_dir.into(),
+            rtr_listen: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            rir_tals: true,
+            tals: Vec::new(),
+            tal_dir: None,
+            accept_arin_rpa: false,
+            refresh: Self::DEFAULT_REFRESH,
+            config_file: None,
+            global_args: Vec::new(),
+            server_args: Vec::new(),
+            restart_backoff_initial: Self::DEFAULT_RESTART_BACKOFF_INITIAL,
+            restart_backoff_cap: Self::DEFAULT_RESTART_BACKOFF_CAP,
+            stable_after: Self::DEFAULT_STABLE_AFTER,
+            stop_timeout: Self::DEFAULT_STOP_TIMEOUT,
+            failure_threshold: Self::DEFAULT_FAILURE_THRESHOLD,
         }
     }
 }

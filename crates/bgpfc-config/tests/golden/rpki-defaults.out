@@ -36,6 +36,7 @@ Config {
         backoff_min: 1s,
         backoff_max: 600s,
         invalid: Drop,
+        routinator: None,
     },
     prefix_lists: [],
     policies: [],

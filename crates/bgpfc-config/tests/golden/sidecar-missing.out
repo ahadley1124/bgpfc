@@ -1,0 +1,6 @@
+sidecar-missing.conf:7:5: `routinator` needs a `binary`
+      routinator { refresh 300; }
+      ^
+sidecar-missing.conf:7:5: `routinator` needs a `repository-dir`
+      routinator { refresh 300; }
+      ^

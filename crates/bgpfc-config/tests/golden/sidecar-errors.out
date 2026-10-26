@@ -1,0 +1,42 @@
+sidecar-errors.conf:10:16: binary must be an absolute path, found `routinator`
+          binary routinator;
+                 ^
+sidecar-errors.conf:11:24: repository-dir must be an absolute path, found `var/lib/rpki`
+          repository-dir var/lib/rpki;
+                         ^
+sidecar-errors.conf:12:9: rtr-listen address 192.0.2.1:3323 is not a loopback address (RFC 8210 §9)
+          rtr-listen 192.0.2.1:3323;
+          ^
+sidecar-errors.conf:13:17: tal-dir must be an absolute path, found `tals`
+          tal-dir tals;
+                  ^
+sidecar-errors.conf:14:21: config-file must be an absolute path, found `routinator.conf`
+          config-file routinator.conf;
+                      ^
+sidecar-errors.conf:15:17: refresh must be between 1 and 7199 seconds
+          refresh 0;
+                  ^
+sidecar-errors.conf:17:13: tal `ripe` is listed twice
+          tal ripe;
+              ^
+sidecar-errors.conf:18:9: restart-backoff cap 30s is below its initial delay 90s
+          restart-backoff 90 30;
+          ^
+sidecar-errors.conf:19:22: stable-after must be between 1 and 86400 seconds
+          stable-after 0;
+                       ^
+sidecar-errors.conf:20:22: stop-timeout must be between 1 and 3600 seconds
+          stop-timeout 7200;
+                       ^
+sidecar-errors.conf:21:27: failure-threshold must be at least 1
+          failure-threshold 0;
+                            ^
+sidecar-errors.conf:22:18: `maybe` is not `yes` or `no`
+          rir-tals maybe;
+                   ^
+sidecar-errors.conf:23:9: unknown statement `colour` in `routinator`
+          colour blue;
+          ^
+sidecar-errors.conf:24:9: `refresh` is given more than once
+          refresh 600;
+          ^

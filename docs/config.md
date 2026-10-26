@@ -57,19 +57,42 @@ control-item = "socket" path ";"
                        [ "writes" yes-no ";" ]        (* default no *)
                        [ "token-file" path ";" ] "}" ;
 
-rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
-             | "cache" host { cache-option } ";"       (* repeatable; options once each *)
+rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"    (* required *)
+             | "cache" host { cache-option } ";"       (* repeatable; options once each;
+                                                          not with mode sidecar *)
+             | "routinator" "{" { routinator-item } "}"    (* required with mode sidecar;
+                                                              not with mode external *)
              | "version" ( "0" | "1" ) ";"             (* default 1 *)
              | "connect-timeout" u32 ";"              (* default 10 *)
              | "response-timeout" u32 ";"             (* default 60 *)
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
              | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
-             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
+             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX;
+                                                          default 1 600, 1 30 with mode sidecar *)
              | "invalid" ( "drop" | "prefer-valid" | "policy" ) ";" ;
-                                                      (* required with mode external; default policy *)
+                                                      (* required with mode external and sidecar;
+                                                          default policy *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
+
+routinator-item
+             = "binary" path ";"                       (* required; absolute *)
+             | "repository-dir" path ";"               (* required; absolute *)
+             | "rtr-listen" ip ":" u16 ";"             (* loopback only; default 127.0.0.1:0 *)
+             | "rir-tals" yes-no ";"                   (* default yes *)
+             | "tal" name ";"                          (* repeatable; a TAL Routinator bundles *)
+             | "tal-dir" path ";"                      (* absolute *)
+             | "accept-arin-rpa" yes-no ";"            (* default no *)
+             | "refresh" u32 ";"                       (* 1-7199; default 600 *)
+             | "config-file" path ";"                  (* absolute *)
+             | "global-arg" argument ";"               (* repeatable *)
+             | "server-arg" argument ";"               (* repeatable *)
+             | "restart-backoff" u32 u32 ";"           (* INITIAL CAP: 1-3600 each, INITIAL <= CAP;
+                                                          default 1 300 *)
+             | "stable-after" u32 ";"                  (* 1-86400; default 300 *)
+             | "stop-timeout" u32 ";"                  (* 1-3600; default 10 *)
+             | "failure-threshold" u32 ";" ;           (* at least 1; default 5 *)
 
 prefix-list  = "prefix-list" name "{" { prefix-entry ";" } "}" ;
 prefix-entry = prefix [ "ge" u8 ] [ "le" u8 ] ;
@@ -479,8 +502,9 @@ disabled`, there are none and every route is `disabled`. The block must
 state its `mode`; nothing else implies one. `mode external` takes the VRPs
 over the RPKI-to-Router protocol (RTR) from the caches listed with `cache`,
 of which there must be at least one; `mode disabled` keeps the cache list
-but uses none of it. What the speaker does with the state is the `invalid`
-statement, below.
+but uses none of it. `mode sidecar` has bgpfcd run Routinator itself and take
+the VRPs from it over RTR on the loopback ("The sidecar", below). What the
+speaker does with the state is the `invalid` statement, below.
 
 > **Keep the cache on the router or on a trusted network.** RTR runs over
 > plain TCP to port 323: nothing authenticates the cache to bgpfcd or
@@ -509,16 +533,17 @@ in any case, and the same port, is an error.
 
 **Invalid routes (`invalid`).** The block states what the RIB does by
 itself with a route whose state is `invalid`, before and apart from the
-policies you wrote. It is required with `mode external` and has no
-default: RFC 8481 §5 ("Set State, Don't Act") says that once routes are
+policies you wrote. It is required with `mode external` and `mode
+sidecar` and has no default: RFC 8481 §5 ("Set State, Don't Act") says that once routes are
 evaluated "the operator should be in complete control of any policy
 applied based on the evaluation state. Absent specific operator
 configuration, policy MUST NOT be applied", and RFC 6811 §2 that a route
 must not be excluded from consideration "as a side effect of its
 validation state, unless explicitly configured to do so", so a cache
 named in the file is not taken to say how to treat the routes it judges.
-Without the statement, an `external` block is an error that names the
-three choices. With `mode disabled` it is optional and defaults to
+Without the statement, an `external` or a `sidecar` block is an error that
+names the three choices; a validator that bgpfcd runs itself is no more
+the operator's word on what to do with its verdicts than a cache is. With `mode disabled` it is optional and defaults to
 `policy`, and one given there acts on the states import policy sets with
 `set rpki`, since no lookup gives any.
 
@@ -628,6 +653,54 @@ so that a validator that restarts is picked up within seconds (issue #57),
 and reaches 600 seconds by the eleventh failure in a row. `backoff 600
 600` keeps to the RFC's default.
 
+**The sidecar (`mode sidecar`).** Routinator is NLnet Labs' RPKI relying
+party: it fetches the RPKI repositories, validates them and serves the
+VRPs over RTR. With `mode sidecar` bgpfcd runs it as a child process,
+restarts it when it fails, and points its RTR client at it. Routinator is
+a separate program that you install: bgpfc neither bundles nor links it.
+The `routinator` block is required, and `cache` statements are an error:
+the one cache is the sidecar.
+
+```
+rpki {
+    mode sidecar;
+    invalid drop;                         # or prefer-valid, or policy
+    routinator {
+        binary /usr/bin/routinator;       # never looked up on PATH
+        repository-dir /var/lib/bgpfc/rpki;
+        rtr-listen 127.0.0.1:3323;        # loopback only; port 0 picks one
+    }
+}
+```
+
+`binary` and `repository-dir` are required, absolute paths. The binary is
+never searched for on `PATH`: a BGP daemon must not run whatever happens
+to be called `routinator`. Before it runs the binary bgpfcd asks it for
+`--version` (ten seconds at most), and refuses a Routinator of any release
+series but the one its command line was written for, 0.15; the daemon does
+not start, or a reload fails, with the reason. The check is made again before
+a restart whenever the file has been replaced, as by a package upgrade.
+`repository-dir` is Routinator's cache of RPKI data and must be writable by
+the user the daemon runs as; it is also the child's home directory, so that
+no file in the service user's own home can change the validator.
+
+The statements of the block:
+
+| Statement | Meaning |
+|---|---|
+| `rtr-listen ADDR:PORT` | where Routinator serves RTR, and where bgpfcd's RTR client connects. A loopback address only (`127.0.0.1:3323`, `[::1]:3323`): RTR is plain TCP, and RFC 8210 §9 allows that only between a cache and a router on a trusted, controlled network, which the host itself is. The default is `127.0.0.1` with a port bgpfcd picks when it starts the sidecar (port 0). The child runs without capabilities, so a port below 1024 works only where `net.ipv4.ip_unprivileged_port_start` allows it; Routinator otherwise fails at every start. Something else may take a picked port before Routinator binds it; the sidecar then fails and is reported, never silently. Name a port to avoid the race |
+| `rir-tals yes\|no` | use the TALs of the five Regional Internet Registries that Routinator bundles; default `yes`. ARIN's is among them only with `accept-arin-rpa yes` |
+| `tal NAME` | a further bundled TAL by name (`apnic-testbed`, `arin-ote`, `ripe-pilot`, `nlnetlabs-testbed`); with `rir-tals no`, RIR names select some of them. Repeatable |
+| `tal-dir PATH` | a directory of `*.tal` files (RFC 8630) used as well. bgpfcd does not read it, so what is in it, ARIN's TAL included, is up to you |
+| `accept-arin-rpa yes\|no` | that you accept ARIN's Relying Party Agreement, the terms under which ARIN publishes its TAL; default `no`. Routinator itself needs no opt-in any more, but accepting an agreement is the operator's decision, so without it the ARIN TAL is left out and routes in ARIN's address space are `not-found` |
+| `refresh SECONDS` | between Routinator's validation runs, and the Refresh Interval it announces (RFC 8210 §6); 1 to 7199, default 600. RFC 8210 §6 requires the Expire Interval to be larger than the Refresh Interval, and Routinator's is 7200 |
+| `config-file PATH` | a Routinator configuration file for what bgpfcd does not model. Trusted: bgpfcd does not read it, and what it sets applies except what the command line replaces (`repository-dir`, the RTR listener, the refresh interval, the TALs when any are named). It must not set `rtr-tls-listen`, `systemd-listen`, `user` or `group`, nor TALs the settings above do not show |
+| `global-arg ARG`, `server-arg ARG` | options passed to Routinator verbatim, before and after its `server` command (`global-arg "--strict";`). Repeatable. The ones bgpfcd sets itself or that would defeat supervision or the loopback rule are refused, with the reason |
+| `restart-backoff INITIAL CAP` | seconds before the first restart of a Routinator that failed, doubling with each failure in a row up to CAP, and then up to half as long again, so that validators that failed together do not return together. Each is 1 to 3600, CAP no lower than INITIAL; default `1 300` |
+| `stable-after SECONDS` | how long Routinator must stay up for its next failure to count as the first of a series again; 1 to 86400, default 300 |
+| `stop-timeout SECONDS` | how long Routinator has to stop after `SIGTERM` before it gets `SIGKILL`; 1 to 3600, default 10 |
+| `failure-threshold N` | failures in a row that raise the `failed` state, an alarm that stays while the restarts keep failing (`show rpki`); at least 1, default 5 |
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
@@ -637,10 +710,14 @@ loopback address; timer constraints above; `extended-next-hop` only with
 family in `families`; a `role` only on an external session, and
 `role-strict yes` only with a `role`; `restart-time` and `stale-time` only
 with `graceful-restart yes`; an `rpki` block has a `mode`, at least one
-`cache` and an `invalid` statement with `mode external`, no cache twice,
-`connect-timeout` ≤ `response-timeout` ≤
+`cache` with `mode external`, a `routinator` block and no `cache` with `mode
+sidecar` (and no `routinator` block with `mode external`), an `invalid`
+statement with either, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
-its MIN.
+its MIN; a `routinator` block has a `binary` and a `repository-dir`, every
+path absolute, `rtr-listen` a loopback address, every number in its range
+and no `tal` twice. `mode disabled` keeps a `cache` list and a `routinator`
+block without using them.
 
 **Reload.** On `SIGHUP` or `bgpfcctl reload` the file is parsed again. If
 it fails, the running configuration stays and the errors are logged.
