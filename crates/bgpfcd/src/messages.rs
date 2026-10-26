@@ -133,8 +133,17 @@ pub(crate) struct PeerReport {
 /// asks it.
 #[derive(Debug)]
 pub(crate) enum FibMsg {
-    /// Loc-RIB changes, in order (RFC 4271 §9.3).
-    Changes(Vec<bgpfc_rib::FibChange>),
+    /// Loc-RIB changes, in order (RFC 4271 §9.3): a batch of what the
+    /// RIB made of one of its inputs.
+    Changes {
+        /// The changes.
+        changes: Vec<bgpfc_rib::FibChange>,
+        /// Whether more batches of the same input follow. The FIB thread
+        /// logs a line per input, once its last batch is in (see
+        /// `crate::fib`, "Logging"); an input whose changes all went in
+        /// batches marked so ends with an empty one.
+        more: bool,
+    },
     /// Switch between dry-run and install. Sent by the RIB thread only
     /// (`RibMsg::FibMode`): going to install, its routes follow as
     /// `Reconcile`; either way `ReconcileEnd` ends the switch.

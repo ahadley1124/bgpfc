@@ -74,6 +74,7 @@ fn run(
         peers,
         fib,
         changes: Vec::new(),
+        open: false,
     };
     let mut transitions = Transitions::default();
     #[cfg(feature = "profiling")]
@@ -373,24 +374,35 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
 pub(crate) const FIB_BATCH: usize = 256;
 
 /// Hands RIB outputs to the FIB and peer threads as the RIB produces them;
-/// FIB changes go in batches, sent when full and after each input.
+/// FIB changes go in batches, sent when full and after each input, the
+/// last batch of an input marked as such for the FIB thread's log.
 struct Deliver<'a> {
     peers: &'a PeerTable,
     fib: &'a SyncSender<FibMsg>,
     changes: Vec<FibChange>,
+    /// Whether a batch of this input's changes went out with more to
+    /// follow, so that its end must be sent even with no change left.
+    open: bool,
 }
 
 impl Deliver<'_> {
+    /// At the end of an input: the rest of its changes, as its last batch.
     fn flush(&mut self) {
-        if self.changes.is_empty() {
+        self.send(false);
+    }
+
+    /// Send the changes held, `more` if the input has more to come.
+    fn send(&mut self, more: bool) {
+        if self.changes.is_empty() && (more || !self.open) {
             return;
         }
         // The next input likely changes about as many destinations.
         let next = Vec::with_capacity(self.changes.len());
         let changes = std::mem::replace(&mut self.changes, next);
+        self.open = more;
         // A bounded channel: a slow kernel slows the RIB rather than
         // growing memory (AGENTS.md §3 backpressure).
-        if self.fib.send(FibMsg::Changes(changes)).is_err() {
+        if self.fib.send(FibMsg::Changes { changes, more }).is_err() {
             bgpfc_log::error!("fib thread gone");
         }
     }
@@ -406,7 +418,7 @@ impl Sink for Deliver<'_> {
             Output::Fib(c) => {
                 self.changes.push(c);
                 if self.changes.len() >= FIB_BATCH {
-                    self.flush();
+                    self.send(true);
                 }
             }
             Output::Send { peer, messages } => {
@@ -496,7 +508,7 @@ impl Sink for Deliver<'_> {
 }
 
 /// Log a line whose field values are already text.
-fn log_line(level: Level, msg: &str, values: &[(&'static str, String)]) {
+pub(crate) fn log_line(level: Level, msg: &str, values: &[(&'static str, String)]) {
     let fields: Vec<bgpfc_log::Field<'_>> = values
         .iter()
         .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
@@ -559,10 +571,13 @@ const TRANSITION: &str = "rib: route validation state changed";
 
 /// One line to log, its field values already text.
 #[derive(Debug, PartialEq, Eq)]
-struct Line {
-    level: Level,
-    msg: &'static str,
-    fields: Vec<(&'static str, String)>,
+pub(crate) struct Line {
+    /// The level it is logged at.
+    pub(crate) level: Level,
+    /// The message.
+    pub(crate) msg: &'static str,
+    /// The fields, in order.
+    pub(crate) fields: Vec<(&'static str, String)>,
 }
 
 /// What a change of the validation source is logged with: the summary
@@ -716,7 +731,7 @@ fn sample(prefixes: &[Prefix]) -> String {
 
 /// `shown`, the first of `total` prefixes, for a log line, `...` marking
 /// the rest.
-fn listed(shown: &[Prefix], total: usize) -> String {
+pub(crate) fn listed(shown: &[Prefix], total: usize) -> String {
     let mut s = shown
         .iter()
         .map(ToString::to_string)
@@ -869,6 +884,7 @@ mod tests {
             peers,
             fib,
             changes: Vec::new(),
+            open: false,
         };
         for o in outputs {
             out.put(o);
@@ -1550,7 +1566,9 @@ mod tests {
         let installed: Vec<_> = fib_rx
             .try_iter()
             .flat_map(|m| match m {
-                FibMsg::Changes(c) => c.into_iter().map(|c| c.prefix.to_string()),
+                FibMsg::Changes { changes, .. } => {
+                    changes.into_iter().map(|c| c.prefix.to_string())
+                }
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -1564,6 +1582,66 @@ mod tests {
             .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
             .collect();
         bgpfc_log::format_line(std::time::UNIX_EPOCH, level, msg, &fields)
+    }
+
+    /// The FIB thread logs a line per input (`crate::fib`, "Logging"):
+    /// an input's changes go in batches of [`FIB_BATCH`] at most, all but
+    /// the last marked `more`, and one that filled its last batch exactly
+    /// ends with an empty one.
+    #[test]
+    fn the_last_fib_batch_of_an_input_is_marked() {
+        let change = |i: usize| {
+            Output::Fib(FibChange {
+                family: V4,
+                prefix: format!("10.{}.{}.0/24", i / 256, i % 256).parse().unwrap(),
+                next_hop: Some(ip("192.0.2.1")),
+                previous: None,
+            })
+        };
+        for (n, want) in [
+            (0, vec![]),
+            (1, vec![(1, false)]),
+            (FIB_BATCH - 1, vec![(FIB_BATCH - 1, false)]),
+            (FIB_BATCH, vec![(FIB_BATCH, true), (0, false)]),
+            (
+                2 * FIB_BATCH + 3,
+                vec![(FIB_BATCH, true), (FIB_BATCH, true), (3, false)],
+            ),
+        ] {
+            let (fib_tx, fib_rx) = sync_channel(8);
+            deliver((0..n).map(change).collect(), &PeerTable::default(), &fib_tx);
+            let batches: Vec<(usize, bool)> = fib_rx
+                .try_iter()
+                .map(|m| match m {
+                    FibMsg::Changes { changes, more } => (changes.len(), more),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect();
+            assert_eq!(batches, want, "{n} changes");
+        }
+        // The next input starts afresh.
+        let (fib_tx, fib_rx) = sync_channel(8);
+        let mut out = Deliver {
+            peers: &PeerTable::default(),
+            fib: &fib_tx,
+            changes: Vec::new(),
+            open: false,
+        };
+        for i in 0..FIB_BATCH {
+            out.put(change(i));
+        }
+        out.flush();
+        out.flush();
+        out.put(change(0));
+        out.flush();
+        let batches: Vec<(usize, bool)> = fib_rx
+            .try_iter()
+            .map(|m| match m {
+                FibMsg::Changes { changes, more } => (changes.len(), more),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(batches, [(FIB_BATCH, true), (0, false), (1, false)]);
     }
 
     #[test]
@@ -1724,7 +1802,8 @@ mod tests {
         let (fib_tx, fib_rx) = sync_channel(4);
         deliver(out, &PeerTable::default(), &fib_tx);
         match fib_rx.try_recv() {
-            Ok(FibMsg::Changes(c)) => {
+            Ok(FibMsg::Changes { changes: c, more }) => {
+                assert!(!more);
                 assert_eq!(c.len(), 1);
                 assert_eq!(c[0].prefix.to_string(), "203.0.113.0/24");
             }

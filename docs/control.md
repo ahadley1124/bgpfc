@@ -267,14 +267,35 @@ Nothing is uncounted: the first line counts every move per pair of
 states, and `show routes` gives every route's current state. A knob
 would change no outcome, only how much is written.
 
-The bounds are on the RIB's lines only. The FIB thread logs each route it
-installs or removes at info (`fib: dry-run` or `fib: applied`), whatever
-made the change, as it does for an UPDATE. So a change of state or of
-`enforcement` adds up to one such line for each destination it counts in
-`best_changed`: under `drop-invalid`, one for each destination whose only
-route it holds or releases. The example above, `best_changed=4800`, comes
-with about 4800 of them. At `log { level warn; }` the FIB thread writes
-only its failures.
+The FIB thread folds its lines the same way. Whatever made a change, it
+writes one line at info for it (`fib: changes`): the `mode` it ran in
+(`dry-run`, only reported, or `install`, sent to the kernel), the routes
+installed or replaced (`install`) and removed (`delete`), the operations
+that failed (`failed`), and the first eight prefixes, `...` marking the
+rest. A change of state or of `enforcement` takes at most one operation
+for each destination it counts in `best_changed`: a removal for one whose
+only route it held, an install for one whose best route has another next
+hop. They come in one line, however many there are; the `enforcement`
+change above, `best_changed=4800`, comes with
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="fib: changes" mode=install install=1300 delete=3500 failed=0 prefixes=192.0.2.0/24,192.0.2.128/25,198.51.100.0/24,198.51.100.0/25,203.0.113.0/24,203.0.113.0/25,203.0.113.128/25,2001:db8::/32,...
+```
+
+For the FIB thread a change is what the RIB made of one of its inputs (an
+UPDATE, a session that went down, a change of the VRPs or of
+`enforcement`, a reload), a switch to install mode with its reconcile,
+the removal of stale routes at startup, or that of every route at
+shutdown. A table that loads from a peer arrives in many UPDATEs, and so
+gets a line for each UPDATE that changed the FIB, never one per route.
+Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
+applied`, with `op`, `prefix` and `gateway`). A failed operation has one
+at error (`fib: failed`, with the kernel's `error`), the first ten of a
+change, the others at `debug`, and the change's line is then at error
+too, counting them all: a kernel that refuses one route, for want of
+`CAP_NET_ADMIN` or for a next hop it cannot reach directly, often refuses
+the whole table, and the first ten already name the reason. At `log {
+level warn; }` the FIB thread writes only its failures.
 
 ## RPKI
 

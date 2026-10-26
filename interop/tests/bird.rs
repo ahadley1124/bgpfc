@@ -34,6 +34,33 @@ fn bgpfcd_opts(lab: &Lab, passive: bool) -> BgpfcdOpts {
     BgpfcdOpts::single(BGPFC_AS, lab.a_addr, n)
 }
 
+/// Whether bgpfcd logged a line for a change of the FIB (`fib: changes`,
+/// at info whatever the level) in `mode` with at least one `op`
+/// (`install` or `delete`) and `prefix` among the prefixes it names.
+fn fib_change(log: &str, mode: &str, op: &str, prefix: &str) -> bool {
+    let count = format!("{op}=");
+    log.lines()
+        .filter(|l| l.contains("msg=\"fib: changes\""))
+        .any(|l| {
+            let field = |key: &str| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(key))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            field("mode=") == mode
+                && field(&count).parse::<u32>().is_ok_and(|n| n > 0)
+                && field("prefixes=").split(',').any(|p| p == prefix)
+        })
+}
+
+/// Whether any line of the FIB thread names `prefix`: neither the line of
+/// a change nor the debug line of a route.
+fn fib_names(log: &str, prefix: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("msg=\"fib: ") && l.split([' ', '=', ',']).any(|w| w == prefix))
+}
+
 /// Both sides report Established, and BIRD's statics reach bgpfcd's RIB.
 fn assert_established(lab: &Lab, bird: &Bird, bgpfcd: &interop::Daemon) {
     let ok = wait_for(ESTABLISH, || {
@@ -222,7 +249,12 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
         routes.contains(&format!("BGP.next_hop: {}", lab.a2_addr)),
         "{routes}"
     );
+    // Dry-run: the change is one line at info, the route one at debug.
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_change(&bgpfcd.log_text(), "dry-run", "install", "192.0.2.0/24")
+    });
     let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
     assert!(
         log.contains(&format!("prefix=192.0.2.0/24 gateway={}", lab.b_addr)),
         "{log}"
@@ -236,6 +268,10 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             .contains("192.0.2.0/24")
     });
     assert!(ok, "withdraw not relayed:\n{}", bgpfcd.log_text());
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_change(&bgpfcd.log_text(), "dry-run", "delete", "192.0.2.0/24")
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
     assert!(
         bgpfcd.log_text().contains("op=delete"),
         "{}",
@@ -332,13 +368,15 @@ fn export_policy_filters_and_sets() {
     });
     let routes = bird2.birdc(&lab, &["show", "route", "all"]);
     assert!(ok, "route not relayed:\n{routes}\n{}", bgpfcd.log_text());
-    // Rejected on import: never reaches BIRD 2, nor the FIB.
+    // Rejected on import: never reaches BIRD 2, nor the FIB, whose lines
+    // name the accepted route and never the rejected one.
     assert!(!routes.contains("198.51.100.0/24"), "{routes}");
-    assert!(
-        !bgpfcd.log_text().contains("prefix=198.51.100.0/24 gateway"),
-        "{}",
-        bgpfcd.log_text()
-    );
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_names(&bgpfcd.log_text(), "192.0.2.0/24")
+    });
+    let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
+    assert!(!fib_names(&log, "198.51.100.0/24"), "{log}");
     // Export set actions, then our AS prepended by the session rules.
     assert!(
         routes.contains("BGP.as_path: 65000 65000 65001"),
@@ -373,11 +411,13 @@ fn fib_install_and_clean_shutdown() {
     assert!(ok, "routes not installed:\n{r}\n{}", bgpfcd.log_text());
     assert!(r.contains(&format!("via {}", lab.b_addr)), "{r}");
     assert!(r.contains("metric 20"), "{r}");
+    let log = bgpfcd.log_text();
     assert!(
-        bgpfcd.log_text().contains("fib: applied"),
-        "{}",
-        bgpfcd.log_text()
+        fib_change(&log, "install", "install", "192.0.2.0/24")
+            && fib_change(&log, "install", "install", "198.51.100.0/24"),
+        "{log}"
     );
+    assert!(log.contains("msg=\"fib: applied\" op=install"), "{log}");
 
     // Withdraw one: only the other stays.
     let _ = bird.birdc(&lab, &["disable", "static1"]);
