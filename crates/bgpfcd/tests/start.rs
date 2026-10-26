@@ -1,8 +1,10 @@
 //! The daemon as a process, where no privilege is needed: a cache of an
 //! external `rpki` block that has no address stops the start, naming the
 //! cache, before anything is opened (issue #60), while `--check` judges
-//! the file alone and looks nothing up (`docs/config.md`, "RPKI"); and the
-//! start line names the `rpki` block's enforcement.
+//! the file alone and looks nothing up (`docs/config.md`, "RPKI"); the
+//! start line names the `rpki` block's enforcement; and `--check` reports
+//! what Routinator's rules refuse in a `sidecar` block at its position,
+//! without running the binary (issue #72).
 
 use std::fs;
 use std::path::PathBuf;
@@ -97,5 +99,70 @@ fn the_start_line_names_the_rpki_enforcement() {
             "{start}"
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Run `bgpfcd --check` on `text`, written to `name` in `dir`.
+fn check(dir: &std::path::Path, name: &str, text: &str) -> std::process::Output {
+    let config = dir.join(name);
+    fs::write(&config, text).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
+        .arg("-c")
+        .arg(&config)
+        .arg("--check")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn check_reports_a_reserved_routinator_option_at_its_block() {
+    let dir = scratch("reserved");
+    let out = check(
+        &dir,
+        "bgpfcd.conf",
+        "router-id 192.0.2.1;\nlocal-as 65000;\nrpki {\n    mode sidecar;\n    \
+         sidecar { global-args --strict \"-d\"; }\n}\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let file = dir.join("bgpfcd.conf");
+    let expected = format!(
+        "{}:5:5: rpki sidecar: extra Routinator argument \"-d\" is not allowed: \
+         a detached Routinator leaves bgpfcd's supervision\n      \
+         sidecar {{ global-args --strict \"-d\"; }}\n      ^\n",
+        file.display()
+    );
+    assert_eq!(stderr, expected);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_does_not_run_routinator() {
+    // `--check` judges the file alone, wherever it runs: a binary that is
+    // not there, and a repository directory that is not either, are the
+    // start's business (m14 design §1.5).
+    let dir = scratch("unrun");
+    let repository = dir.join("repo");
+    let out = check(
+        &dir,
+        "bgpfcd.conf",
+        &format!(
+            "router-id 192.0.2.1;\nlocal-as 65000;\n\
+             rpki {{ mode sidecar; sidecar {{ binary /nonexistent/routinator; \
+             repository-dir {}; }} }}\n",
+            repository.display()
+        ),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with(": ok (0 neighbors, 0 policies)\n"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !repository.exists(),
+        "--check created the repository directory"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

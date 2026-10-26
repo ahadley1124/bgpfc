@@ -159,6 +159,7 @@ dependencies = [
  "bgpfc-rib",
  "bgpfc-rpki",
  "bgpfc-rtr",
+ "bgpfc-sidecar",
  "bgpfc-sys",
  "bgpfc-wire",
 ]

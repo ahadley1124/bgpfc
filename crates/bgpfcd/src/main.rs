@@ -235,13 +235,14 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 }
 
-/// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
-/// client cannot be started.
+/// Run the `rpki` block, publishing to the RIB thread; exits if it cannot
+/// be started (issue #60: fail loudly and early), before any neighbor
+/// starts.
 fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpki::Rpki {
     match rpki::Rpki::start(&config.rpki, config.router_id, rib_tx.clone()) {
         Ok(r) => r,
         Err(e) => {
-            bgpfc_log::error!("cannot start the rtr client", error = e);
+            bgpfc_log::error!("cannot start rpki", error = e);
             std::process::exit(1);
         }
     }
@@ -342,11 +343,10 @@ impl Coordinator<'_> {
     fn reload(&mut self) -> Result<String, String> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
-        // Issue #60: a new cache that cannot be found fails the reload
-        // before anything changes, as it fails the start.
-        if diff.global.contains(&GlobalChange::Rpki) {
-            rpki::resolve(&new.rpki)?;
-        }
+        // Issue #60: a changed `rpki` block that cannot run, such as a new
+        // cache that cannot be found, fails the reload before anything
+        // changes, as it fails the start.
+        rpki::preflight(&self.config.rpki, &new.rpki)?;
         let mut notes = Vec::new();
         for g in &diff.global {
             match g {

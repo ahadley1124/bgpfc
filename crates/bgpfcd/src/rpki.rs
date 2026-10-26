@@ -40,6 +40,7 @@
 //! change of the VRPs reaches the RIB, which validates the affected routes
 //! again).
 
+use std::ffi::OsString;
 use std::io;
 use std::net::ToSocketAddrs as _;
 use std::sync::mpsc::SyncSender;
@@ -50,6 +51,7 @@ use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
 use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held, Status};
 use bgpfc_rtr::session;
+use bgpfc_sidecar::{BackoffConfig, SidecarConfig, TalConfig};
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::RibMsg;
@@ -60,23 +62,105 @@ use crate::messages::RibMsg;
 /// `bgpfcd --check`, at start and at a reload. They judge the file alone,
 /// like the configuration crate, and run nothing.
 ///
-/// This bgpfcd does not run the Routinator sidecar yet, so `mode sidecar`
-/// is an error at the `sidecar` block, or at the `mode` statement without
-/// one: a file that asks for validation must not load as if it had none
-/// (issue #60: fail loudly and early).
+/// With `mode sidecar`, the `sidecar` block as Routinator would take it
+/// ([`SidecarConfig::validate`]): TAL names, the ARIN agreement, settings
+/// that leave no trust anchor, and the options the escape hatches may not
+/// carry (issue #72). That is Routinator knowledge, which lives in
+/// `bgpfc-sidecar` alone. The error, `rpki sidecar: ...`, is reported at
+/// the `sidecar` block, or at the `mode` statement without one. With
+/// another mode the block is only read, so that turning validation off
+/// stays a one-word change (issue #60). Nothing runs here: the binary's
+/// version is checked when the sidecar starts, where bgpfcd runs, not
+/// wherever `--check` does.
 pub(crate) fn check_config(config: &bgpfc_config::Config) -> Vec<ConfigError> {
-    match config.rpki.mode {
-        RpkiMode::Disabled | RpkiMode::External => Vec::new(),
-        RpkiMode::Sidecar => {
+    let rpki = &config.rpki;
+    if rpki.mode != RpkiMode::Sidecar {
+        return Vec::new();
+    }
+    match sidecar_config(&rpki.sidecar).validate() {
+        Ok(()) => Vec::new(),
+        Err(e) => {
             // The configuration crate places every `mode sidecar` block;
             // the start of the file stands in for a hand-built one.
-            let pos = config.rpki.sidecar.pos.unwrap_or(Pos { line: 1, col: 1 });
-            vec![ConfigError::new(
-                pos,
-                "`mode sidecar` is not supported by this bgpfcd yet",
-            )]
+            let pos = rpki.sidecar.pos.unwrap_or(Pos { line: 1, col: 1 });
+            vec![ConfigError::new(pos, format!("rpki sidecar: {e}"))]
         }
     }
+}
+
+/// The `sidecar` block as the sidecar crate takes it. Pure.
+///
+/// The block's durations are whole seconds, so they meet the crate's
+/// floors below a second ([`SidecarConfig::MIN_BACKOFF`],
+/// [`SidecarConfig::MIN_BACKOFF_CAP`]) by construction; the configuration
+/// crate's bounds are the crate's others.
+pub(crate) fn sidecar_config(s: &ast::RpkiSidecar) -> SidecarConfig {
+    // Destructured, so that a new setting cannot be left out.
+    let ast::RpkiSidecar {
+        pos: _,
+        binary,
+        repository_dir,
+        rtr_listen,
+        rir_tals,
+        tals,
+        extra_tals_dir,
+        accept_arin_rpa,
+        refresh,
+        config_file,
+        global_args,
+        server_args,
+        restart_initial,
+        restart_cap,
+        stable_after,
+        stop_timeout,
+        failure_threshold,
+    } = s;
+    SidecarConfig {
+        binary: binary.clone(),
+        rtr_listen: *rtr_listen,
+        repository_dir: repository_dir.clone(),
+        tals: TalConfig {
+            rir_tals: *rir_tals,
+            bundled: tals.clone(),
+            extra_dir: extra_tals_dir.clone(),
+        },
+        accept_arin_rpa: *accept_arin_rpa,
+        refresh: *refresh,
+        config_file: config_file.clone(),
+        extra_global_args: global_args.iter().map(OsString::from).collect(),
+        extra_server_args: server_args.iter().map(OsString::from).collect(),
+        backoff: BackoffConfig {
+            initial: *restart_initial,
+            cap: *restart_cap,
+            stable: *stable_after,
+        },
+        stop_timeout: *stop_timeout,
+        failure_threshold: *failure_threshold,
+    }
+}
+
+/// What a reload checks before it changes anything, so that a reload that
+/// would fail fails with the running configuration kept: for a changed
+/// block in `mode external`, that every cache can be found (issue #60), as
+/// [`resolve`] checks at start.
+///
+/// This bgpfcd does not reload the Routinator sidecar yet, so a changed
+/// block with `mode sidecar` before or after the reload fails it: applied,
+/// it would leave validation silently off.
+///
+/// # Errors
+/// What fails, for the reload's error.
+pub(crate) fn preflight(old: &ast::Rpki, new: &ast::Rpki) -> Result<(), String> {
+    if old.same_as(new) {
+        return Ok(());
+    }
+    if old.mode == RpkiMode::Sidecar || new.mode == RpkiMode::Sidecar {
+        return Err(
+            "rpki: a reload that changes an rpki block with mode sidecar is not supported by this bgpfcd yet"
+                .to_owned(),
+        );
+    }
+    resolve(new)
 }
 
 /// Look up every cache of an external `rpki` block, so that a name that
@@ -177,18 +261,26 @@ impl Rpki {
     /// checked with [`resolve`] that the caches can be found.
     ///
     /// # Errors
-    /// The client thread could not be spawned.
+    /// The client thread could not be spawned, or `config` asks for the
+    /// sidecar, which this bgpfcd does not run yet: a file that asks for
+    /// validation must not run as if it had none (issue #60: fail loudly
+    /// and early).
     pub(crate) fn start(
         config: &ast::Rpki,
         router_id: RouterId,
         rib: SyncSender<RibMsg>,
-    ) -> io::Result<Rpki> {
+    ) -> Result<Rpki, String> {
+        if config.mode == RpkiMode::Sidecar {
+            return Err("mode sidecar is not supported by this bgpfcd yet".to_owned());
+        }
         let mut rpki = Rpki {
             rib,
             router_id,
             client: None,
         };
-        rpki.client = rpki.spawn(config, None)?;
+        rpki.client = rpki
+            .spawn(config, None)
+            .map_err(|e| format!("cannot start the rtr client: {e}"))?;
         Ok(rpki)
     }
 
@@ -214,8 +306,8 @@ impl Rpki {
 
     /// Apply `new`, the block of a reloaded configuration, in place of
     /// `old`, the running one; what was done, for the reload's summary.
-    /// The caller has checked with [`resolve`] that the new caches can be
-    /// found.
+    /// The caller has checked with [`preflight`] that the new caches can
+    /// be found, and that neither block runs the sidecar.
     ///
     /// # Errors
     /// The new client thread could not be spawned. Validation is then
@@ -504,46 +596,218 @@ mod tests {
         assert_eq!(resolve(&off.rpki), Ok(()));
     }
 
-    /// The parse hook finds nothing in the modes bgpfcd runs, so such a
-    /// file loads as the configuration crate alone judges it.
+    /// The parse hook finds nothing in a file the sidecar crate accepts,
+    /// so such a file loads as the configuration crate alone judges it.
     #[test]
     fn the_parse_hook_accepts_the_modes_bgpfcd_runs() {
         for rpki in [
             "",
             "rpki { mode disabled; }",
             "rpki { mode external; cache 192.0.2.10; }",
+            "rpki { mode sidecar; }",
         ] {
             let errors = check_config(&config(rpki));
             assert!(errors.is_empty(), "{rpki}: {errors:?}");
         }
     }
 
-    /// Until bgpfcd runs the sidecar, `mode sidecar` stops the load at
-    /// its block, or at the mode without one, with the file's other
-    /// errors; the configuration crate alone accepts the file.
+    /// The golden file with every sidecar statement written out, read
+    /// from the configuration crate's tests.
+    const FULL_SIDECAR: &str = include_str!("../../bgpfc-config/tests/golden/rpki-sidecar.conf");
+    /// The golden file with the one-line sidecar block.
+    const DEFAULT_SIDECAR: &str =
+        include_str!("../../bgpfc-config/tests/golden/rpki-sidecar-defaults.conf");
+
+    #[test]
+    fn the_sidecar_settings_lower_to_the_sidecar_crate() {
+        let cfg = bgpfc_config::parse_str("rpki-sidecar.conf", FULL_SIDECAR).unwrap();
+        let expected = SidecarConfig {
+            binary: "/opt/routinator/bin/routinator".into(),
+            rtr_listen: "[::1]:3323".parse().unwrap(),
+            repository_dir: "/var/lib/bgpfc/rpki cache".into(),
+            tals: TalConfig {
+                rir_tals: false,
+                bundled: vec!["ripe".to_owned(), "ripe-pilot".to_owned()],
+                extra_dir: Some("/etc/bgpfc/tals".into()),
+            },
+            accept_arin_rpa: true,
+            refresh: Duration::from_secs(300),
+            config_file: Some("/etc/bgpfc/routinator.conf".into()),
+            extra_global_args: vec![
+                "--strict".into(),
+                "--exceptions=/etc/bgpfc/slurm;local.json".into(),
+            ],
+            extra_server_args: vec![
+                "--rtr-tcp-keepalive=30".into(),
+                "--http=127.0.0.1:8323".into(),
+            ],
+            backoff: BackoffConfig {
+                initial: Duration::from_secs(2),
+                cap: Duration::from_secs(600),
+                stable: Duration::from_mins(15),
+            },
+            stop_timeout: Duration::from_secs(20),
+            failure_threshold: 3,
+        };
+        assert_eq!(sidecar_config(&cfg.rpki.sidecar), expected);
+    }
+
+    /// The defaults and bounds of the `sidecar` block are those of the
+    /// sidecar crate (m14 design §1.2), as m12 checks the RTR client's.
+    #[test]
+    fn the_sidecar_defaults_are_the_sidecar_crates() {
+        use bgpfc_config::ast::RpkiSidecar as S;
+        assert_eq!(
+            sidecar_config(&S::default()),
+            SidecarConfig::new(S::DEFAULT_BINARY, S::DEFAULT_REPOSITORY_DIR)
+        );
+        let cfg = bgpfc_config::parse_str("defaults", DEFAULT_SIDECAR).unwrap();
+        assert_eq!(
+            sidecar_config(&cfg.rpki.sidecar),
+            SidecarConfig::new(S::DEFAULT_BINARY, S::DEFAULT_REPOSITORY_DIR)
+        );
+        assert_eq!(S::DEFAULT_REFRESH, SidecarConfig::DEFAULT_REFRESH);
+        assert_eq!(S::DEFAULT_STOP_TIMEOUT, SidecarConfig::DEFAULT_STOP_TIMEOUT);
+        assert_eq!(
+            S::DEFAULT_FAILURE_THRESHOLD,
+            SidecarConfig::DEFAULT_FAILURE_THRESHOLD
+        );
+        let backoff = BackoffConfig::default();
+        assert_eq!(S::DEFAULT_RESTART_INITIAL, backoff.initial);
+        assert_eq!(S::DEFAULT_RESTART_CAP, backoff.cap);
+        assert_eq!(S::DEFAULT_STABLE_AFTER, backoff.stable);
+        // The bounds the language allows are the crate's: whole seconds
+        // meet its sub-second floors, and the longest values are its own.
+        assert_eq!(S::MAX_RESTART_BACKOFF, SidecarConfig::MAX_DELAY);
+        assert_eq!(S::MAX_STOP_TIMEOUT, SidecarConfig::MAX_DELAY);
+        assert_eq!(S::MAX_STABLE_AFTER, SidecarConfig::MAX_STABLE);
+        assert!(Duration::from_secs(1) >= SidecarConfig::MIN_BACKOFF);
+        assert!(Duration::from_secs(1) >= SidecarConfig::MIN_BACKOFF_CAP);
+        assert_eq!(S::MAX_REFRESH, Duration::from_secs(7_199));
+        // So the extremes the language accepts pass the crate's checks,
+        // and one second past the longest refresh does not.
+        let extremes = [
+            "refresh 1; restart-backoff 1 1; stable-after 1; stop-timeout 1; \
+             failure-threshold 1;",
+            "refresh 7199; restart-backoff 3600 3600; stable-after 86400; \
+             stop-timeout 3600; failure-threshold 4294967295;",
+        ];
+        for settings in extremes {
+            let cfg = config(&format!(
+                "rpki {{ mode sidecar; sidecar {{ {settings} }} }}"
+            ));
+            assert_eq!(sidecar_config(&cfg.rpki.sidecar).validate(), Ok(()));
+        }
+        let mut past = sidecar_config(&S::default());
+        past.refresh = S::MAX_REFRESH + Duration::from_secs(1);
+        assert!(past.validate().is_err());
+    }
+
+    #[test]
+    fn every_sidecar_block_the_parser_accepts_passes_validate() {
+        for (name, text) in [
+            ("rpki-sidecar.conf", FULL_SIDECAR),
+            ("rpki-sidecar-defaults.conf", DEFAULT_SIDECAR),
+        ] {
+            let cfg = bgpfc_config::parse_str_with(name, text, &check_config);
+            assert!(cfg.is_ok(), "{name}: {}", cfg.unwrap_err());
+        }
+    }
+
+    /// Issue #72: what only Routinator's rules refuse is reported at the
+    /// `sidecar` block, with the file's position and caret, as any other
+    /// error; under `mode disabled` the same block is only read.
+    #[test]
+    fn routinator_rules_are_reported_at_the_sidecar_block() {
+        let cases = [
+            (
+                "tals ripe-ncc;",
+                "rpki sidecar: Routinator 0.15 bundles no TAL named \"ripe-ncc\"; it knows \
+                 afrinic, apnic, arin, lacnic, ripe, apnic-testbed, arin-ote, ripe-pilot, \
+                 nlnetlabs-testbed",
+            ),
+            (
+                "tals arin;",
+                "rpki sidecar: the ARIN TAL is listed, but ARIN's Relying Party Agreement \
+                 has not been accepted",
+            ),
+            (
+                "rir-tals no;",
+                "rpki sidecar: no trust anchors: enable the RIR TALs, name a bundled TAL or \
+                 give an extra TAL directory",
+            ),
+            (
+                "global-args \"-d\";",
+                "rpki sidecar: extra Routinator argument \"-d\" is not allowed: a detached \
+                 Routinator leaves bgpfcd's supervision",
+            ),
+            (
+                "server-args \"--rtr=0.0.0.0:323\";",
+                "rpki sidecar: extra Routinator argument \"--rtr=0.0.0.0:323\" is not \
+                 allowed: bgpfcd passes --rtr; RTR is served on the configured loopback \
+                 address only",
+            ),
+        ];
+        let head = "router-id 192.0.2.1;\nlocal-as 65000;\n";
+        for (statement, message) in cases {
+            let block = format!("  sidecar {{ {statement} }}");
+            let text = format!("{head}rpki {{\n  mode sidecar;\n{block}\n}}\n");
+            let errors = bgpfc_config::parse_str_with("t", &text, &check_config).unwrap_err();
+            assert_eq!(
+                errors.to_string(),
+                format!("t:5:3: {message}\n  {block}\n    ^"),
+                "{statement}"
+            );
+            let disabled = text.replace("mode sidecar", "mode disabled");
+            let cfg = bgpfc_config::parse_str_with("t", &disabled, &check_config);
+            assert!(cfg.is_ok(), "{statement}: {}", cfg.unwrap_err());
+        }
+        // Without a block, at the mode, which is all there is to point to.
+        let config = bgpfc_config::Config {
+            rpki: ast::Rpki {
+                sidecar: ast::RpkiSidecar {
+                    pos: Some(Pos { line: 3, col: 8 }),
+                    rir_tals: false,
+                    ..ast::RpkiSidecar::default()
+                },
+                ..ast::Rpki::defaults(RpkiMode::Sidecar)
+            },
+            ..config("")
+        };
+        let errors = check_config(&config);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].pos, Pos { line: 3, col: 8 });
+    }
+
+    /// Until bgpfcd runs the sidecar, `mode sidecar` stops the start, and
+    /// a reload that changes a block with it fails before anything
+    /// changes: neither may leave validation silently off.
     #[test]
     fn mode_sidecar_is_refused_until_bgpfcd_runs_it() {
-        let head = "router-id 192.0.2.1;\nlocal-as 65000;\n";
-        let bare = format!("{head}rpki {{ mode sidecar; }}\n");
-        let errors = bgpfc_config::parse_str_with("t", &bare, &check_config).unwrap_err();
+        let (tx, rx) = sync_channel(4);
+        let sidecar = config("rpki { mode sidecar; }");
+        let err = Rpki::start(&sidecar.rpki, sidecar.router_id, tx).unwrap_err();
+        assert_eq!(err, "mode sidecar is not supported by this bgpfcd yet");
+        assert!(rx.try_recv().is_err());
+        let external = config("rpki { mode external; cache 127.0.0.1; }");
+        let refused = "rpki: a reload that changes an rpki block with mode sidecar is not \
+                       supported by this bgpfcd yet";
         assert_eq!(
-            errors.to_string(),
-            "t:3:8: `mode sidecar` is not supported by this bgpfcd yet\n  \
-             rpki { mode sidecar; }\n         ^"
+            preflight(&external.rpki, &sidecar.rpki),
+            Err(refused.to_owned())
         );
-        let block = format!("{head}rpki {{\n  mode sidecar;\n  sidecar {{ refresh 300; }}\n}}\n");
-        let errors = bgpfc_config::parse_str_with("t", &block, &check_config).unwrap_err();
         assert_eq!(
-            errors.to_string(),
-            "t:5:3: `mode sidecar` is not supported by this bgpfcd yet\n    \
-             sidecar { refresh 300; }\n    ^"
+            preflight(&sidecar.rpki, &external.rpki),
+            Err(refused.to_owned())
         );
-        for text in [&bare, &block] {
-            assert!(bgpfc_config::parse_str("t", text).is_ok(), "{text}");
-        }
-        // The other modes may keep a sidecar block (issue #60).
-        let disabled = config("rpki { mode disabled; sidecar { refresh 300; } }");
-        assert_eq!(check_config(&disabled), []);
+        // An unchanged block, or an `enforcement` alone, changes nothing.
+        let prefer = config("rpki { mode sidecar; enforcement prefer-valid; }");
+        assert_eq!(preflight(&sidecar.rpki, &prefer.rpki), Ok(()));
+        // External caches are looked up as at start; a block that has
+        // not changed is not looked up again.
+        let bad = config("rpki { mode external; cache rtr.invalid; }");
+        assert!(preflight(&external.rpki, &bad.rpki).is_err());
+        assert_eq!(preflight(&bad.rpki, &bad.rpki), Ok(()));
     }
 
     #[test]

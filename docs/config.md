@@ -543,10 +543,11 @@ the timeouts, `max-expire`, `max-vrps` and `backoff`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
 Routinator 0.15.x, and is tested with 0.15.2.
 
-> **Not run yet.** This bgpfcd does not run the sidecar: `bgpfcd --check`,
-> the daemon and a reload refuse `mode sidecar` with an error at the
-> `sidecar` block, or at the `mode` statement without one. The rest of
-> this section describes the language.
+> **Not run yet.** This bgpfcd does not run the sidecar: `bgpfcd --check`
+> checks the `sidecar` block as described below, but the daemon refuses to
+> start with `mode sidecar` (`cannot start rpki`), and a reload that changes
+> an `rpki` block with `mode sidecar` before or after it fails, keeping the
+> running configuration.
 
 The smallest file that validates every route:
 
