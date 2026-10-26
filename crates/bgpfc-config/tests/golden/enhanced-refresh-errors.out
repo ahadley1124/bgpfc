@@ -1,0 +1,42 @@
+enhanced-refresh-errors.conf:8:22: `maybe` is not `yes` or `no`
+      enhanced-refresh maybe;
+                       ^
+enhanced-refresh-errors.conf:9:5: `enhanced-refresh` is given more than once
+      enhanced-refresh yes;
+      ^
+enhanced-refresh-errors.conf:10:5: `enhanced-refresh` is given more than once
+      enhanced-refresh no;
+      ^
+enhanced-refresh-errors.conf:11:24: refresh-stale-time must be at least 1 (RFC 7313 §4)
+      refresh-stale-time 0;
+                         ^
+enhanced-refresh-errors.conf:12:5: `refresh-stale-time` is given more than once
+      refresh-stale-time 65536;
+      ^
+enhanced-refresh-errors.conf:12:24: `65536` is not a number of seconds (1-65535)
+      refresh-stale-time 65536;
+                         ^
+enhanced-refresh-errors.conf:13:5: `refresh-stale-time` is given more than once
+      refresh-stale-time long;
+      ^
+enhanced-refresh-errors.conf:13:24: `long` is not a number of seconds (1-65535)
+      refresh-stale-time long;
+                         ^
+enhanced-refresh-errors.conf:14:5: `refresh-stale-time` is given more than once
+      refresh-stale-time 360;
+      ^
+enhanced-refresh-errors.conf:15:5: `refresh-stale-time` takes one argument, found 0
+      refresh-stale-time;
+      ^
+enhanced-refresh-errors.conf:15:5: `refresh-stale-time` is given more than once
+      refresh-stale-time;
+      ^
+enhanced-refresh-errors.conf:16:5: `refresh-stale-time` takes one argument, found 2
+      refresh-stale-time 1 2;
+      ^
+enhanced-refresh-errors.conf:16:5: `refresh-stale-time` is given more than once
+      refresh-stale-time 1 2;
+      ^
+enhanced-refresh-errors.conf:18:80: neighbor 192.0.2.3: `refresh-stale-time` needs `enhanced-refresh yes`, the default
+  neighbor 192.0.2.3 { remote-as 65001; import A; export A; enhanced-refresh no; refresh-stale-time 360; }
+                                                                                 ^

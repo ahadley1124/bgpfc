@@ -29,9 +29,10 @@ use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 
 use crate::ast::{
-    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, DEFAULT_RESTART_TIME,
-    DEFAULT_STALE_TIME, Fib, FibMode, GracefulRestart, Http, Match, Neighbor, Policy, PrefixEntry,
-    PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction, Term,
+    Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_REFRESH_STALE_TIME,
+    DEFAULT_RESTART_LIMIT, DEFAULT_RESTART_TIME, DEFAULT_STALE_TIME, EnhancedRefresh, Fib, FibMode,
+    GracefulRestart, Http, Match, Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache,
+    RpkiMode, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -1228,6 +1229,11 @@ struct NeighborBuilder {
     /// Where `restart-time` and `stale-time` stand, for the error when
     /// Graceful Restart is not on for them to tune.
     restart_options_at: Option<Pos>,
+    enhanced_refresh: Once<bool>,
+    refresh_stale_time: Once<Duration>,
+    /// Where `refresh-stale-time` stands, for the error when Enhanced Route
+    /// Refresh is off.
+    refresh_options_at: Option<Pos>,
 }
 
 impl NeighborBuilder {
@@ -1259,6 +1265,9 @@ impl NeighborBuilder {
             restart_time: Once::new("restart-time"),
             stale_time: Once::new("stale-time"),
             restart_options_at: None,
+            enhanced_refresh: Once::new("enhanced-refresh"),
+            refresh_stale_time: Once::new("refresh-stale-time"),
+            refresh_options_at: None,
         }
     }
 
@@ -1344,21 +1353,11 @@ impl NeighborBuilder {
                 let v = l.yes_no(t);
                 self.extended_next_hop.set(l, t.pos, v);
             }
-            "restart-limit" => {
-                // RFC 4486 §4: an upper bound on consecutive automatic
-                // retries; `off` for none.
-                let v = l.arg(t).and_then(|a| {
-                    if a.value == "off" {
-                        Some(None)
-                    } else {
-                        l.parse::<u32>(a, "a number of restarts or `off`").map(Some)
-                    }
-                });
-                self.restart_limit.set(l, t.pos, v);
-            }
+            "restart-limit" => self.restart_limit(l, t),
             "maximum-prefix" => self.maximum_prefix(l, t),
             "add-path" => self.add_path(l, t),
             "graceful-restart" | "restart-time" | "stale-time" => self.graceful_restart(l, t),
+            "enhanced-refresh" | "refresh-stale-time" => self.enhanced_refresh(l, t),
             "role" => self.role(l, t),
             "role-strict" => {
                 let v = l.yes_no(t);
@@ -1369,6 +1368,19 @@ impl NeighborBuilder {
             }
             _ => l.unknown(t, "`neighbor`"),
         }
+    }
+
+    /// `restart-limit N|off`: RFC 4486 §4's upper bound on consecutive
+    /// automatic retries; `off` for none.
+    fn restart_limit(&mut self, l: &mut Lowerer, t: &Statement) {
+        let v = l.arg(t).and_then(|a| {
+            if a.value == "off" {
+                Some(None)
+            } else {
+                l.parse::<u32>(a, "a number of restarts or `off`").map(Some)
+            }
+        });
+        self.restart_limit.set(l, t.pos, v);
     }
 
     /// `add-path receive FAMILY yes|no` or `add-path send FAMILY N|all|off`,
@@ -1493,6 +1505,29 @@ impl NeighborBuilder {
         self.stale_time.set(l, t.pos, v);
     }
 
+    /// `enhanced-refresh yes|no`, and the `refresh-stale-time` that tunes it
+    /// (RFC 7313).
+    fn enhanced_refresh(&mut self, l: &mut Lowerer, t: &Statement) {
+        if t.keyword == "refresh-stale-time" {
+            // RFC 7313 §4 lets an implementation bound the wait for an
+            // EoRR; zero would purge the routes the moment the refresh
+            // began.
+            let v = l.arg(t).and_then(|a| {
+                let secs: u16 = l.parse(a, "a number of seconds (1-65535)")?;
+                if secs == 0 {
+                    l.err(a.pos, "refresh-stale-time must be at least 1 (RFC 7313 §4)");
+                    return None;
+                }
+                Some(Duration::from_secs(u64::from(secs)))
+            });
+            self.refresh_options_at.get_or_insert(t.pos);
+            self.refresh_stale_time.set(l, t.pos, v);
+        } else {
+            let v = l.yes_no(t);
+            self.enhanced_refresh.set(l, t.pos, v);
+        }
+    }
+
     /// `role NAME`: one of the five Roles of RFC 9234 §4.1, Table 1, by the
     /// names the RFC uses. It is ours, not the neighbor's.
     fn role(&mut self, l: &mut Lowerer, t: &Statement) {
@@ -1540,16 +1575,16 @@ impl NeighborBuilder {
         }
     }
 
-    fn finish(self, l: &mut Lowerer, pos: Pos, addr: IpAddr) -> Option<Neighbor> {
-        for (present, kw) in [
-            (self.remote_as.seen, "remote-as"),
-            (self.import.seen, "import"),
-            (self.export.seen, "export"),
-        ] {
-            if !present {
-                l.err(pos, format!("neighbor {addr} has no `{kw}`"));
-            }
-        }
+    /// The options that tune a statement which is off: `role-strict yes`
+    /// without a `role`, `restart-time` and `stale-time` without
+    /// `graceful-restart yes`, `refresh-stale-time` with `enhanced-refresh
+    /// no`. Alone they would silently do nothing.
+    fn check_options(
+        &self,
+        l: &mut Lowerer,
+        addr: IpAddr,
+        (graceful_restart, enhanced_refresh): (bool, bool),
+    ) {
         // RFC 9234 §4.2: strict mode is about the Role capability we sent,
         // and one is sent only for a configured Role.
         if let Some(at) = self.role_strict_at
@@ -1563,7 +1598,6 @@ impl NeighborBuilder {
         // `restart-time` and `stale-time` tune what `graceful-restart yes`
         // turns on: alone they would silently do nothing.
         // A `graceful-restart` that was given but is bad has been reported.
-        let graceful_restart = self.graceful_restart.value.unwrap_or(false);
         if let Some(at) = self.restart_options_at
             && !graceful_restart
             && (self.graceful_restart.value.is_some() || !self.graceful_restart.seen)
@@ -1575,6 +1609,33 @@ impl NeighborBuilder {
                 ),
             );
         }
+        // `refresh-stale-time` tunes what `enhanced-refresh yes`, the
+        // default, has on: with `no` stated it would silently do nothing.
+        if let Some(at) = self.refresh_options_at
+            && !enhanced_refresh
+        {
+            l.err(
+                at,
+                format!(
+                    "neighbor {addr}: `refresh-stale-time` needs `enhanced-refresh yes`, the default"
+                ),
+            );
+        }
+    }
+
+    fn finish(self, l: &mut Lowerer, pos: Pos, addr: IpAddr) -> Option<Neighbor> {
+        for (present, kw) in [
+            (self.remote_as.seen, "remote-as"),
+            (self.import.seen, "import"),
+            (self.export.seen, "export"),
+        ] {
+            if !present {
+                l.err(pos, format!("neighbor {addr} has no `{kw}`"));
+            }
+        }
+        let graceful_restart = self.graceful_restart.value.unwrap_or(false);
+        let enhanced_refresh = self.enhanced_refresh.value.unwrap_or(true);
+        self.check_options(l, addr, (graceful_restart, enhanced_refresh));
         Some(Neighbor {
             pos,
             addr,
@@ -1633,6 +1694,12 @@ impl NeighborBuilder {
                     .stale_time
                     .value
                     .unwrap_or(Duration::from_secs(u64::from(DEFAULT_STALE_TIME))),
+            }),
+            enhanced_refresh: enhanced_refresh.then(|| EnhancedRefresh {
+                stale_time: self
+                    .refresh_stale_time
+                    .value
+                    .unwrap_or(Duration::from_secs(u64::from(DEFAULT_REFRESH_STALE_TIME))),
             }),
             role: self.role.value.map(|role| LocalRole {
                 role,

@@ -272,6 +272,11 @@ Config {
                 ),
             ],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: Some(
                 LocalRole {
                     role: Customer,
@@ -353,6 +358,11 @@ Config {
                 ),
             ],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: Some(
                 LocalRole {
                     role: RouteServerClient,
@@ -401,6 +411,11 @@ Config {
             add_path_receive: [],
             add_path_send: [],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: Some(
                 LocalRole {
                     role: Peer,

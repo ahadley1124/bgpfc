@@ -95,6 +95,11 @@ Config {
             add_path_receive: [],
             add_path_send: [],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: None,
         },
         Neighbor {
@@ -142,6 +147,11 @@ Config {
                     restart_time: RestartTime(
                         120,
                     ),
+                    stale_time: 360s,
+                },
+            ),
+            enhanced_refresh: Some(
+                EnhancedRefresh {
                     stale_time: 360s,
                 },
             ),
@@ -195,6 +205,11 @@ Config {
                     stale_time: 65535s,
                 },
             ),
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: None,
         },
         Neighbor {
@@ -238,6 +253,11 @@ Config {
             add_path_receive: [],
             add_path_send: [],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: None,
         },
         Neighbor {
@@ -286,6 +306,11 @@ Config {
                         0,
                     ),
                     stale_time: 1s,
+                },
+            ),
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
                 },
             ),
             role: None,
