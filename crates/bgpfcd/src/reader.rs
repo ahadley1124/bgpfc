@@ -14,7 +14,6 @@ use bgpfc_wire::error::DecodeError;
 use bgpfc_wire::header::{HEADER_LEN, Header, MessageType};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::route_refresh::RouteRefreshMessage;
 
 use crate::messages::{ConnId, Inbound, PeerInput};
 
@@ -61,8 +60,9 @@ pub(crate) fn run(
     }
 }
 
-/// Decode a body into the typed message its header announced. UPDATEs are
-/// left raw for the peer thread, which has the session context.
+/// Decode a body into the typed message its header announced. UPDATEs and
+/// ROUTE-REFRESHes are left raw for the peer thread, which has the session
+/// context their errors depend on (RFC 7606, RFC 7313 §5).
 fn decode(kind: MessageType, body: &[u8]) -> Result<Inbound, DecodeError> {
     Ok(match kind {
         MessageType::Open => Inbound::Open(OpenMessage::decode(body)?),
@@ -72,8 +72,6 @@ fn decode(kind: MessageType, body: &[u8]) -> Result<Inbound, DecodeError> {
             NotificationMessage::decode(body).map_or(Inbound::Keepalive, Inbound::Notification)
         }
         MessageType::Keepalive => Inbound::Keepalive,
-        MessageType::RouteRefresh => {
-            Inbound::RouteRefresh(RouteRefreshMessage::decode(body, false)?)
-        }
+        MessageType::RouteRefresh => Inbound::RouteRefresh(body.to_vec()),
     })
 }

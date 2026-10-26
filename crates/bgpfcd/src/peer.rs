@@ -11,7 +11,11 @@
 //! (a received Shutdown Communication is logged); RFC 4724 §2, §4.2, §5 and
 //! RFC 8538 §4 (the End-of-RIB marker goes to the RIB, a session that ends
 //! gracefully leaves its routes there as stale ones, and a connection from a
-//! peer that restarted replaces the established session).
+//! peer that restarted replaces the established session); RFC 7313 §3.2,
+//! §4, §5 (the Message Subtype of a ROUTE-REFRESH is read only on a session
+//! with Enhanced Route Refresh, where a `BoRR` and an `EoRR` go to the RIB, an
+//! unknown subtype is ignored and logged, and a wrong length is a
+//! ROUTE-REFRESH Message Error).
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
@@ -27,7 +31,7 @@ use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
-use bgpfc_wire::route_refresh::RouteRefreshMessage;
+use bgpfc_wire::route_refresh::{RefreshSubtype, RouteRefreshMessage};
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::{DecodeContext, PeerKind, UpdateMessage};
 
@@ -72,6 +76,9 @@ pub(crate) struct PeerConfig {
     /// `stale-time` of a neighbor with `graceful-restart yes` (RFC 8538
     /// §4.1): the RIB bounds the wait for the End-of-RIB marker with it.
     pub(crate) stale_time: Option<Duration>,
+    /// `refresh-stale-time` of a neighbor with `enhanced-refresh yes` (RFC
+    /// 7313 §4): the RIB bounds the wait for an `EoRR` with it.
+    pub(crate) refresh_stale_time: Option<Duration>,
 }
 
 /// How other threads reach a peer thread.
@@ -425,6 +432,7 @@ impl Peer {
                         local_addr,
                         session,
                         stale_time: self.cfg.stale_time,
+                        refresh_stale_time: self.cfg.refresh_stale_time,
                     });
                 }
                 Action::SessionDown { retain } => {
@@ -971,29 +979,7 @@ impl Peer {
                 }
             }
             Ok(Inbound::Keepalive) => self.event(Event::KeepAliveMsg, now),
-            Ok(Inbound::RouteRefresh(r)) => {
-                let established = self.fsm.state() == State::Established;
-                self.event(Event::RouteRefreshMsg, now);
-                if established {
-                    let known = self
-                        .session
-                        .as_ref()
-                        .is_some_and(|s| s.families.contains(&r.family));
-                    if known {
-                        self.rib_send(RibMsg::RouteRefresh {
-                            peer: self.cfg.addr,
-                            family: r.family,
-                        });
-                    } else {
-                        // RFC 2918 §4: a family we did not advertise is ignored.
-                        bgpfc_log::debug!(
-                            "route refresh for unadvertised family",
-                            peer = self.cfg.addr,
-                            family = r.family
-                        );
-                    }
-                }
-            }
+            Ok(Inbound::RouteRefresh(body)) => self.route_refresh(&body, now),
             Err(e) => {
                 // RFC 4271 §8.1.5: event 22 for an OPEN that failed §6.2,
                 // event 21 for anything the header checks rejected.
@@ -1003,6 +989,69 @@ impl Peer {
                     self.event(Event::BgpHeaderErr(e), now);
                 }
             }
+        }
+    }
+
+    /// A ROUTE-REFRESH. The RFC 7313 §3.2 Message Subtype is read only on a
+    /// session that negotiated Enhanced Route Refresh; on any other the
+    /// octet is the Reserved one of RFC 2918 §3, which the receiver ignores,
+    /// and the message is a request.
+    fn route_refresh(&mut self, body: &[u8], now: Instant) {
+        let established = self.fsm.state() == State::Established;
+        let enhanced = established
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.route_refresh.enhanced());
+        let message = match RouteRefreshMessage::decode(body, enhanced) {
+            Ok(m) => m,
+            // RFC 7313 §5, or RFC 4271 §6.1 where it does not apply.
+            Err(e) => {
+                self.event(Event::BgpHeaderErr(e), now);
+                return;
+            }
+        };
+        self.event(Event::RouteRefreshMsg, now);
+        if !established {
+            return;
+        }
+        let family = message.family;
+        let subtype = if enhanced {
+            message.subtype
+        } else {
+            RefreshSubtype::Request
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        // RFC 2918 §4: a request for a family we did not negotiate is
+        // ignored. The brackets of the peer's own refresh are for the routes
+        // it sends, those of any family we advertised.
+        let known = match subtype {
+            RefreshSubtype::Request => session.families.contains(&family),
+            _ => session.receive_families.contains(&family),
+        };
+        if !known {
+            bgpfc_log::debug!(
+                "route refresh for unadvertised family",
+                peer = self.cfg.addr,
+                family = family
+            );
+            return;
+        }
+        let peer = self.cfg.addr;
+        match subtype {
+            RefreshSubtype::Request => self.rib_send(RibMsg::RouteRefresh { peer, family }),
+            RefreshSubtype::BeginOfRefresh => self.rib_send(RibMsg::RefreshBegin { peer, family }),
+            RefreshSubtype::EndOfRefresh => self.rib_send(RibMsg::RefreshEnd { peer, family }),
+            // RFC 7313 §5: "it MUST ignore the received ROUTE-REFRESH
+            // message. It SHOULD log an error for further analysis."
+            RefreshSubtype::Unknown(subtype) => bgpfc_log::error!(
+                "route refresh with an unknown message subtype ignored",
+                peer = peer,
+                family = family,
+                subtype = subtype
+            ),
         }
     }
 
@@ -1483,6 +1532,7 @@ mod tests {
             fsm,
             allow_as_set: false,
             stale_time: None,
+            refresh_stale_time: None,
         };
         let (rib, _) = sync_channel(4);
         let (_, peer) = prepare(cfg, rib, Arc::default());
@@ -1625,6 +1675,183 @@ mod tests {
                 !lingers,
                 "{case:?}"
             );
+        }
+    }
+
+    /// A peer thread with its session Established, whatever `ours` and
+    /// `theirs` advertise, the RIB messages it sent so far read, and the
+    /// neighbor's end of the connection.
+    fn established(
+        ours: &[Capability],
+        theirs: &[Capability],
+    ) -> (Peer, Receiver<RibMsg>, TcpStream) {
+        use bgpfc_wire::types::{Asn, HoldTime, RouterId};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        fsm.capabilities = ours.to_vec();
+        let cfg = PeerConfig {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+            stale_time: None,
+            refresh_stale_time: None,
+        };
+        let (rib_tx, rib) = sync_channel(16);
+        let (_, mut peer) = prepare(cfg, rib_tx, Arc::default());
+        let (_, stream) = connect(&mut peer, &listener);
+        let now = Instant::now();
+        peer.event(Event::ManualStart, now);
+        peer.event(Event::TcpCrAcked, now);
+        let open = OpenMessage::new(
+            Asn(65_001),
+            HoldTime::new(90).unwrap(),
+            RouterId::new(2).unwrap(),
+            theirs.to_vec(),
+        );
+        peer.event(Event::BgpOpen(open), now);
+        peer.event(Event::KeepAliveMsg, now);
+        assert_eq!(peer.fsm.state(), State::Established);
+        assert!(matches!(rib.try_recv(), Ok(RibMsg::PeerUp { .. })));
+        (peer, rib, stream)
+    }
+
+    /// The messages `theirs` has been sent, as (type, body), read until the
+    /// connection is quiet or closed.
+    fn received(theirs: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        use std::io::Read;
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut all = Vec::new();
+        loop {
+            let mut header = [0u8; 19];
+            if theirs.read_exact(&mut header).is_err() {
+                return all;
+            }
+            let mut body = vec![0; usize::from(u16::from_be_bytes([header[16], header[17]])) - 19];
+            if theirs.read_exact(&mut body).is_err() {
+                return all;
+            }
+            all.push((header[18], body));
+        }
+    }
+
+    fn refresh_caps(enhanced: bool) -> Vec<Capability> {
+        let mut caps = vec![
+            Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+            Capability::RouteRefresh,
+        ];
+        if enhanced {
+            caps.push(Capability::EnhancedRouteRefresh);
+        }
+        caps
+    }
+
+    #[test]
+    fn the_subtypes_of_a_route_refresh_reach_the_rib_when_both_sides_have_the_capability() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let caps = refresh_caps(true);
+        let (mut peer, rib, _theirs) = established(&caps, &caps);
+        assert!(peer.session.as_ref().unwrap().route_refresh.enhanced());
+        let now = Instant::now();
+        let mut sent = |body: &[u8]| {
+            peer.primary_message(Ok(Inbound::RouteRefresh(body.to_vec())), now);
+            rib.try_iter().collect::<Vec<_>>()
+        };
+        // RFC 7313 §3.2: 0 request, 1 BoRR, 2 EoRR.
+        assert!(matches!(
+            sent(&[0, 1, 0, 1])[..],
+            [RibMsg::RouteRefresh { family, .. }] if family == v4
+        ));
+        assert!(matches!(
+            sent(&[0, 1, 1, 1])[..],
+            [RibMsg::RefreshBegin { family, .. }] if family == v4
+        ));
+        assert!(matches!(
+            sent(&[0, 1, 2, 1])[..],
+            [RibMsg::RefreshEnd { family, .. }] if family == v4
+        ));
+        // RFC 7313 §5: any other subtype is ignored (and logged), and the
+        // session goes on.
+        for subtype in [3, 100, 255] {
+            assert!(sent(&[0, 1, subtype, 1]).is_empty());
+        }
+        // RFC 2918 §4: a request for a family we did not negotiate, and the
+        // brackets of one we do not take routes of, are ignored.
+        for subtype in [0, 1, 2] {
+            assert!(sent(&[0, 2, subtype, 1]).is_empty());
+        }
+        assert_eq!(peer.fsm.state(), State::Established);
+    }
+
+    #[test]
+    fn without_the_capability_on_both_sides_the_subtype_is_ignored_and_it_is_a_request() {
+        // RFC 2918 §3: the receiver ignores the Reserved octet.
+        for (ours, theirs) in [
+            (refresh_caps(true), refresh_caps(false)),
+            (refresh_caps(false), refresh_caps(true)),
+            (refresh_caps(false), refresh_caps(false)),
+        ] {
+            let (mut peer, rib, _theirs) = established(&ours, &theirs);
+            assert!(!peer.session.as_ref().unwrap().route_refresh.enhanced());
+            for subtype in [0, 1, 2, 77] {
+                peer.primary_message(
+                    Ok(Inbound::RouteRefresh(vec![0, 1, subtype, 1])),
+                    Instant::now(),
+                );
+                assert!(
+                    matches!(
+                        rib.try_iter().collect::<Vec<_>>()[..],
+                        [RibMsg::RouteRefresh { .. }]
+                    ),
+                    "subtype {subtype}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_borr_or_eorr_of_the_wrong_length_is_answered_with_a_route_refresh_message_error() {
+        let caps = refresh_caps(true);
+        for subtype in [1u8, 2] {
+            let (mut peer, rib, mut theirs) = established(&caps, &caps);
+            let body = vec![0, 1, subtype, 1, 0];
+            peer.primary_message(Ok(Inbound::RouteRefresh(body.clone())), Instant::now());
+            // RFC 7313 §5: code 7, subcode 1, "the complete ROUTE-REFRESH
+            // message" as data, and the session ends.
+            let notification = received(&mut theirs)
+                .into_iter()
+                .find(|(kind, _)| *kind == 3)
+                .expect("a NOTIFICATION")
+                .1;
+            let mut whole = vec![0xff; 16];
+            whole.extend_from_slice(&[0, 24, 5]);
+            whole.extend_from_slice(&body);
+            assert_eq!(notification[..2], [7, 1]);
+            assert_eq!(notification[2..], whole[..]);
+            assert_ne!(peer.fsm.state(), State::Established);
+            assert!(matches!(
+                rib.try_iter().collect::<Vec<_>>()[..],
+                [RibMsg::PeerDown { .. }]
+            ));
+        }
+        // A request of the wrong length, or the same where the capability is
+        // not in use, is the header error it always was.
+        for (caps, body) in [
+            (refresh_caps(true), vec![0, 1, 0, 1, 0]),
+            (refresh_caps(false), vec![0, 1, 1, 1, 0]),
+        ] {
+            let (mut peer, _rib, mut theirs) = established(&caps, &caps);
+            peer.primary_message(Ok(Inbound::RouteRefresh(body)), Instant::now());
+            let notification = received(&mut theirs)
+                .into_iter()
+                .find(|(kind, _)| *kind == 3)
+                .expect("a NOTIFICATION")
+                .1;
+            // Message Header Error / Bad Message Length, with the Length
+            // field as data.
+            assert_eq!(notification, [1, 2, 0, 24]);
         }
     }
 

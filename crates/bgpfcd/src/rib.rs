@@ -30,16 +30,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{FibChange, Output, PathLimit, PeerInfo, RefreshIgnored, Revalidation, Rib, Sink};
+use bgpfc_rib::{
+    EnhancedRefresh, FibChange, Output, PathLimit, PeerInfo, RefreshIgnored, Revalidation, Rib,
+    Sink,
+};
 use bgpfc_rpki::{AffectedPrefixes, InvalidAction};
+use bgpfc_wire::capability::Capability;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, RestartReport, RibMsg, RibQuery, RibReply, RibSettings,
-    RouteReport, StaleReport,
+    FibMsg, Intervals, PAGE, PeerInput, RefreshingReport, RestartReport, RibMsg, RibQuery,
+    RibReply, RibSettings, RouteReport, StaleReport,
 };
 use crate::peer::SendError;
 use crate::restart::{self, RestartState};
@@ -138,10 +142,17 @@ fn handle(
             local_addr,
             session,
             stale_time,
+            refresh_stale_time,
         } => peer_up(
             rib,
             settings,
-            (peer, local_addr, &session, stale_time),
+            &SessionUp {
+                peer,
+                local_addr,
+                session: &session,
+                stale_time,
+                refresh_stale_time,
+            },
             now,
             out,
         ),
@@ -156,6 +167,19 @@ fn handle(
         RibMsg::EndOfRib { peer, family } => {
             bgpfc_log::info!("rib: end-of-rib", peer = peer, family = family);
             rib.end_of_rib(peer, family, now, out);
+        }
+        RibMsg::RefreshBegin { peer, family } => {
+            let stale = rib.refresh_begin(peer, family, now, out);
+            bgpfc_log::info!(
+                "rib: route refresh begins",
+                peer = peer,
+                family = family,
+                stale_routes = stale
+            );
+        }
+        RibMsg::RefreshEnd { peer, family } => {
+            bgpfc_log::info!("rib: route refresh ends", peer = peer, family = family);
+            rib.refresh_end(peer, family, now, out);
         }
         RibMsg::PeerDown { peer, retain } => peer_down(rib, peer, retain.as_ref(), now, out),
         RibMsg::Query(q, reply) => {
@@ -203,15 +227,34 @@ fn handle(
     }
 }
 
+/// A session that reached Established, with the per-neighbor settings its
+/// configuration gives it that the RIB reads when it comes up.
+struct SessionUp<'a> {
+    peer: IpAddr,
+    local_addr: IpAddr,
+    session: &'a Session,
+    /// `stale-time` (RFC 8538 §4.1), with `graceful-restart yes`.
+    stale_time: Option<Duration>,
+    /// `refresh-stale-time` (RFC 7313 §4), with `enhanced-refresh yes`.
+    refresh_stale_time: Option<Duration>,
+}
+
 /// A session reached Established: tell the RIB, with the settings the
 /// configuration gives the neighbor.
 fn peer_up(
     rib: &mut Rib,
     settings: &RibSettings,
-    (peer, local_addr, session, stale_time): (IpAddr, IpAddr, &Session, Option<Duration>),
+    up: &SessionUp<'_>,
     now: Instant,
     out: &mut impl Sink,
 ) {
+    let SessionUp {
+        peer,
+        local_addr,
+        session,
+        stale_time,
+        refresh_stale_time,
+    } = *up;
     let interval = advertisement_interval(configured(&settings.intervals, peer), session.peer);
     let limits = prefix_limits(settings, peer);
     bgpfc_log::info!(
@@ -238,6 +281,7 @@ fn peer_up(
     let mut info = peer_info(peer, local_addr, session, interval);
     info.prefix_limits = limits;
     info.restart = restart::rib_restart(session, stale_time);
+    info.enhanced_refresh = enhanced_refresh(session, refresh_stale_time);
     info.add_path_send = add_path_send(settings, peer, &session.add_path_send);
     if !info.add_path_receive.is_empty() || !info.add_path_send.is_empty() {
         bgpfc_log::info!(
@@ -248,6 +292,23 @@ fn peer_up(
         );
     }
     rib.peer_up(info, now, out);
+}
+
+/// What the RIB needs of a session's Enhanced Route Refresh (RFC 7313 §4):
+/// `None` unless both sides advertised the capability. The neighbor's
+/// `refresh-stale-time` bounds the wait for an `EoRR`, and whether it
+/// advertised Graceful Restart (whether or not we did) decides whether its
+/// `BoRR` waits for its End-of-RIB.
+fn enhanced_refresh(session: &Session, stale_time: Option<Duration>) -> Option<EnhancedRefresh> {
+    session.route_refresh.enhanced().then(|| EnhancedRefresh {
+        stale_time: stale_time.unwrap_or_else(|| {
+            Duration::from_secs(u64::from(bgpfc_config::ast::DEFAULT_REFRESH_STALE_TIME))
+        }),
+        peer_graceful_restart: session
+            .peer_capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::GracefulRestart(_))),
+    })
 }
 
 /// Switch what the RIB does with Invalid routes by itself (RFC 6811 §5)
@@ -900,6 +961,19 @@ fn restart_report(rib: &Rib, now: Instant) -> RestartReport {
                 peer,
             })
             .collect(),
+        // RFC 7313 §4: the routes of a refresh still stale, by family.
+        refreshing: rib
+            .refreshes(now)
+            .into_iter()
+            .map(|refresh| RefreshingReport {
+                routes: rib
+                    .stale_routes(refresh.addr)
+                    .into_iter()
+                    .find_map(|(f, n)| (f == refresh.family).then_some(n))
+                    .unwrap_or(0),
+                refresh,
+            })
+            .collect(),
     }
 }
 
@@ -971,6 +1045,7 @@ mod tests {
             local_addr: ip("192.0.2.254"),
             session: session(peer_as, kind),
             stale_time: None,
+            refresh_stale_time: None,
         }
     }
 
@@ -1206,6 +1281,7 @@ mod tests {
                 local_addr: ip("192.0.2.254"),
                 session: s,
                 stale_time: None,
+                refresh_stale_time: None,
             };
             handle(&mut rib, &mut settings, msg, now);
         }
@@ -1442,6 +1518,7 @@ mod tests {
             fsm,
             allow_as_set: false,
             stale_time: None,
+            refresh_stale_time: None,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx, Arc::default());
@@ -1516,6 +1593,7 @@ mod tests {
             fsm,
             allow_as_set: false,
             stale_time: None,
+            refresh_stale_time: None,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx, Arc::default());
@@ -1656,6 +1734,7 @@ mod tests {
             local_addr: ip("192.0.2.254"),
             session: s,
             stale_time: Some(Duration::from_secs(200)),
+            refresh_stale_time: None,
         }
     }
 
@@ -1665,6 +1744,201 @@ mod tests {
             restart_time: bgpfc_wire::types::RestartTime::new(120).unwrap(),
             notification: false,
         }
+    }
+
+    /// A session with Enhanced Route Refresh negotiated, and the peer's
+    /// Graceful Restart capability as given.
+    fn err_up(peer: &str, peer_as: u32, peer_graceful_restart: bool) -> RibMsg {
+        let mut s = session(peer_as, PeerKind::External);
+        s.route_refresh = bgpfc_fsm::RouteRefresh::Enhanced;
+        if peer_graceful_restart {
+            s.peer_capabilities = vec![Capability::GracefulRestart(
+                bgpfc_wire::capability::GracefulRestart {
+                    restarting: false,
+                    notification: false,
+                    restart_time: bgpfc_wire::types::RestartTime::new(120).unwrap(),
+                    families: Vec::new(),
+                },
+            )];
+        }
+        RibMsg::PeerUp {
+            peer: ip(peer),
+            local_addr: ip("192.0.2.254"),
+            session: s,
+            stale_time: None,
+            refresh_stale_time: Some(Duration::from_secs(90)),
+        }
+    }
+
+    #[test]
+    fn a_route_refresh_from_the_peer_removes_the_routes_it_does_not_send_again() {
+        // RFC 7313 §4 through the RIB thread's messages: the capability and
+        // the stale time reach the RIB, a BoRR marks the routes, those sent
+        // again replace theirs, and the EoRR removes the rest.
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let peer = ip("192.0.2.1");
+        handle(
+            &mut rib,
+            &mut settings,
+            err_up("192.0.2.1", 65_001, false),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.2", 65_002, PeerKind::External),
+            now,
+        );
+        let enhanced = rib.peer(peer).unwrap().enhanced_refresh.clone().unwrap();
+        assert_eq!(enhanced.stale_time, Duration::from_secs(90));
+        assert!(!enhanced.peer_graceful_restart);
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::RefreshBegin { peer, family: V4 },
+            now,
+        );
+        assert_eq!(out, vec![]);
+        let q = RibQuery::Routes {
+            family: V4,
+            prefix: None,
+            after: None,
+        };
+        match answer(&rib, &q) {
+            RibReply::Routes(r) => assert!(r.iter().all(|r| r.stale) && r.len() == 2),
+            other => panic!("{other:?}"),
+        }
+        let report = match answer(&rib, &RibQuery::Restart) {
+            RibReply::Restart(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(report.refreshing.len(), 1);
+        assert_eq!(report.refreshing[0].routes, 2);
+        assert_eq!(report.refreshing[0].refresh.family, V4);
+        assert_eq!(report.stale.len(), 0);
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::RefreshEnd { peer, family: V4 },
+            now,
+        );
+        let removed: Vec<_> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::StaleRemoved { routes, why, .. } => Some((*routes, *why)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec![(1, bgpfc_rib::StaleEnd::EndOfRefresh)]);
+        assert_eq!(rib.loc_rib(V4).count(), 1);
+        match answer(&rib, &q) {
+            RibReply::Routes(r) => assert!(r.iter().all(|r| !r.stale)),
+            other => panic!("{other:?}"),
+        }
+        match answer(&rib, &RibQuery::Restart) {
+            RibReply::Restart(r) => assert_eq!(r.refreshing.len(), 0),
+            other => panic!("{other:?}"),
+        }
+        // The stale time is the neighbor's: 90 seconds from the BoRR.
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::RefreshBegin { peer, family: V4 },
+            now,
+        );
+        assert_eq!(
+            rib.refreshes(now)[0].stale_in,
+            Some(Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn a_peer_that_advertised_graceful_restart_is_waited_for_before_its_borr_counts() {
+        // RFC 7313 §4: the capability the peer sent decides, and the session
+        // carries it whether or not ours was on.
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let peer = ip("192.0.2.1");
+        handle(
+            &mut rib,
+            &mut settings,
+            err_up("192.0.2.1", 65_001, true),
+            now,
+        );
+        assert!(
+            rib.peer(peer)
+                .unwrap()
+                .enhanced_refresh
+                .as_ref()
+                .unwrap()
+                .peer_graceful_restart
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::RefreshBegin { peer, family: V4 },
+            now,
+        );
+        assert!(matches!(
+            out[..],
+            [Output::RefreshIgnored {
+                why: bgpfc_rib::RefreshIgnored::BeforeEndOfRib,
+                ..
+            }]
+        ));
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::EndOfRib { peer, family: V4 },
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::RefreshBegin { peer, family: V4 },
+            now,
+        );
+        assert_eq!(out, vec![]);
+    }
+
+    #[test]
+    fn a_session_without_both_capabilities_has_no_enhanced_refresh_in_the_rib() {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        assert!(
+            rib.peer(ip("192.0.2.1"))
+                .unwrap()
+                .enhanced_refresh
+                .is_none()
+        );
     }
 
     #[test]

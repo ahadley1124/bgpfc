@@ -30,12 +30,12 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, and the families whose route selection waits for End-of-RIB markers after a restart (see [Graceful Restart](#graceful-restart)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), whether the `restart-limit` left the neighbor Idle (RFC 4486 §4), and, for a neighbor with `graceful-restart yes`, what it advertised and the stale routes kept from it (see [Graceful Restart](#graceful-restart)) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`, then the routes the Adj-RIB-In holds for it that are no candidate, marked `held` (see [Validation state](#validation-state)); each route with its origin validation state (`rov`); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; a route with the Only to Customer attribute has `otc ASN` next (see [Only to Customer](#only-to-customer)), then `held` where it is held; and a route kept from a session that ended ends in `stale` (see [Graceful Restart](#graceful-restart)) |
+| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities (Route Refresh, and Enhanced Route Refresh where both sides advertised it, RFC 7313), families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), whether the `restart-limit` left the neighbor Idle (RFC 4486 §4), and, for a neighbor with `graceful-restart yes`, what it advertised and the stale routes kept from it (see [Graceful Restart](#graceful-restart)), and the route refresh the neighbor has begun and not ended (see [Enhanced Route Refresh](#enhanced-route-refresh)) |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`, then the routes the Adj-RIB-In holds for it that are no candidate, marked `held` (see [Validation state](#validation-state)); each route with its origin validation state (`rov`); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; a route with the Only to Customer attribute has `otc ASN` next (see [Only to Customer](#only-to-customer)), then `held` where it is held; and a route kept from a session that ended, or one a route refresh of the neighbor has not sent again yet, ends in `stale` (see [Graceful Restart](#graceful-restart), [Enhanced Route Refresh](#enhanced-route-refresh)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
-| `clear neighbor ADDR [soft\|hard-reset]` | without a keyword, a session reset: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle. Where the neighbor and bgpfcd exchanged the Graceful Notification bit, it is a graceful reset: both keep the other's routes as stale ones (RFC 8538 §4). `soft`: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out; refused if the peer did not advertise the capability. `hard-reset`: the Administrative Reset inside a Cease / Hard Reset (RFC 8538 §3, §5.2), so that both sides delete the other's routes at once; to a neighbor that did not send the Graceful Notification bit it is the plain reset, which ends the session the same way (RFC 8538 §4) |
+| `clear neighbor ADDR [soft\|hard-reset]` | without a keyword, a session reset: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle. Where the neighbor and bgpfcd exchanged the Graceful Notification bit, it is a graceful reset: both keep the other's routes as stale ones (RFC 8538 §4). `soft`: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out, which with Enhanced Route Refresh negotiated is bracketed by a BoRR and an EoRR per family (RFC 7313 §4); refused if the peer did not advertise the capability. `hard-reset`: the Administrative Reset inside a Cease / Hard Reset (RFC 8538 §3, §5.2), so that both sides delete the other's routes at once; to a neighbor that did not send the Graceful Notification bit it is the plain reset, which ends the session the same way (RFC 8538 §4) |
 | `clear neighbor ADDR [hard-reset] MESSAGE` | a reset carrying a Shutdown Communication (RFC 9003; with `hard-reset`, inside the Hard Reset, RFC 8538 §5.2); at most 128 octets (RFC 9003 §3) |
 | `reload` | re-read the configuration file and apply the difference (`docs/config.md`, "Reload") |
 | `fib mode dry-run\|install` | switch the FIB mode at runtime; switching to install performs a full reconcile |
@@ -99,12 +99,13 @@ Example objects:
               {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
+             "enhanced_route_refresh":true,
              "role":{"local":"customer","remote":"provider"},
              "families":["ipv4-unicast","ipv6-unicast"],
              "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]},
              "add_path":{"receive":["ipv4-unicast"],
                          "send":[{"family":"ipv4-unicast","paths":"all"}]}},
-  "graceful_restart":null}]
+  "graceful_restart":null,"refreshing":[]}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
   "otc":64511,"peer":"198.51.100.1","path_id":7,"best":true,"held":false,"stale":false,
@@ -222,6 +223,36 @@ the end of the connection along with the NOTIFICATION may take the pair for a
 failure of the transport and keep our routes (RFC 4724 §4.2), which a Hard
 Reset (RFC 8538 §3.2) is there to prevent. The session is over for bgpfcd,
 its state and its routes, at once; only the socket stays.
+
+## Enhanced Route Refresh
+
+On a session where both sides advertised Enhanced Route Refresh (RFC 7313,
+`docs/config.md`), `show neighbor` has `enhanced-route-refresh=true` among
+its capabilities (`session.enhanced_route_refresh` in JSON; `route_refresh`
+is whether the neighbor advertised plain Route Refresh). While the neighbor
+has begun a route refresh with a BoRR and not yet ended it with an EoRR,
+its routes of the family that it has not sent again are stale: `show
+routes` ends their lines in `stale`, as with Graceful Restart, and `show
+neighbor` has a line for each refresh under way (`GET
+/v1/neighbors/{addr}` has them as `refreshing`, an empty list when there
+are none):
+
+```
+  route refresh under way for ipv4-unicast: 1200 stale routes, stale timer 340s
+```
+
+```json
+"refreshing":[{"family":"ipv4-unicast","stale_routes":1200,"stale_timer_seconds":340}]
+```
+
+`stale timer` is what is left of `refresh-stale-time`; the routes still
+stale go at the EoRR, or when it has run out. `stale_timer_seconds` is
+`null` for a refresh that began with none of the neighbor's routes of the
+family to mark. The daemon logs the routes removed, at the `info` level (a
+line `msg="rib: stale routes removed"` with `why` `end-of-refresh` or
+`refresh timer`), and logs a BoRR it ignores because the neighbor, which
+advertised Graceful Restart, has not sent its End-of-RIB for the family
+(an error, as RFC 7313 §4 asks), and an EoRR with no BoRR (a warning).
 
 ## Validation state
 
