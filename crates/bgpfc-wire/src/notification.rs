@@ -10,12 +10,25 @@
 use std::fmt;
 
 use crate::error::{CeaseSubcode, DecodeError, EncodeError, ErrorCode, FsmSubcode, subcode_name};
-use crate::header::MAX_MESSAGE_LEN;
+use crate::header::{HEADER_LEN, MAX_EXTENDED_MESSAGE_LEN, MAX_MESSAGE_LEN};
 use crate::reader::{Reader, Truncated, WriteBytes as _};
 use crate::types::{AddressFamily, Afi, Safi};
 
 /// Largest Shutdown Communication (RFC 9003 §2: a one-octet length).
 pub const MAX_SHUTDOWN_COMMUNICATION: usize = 255;
+
+/// The most octets of Data a NOTIFICATION can carry: the longest message
+/// (4096 octets, RFC 4271 §4.1; 65535 to a peer with Extended Message, RFC
+/// 8654 §5) less its header, code and subcode.
+#[must_use]
+pub const fn max_data_len(extended: bool) -> usize {
+    let max = if extended {
+        MAX_EXTENDED_MESSAGE_LEN
+    } else {
+        MAX_MESSAGE_LEN
+    };
+    max as usize - (HEADER_LEN + 2)
+}
 
 /// A NOTIFICATION message body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,10 +194,7 @@ impl NotificationMessage {
         } else {
             usize::from(MAX_MESSAGE_LEN)
         };
-        let total = self
-            .data
-            .len()
-            .saturating_add(crate::header::HEADER_LEN + 2);
+        let total = self.data.len().saturating_add(HEADER_LEN + 2);
         if total > max {
             return Err(EncodeError::TooLong {
                 what: "notification",
@@ -593,5 +603,19 @@ mod tests {
             ..big.clone()
         };
         assert_eq!(fits.encode(false).unwrap().len(), 4096 - 19);
+        // The most Data a NOTIFICATION holds is what fits, and no more.
+        for (extended, most) in [(false, 4075), (true, 65_514)] {
+            assert_eq!(max_data_len(extended), most);
+            let at = NotificationMessage {
+                data: vec![0; most],
+                ..big.clone()
+            };
+            assert!(at.encode(extended).is_ok());
+            let over = NotificationMessage {
+                data: vec![0; most + 1],
+                ..big.clone()
+            };
+            assert!(over.encode(extended).is_err());
+        }
     }
 }

@@ -27,7 +27,7 @@ use bgpfc_wire::capability::{Capability, GracefulRestart, GracefulRestartFamily}
 use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
-use bgpfc_wire::notification::NotificationMessage;
+use bgpfc_wire::notification::{NotificationMessage, max_data_len};
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::route_refresh::{RefreshSubtype, RouteRefreshMessage};
@@ -319,7 +319,7 @@ impl Stub {
                     read.order.push(None);
                 }
                 Ok((MessageType::RouteRefresh, body)) => {
-                    let m = RouteRefreshMessage::decode(&body, true).unwrap();
+                    let m = RouteRefreshMessage::decode(&body, Some(max_data_len(false))).unwrap();
                     assert_eq!(m.family, V4);
                     read.order.push(Some(m.subtype));
                 }

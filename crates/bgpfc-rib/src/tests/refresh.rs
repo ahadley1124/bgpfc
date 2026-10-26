@@ -4,6 +4,7 @@
 //! and `EoRR`.
 
 use bgpfc_wire::header::MessageType;
+use bgpfc_wire::notification::max_data_len;
 use bgpfc_wire::route_refresh::{RefreshSubtype, RouteRefreshMessage};
 
 use super::add_path::{add_path_peer, announce_paths, withdraw_paths};
@@ -110,7 +111,8 @@ fn sent(out: &[Output], to: &PeerInfo) -> Vec<Sent> {
         for m in messages {
             if m[18] == MessageType::RouteRefresh as u8 {
                 assert_eq!(m.len(), 23, "a ROUTE-REFRESH is 23 octets");
-                let r = RouteRefreshMessage::decode(&m[HEADER_LEN..], true).unwrap();
+                let r = RouteRefreshMessage::decode(&m[HEADER_LEN..], Some(max_data_len(false)))
+                    .unwrap();
                 all.push(Sent::Refresh(r.subtype, r.family));
             } else {
                 let u = UpdateMessage::decode(&m[HEADER_LEN..], &ctx)

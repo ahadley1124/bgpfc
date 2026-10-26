@@ -511,8 +511,7 @@ pub struct EnhancedRefresh {
 ///
 /// NOTE(interop): RFC 7313 §4 names no value. FRR bounds the wait for an
 /// `EoRR` with its `bgp graceful-restart stalepath-time`, 360 seconds by
-/// default, and bgpfcd follows it. BIRD sets no bound: its stale routes of
-/// a refresh wait for the `EoRR` for as long as it takes.
+/// default, and bgpfcd follows it. BIRD has no setting for it.
 pub const DEFAULT_REFRESH_STALE_TIME: u16 = 360;
 
 /// A `neighbor` block.

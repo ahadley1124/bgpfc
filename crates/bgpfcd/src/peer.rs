@@ -29,7 +29,7 @@ use bgpfc_fsm::{Action, Event, Fsm, Session, State};
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, OpenSubcode};
 use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
-use bgpfc_wire::notification::NotificationMessage;
+use bgpfc_wire::notification::{NotificationMessage, max_data_len};
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::route_refresh::{RefreshSubtype, RouteRefreshMessage};
 use bgpfc_wire::types::AddressFamily;
@@ -998,12 +998,20 @@ impl Peer {
     /// and the message is a request.
     fn route_refresh(&mut self, body: &[u8], now: Instant) {
         let established = self.fsm.state() == State::Established;
+        // RFC 7313 §5: the error for a wrong length is for a session with the
+        // capability, and carries the message as far as a NOTIFICATION to the
+        // peer can hold it.
         let enhanced = established
             && self
                 .session
                 .as_ref()
                 .is_some_and(|s| s.route_refresh.enhanced());
-        let message = match RouteRefreshMessage::decode(body, enhanced) {
+        let echo = self
+            .session
+            .as_ref()
+            .filter(|_| enhanced)
+            .map(|s| max_data_len(s.extended_messages));
+        let message = match RouteRefreshMessage::decode(body, echo) {
             Ok(m) => m,
             // RFC 7313 §5, or RFC 4271 §6.1 where it does not apply.
             Err(e) => {

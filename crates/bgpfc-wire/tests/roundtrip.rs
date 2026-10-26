@@ -21,7 +21,7 @@ use bgpfc_wire::error::ErrorCode;
 use bgpfc_wire::error::UpdateSubcode;
 use bgpfc_wire::header::{Header, MessageType, frame};
 use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop, is_global_ipv6, is_host_ipv4};
-use bgpfc_wire::notification::NotificationMessage;
+use bgpfc_wire::notification::{NotificationMessage, max_data_len};
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::prefix::{
     Ipv4Key, Prefix, decode_prefixes, decode_prefixes_with_ids, encode_prefixes_with_ids,
@@ -747,7 +747,8 @@ proptest! {
     fn route_refresh_round_trip(f in address_family(), subtype in any::<u8>(), enhanced in any::<bool>()) {
         // RFC 7313 §3.2: any subtype value survives, assigned or not.
         let m = RouteRefreshMessage { family: f, subtype: RefreshSubtype::from_u8(subtype) };
-        prop_assert_eq!(RouteRefreshMessage::decode(&m.encode(), enhanced).unwrap(), m);
+        let echo = enhanced.then(|| max_data_len(false));
+        prop_assert_eq!(RouteRefreshMessage::decode(&m.encode(), echo).unwrap(), m);
         // And the framed message is a header and those four octets.
         let framed = m.frame();
         let h = Header::decode(&framed, false).unwrap();
@@ -758,7 +759,7 @@ proptest! {
     #[test]
     fn route_refresh_bytes_round_trip(body in vec(any::<u8>(), ROUTE_REFRESH_LEN..=ROUTE_REFRESH_LEN), enhanced in any::<bool>()) {
         // encode(decode(b)) == b for every canonical (four-octet) body.
-        let m = RouteRefreshMessage::decode(&body, enhanced).unwrap();
+        let m = RouteRefreshMessage::decode(&body, enhanced.then(|| max_data_len(true))).unwrap();
         prop_assert_eq!(m.encode(), body);
     }
 
@@ -770,7 +771,7 @@ proptest! {
         // length is ROUTE-REFRESH Message Error / Invalid Message Length
         // carrying the whole message; any other message of another length
         // (and any at all without the capability) is Bad Message Length.
-        let e = RouteRefreshMessage::decode(&body, true).unwrap_err();
+        let e = RouteRefreshMessage::decode(&body, Some(max_data_len(false))).unwrap_err();
         let begin_or_end = body.get(2).is_some_and(|v| matches!(v, 1 | 2));
         if begin_or_end {
             prop_assert_eq!((e.code, e.subcode), (ErrorCode::RouteRefresh, 1));
@@ -779,7 +780,7 @@ proptest! {
             prop_assert_eq!((e.code, e.subcode), (ErrorCode::MessageHeader, 2));
             prop_assert_eq!(e.data, u16::try_from(body.len() + 19).unwrap().to_be_bytes().to_vec());
         }
-        let e = RouteRefreshMessage::decode(&body, false).unwrap_err();
+        let e = RouteRefreshMessage::decode(&body, None).unwrap_err();
         prop_assert_eq!((e.code, e.subcode), (ErrorCode::MessageHeader, 2));
     }
 
@@ -1134,7 +1135,7 @@ proptest! {
         let _ = Header::decode(&bytes, flag);
         let _ = OpenMessage::decode(&bytes);
         let _ = NotificationMessage::decode(&bytes);
-        let _ = RouteRefreshMessage::decode(&bytes, flag);
+        let _ = RouteRefreshMessage::decode(&bytes, flag.then(|| max_data_len(flag)));
         let _ = UpdateMessage::decode(&bytes, &IBGP4);
         let _ = UpdateMessage::decode(&bytes, &IBGP2);
         let _ = UpdateMessage::decode(&bytes, &EBGP4);
