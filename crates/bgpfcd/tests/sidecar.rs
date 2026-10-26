@@ -423,7 +423,12 @@ fn the_daemon_runs_the_sidecar_and_reads_its_vrps_from_the_port() {
     let cache = Cache::start(vec![vrp("192.0.2.0/24", 24, 64_496)]);
     let mut daemon = Daemon::start(&dir, &sidecar_block(&dir, &stub, cache.port, "", ""));
 
-    let shown = daemon.wait_for("show rpki", loaded(cache.port));
+    // The cache here is not the child, so the client can have its VRPs
+    // before the supervisor has started the stub: wait for both.
+    let has_vrps = loaded(cache.port);
+    let shown = daemon.wait_for("show rpki", |r| {
+        has_vrps(r) && r.contains("sidecar state running, pid ")
+    });
     let pid = pid_of(&shown);
     assert!(shown.contains("mode sidecar\ninvalid drop\n"), "{shown}");
     assert!(
