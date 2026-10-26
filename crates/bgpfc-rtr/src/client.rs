@@ -77,6 +77,17 @@
 //! of the Refresh Interval and the response timeout find a dead
 //! connection instead.
 //!
+//! # Checking the other end
+//!
+//! On the unprotected TCP of RFC 8210 §9 the router believes whatever
+//! answers at a cache's address, which is why the cache must be on a
+//! trusted network (§13). A caller that knows more about who should
+//! answer, such as that a cache on the loopback is a process it started,
+//! sets [`Config::check`]: a [`ConnectionCheck`] runs on every connection
+//! as it is made, on the attempt's thread and before anything is sent or
+//! read, and a connection it refuses is closed and fails like an attempt
+//! that found no cache.
+//!
 //! Implements: RFC 8210 §4 (the most preferred cache that accepts a
 //! connection, also one that comes back), §8.3 and §8.4 (other caches
 //! first after a Cache Reset or No Data Available), §9 (unprotected TCP to
@@ -246,7 +257,56 @@ pub struct Config {
     /// override ([`max_expire`](session::Config::max_expire)), for the
     /// session with each cache.
     pub session: session::Config,
+    /// What each new connection must pass before the client uses it, if
+    /// anything (see [`ConnectionCheck`]).
+    pub check: Option<ConnectionCheck>,
 }
+
+/// A check of each connection the client makes, before it sends or reads
+/// anything on it (see the module documentation, "Checking the other
+/// end"). It returns why a connection must not be used, if it must not:
+/// the client then closes it and counts a failed attempt, which the log
+/// line, [`Status::last_error`] and the back-off treat like any other,
+/// with the check's error as the reason.
+///
+/// It runs on the thread of the connection attempt, which the client does
+/// not wait for once it is stopped, so a check that takes a while holds up
+/// no stop.
+#[derive(Clone)]
+pub struct ConnectionCheck(Arc<CheckFn>);
+
+/// What a [`ConnectionCheck`] calls.
+type CheckFn = dyn Fn(&TcpStream) -> io::Result<()> + Send + Sync;
+
+impl ConnectionCheck {
+    /// The check `check` makes.
+    pub fn new(check: impl Fn(&TcpStream) -> io::Result<()> + Send + Sync + 'static) -> Self {
+        ConnectionCheck(Arc::new(check))
+    }
+
+    /// Whether `stream` may be used.
+    ///
+    /// # Errors
+    /// Why it may not.
+    pub fn run(&self, stream: &TcpStream) -> io::Result<()> {
+        (self.0)(stream)
+    }
+}
+
+impl fmt::Debug for ConnectionCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConnectionCheck(..)")
+    }
+}
+
+/// The same check: clones of one [`ConnectionCheck`].
+impl PartialEq for ConnectionCheck {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ConnectionCheck {}
 
 impl Config {
     /// The default [`Config::connect_timeout`]. No RFC gives one; ten
@@ -254,7 +314,7 @@ impl Config {
     pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// The given caches, with the default timeout, back-off and session
-    /// settings, and jitter seed 0.
+    /// settings, jitter seed 0, and no [`ConnectionCheck`].
     #[must_use]
     pub fn new(caches: Vec<Cache>) -> Config {
         Config {
@@ -263,6 +323,7 @@ impl Config {
             backoff: Backoff::DEFAULT,
             jitter_seed: 0,
             session: session::Config::default(),
+            check: None,
         }
     }
 }
@@ -447,8 +508,9 @@ impl Shared {
         }
     }
 
-    /// Connect to `cache` within `timeout`, as [`open`] does, and return
-    /// the outcome, or `None` once the client is stopped.
+    /// Connect to `cache` within `timeout`, as [`open`] does, run `check`
+    /// on the connection, and return the outcome, or `None` once the
+    /// client is stopped.
     ///
     /// Neither the connection attempt nor the name lookup before it can be
     /// cut short, so they run on a thread of their own, and a stop wakes
@@ -459,13 +521,21 @@ impl Shared {
         self: &Arc<Self>,
         cache: &Cache,
         timeout: Duration,
+        check: Option<&ConnectionCheck>,
     ) -> Option<io::Result<TcpStream>> {
         let shared = Arc::clone(self);
         let cache = cache.clone();
+        let check = check.cloned();
         let spawned = thread::Builder::new()
             .name("rtr-connect".to_owned())
             .spawn(move || {
-                let outcome = open(&cache, timeout);
+                let outcome = open(&cache, timeout).and_then(|stream| {
+                    if let Some(Err(refused)) = check.map(|c| c.run(&stream)) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return Err(refused);
+                    }
+                    Ok(stream)
+                });
                 let mut slot = lock(&shared.slot);
                 if !shared.stopping() {
                     slot.attempt = Some(outcome);
@@ -659,6 +729,7 @@ struct Worker<S> {
     backoff: Backoff,
     jitter_seed: u64,
     session_config: session::Config,
+    check: Option<ConnectionCheck>,
     sink: S,
     shared: Arc<Shared>,
     status: Arc<Mutex<Status>>,
@@ -744,6 +815,7 @@ impl<S: ValidationSink> Worker<S> {
             backoff: config.backoff,
             jitter_seed: config.jitter_seed,
             session_config: config.session,
+            check: config.check,
             sink,
             shared,
             status: Arc::new(Mutex::new(status)),
@@ -1144,7 +1216,10 @@ impl<S: ValidationSink> Worker<S> {
             .cloned()
             .collect::<Vec<_>>();
         for (index, cache) in preferred.iter().enumerate() {
-            match self.shared.connect(cache, self.connect_timeout) {
+            match self
+                .shared
+                .connect(cache, self.connect_timeout, self.check.as_ref())
+            {
                 // Stopped meanwhile.
                 None => return,
                 Some(Ok(probe)) => {
@@ -1227,7 +1302,11 @@ impl<S: ValidationSink> Worker<S> {
         }
         // The control plane sees the attempt while it lasts.
         self.publish_status(true);
-        let stream = match self.shared.connect(self.cache(), self.connect_timeout)? {
+        let check = self.check.as_ref();
+        let stream = match self
+            .shared
+            .connect(self.cache(), self.connect_timeout, check)?
+        {
             Ok(stream) => stream,
             Err(e) => {
                 self.pending_error = Some(e.to_string());

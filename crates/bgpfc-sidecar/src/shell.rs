@@ -206,28 +206,75 @@ impl Sidecar {
     ///
     /// A configured RTR port of 0 is replaced with a free one: bind the
     /// configured loopback address with port 0, read the port the kernel
-    /// chose, and close the socket again. Something else may bind that
-    /// port before Routinator does, and Routinator binds only after its
-    /// first validation run. That is acceptable: the port comes from the
+    /// chose, and close the socket again. Routinator binds its port only
+    /// after its first validation run, minutes from a cold cache, and
+    /// again after each restart; until then any process on this host may
+    /// bind the port, a picked one or a configured one alike, and the port
+    /// is no secret, being on Routinator's command line. Such a process
+    /// then serves RTR on it, so a client must not take whatever answers
+    /// there for Routinator: bgpfcd's RTR client uses a connection only if
+    /// the socket at its other end belongs to bgpfcd's user, as
+    /// Routinator's does. Routinator, finding the port taken, fails to
+    /// bind and exits, which the supervisor reports as failures and then
+    /// as the [`SidecarState::Failed`] alarm. A picked port comes from the
     /// ephemeral range, which the kernel hands out in rotation rather than
-    /// reusing at once; loopback is open to this host only; and if the
-    /// port is taken, Routinator fails to bind and exits, which the
-    /// supervisor reports as failures and then as the
-    /// [`SidecarState::Failed`] alarm, never silently. Handing Routinator
-    /// the bound socket instead (`--systemd-listen`) would need
-    /// `LISTEN_PID` set to the child's own id, which only the child knows,
-    /// after `fork`, where nothing may allocate. Configure a fixed port to
-    /// avoid the race.
+    /// reusing at once, so a program that takes it by chance is unlikely;
+    /// a fixed port rules that out, though not a process that takes it on
+    /// purpose. Handing Routinator the bound socket instead
+    /// (`--systemd-listen`) would close the window, but needs `LISTEN_PID`
+    /// set to the child's own id, which only the child knows, after
+    /// `fork`, where nothing may allocate. A fixed port is not bound here,
+    /// but its address is, with port 0, so that an address this host
+    /// cannot bind at all, such as `::1` without IPv6, fails the start
+    /// rather than every start of Routinator.
     ///
     /// # Errors
     /// The [`SidecarError`] from [`SidecarConfig::validate`] or the
     /// version check: [`SidecarError::VersionCheck`] if the binary cannot
     /// be run or fails, [`SidecarError::VersionTimeout`] if it hangs,
     /// [`SidecarError::UnrecognizedVersion`] or
-    /// [`SidecarError::IncompatibleVersion`]. [`SidecarError::Io`] if no
-    /// RTR port or thread could be had.
+    /// [`SidecarError::IncompatibleVersion`]. [`SidecarError::Io`] if the
+    /// RTR address cannot be bound or no thread could be had.
     pub fn start(config: SidecarConfig) -> Result<Sidecar, SidecarError> {
         Sidecar::start_with(config, Options::new())
+    }
+
+    /// Check `config` and the binary as [`start`](Self::start) does,
+    /// without starting anything: [`SidecarConfig::validate`], then
+    /// `<binary> --version`, run with the child's environment and killed
+    /// if it takes longer than ten seconds, then the RTR address, bound
+    /// with port 0 and closed again, as [`start`](Self::start) binds it.
+    /// Port 0 keeps a configured port that the running Routinator holds
+    /// from failing the check. Returns the version the binary reported.
+    ///
+    /// It exists for a reload that replaces a running sidecar: bgpfcd runs
+    /// it before it stops the running Routinator, so that new settings or
+    /// a replaced binary that would fail to start (a release of another
+    /// series, a binary that is gone) fail the reload instead, and the
+    /// running Routinator goes on serving. Starting the new one first and
+    /// stopping the old one after is no way round it: two Routinators
+    /// would share the repository directory. Nothing stops the binary from
+    /// being replaced between this check and the [`start`](Self::start)
+    /// that follows; that start checks it again.
+    ///
+    /// # Errors
+    /// As [`start`](Self::start), except that no supervisor thread is
+    /// needed: the error from [`SidecarConfig::validate`], before anything
+    /// runs, from the version check, or [`SidecarError::Io`] for an RTR
+    /// address this host cannot bind.
+    pub fn check(config: &SidecarConfig) -> Result<Version, SidecarError> {
+        Sidecar::check_with(config, &Options::new())
+    }
+
+    /// [`Sidecar::check`] with the shell's own settings given.
+    pub(crate) fn check_with(
+        config: &SidecarConfig,
+        options: &Options,
+    ) -> Result<Version, SidecarError> {
+        config.validate()?;
+        let version = check_version(config, options, &Threads::default())?;
+        resolve_rtr(config.rtr_listen)?;
+        Ok(version)
     }
 
     /// [`Sidecar::start`] with the shell's own settings given.
@@ -730,15 +777,28 @@ impl BinaryId {
 /// address with port 0 and closing the socket again (see
 /// [`Sidecar::start`] for the race that leaves). The IPv6 scope id and
 /// flow label are dropped, as [`routinator_args`] drops them.
+///
+/// A configured port is not bound, since a running Routinator may hold
+/// it, as when [`Sidecar::check`] runs before a reload replaces that
+/// Routinator; the address is still tried with port 0. So an address
+/// this host cannot bind at all, such as `::1` without IPv6, is an error
+/// here, where [`Sidecar::check`] and [`Sidecar::start`] report it, and
+/// not only once Routinator fails to bind it.
 fn resolve_rtr(listen: SocketAddr) -> Result<SocketAddr, SidecarError> {
     let addr = SocketAddr::new(listen.ip(), listen.port());
-    if addr.port() != 0 {
-        return Ok(addr);
-    }
-    let picked = TcpListener::bind(addr)
+    let (action, probe) = if addr.port() == 0 {
+        ("picking a free RTR port", addr)
+    } else {
+        ("trying the RTR address", SocketAddr::new(addr.ip(), 0))
+    };
+    let picked = TcpListener::bind(probe)
         .and_then(|listener| listener.local_addr())
-        .map_err(|e| SidecarError::io("picking a free RTR port", &e))?;
-    Ok(SocketAddr::new(addr.ip(), picked.port()))
+        .map_err(|e| SidecarError::io(action, &e))?;
+    Ok(if addr.port() == 0 {
+        SocketAddr::new(addr.ip(), picked.port())
+    } else {
+        addr
+    })
 }
 
 /// A seed for the backoff jitter that differs between processes, so
@@ -1357,6 +1417,133 @@ mod tests {
         assert_eq!(BinaryId::of(&dir.join("missing")), None);
     }
 
+    /// A stub that answers `--version` with `version` and otherwise
+    /// creates `served`: the server it would be, had it been started.
+    fn marking_stub(dir: &TempDir, version: &str, served: &Path) -> PathBuf {
+        let body = format!("touch '{}'\nexec sleep 30", served.display());
+        dir.versioned_stub("routinator", version, &body)
+    }
+
+    /// `check` reports the version of a supported binary, and runs no
+    /// more than `--version`: no server, and no thread is left.
+    #[test]
+    fn check_accepts_a_supported_binary() {
+        let dir = TempDir::new("check-ok");
+        let served = dir.join("served");
+        let binary = marking_stub(&dir, &TESTED_VERSION.to_string(), &served);
+        let config = config(&dir, binary);
+        assert_eq!(Sidecar::check(&config), Ok(TESTED_VERSION));
+        let capture = Capture::default();
+        assert_eq!(
+            Sidecar::check_with(&config, &capture.options()),
+            Ok(TESTED_VERSION)
+        );
+        assert!(!served.exists(), "check started a server");
+        assert!(
+            capture.find("found a supported Routinator").is_empty(),
+            "check logs nothing"
+        );
+    }
+
+    /// Issue #72: a release of another series fails the check, as it
+    /// fails the start.
+    #[test]
+    fn check_reports_another_release() {
+        let dir = TempDir::new("check-old");
+        let served = dir.join("served");
+        let binary = marking_stub(&dir, "0.14.1", &served);
+        let found = Version {
+            major: 0,
+            minor: 14,
+            patch: 1,
+            pre: None,
+        };
+        let expected = SidecarError::IncompatibleVersion {
+            found,
+            tested: TESTED_VERSION,
+        };
+        assert_eq!(Sidecar::check(&config(&dir, binary)), Err(expected));
+        assert!(!served.exists());
+    }
+
+    #[test]
+    fn check_reports_a_missing_binary() {
+        let dir = TempDir::new("check-missing");
+        let binary = dir.join("missing");
+        let missing = ExitReason::SpawnFailed("No such file or directory (os error 2)".to_owned());
+        let expected = SidecarError::VersionCheck {
+            binary: binary.clone(),
+            outcome: missing,
+            output: String::new(),
+        };
+        assert_eq!(Sidecar::check(&config(&dir, binary)), Err(expected));
+    }
+
+    /// The settings are validated before the binary is run at all: not
+    /// even `--version` runs, as a stub that marks every run shows.
+    #[test]
+    fn check_validates_before_running() {
+        let dir = TempDir::new("check-invalid");
+        let ran = dir.join("ran");
+        let body = format!("touch '{}'\necho 'Routinator 0.15.2'", ran.display());
+        let binary = dir.script("routinator", &body);
+        // The stub's own path made relative: from `/`, the child's working
+        // directory, it names the stub.
+        let relative = binary.strip_prefix("/").unwrap().to_path_buf();
+        let err = Sidecar::check(&config(&dir, relative.clone())).unwrap_err();
+        assert_eq!(err, SidecarError::BinaryNotAbsolute(relative));
+        // Routinator's own rules are checked first too.
+        let mut unknown_tal = config(&dir, binary);
+        unknown_tal.tals.bundled = vec!["ripe-ncc".to_owned()];
+        let err = Sidecar::check(&unknown_tal).unwrap_err();
+        assert_eq!(err, SidecarError::UnknownTal("ripe-ncc".to_owned()));
+        assert!(!ran.exists(), "the binary ran before validation");
+    }
+
+    /// Whether this host can bind `::1`: not without IPv6.
+    fn ipv6_loopback() -> bool {
+        TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    /// `check` tries the RTR address as `start` does, so that a reload
+    /// that passes the check does not fail at the start (bgpfcd's reload
+    /// preflight): the same answer from both, here for `::1`, which this
+    /// host may or may not be able to bind, with a fixed port and with
+    /// port 0.
+    #[test]
+    fn check_tries_the_rtr_address_as_start_does() {
+        let dir = TempDir::new("check-rtr");
+        let served = dir.join("served");
+        let binary = marking_stub(&dir, &TESTED_VERSION.to_string(), &served);
+        for (port, action) in [
+            (0, "picking a free RTR port"),
+            (3323, "trying the RTR address"),
+        ] {
+            let mut config = config(&dir, binary.clone());
+            config.rtr_listen = SocketAddr::new("::1".parse().unwrap(), port);
+            let capture = Capture::default();
+            let checked = Sidecar::check_with(&config, &capture.options());
+            let started = Sidecar::start_with(config, capture.options());
+            if ipv6_loopback() {
+                assert_eq!(checked, Ok(TESTED_VERSION));
+                started.unwrap().stop();
+            } else {
+                let Err(SidecarError::Io { action: a, .. }) = &checked else {
+                    panic!("{port}: {checked:?}");
+                };
+                assert_eq!(*a, action);
+                assert_eq!(started.err(), checked.err(), "{port}");
+                assert!(!served.exists(), "a server was started");
+            }
+        }
+        // A fixed port that something holds, as the running Routinator holds
+        // its own at a reload, passes: only the address is tried.
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = config(&dir, binary);
+        config.rtr_listen = held.local_addr().unwrap();
+        assert_eq!(Sidecar::check(&config), Ok(TESTED_VERSION));
+    }
+
     /// Bad settings are refused before anything runs.
     #[test]
     fn invalid_settings_start_nothing() {
@@ -1545,6 +1732,16 @@ mod tests {
     fn port_zero_is_replaced_with_a_free_port() {
         let fixed: SocketAddr = "127.0.0.1:3323".parse().unwrap();
         assert_eq!(resolve_rtr(fixed), Ok(fixed));
+        // A fixed port is kept even while it is taken: only its address is
+        // tried, with port 0.
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = taken.local_addr().unwrap();
+        assert_eq!(resolve_rtr(taken), Ok(taken));
+        // An address this host cannot bind fails, whatever the port.
+        for port in [0, 3323] {
+            let v6 = SocketAddr::new("::1".parse().unwrap(), port);
+            assert_eq!(resolve_rtr(v6).is_ok(), ipv6_loopback(), "{v6}");
+        }
         for ip in ["127.0.0.1", "127.0.0.53"] {
             let addr = resolve_rtr(SocketAddr::new(ip.parse().unwrap(), 0)).unwrap();
             assert_eq!(addr.ip().to_string(), ip);

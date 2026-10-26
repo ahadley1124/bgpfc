@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -273,6 +274,24 @@ pub(crate) struct RpkiReport {
     /// The RTR client's status, if one runs. Its VRPs are the data the
     /// RIB validates with.
     pub(crate) status: Option<bgpfc_rtr::client::Status>,
+    /// Since when every route has waited, `disabled`, for the client's
+    /// first full set, while it still does (issue #71; m14 design §3.3).
+    pub(crate) waiting_since: Option<Instant>,
+    /// Routinator, while a sidecar runs (`mode sidecar`).
+    pub(crate) sidecar: Option<SidecarReport>,
+}
+
+/// What the coordinator reports about Routinator, read from the sidecar
+/// at each request: its version may change at a restart, after the binary
+/// was replaced (`bgpfc_sidecar::Sidecar::version`).
+#[derive(Clone, Debug)]
+pub(crate) struct SidecarReport {
+    /// Where supervision stands, and the address Routinator serves RTR on.
+    pub(crate) status: bgpfc_sidecar::SidecarStatus,
+    /// The version the binary reported when it was last checked.
+    pub(crate) version: bgpfc_sidecar::Version,
+    /// The binary, as the `sidecar` block names it.
+    pub(crate) binary: PathBuf,
 }
 
 /// Each neighbor's configured `advertisement-interval` (RFC 4271

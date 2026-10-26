@@ -4,7 +4,7 @@
 //! point at (neighbors, policies, terms, prefix lists); everything else is
 //! plain data so that reload diffing can compare values.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ pub struct Config {
     pub fib: Fib,
     /// `control { ... }`.
     pub control: Control,
-    /// `rpki { ... }`; [`RpkiMode::Disabled`] when there is none.
+    /// `rpki { ... }`; [`Rpki::implicit`] when there is none.
     pub rpki: Rpki,
     /// `prefix-list NAME { ... }` blocks, in file order.
     pub prefix_lists: Vec<PrefixList>,
@@ -139,8 +139,13 @@ pub struct Rpki {
     /// with `mode disabled` only a state import policy sets is acted on.
     pub enforcement: Enforcement,
     /// `cache` statements in file order: the router's cache list
-    /// (RFC 8210 §10). At least one in [`RpkiMode::External`].
+    /// (RFC 8210 §10). At least one in [`RpkiMode::External`], none in
+    /// [`RpkiMode::Sidecar`].
     pub caches: Vec<RpkiCache>,
+    /// `sidecar { ... }`: the Routinator bgpfcd runs and supervises, used
+    /// in [`RpkiMode::Sidecar`] only. Always present: the defaults where
+    /// the block is not written.
+    pub sidecar: RpkiSidecar,
     /// `version`: the RTR protocol version offered first, 0 or 1
     /// (RFC 8210 §7). Version 1 falls back to 0 for a cache that only
     /// speaks 0; `version 0` is for a cache that mishandles version 1.
@@ -162,6 +167,7 @@ pub struct Rpki {
     pub max_vrps: u32,
     /// `backoff MIN MAX`: the delay before the first reconnect after a
     /// failure, doubling with each failure in a row up to the second.
+    /// [`Rpki::default_backoff`] of the mode unless given.
     pub backoff_min: Duration,
     /// The longest reconnect delay.
     pub backoff_max: Duration,
@@ -200,14 +206,73 @@ impl Rpki {
     /// Retry Interval RFC 8210 §6 allows a cache to ask for, "Maximum
     /// allowed value: 7200 seconds".
     pub const MAX_BACKOFF: Duration = Duration::from_hours(2);
+    /// The default longest reconnect delay with [`RpkiMode::Sidecar`].
+    /// Routinator opens its RTR listener only once its first validation
+    /// run has ended, minutes after it starts from a cold cache; with the
+    /// 600 s of [`Rpki::DEFAULT_BACKOFF_MAX`] the client could then wait
+    /// up to about 15 minutes more, with this cap about 45 s. The cache is
+    /// the router's own child on loopback, so the attempts cost a SYN and
+    /// a RST each. RFC 8210 §6 asks a router not to retry sooner than the
+    /// Retry Interval; the default `backoff` already departs from that.
+    pub const SIDECAR_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+    /// The reconnect back-off, `(MIN, MAX)`, of a block in `mode` that
+    /// writes no `backoff`.
+    #[must_use]
+    pub const fn default_backoff(mode: RpkiMode) -> (Duration, Duration) {
+        match mode {
+            RpkiMode::Disabled | RpkiMode::External => {
+                (Rpki::DEFAULT_BACKOFF_MIN, Rpki::DEFAULT_BACKOFF_MAX)
+            }
+            RpkiMode::Sidecar => (Rpki::DEFAULT_BACKOFF_MIN, Rpki::SIDECAR_BACKOFF_MAX),
+        }
+    }
+
+    /// What a block that states only `mode` runs with: every other
+    /// setting at its default, the back-off that of the mode.
+    #[must_use]
+    pub fn defaults(mode: RpkiMode) -> Rpki {
+        let (backoff_min, backoff_max) = Rpki::default_backoff(mode);
+        Rpki {
+            mode,
+            enforcement: Rpki::DEFAULT_ENFORCEMENT,
+            caches: Vec::new(),
+            sidecar: RpkiSidecar::default(),
+            version: 1,
+            connect_timeout: Rpki::DEFAULT_CONNECT_TIMEOUT,
+            response_timeout: Rpki::DEFAULT_RESPONSE_TIMEOUT,
+            reply_timeout: Rpki::DEFAULT_REPLY_TIMEOUT,
+            max_expire: Rpki::MAX_EXPIRE,
+            max_vrps: Rpki::DEFAULT_MAX_VRPS,
+            backoff_min,
+            backoff_max,
+        }
+    }
+
+    /// What a file without an `rpki` block runs: the one place that
+    /// decides it (issues #60, #72). Validation is off, as with `rpki {
+    /// mode disabled; }`, so that a file that never asked for origin
+    /// validation needs no validator on the host (issue #26: the daemon
+    /// "must work without Routinator present"), and no route leaves route
+    /// selection for its state without configuration (RFC 6811 §2).
+    /// `rpki { mode sidecar; }` is the one line that turns it on with
+    /// Routinator run by bgpfcd. Whether a file without the block should
+    /// run the sidecar instead is the maintainer's decision; changing it
+    /// here changes it everywhere.
+    #[must_use]
+    pub fn implicit() -> Rpki {
+        Rpki::defaults(RpkiMode::Disabled)
+    }
 }
 
 impl Rpki {
-    /// Whether `other` asks the RTR client for what `self` does: every
-    /// setting of the client the same, and the same caches in the same
-    /// order with the same preferences, each host however it is spelled
-    /// (see [`RpkiCache::is_at`]). A reload leaves the RTR client alone
-    /// unless this is false. The `enforcement` is not compared.
+    /// Whether `other` asks the RTR client and the sidecar for what
+    /// `self` does: every setting of the client the same, the same caches
+    /// in the same order with the same preferences, each host however it
+    /// is spelled (see [`RpkiCache::is_at`]), and the same sidecar
+    /// settings (see [`RpkiSidecar::same_as`]). A reload leaves the RTR
+    /// client and the sidecar alone unless this is false. The
+    /// `enforcement` is not compared.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
@@ -220,6 +285,7 @@ impl Rpki {
             // it would reload every cache for nothing.
             enforcement: _,
             caches,
+            sidecar,
             version,
             connect_timeout,
             response_timeout,
@@ -235,6 +301,7 @@ impl Rpki {
                 .iter()
                 .zip(&other.caches)
                 .all(|(a, b)| a.preference == b.preference && a.is_at(&b.host, b.port))
+            && sidecar.same_as(&other.sidecar)
             && *version == other.version
             && *connect_timeout == other.connect_timeout
             && *response_timeout == other.response_timeout
@@ -247,21 +314,9 @@ impl Rpki {
 }
 
 impl Default for Rpki {
-    /// No `rpki` block: disabled.
+    /// No `rpki` block: [`Rpki::implicit`].
     fn default() -> Rpki {
-        Rpki {
-            mode: RpkiMode::Disabled,
-            enforcement: Rpki::DEFAULT_ENFORCEMENT,
-            caches: Vec::new(),
-            version: 1,
-            connect_timeout: Rpki::DEFAULT_CONNECT_TIMEOUT,
-            response_timeout: Rpki::DEFAULT_RESPONSE_TIMEOUT,
-            reply_timeout: Rpki::DEFAULT_REPLY_TIMEOUT,
-            max_expire: Rpki::MAX_EXPIRE,
-            max_vrps: Rpki::DEFAULT_MAX_VRPS,
-            backoff_min: Rpki::DEFAULT_BACKOFF_MIN,
-            backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
-        }
+        Rpki::implicit()
     }
 }
 
@@ -272,6 +327,9 @@ pub enum RpkiMode {
     Disabled,
     /// VRPs from the configured RTR caches (RFC 8210).
     External,
+    /// VRPs from Routinator, which bgpfcd runs and supervises as set by
+    /// the `sidecar` block, over RTR on loopback (issues #26, #70-#72).
+    Sidecar,
 }
 
 impl std::fmt::Display for RpkiMode {
@@ -279,7 +337,180 @@ impl std::fmt::Display for RpkiMode {
         f.write_str(match self {
             RpkiMode::Disabled => "disabled",
             RpkiMode::External => "external",
+            RpkiMode::Sidecar => "sidecar",
         })
+    }
+}
+
+/// The `sidecar` block of `rpki`: Routinator, run and supervised by
+/// bgpfcd, serving RTR to bgpfcd's own client on loopback (issues #26,
+/// #70-#72). bgpfcd turns it into the settings of the `bgpfc-sidecar`
+/// crate, whose defaults and bounds these are, and checks there what is
+/// Routinator's business: TAL names, the ARIN agreement, and the options
+/// the escape hatches may not carry.
+///
+/// The durations are whole seconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpkiSidecar {
+    /// The `sidecar` statement, or the `mode sidecar` statement when there
+    /// is no block; `None` when neither is written, as in
+    /// [`Rpki::implicit`]. For the errors bgpfcd finds in the block (see
+    /// [`parse_str_with`](crate::parse_str_with)). Not compared by
+    /// [`RpkiSidecar::same_as`].
+    pub pos: Option<Pos>,
+    /// `binary`: the Routinator executable, an absolute path; bgpfcd never
+    /// searches `PATH` for it (issue #70).
+    pub binary: PathBuf,
+    /// `repository-dir`: Routinator's cache of RPKI data, an absolute
+    /// path.
+    pub repository_dir: PathBuf,
+    /// `rtr-listen ADDR [port N]`: where Routinator serves RTR, a loopback
+    /// address (issue #71; RFC 8210 §9), on a port of
+    /// [`RpkiSidecar::MIN_RTR_PORT`] or above, or 0 for one picked when the
+    /// sidecar starts.
+    pub rtr_listen: SocketAddr,
+    /// `rir-tals`: whether the production TALs of the five RIRs are used
+    /// (ARIN's only with `accept_arin_rpa`).
+    pub rir_tals: bool,
+    /// `tals`: further TALs Routinator bundles, by name.
+    pub tals: Vec<String>,
+    /// `extra-tals-dir`: a directory of more `.tal` files, an absolute
+    /// path.
+    pub extra_tals_dir: Option<PathBuf>,
+    /// `accept-arin-rpa`: whether the operator accepts ARIN's Relying
+    /// Party Agreement, without which ARIN's TAL is not used.
+    pub accept_arin_rpa: bool,
+    /// `refresh`: the time between Routinator's validation runs, which it
+    /// also announces as the Refresh Interval (RFC 8210 §6).
+    pub refresh: Duration,
+    /// `config-file`: a Routinator config file, an absolute path, which
+    /// bgpfcd passes on and does not read.
+    pub config_file: Option<PathBuf>,
+    /// `global-args`: escape hatch (issue #72), options passed verbatim
+    /// before Routinator's `server` command.
+    pub global_args: Vec<String>,
+    /// `server-args`: escape hatch (issue #72), options passed verbatim
+    /// after it.
+    pub server_args: Vec<String>,
+    /// `restart-backoff INITIAL CAP`: the delay before restarting a
+    /// Routinator that failed, doubling with each failure in a row up to
+    /// the cap.
+    pub restart_initial: Duration,
+    /// The longest restart delay.
+    pub restart_cap: Duration,
+    /// `stable-after`: how long Routinator must run before a failure no
+    /// longer counts as one in a row.
+    pub stable_after: Duration,
+    /// `stop-timeout`: how long Routinator may take to stop after
+    /// `SIGTERM` before it is killed.
+    pub stop_timeout: Duration,
+    /// `failure-threshold`: the failures in a row after which the sidecar
+    /// is reported as failed.
+    pub failure_threshold: u32,
+}
+
+impl RpkiSidecar {
+    /// The default `binary`, where Routinator's own packages install it.
+    pub const DEFAULT_BINARY: &str = "/usr/bin/routinator";
+    /// The default `repository-dir`, under the service's state directory
+    /// (`contrib/bgpfcd.service`).
+    pub const DEFAULT_REPOSITORY_DIR: &str = "/var/lib/bgpfc/rpki";
+    /// The default `rtr-listen`: `127.0.0.1`, with a port picked when the
+    /// sidecar starts.
+    pub const DEFAULT_RTR_LISTEN: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    /// The lowest `rtr-listen` port but 0: Routinator runs without
+    /// capabilities, so it cannot bind a port below it on a host that
+    /// keeps them privileged.
+    pub const MIN_RTR_PORT: u16 = 1024;
+    /// The default `refresh`, Routinator's own.
+    pub const DEFAULT_REFRESH: Duration = Duration::from_mins(10);
+    /// The longest `refresh`: RFC 8210 §6 wants the Expire Interval larger
+    /// than the Refresh Interval, and Routinator's is 7200 s.
+    pub const MAX_REFRESH: Duration = Duration::from_secs(7_199);
+    /// The default first restart delay.
+    pub const DEFAULT_RESTART_INITIAL: Duration = Duration::from_secs(1);
+    /// The default longest restart delay.
+    pub const DEFAULT_RESTART_CAP: Duration = Duration::from_mins(5);
+    /// The longest restart delay that may be configured, either bound.
+    pub const MAX_RESTART_BACKOFF: Duration = Duration::from_hours(1);
+    /// The default `stable-after`.
+    pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_mins(5);
+    /// The longest `stable-after`.
+    pub const MAX_STABLE_AFTER: Duration = Duration::from_hours(24);
+    /// The default `stop-timeout`.
+    pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The longest `stop-timeout`.
+    pub const MAX_STOP_TIMEOUT: Duration = Duration::from_hours(1);
+    /// The default `failure-threshold`.
+    pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+    /// Whether `other` runs Routinator as `self` does: every setting the
+    /// same, wherever the block is. A reload restarts the sidecar only
+    /// when this is false.
+    #[must_use]
+    pub fn same_as(&self, other: &RpkiSidecar) -> bool {
+        // Destructured, so that a new setting cannot be left out.
+        let RpkiSidecar {
+            pos: _,
+            binary,
+            repository_dir,
+            rtr_listen,
+            rir_tals,
+            tals,
+            extra_tals_dir,
+            accept_arin_rpa,
+            refresh,
+            config_file,
+            global_args,
+            server_args,
+            restart_initial,
+            restart_cap,
+            stable_after,
+            stop_timeout,
+            failure_threshold,
+        } = self;
+        *binary == other.binary
+            && *repository_dir == other.repository_dir
+            && *rtr_listen == other.rtr_listen
+            && *rir_tals == other.rir_tals
+            && *tals == other.tals
+            && *extra_tals_dir == other.extra_tals_dir
+            && *accept_arin_rpa == other.accept_arin_rpa
+            && *refresh == other.refresh
+            && *config_file == other.config_file
+            && *global_args == other.global_args
+            && *server_args == other.server_args
+            && *restart_initial == other.restart_initial
+            && *restart_cap == other.restart_cap
+            && *stable_after == other.stable_after
+            && *stop_timeout == other.stop_timeout
+            && *failure_threshold == other.failure_threshold
+    }
+}
+
+impl Default for RpkiSidecar {
+    /// The `DEFAULT_*` settings, with no position.
+    fn default() -> RpkiSidecar {
+        RpkiSidecar {
+            pos: None,
+            binary: PathBuf::from(RpkiSidecar::DEFAULT_BINARY),
+            repository_dir: PathBuf::from(RpkiSidecar::DEFAULT_REPOSITORY_DIR),
+            rtr_listen: RpkiSidecar::DEFAULT_RTR_LISTEN,
+            rir_tals: true,
+            tals: Vec::new(),
+            extra_tals_dir: None,
+            accept_arin_rpa: false,
+            refresh: RpkiSidecar::DEFAULT_REFRESH,
+            config_file: None,
+            global_args: Vec::new(),
+            server_args: Vec::new(),
+            restart_initial: RpkiSidecar::DEFAULT_RESTART_INITIAL,
+            restart_cap: RpkiSidecar::DEFAULT_RESTART_CAP,
+            stable_after: RpkiSidecar::DEFAULT_STABLE_AFTER,
+            stop_timeout: RpkiSidecar::DEFAULT_STOP_TIMEOUT,
+            failure_threshold: RpkiSidecar::DEFAULT_FAILURE_THRESHOLD,
+        }
     }
 }
 
@@ -549,5 +780,89 @@ impl Neighbor {
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No `rpki` block is `mode disabled` with every default (issues #60,
+    /// #72): the file never asked for validation.
+    #[test]
+    fn the_implicit_rpki_block_is_disabled() {
+        let implicit = Rpki::implicit();
+        assert_eq!(implicit, Rpki::defaults(RpkiMode::Disabled));
+        assert_eq!(Rpki::default(), implicit);
+        assert_eq!(implicit.mode, RpkiMode::Disabled);
+        assert_eq!(implicit.enforcement, Rpki::DEFAULT_ENFORCEMENT);
+        assert_eq!(implicit.caches, []);
+        assert_eq!(implicit.sidecar, RpkiSidecar::default());
+        assert_eq!(implicit.sidecar.pos, None);
+        assert_eq!(
+            (implicit.backoff_min, implicit.backoff_max),
+            (Rpki::DEFAULT_BACKOFF_MIN, Rpki::DEFAULT_BACKOFF_MAX)
+        );
+    }
+
+    /// The back-off follows the mode; nothing else does.
+    #[test]
+    fn the_defaults_differ_by_mode_in_the_backoff_only() {
+        assert_eq!(
+            Rpki::default_backoff(RpkiMode::External),
+            (Duration::from_secs(1), Duration::from_secs(600))
+        );
+        assert_eq!(
+            Rpki::default_backoff(RpkiMode::Sidecar),
+            (Duration::from_secs(1), Duration::from_secs(30))
+        );
+        let sidecar = Rpki::defaults(RpkiMode::Sidecar);
+        assert_eq!(sidecar.backoff_max, Rpki::SIDECAR_BACKOFF_MAX);
+        let external = Rpki::defaults(RpkiMode::External);
+        assert_eq!(
+            Rpki {
+                mode: RpkiMode::External,
+                backoff_max: Rpki::DEFAULT_BACKOFF_MAX,
+                ..sidecar
+            },
+            external
+        );
+    }
+
+    /// Where the block is does not matter; any setting does.
+    #[test]
+    fn a_sidecar_is_the_same_wherever_it_is_written() {
+        let a = RpkiSidecar::default();
+        let moved = RpkiSidecar {
+            pos: Some(Pos { line: 9, col: 5 }),
+            ..a.clone()
+        };
+        assert!(a.same_as(&moved));
+        assert_ne!(a, moved);
+        let changed = [
+            RpkiSidecar {
+                binary: PathBuf::from("/opt/routinator/bin/routinator"),
+                ..a.clone()
+            },
+            RpkiSidecar {
+                rtr_listen: "127.0.0.1:3323".parse().unwrap(),
+                ..a.clone()
+            },
+            RpkiSidecar {
+                tals: vec!["ripe-pilot".to_owned()],
+                ..a.clone()
+            },
+            RpkiSidecar {
+                server_args: vec!["--rtr-tcp-keepalive=30".to_owned()],
+                ..a.clone()
+            },
+            RpkiSidecar {
+                failure_threshold: 6,
+                ..a.clone()
+            },
+        ];
+        for other in changed {
+            assert!(!a.same_as(&other), "{other:?}");
+        }
     }
 }

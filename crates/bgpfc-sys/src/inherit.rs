@@ -92,11 +92,11 @@ const DEFAULT_NR_OPEN: c_int = 1 << 20;
 /// `cmd` spawns (`fcntl(fd, F_SETFD, FD_CLOEXEC)`, `fcntl(2)`), so the
 /// program starts with standard input, output and error only.
 ///
-/// std opens its own descriptors close-on-exec, but one made otherwise,
-/// such as the self-pipe of [`Signals`](crate::Signals), stays open in
+/// std opens its own descriptors close-on-exec, and so does
+/// [`Signals`](crate::Signals) for its self-pipe, but one made otherwise,
+/// such as one inherited from whatever started the process, stays open in
 /// every program the process starts, and in what those start in turn,
-/// for as long as they run. A program that writes to that pipe makes
-/// [`Signals::wait`](crate::Signals::wait) report a signal nobody sent.
+/// for as long as they run.
 ///
 /// The descriptors are marked rather than closed, so the one std uses to
 /// report a failed `execve` to [`Command::spawn`] keeps working, and the
@@ -267,15 +267,16 @@ mod tests {
         assert!(status.success(), "{status}");
     }
 
-    /// A pipe without `O_CLOEXEC`, as [`Signals`](crate::Signals) makes
-    /// one: its read and write ends.
-    #[allow(unsafe_code, reason = "pipe(2) for the test")]
+    /// A pipe without `O_CLOEXEC`: its read and write ends.
+    #[allow(unsafe_code, reason = "pipe2(2) for the test")]
     fn inheritable_pipe() -> (OwnedFd, OwnedFd) {
         let mut fds: [c_int; 2] = [-1, -1];
-        // SAFETY: `fds` is a writable array of two ints, as `pipe(2)` wants.
-        let rc = unsafe { ffi::pipe(fds.as_mut_ptr()) };
+        // SAFETY: `fds` is a writable array of two ints, as `pipe2(2)`
+        // wants; no flags makes it `pipe(2)`, so neither end is
+        // close-on-exec.
+        let rc = unsafe { ffi::pipe2(fds.as_mut_ptr(), 0) };
         assert_eq!(rc, 0, "{}", io::Error::last_os_error());
-        // SAFETY: both descriptors were just created by `pipe` and are
+        // SAFETY: both descriptors were just created by `pipe2` and are
         // owned by nobody else; wrapping them now closes them on drop.
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }

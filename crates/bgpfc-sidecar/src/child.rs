@@ -103,11 +103,12 @@ pub(crate) fn child_env(config: &SidecarConfig) -> [(OsString, OsString); 2] {
 /// bind a port below 1024 then, unless the host's
 /// `net.ipv4.ip_unprivileged_port_start` allows it.
 ///
-/// bgpfcd's signal self-pipe ([`bgpfc_sys::Signals`]) is not
-/// close-on-exec, and a child holding it could feed bgpfcd fake
-/// `SIGTERM`s for as long as it runs. Every descriptor from 3 up is
-/// therefore marked close-on-exec in the child, leaving it its standard
-/// streams.
+/// A descriptor bgpfcd holds without close-on-exec, such as one
+/// inherited from whatever started it, would stay open in Routinator and
+/// in every `rsync` it runs, for as long as they run. Every descriptor
+/// from 3 up is therefore marked close-on-exec in the child, leaving it
+/// its standard streams. (bgpfcd's signal self-pipe,
+/// [`bgpfc_sys::Signals`], is close-on-exec itself.)
 pub(crate) fn command(config: &SidecarConfig) -> Command {
     let mut cmd = Command::new(&config.binary);
     cmd.env_clear()
@@ -571,13 +572,23 @@ mod tests {
             items.join(",")
         }
 
+        /// The descriptor [`OPEN_INHERITED`] leaves open, without
+        /// close-on-exec, in the copy of this test binary it starts.
+        const INHERITED_FD: &str = "9";
+
+        /// A [`run_probe`] wrapper: `/bin/sh` opens [`INHERITED_FD`] on
+        /// `/dev/null`, as a redirection of `exec` without a command, so
+        /// not close-on-exec, and then runs the test binary with it open.
+        const OPEN_INHERITED: [&str; 4] = ["/bin/sh", "-c", "exec 9</dev/null; exec \"$@\"", "sh"];
+
         /// Not a test on its own: [`run_probe`] runs this test binary
         /// again with [`PROBE_ENV`] set, and this function then plays
-        /// bgpfcd: it installs the signal handlers, whose self-pipe is not
-        /// close-on-exec, and spawns a child of a plain [`Command`] and a
-        /// child of [`command`]. It prints the ambient sets of itself and
-        /// of both children, the self-pipe's descriptors, and which of them
-        /// each child holds. Without the variable it returns at once.
+        /// bgpfcd: it installs the signal handlers and spawns a child of a
+        /// plain [`Command`] and a child of [`command`]. It prints the
+        /// ambient sets of itself and of both children, the self-pipe's
+        /// descriptors, and which of those and of [`INHERITED_FD`] (when
+        /// open) each child holds. Without the variable it returns at
+        /// once.
         #[test]
         fn probe_intermediate() {
             if std::env::var_os(PROBE_ENV).is_none() {
@@ -592,10 +603,17 @@ mod tests {
                 .into_iter()
                 .filter(|fd| !inherited.contains(fd))
                 .collect();
+            let mut probed = pipes.clone();
+            if std::path::Path::new("/proc/self/fd")
+                .join(INHERITED_FD)
+                .exists()
+            {
+                probed.push(INHERITED_FD.to_owned());
+            }
             let own = ambient(&std::fs::read_to_string("/proc/self/status").unwrap());
-            let (bare, bare_open) = child_report(Command::new("/bin/sh"), &pipes);
+            let (bare, bare_open) = child_report(Command::new("/bin/sh"), &probed);
             let config = SidecarConfig::new("/bin/sh", "/");
-            let (sidecar, sidecar_open) = child_report(command(&config), &pipes);
+            let (sidecar, sidecar_open) = child_report(command(&config), &probed);
             let pipes = list(&pipes);
             println!("probe {own:x} {bare:x} {sidecar:x} {pipes} {bare_open} {sidecar_open}");
         }
@@ -667,18 +685,22 @@ mod tests {
             assert_eq!(sidecar, 0, "the sidecar's child has ambient capabilities");
         }
 
-        /// bgpfcd with its signal handlers installed: a child of a plain
-        /// `Command` holds both ends of the self-pipe, the control, and
-        /// the sidecar's child holds neither.
+        /// bgpfcd with its signal handlers installed and a descriptor
+        /// that is not close-on-exec: a child of a plain `Command` holds
+        /// that descriptor, the control, but neither end of the self-pipe,
+        /// which is close-on-exec; the sidecar's child holds none of them.
         #[test]
         fn the_child_gets_none_of_bgpfcds_descriptors() {
-            let words = run_probe(&[]);
+            let words = run_probe(&OPEN_INHERITED);
             let [_, _, _, pipes, bare, sidecar] = &words[..] else {
                 panic!("six words expected: {words:?}");
             };
             assert_eq!(pipes.split(',').count(), 2, "the self-pipe: {pipes}");
-            assert_eq!(bare, pipes, "the control inherits the self-pipe");
-            assert_eq!(sidecar, "-", "the sidecar's child holds the self-pipe");
+            assert_eq!(
+                bare, INHERITED_FD,
+                "the control inherits only the descriptor"
+            );
+            assert_eq!(sidecar, "-", "the sidecar's child holds a descriptor");
         }
     }
 }

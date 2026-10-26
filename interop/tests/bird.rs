@@ -195,6 +195,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
             neighbors: vec![NeighborOpts::new(lab.b_addr, BIRD_AS), to_bird2],
             extra: String::new(),
+            args: Vec::new(),
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -311,6 +312,7 @@ fn export_policy_filters_and_sets() {
                         term tag { set community add 65000:42; set as-path prepend 65000; action accept; }
                     }"
             .to_owned(),
+            args: Vec::new(),
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -465,7 +467,10 @@ fn control_plane_commands() {
     let (out, ok) = ctl(&["show", "fib"]);
     assert!(ok && out.starts_with("mode dry-run"), "{out}");
     let (out, ok) = ctl(&["show", "status"]);
-    assert!(ok && out.contains("established 1"), "{out}");
+    assert!(
+        ok && out.contains("established 1") && out.ends_with("\nrpki disabled, validation off\n"),
+        "{out}"
+    );
     let (out, ok) = ctl(&["bogus"]);
     assert!(!ok && out.contains("unknown command"), "{out}");
 
@@ -481,7 +486,9 @@ fn control_plane_commands() {
     let auth = "Authorization: Bearer s3cret";
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/status"]);
     assert!(
-        r.starts_with("HTTP/1.1 200") && r.contains("\"established\":1"),
+        r.starts_with("HTTP/1.1 200")
+            && r.contains("\"established\":1")
+            && r.contains("\"rpki\":{\"mode\":\"disabled\",\"validation\":\"off\"},\"alarms\":[]}"),
         "{r}"
     );
     let r = curl(&["-H", auth, "http://127.0.0.1:8179/v1/neighbors"]);
@@ -716,6 +723,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
             neighbors: vec![to_b, to_c],
             extra: format!("control {{ socket {}; }}", socket.display()),
+            args: Vec::new(),
         },
     );
     (bird_b, bird_c, bgpfcd, socket)

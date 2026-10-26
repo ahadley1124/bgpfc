@@ -5,7 +5,8 @@
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
-//! client of the `rpki` block, which feeds the RIB thread.
+//! client of the `rpki` block, which feeds the RIB thread, and since step
+//! 14, with `mode sidecar`, Routinator as the client's cache.
 #![forbid(unsafe_code)]
 
 mod args;
@@ -13,6 +14,7 @@ mod control;
 mod coordinator;
 mod fib;
 mod messages;
+mod owner;
 mod peer;
 mod privileges;
 #[cfg(feature = "profiling")]
@@ -94,9 +96,11 @@ fn main() {
 }
 
 /// Parse, validate and compile the configuration file, with the command
-/// line overrides applied; exits with the errors printed otherwise.
+/// line overrides applied; exits with the errors printed otherwise. The
+/// checks of [`rpki::check_config`] are among the validation errors, with
+/// their positions in the file.
 fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
-    let mut config = match bgpfc_config::parse_file(&opts.config) {
+    let mut config = match bgpfc_config::parse_file_with(&opts.config, &rpki::check_config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -126,6 +130,11 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
 /// coordinator loop.
 fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::Engine) {
     // Signals first, so every thread inherits the handlers (AGENTS.md §3).
+    // Only the sidecar reaps its own child; nothing else in bgpfcd may reap
+    // or ignore SIGCHLD, or the sidecar loses its child (bgpfc-sidecar,
+    // `Sidecar`, "Threads"): no `waitpid(-1)`, no reaper thread, no
+    // `SIG_IGN` for SIGCHLD (m14 design §4.4). The self-pipe is
+    // close-on-exec, so no child inherits it.
     let signals = match bgpfc_sys::Signals::install() {
         Ok(s) => s,
         Err(e) => {
@@ -133,6 +142,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
             std::process::exit(1);
         }
     };
+    // Refuses `mode sidecar` as root without `--user` (m14 design §4.2).
     privileges::check(&config, opts.user.as_deref());
 
     // The netlink socket and the listeners are opened while still
@@ -189,8 +199,12 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         Arc::clone(&table),
         fib_tx.clone(),
     );
-    // Before the peers, so that the VRPs often arrive before the routes
-    // and most routes are validated once, on arrival.
+    // After the privilege drop, so that Routinator, with `mode sidecar`,
+    // is born with the service user's credentials and no capabilities
+    // (m14 design §4.1); its version check may take up to ten seconds,
+    // which delays only the peers. Before the peers, so that the VRPs
+    // often arrive before the routes and most routes are validated once,
+    // on arrival.
     let rpki = start_rpki(&config, &rib_tx);
     for peer in peers {
         peer.start();
@@ -233,13 +247,14 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 }
 
-/// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
-/// client cannot be started.
+/// Run the `rpki` block, publishing to the RIB thread; exits if it cannot
+/// be started (issue #60: fail loudly and early), before any neighbor
+/// starts.
 fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpki::Rpki {
     match rpki::Rpki::start(&config.rpki, config.router_id, rib_tx.clone()) {
         Ok(r) => r,
         Err(e) => {
-            bgpfc_log::error!("cannot start the rtr client", error = e);
+            bgpfc_log::error!("cannot start rpki", error = e);
             std::process::exit(1);
         }
     }
@@ -323,7 +338,8 @@ struct Coordinator<'a> {
     table: PeerTable,
     rib_tx: SyncSender<RibMsg>,
     fib_tx: SyncSender<FibMsg>,
-    /// The `rpki` block at work: the RTR client, if one runs.
+    /// The `rpki` block at work: the RTR client and Routinator, if they
+    /// run.
     rpki: rpki::Rpki,
 }
 
@@ -340,11 +356,15 @@ impl Coordinator<'_> {
     fn reload(&mut self) -> Result<String, String> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
-        // Issue #60: a new cache that cannot be found fails the reload
-        // before anything changes, as it fails the start.
-        if diff.global.contains(&GlobalChange::Rpki) {
-            rpki::resolve(&new.rpki)?;
-        }
+        // What the `rpki` block runs now: `mode disabled` if an earlier
+        // reload could not start it, so that this one starts it, from an
+        // unchanged file too.
+        let rpki = self.rpki.in_effect(&self.config.rpki);
+        // Issue #60: a changed `rpki` block that cannot run, such as a new
+        // cache that cannot be found or a Routinator that would not start
+        // (issue #72), fails the reload before anything changes, as it
+        // fails the start; a running Routinator goes on (m14 design §5.1).
+        rpki::preflight(&rpki, &new.rpki)?;
         let mut notes = Vec::new();
         for g in &diff.global {
             match g {
@@ -354,10 +374,8 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
-                GlobalChange::Rpki => {
-                    let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
-                    notes.push(done.map_or_else(|e| e, str::to_owned));
-                }
+                // Applied below, from the block in effect.
+                GlobalChange::Rpki => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
@@ -384,6 +402,12 @@ impl Coordinator<'_> {
                     }
                 }
             }
+        }
+        // A changed block, or an unchanged one an earlier reload could not
+        // start.
+        if !rpki.same_as(&new.rpki) {
+            let done = self.rpki.reconfigure(&rpki, &new.rpki);
+            notes.push(done.map_or_else(|e| e, str::to_owned));
         }
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.
@@ -453,17 +477,14 @@ impl Coordinator<'_> {
         Ok(summary)
     }
 
-    /// The running `rpki` block and its client's status.
+    /// The running `rpki` block, its client and its sidecar.
     fn rpki_report(&self) -> messages::RpkiReport {
-        messages::RpkiReport {
-            config: self.config.rpki.clone(),
-            status: self.rpki.status(),
-        }
+        self.rpki.report(&self.config.rpki)
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown), remove our routes from the kernel, then stop the RTR
-    /// client.
+    /// Shutdown), stop the RTR client and, after it, Routinator, and remove
+    /// our routes from the kernel while Routinator stops.
     fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
@@ -472,6 +493,13 @@ impl Coordinator<'_> {
                     .try_send(PeerInput::Stop(CeaseSubcode::AdministrativeShutdown));
             }
         }
+        // Issue #70: from here on no Routinator is started again, also one
+        // that exits meanwhile. Neither the Ceases nor the FIB cleanup need
+        // the block. The client stops now, which may first hand the RIB
+        // thread a change (see `rpki`), so that it neither warns about the
+        // cache it loses nor changes routes for a FIB that is going;
+        // Routinator stops meanwhile, which may take `stop-timeout`.
+        let rpki = self.rpki.begin_stop();
         // Give the peer threads a moment to write their NOTIFICATIONs.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let (done_tx, done_rx) = sync_channel(1);
@@ -481,9 +509,8 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
-        // Last: neither the Ceases nor the FIB cleanup need it, and it may
-        // first have to hand the RIB thread a change (see `rpki`).
-        self.rpki.stop();
+        // Routinator is gone before bgpfcd says it stopped.
+        rpki.finish();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));
         bgpfc_log::info!("bgpfcd stopped");
@@ -493,7 +520,8 @@ impl Coordinator<'_> {
 /// [`load`] without exiting: for reload, where the running configuration
 /// must survive a bad file.
 fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy::Engine), String> {
-    let mut config = bgpfc_config::parse_file(&opts.config).map_err(|e| e.to_string())?;
+    let mut config = bgpfc_config::parse_file_with(&opts.config, &rpki::check_config)
+        .map_err(|e| e.to_string())?;
     let engine = bgpfc_policy::Engine::new(&config).map_err(|errors| {
         errors
             .iter()

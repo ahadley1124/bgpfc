@@ -60,8 +60,8 @@ impl Signals {
     /// before spawning threads, so every thread inherits the disposition.
     ///
     /// # Errors
-    /// The `pipe` or `signal` failure, or if already installed.
-    #[allow(unsafe_code, reason = "pipe and signal FFI")]
+    /// The `pipe2` or `signal` failure, or if already installed.
+    #[allow(unsafe_code, reason = "pipe2 and signal FFI")]
     pub fn install() -> io::Result<Signals> {
         if PIPE_WRITER.load(Ordering::Relaxed) >= 0 {
             return Err(io::Error::new(
@@ -70,11 +70,16 @@ impl Signals {
             ));
         }
         let mut fds: [c_int; 2] = [-1, -1];
-        // SAFETY: `fds` is a writable array of two ints, as `pipe(2)` wants.
-        if unsafe { ffi::pipe(fds.as_mut_ptr()) } < 0 {
+        // Close-on-exec, so that no child bgpfcd runs (the RPKI sidecar's
+        // version check, for one) inherits either end: a child holding the
+        // write end could wake the daemon, and one holding the read end
+        // could steal its signals.
+        // SAFETY: `fds` is a writable array of two ints, as `pipe2(2)`
+        // wants, and `O_CLOEXEC` is one of the flags it accepts.
+        if unsafe { ffi::pipe2(fds.as_mut_ptr(), ffi::O_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: both descriptors were just created by `pipe` and are
+        // SAFETY: both descriptors were just created by `pipe2` and are
         // owned by nobody else; wrapping them now closes them on drop.
         let (reader, writer) =
             unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };

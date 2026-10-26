@@ -1,8 +1,9 @@
 //! Interoperability test harness. Drives BIRD, FRR and `GoBGP` in network
 //! namespaces and peers them with `bgpfcd`, and serves it VRPs over RTR
 //! from `StayRTR`, or from this crate's stub cache (`src/bin/rtr-stub.rs`)
-//! where `StayRTR` cannot be used. Nothing in this crate is shipped
-//! (AGENTS.md §1.2).
+//! where `StayRTR` cannot be used. For `rpki { mode sidecar; }` it stands
+//! in a [`FakeRoutinator`] for Routinator, which is never run (AGENTS.md
+//! §5). Nothing in this crate is shipped (AGENTS.md §1.2).
 //!
 //! Needs root, `iproute2` and the daemon under test:
 //!
@@ -19,8 +20,10 @@
 use std::fs;
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -38,6 +41,33 @@ fn sh(cmd: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Whether every directory from `/` down to `dir` lets others through
+/// (their mode has `o+x`), as a process that dropped to `nobody` needs to
+/// reach anything below it.
+fn others_can_reach(dir: &Path) -> bool {
+    dir.canonicalize().is_ok_and(|dir| {
+        dir.ancestors().all(|d| {
+            fs::metadata(d).is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o001 != 0)
+        })
+    })
+}
+
+/// Where a [`Lab`] keeps its scratch directory: the system's temporary
+/// directory if `nobody` can reach it, as a bgpfcd run with `--user nobody`
+/// must, and otherwise `/tmp`, as when `TMPDIR` names a directory only root
+/// may enter.
+fn scratch_base() -> PathBuf {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .into_iter()
+        .find(|base| others_can_reach(base))
+        .unwrap_or_else(|| {
+            panic!(
+                "neither TMPDIR nor /tmp lets nobody through; set TMPDIR to a directory every \
+                 user can reach"
+            )
+        })
 }
 
 /// Two network namespaces, `a` and `b`, on one /24 joined by a veth pair.
@@ -74,9 +104,12 @@ impl Lab {
         let b = format!("bgpfc-{id}-b");
         let va = format!("v{id}a");
         let vb = format!("v{id}b");
-        let dir = std::env::temp_dir().join(format!("bgpfc-interop-{id}"));
+        let dir = scratch_base().join(format!("bgpfc-interop-{id}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
+        // Whatever the umask: a bgpfcd that dropped to `nobody` reads its
+        // configuration file here again at a reload.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("scratch dir mode");
         let a_addr = Ipv4Addr::new(10, 99, subnet, 1);
         let b_addr = Ipv4Addr::new(10, 99, subnet, 2);
         sh("ip", &["netns", "add", &a]);
@@ -255,6 +288,28 @@ impl Daemon {
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// The process ID. `ip netns exec` executes the program in its own
+    /// place, so this is the daemon's, not `ip`'s.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Wait up to `timeout` for the process to exit by itself; how it
+    /// exited, or `None` if it still runs.
+    pub fn wait(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -385,6 +440,8 @@ pub struct BgpfcdOpts {
     pub neighbors: Vec<NeighborOpts>,
     /// Extra configuration text: policies and prefix lists.
     pub extra: String,
+    /// Further command-line arguments, such as `--user nobody`.
+    pub args: Vec<String>,
 }
 
 impl BgpfcdOpts {
@@ -397,13 +454,16 @@ impl BgpfcdOpts {
             listen: vec![IpAddr::V4(router_id)],
             neighbors: vec![neighbor],
             extra: String::new(),
+            args: Vec::new(),
         }
     }
 }
 
 /// Write a configuration and start `bgpfcd` in namespace `ns` with debug
-/// logging. Both families are offered, and an accept-all policy is used
-/// in both directions.
+/// logging and the further arguments of `opts`. Both families are
+/// offered, and an accept-all policy is used in both directions. The file
+/// is readable by every user, as a bgpfcd started with `--user` reads it
+/// again at a reload.
 ///
 /// # Panics
 /// If the config cannot be written or the process cannot be spawned.
@@ -438,8 +498,10 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
         );
     }
     fs::write(&cfg, text).expect("bgpfcd config");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).expect("bgpfcd config mode");
     let mut cmd = lab.exec(ns, bgpfcd_path().to_str().expect("path"));
     cmd.args(["-c", cfg.to_str().expect("path")]);
+    cmd.args(&opts.args);
     Daemon::start(cmd, lab.dir.join(format!("bgpfcd-{ns}.log")))
 }
 
@@ -935,6 +997,249 @@ impl RtrStub {
     }
 }
 
+/// The user a [`FakeRoutinator`] runs as, with `bgpfcd --user nobody`:
+/// `nobody`, and its group, 65534 on Debian and Ubuntu.
+pub const NOBODY: u32 = 65_534;
+
+/// The fake Routinator: a shell script that answers `--version` from the
+/// file `version`, records the arguments of every other start in
+/// `invocations`, insists on `server` and `--rtr=ADDR:PORT` as bgpfcd
+/// derives them, and then becomes this crate's `rtr-stub` on that address,
+/// serving the VRPs of the file `vrps` under a new Session ID each time,
+/// as a restarted Routinator does. `fail` makes every start exit 1 at once.
+/// Otherwise each start leaves a child of its own running, in its process
+/// group, as Routinator's `rsync` runs during a validation run: a `sleep`,
+/// whose process ID goes to `children`. `delay` holds the start that many
+/// seconds before it listens, as Routinator's first validation run does.
+/// Every `--version` adds a line
+/// to `version-checks`; from the one whose number `version-from` holds on,
+/// it prints `version-later` instead of `version`. `@DIR@` is the
+/// directory of these files.
+const FAKE_ROUTINATOR: &str = r#"#!/bin/sh
+# A stand-in for Routinator 0.15 in bgpfc's interop tests; never shipped.
+dir=@DIR@
+case "$1" in --version|-V)
+  echo "$*" >> "$dir/version-checks"
+  if [ -e "$dir/version-from" ] && [ "$(wc -l < "$dir/version-checks")" -ge "$(cat "$dir/version-from")" ]
+  then cat "$dir/version-later"; else cat "$dir/version"; fi
+  exit 0 ;;
+esac
+{ printf 'start'; for a in "$@"; do printf ' %s' "$a"; done; echo; } >> "$dir/invocations"
+rtr=; server=
+for a in "$@"; do
+  case "$a" in --rtr=*) rtr=${a#--rtr=} ;; server) server=1 ;; esac
+done
+[ -n "$server" ] && [ -n "$rtr" ] || { echo "fake routinator: expected server --rtr=ADDR:PORT" >&2; exit 2; }
+[ -e "$dir/fail" ] && { echo "fake routinator: failing as asked" >&2; exit 1; }
+sleep @CHILD@ </dev/null >/dev/null 2>&1 &   # Routinator's rsync
+echo $! >> "$dir/children"
+delay=$(cat "$dir/delay" 2>/dev/null || echo 0)
+[ "$delay" -gt 0 ] && sleep "$delay"   # Routinator listens after its first run
+echo $$ > "$dir/pid"
+# exec: the RTR server must be this very process, which carries the
+# parent-death signal (prctl(2)); a new Session ID per start, as Routinator.
+exec "$dir/rtr-stub" "$rtr" $(( $$ % 65535 + 1 )) $(cat "$dir/vrps")
+"#;
+
+/// How long the child each start of a [`FakeRoutinator`] leaves runs.
+const CHILD_SECONDS: u32 = 300;
+
+/// A fake Routinator 0.15.2 for `rpki { mode sidecar; }` (AGENTS.md §5:
+/// never a real Routinator), in the directory `routinator` of a lab: the
+/// shell script of the private `FAKE_ROUTINATOR`, whose documentation says
+/// what it does, and its own copy of `rtr-stub`, which a bgpfcd run as
+/// `nobody` can execute whatever the permissions of the checkout. The
+/// directory belongs to [`NOBODY`], so that the script can write its
+/// records, and bgpfcd the repository directory, there.
+pub struct FakeRoutinator {
+    /// The directory of the script, its records and its controls.
+    pub dir: PathBuf,
+    /// The script, for the `binary` statement.
+    pub binary: PathBuf,
+    /// For the `repository-dir` statement; bgpfcd creates it.
+    pub repository: PathBuf,
+}
+
+impl FakeRoutinator {
+    /// Install a fake that reports version 0.15.2, serving `vrps`:
+    /// (prefix, max length, origin AS).
+    ///
+    /// # Panics
+    /// If a file cannot be written or `rtr-stub` is not built.
+    #[must_use]
+    pub fn install(lab: &Lab, vrps: &[(&str, u8, u32)]) -> FakeRoutinator {
+        let dir = lab.dir.join("routinator");
+        fs::create_dir_all(&dir).expect("fake routinator dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
+            .expect("fake routinator dir mode");
+        std::os::unix::fs::chown(&dir, Some(NOBODY), Some(NOBODY))
+            .expect("chown the fake routinator dir to nobody");
+        let binary = dir.join("routinator");
+        let dir_text = dir.to_str().expect("path");
+        assert!(
+            !dir_text.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"'),
+            "{dir_text}: the script takes the path unquoted"
+        );
+        let script = FAKE_ROUTINATOR
+            .replace("@DIR@", dir_text)
+            .replace("@CHILD@", &CHILD_SECONDS.to_string());
+        fs::write(&binary, script).expect("fake routinator");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("fake routinator mode");
+        let stub = dir.join("rtr-stub");
+        fs::copy(rtr_stub_path(), &stub).expect("copy rtr-stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("rtr-stub mode");
+        let vrps: Vec<String> = vrps
+            .iter()
+            .map(|(prefix, max_len, asn)| format!("{prefix}-{max_len}-{asn}"))
+            .collect();
+        fs::write(dir.join("vrps"), vrps.join(" ")).expect("fake routinator vrps");
+        let fake = FakeRoutinator {
+            repository: dir.join("repository"),
+            binary,
+            dir,
+        };
+        fake.set_version("Routinator 0.15.2");
+        fake
+    }
+
+    /// What `--version` prints from now on; it ends a switch that
+    /// [`FakeRoutinator::switch_version`] set.
+    ///
+    /// # Panics
+    /// If the file cannot be written.
+    pub fn set_version(&self, line: &str) {
+        let _ = fs::remove_file(self.dir.join("version-from"));
+        fs::write(self.dir.join("version"), format!("{line}\n")).expect("fake routinator version");
+    }
+
+    /// What `--version` prints from the `check`-th question on, counting
+    /// every one since [`FakeRoutinator::install`]: a binary replaced
+    /// between two of bgpfcd's checks, such as a reload's preflight and
+    /// the start that follows it.
+    ///
+    /// # Panics
+    /// If a file cannot be written.
+    pub fn switch_version(&self, check: usize, line: &str) {
+        fs::write(self.dir.join("version-later"), format!("{line}\n"))
+            .expect("fake routinator later version");
+        fs::write(self.dir.join("version-from"), check.to_string())
+            .expect("fake routinator version switch");
+    }
+
+    /// Whether every start from now on fails at once, with exit status 1.
+    ///
+    /// # Panics
+    /// If the marker cannot be written or removed.
+    pub fn set_failing(&self, on: bool) {
+        let marker = self.dir.join("fail");
+        if on {
+            fs::write(marker, "").expect("fake routinator fail marker");
+        } else if marker.exists() {
+            fs::remove_file(marker).expect("fake routinator fail marker");
+        }
+    }
+
+    /// How many seconds every start from now on waits before it listens,
+    /// as Routinator does until its first validation run ends.
+    ///
+    /// # Panics
+    /// If the file cannot be written.
+    pub fn set_delay(&self, secs: u32) {
+        fs::write(self.dir.join("delay"), secs.to_string()).expect("fake routinator delay");
+    }
+
+    /// The arguments of every start other than `--version`, in order.
+    #[must_use]
+    pub fn invocations(&self) -> Vec<Vec<String>> {
+        read(&self.dir.join("invocations"))
+            .lines()
+            .filter_map(|l| l.strip_prefix("start"))
+            .map(|args| args.split_whitespace().map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// How often the fake was asked `--version`.
+    #[must_use]
+    pub fn version_checks(&self) -> usize {
+        read(&self.dir.join("version-checks")).lines().count()
+    }
+
+    /// The process ID of the latest start that came to serve RTR: the
+    /// script's own, which `exec` hands to `rtr-stub`.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        read(&self.dir.join("pid")).trim().parse().ok()
+    }
+
+    /// The process IDs of the children its starts left, the stand-ins for
+    /// Routinator's `rsync`, in order: dead ones too.
+    #[must_use]
+    pub fn children(&self) -> Vec<u32> {
+        read(&self.dir.join("children"))
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    /// Kill the children that still run, as systemd kills what is left of
+    /// a service's control group. A process ID is signalled only while it
+    /// still runs the child's command, so not once another process has it.
+    pub fn kill_children(&self) {
+        let command = format!("sleep\0{CHILD_SECONDS}\0");
+        for pid in self.children() {
+            let running =
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == command.as_bytes());
+            if running {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+
+    /// The processes that run this fake's `rtr-stub`, by their command
+    /// lines: the fake Routinators serving RTR now.
+    #[must_use]
+    pub fn serving(&self) -> Vec<u32> {
+        let stub = self.dir.join("rtr-stub");
+        let stub = stub.as_os_str().as_bytes();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut pids: Vec<u32> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| c.split(|&b| b == 0).next() == Some(stub))
+            })
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// An `rpki` block that runs this fake: `mode sidecar`, then
+    /// `rpki_extra`, then a `sidecar` block with its binary and repository
+    /// directory, then `sidecar_extra`.
+    #[must_use]
+    pub fn block(&self, rpki_extra: &str, sidecar_extra: &str) -> String {
+        format!(
+            "rpki {{ mode sidecar; {rpki_extra} sidecar {{ binary \"{}\"; repository-dir \"{}\"; {sidecar_extra} }} }}",
+            self.binary.display(),
+            self.repository.display()
+        )
+    }
+}
+
+impl Drop for FakeRoutinator {
+    /// [`FakeRoutinator::kill_children`]: a test leaves no `sleep` behind,
+    /// also one that fails.
+    fn drop(&mut self) {
+        self.kill_children();
+    }
+}
+
 /// Path to `rtr-stub`. Cargo builds a package's binaries for its
 /// integration tests and puts them in `target/<profile>/`, beside the
 /// `deps/` directory the test binary runs from.
@@ -951,4 +1256,124 @@ fn rtr_stub_path() -> PathBuf {
         path.display()
     );
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fake keeps the contract the sidecar scenarios rely on: it
+    /// answers `--version` from its file and records the question, refuses
+    /// a start that is not `server --rtr=ADDR:PORT`, fails on demand, and
+    /// otherwise becomes `rtr-stub` on that address in its own process, so
+    /// that its recorded pid is the server's. Its `rpki` block passes
+    /// `bgpfcd --check`, which does not run the binary.
+    #[test]
+    #[ignore = "needs root and iproute2"]
+    fn the_fake_routinator_behaves_as_documented() {
+        let lab = Lab::new("fr", 25);
+        let fake = FakeRoutinator::install(&lab, &[("192.0.2.0/24", 24, 65_001)]);
+        let run = |args: &[&str]| {
+            Command::new(&fake.binary)
+                .args(args)
+                .output()
+                .expect("fake routinator")
+        };
+
+        let out = run(&["--version"]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "Routinator 0.15.2\n");
+        fake.set_version("Routinator 0.14.1");
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["-V"]).stdout),
+            "Routinator 0.14.1\n"
+        );
+        assert_eq!(fake.version_checks(), 2);
+        assert_eq!(fake.invocations(), Vec::<Vec<String>>::new());
+        // A switch from the fourth question on, which `set_version` ends.
+        fake.switch_version(4, "Routinator 0.13.0");
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["--version"]).stdout),
+            "Routinator 0.14.1\n"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                String::from_utf8_lossy(&run(&["--version"]).stdout),
+                "Routinator 0.13.0\n"
+            );
+        }
+        fake.set_version("Routinator 0.14.1");
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["--version"]).stdout),
+            "Routinator 0.14.1\n"
+        );
+        assert_eq!(fake.version_checks(), 6);
+
+        let out = run(&["--strict", "server"]);
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        fake.set_failing(true);
+        let out = run(&["server", "--rtr=127.0.0.1:3323"]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("failing as asked"));
+        fake.set_failing(false);
+        assert_eq!(
+            fake.invocations(),
+            [
+                vec!["--strict", "server"],
+                vec!["server", "--rtr=127.0.0.1:3323"]
+            ]
+        );
+        assert_eq!(fake.pid(), None);
+
+        let mut cmd = lab.exec(&lab.a, fake.binary.to_str().expect("path"));
+        cmd.args(["--no-rir-tals", "server", "--rtr=127.0.0.1:3323"]);
+        let mut serving = Daemon::start(cmd, lab.dir.join("fake.log"));
+        assert!(
+            wait_for(Duration::from_secs(10), || serving
+                .log_text()
+                .contains("listening on 127.0.0.1:3323: session ")),
+            "{}",
+            serving.log_text()
+        );
+        assert!(
+            serving.log_text().ends_with(", 1 VRPs\n"),
+            "{}",
+            serving.log_text()
+        );
+        assert_eq!(fake.pid(), Some(serving.pid()));
+        assert_eq!(fake.serving(), [serving.pid()]);
+        assert_eq!(fake.invocations().len(), 3);
+        // One child, in the server's process group, which a kill of the
+        // server alone leaves running.
+        let children = fake.children();
+        assert_eq!(children.len(), 1, "{children:?}");
+        let alive = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+            })
+        };
+        assert!(alive(children[0]));
+        serving.kill();
+        assert_eq!(fake.serving(), Vec::<u32>::new());
+        assert!(alive(children[0]));
+        fake.kill_children();
+        assert!(wait_for(Duration::from_secs(5), || !alive(children[0])));
+
+        let cfg = lab.dir.join("check.conf");
+        fs::write(
+            &cfg,
+            format!(
+                "router-id 192.0.2.1;\nlocal-as 65000;\n{}\n",
+                fake.block("backoff 1 5;", "refresh 300;")
+            ),
+        )
+        .expect("config");
+        let out = Command::new(bgpfcd_path())
+            .args(["--check", "-c", cfg.to_str().expect("path")])
+            .output()
+            .expect("bgpfcd --check");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(fake.version_checks(), 6);
+    }
 }

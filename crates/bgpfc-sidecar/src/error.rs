@@ -90,8 +90,9 @@ pub enum SidecarError {
         /// How long it had.
         timeout: Duration,
     },
-    /// The operating system refused something the sidecar needs: a free
-    /// RTR port, a socket pair for the child's output, or a thread.
+    /// The operating system refused something the sidecar needs: the RTR
+    /// address or a free port on it, a socket pair for the child's output,
+    /// or a thread.
     Io {
         /// What failed, such as `"picking a free RTR port"`.
         action: &'static str,
