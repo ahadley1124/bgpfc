@@ -24,9 +24,12 @@ KillSignal=SIGTERM
 # shuts down in order (Cease, RTR client, then Routinator with SIGTERM
 # and, after its stop-timeout, SIGKILL, while the FIB is cleaned up).
 # systemd's SIGKILL reaches whatever is left in the cgroup only after
-# bgpfcd has exited. With the default KillMode=control-group, Routinator
-# would get SIGTERM at the same moment as bgpfcd, before the RTR client
-# lets go of it, and bgpfcd would log an exit it did not ask for.
+# bgpfcd has exited: nothing after a clean stop, and after a crash or
+# SIGKILL of bgpfcd, the rsync Routinator may have been running, which the
+# kernel's parent-death signal for Routinator does not reach. With the
+# default KillMode=control-group, Routinator would get SIGTERM at the same
+# moment as bgpfcd, before the RTR client lets go of it, and bgpfcd would
+# log an exit it did not ask for.
 KillMode=mixed
 # Routinator's stop, during the FIB cleanup (up to 10 s): its stop-timeout
 # (10 s by default) and a version check that may be running (up to 10 s).

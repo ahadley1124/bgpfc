@@ -602,7 +602,16 @@ stops its RTR client, then Routinator: `SIGTERM`, and `SIGKILL` after
 `stop-timeout`, while it removes its routes from the kernel. From then on
 it starts no Routinator again, even one that exits meanwhile (issue #70).
 If bgpfcd dies without stopping it, the kernel kills Routinator too
-(`PR_SET_PDEATHSIG`).
+(`PR_SET_PDEATHSIG`), but not what Routinator started, such as an `rsync`
+under way: the death signal is not passed on to a child's children, and
+Routinator's process group, which bgpfcd kills when it reaps Routinator,
+is never killed by a bgpfcd that was killed itself. Such a process runs
+on, in the repository directory the next Routinator uses, until it ends or
+times out. Under systemd, `KillMode=mixed` (`contrib/bgpfcd.service`) kills
+it with the rest of the service once bgpfcd is gone; under another
+supervisor, have it kill bgpfcd's whole process tree or control group when
+bgpfcd dies. A Routinator that bgpfcd stops, or that exits by itself,
+takes its process group along.
 Nothing else in bgpfcd reaps child processes, which is what lets the
 sidecar keep track of its own.
 

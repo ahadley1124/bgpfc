@@ -141,15 +141,17 @@ RTR on a loopback port bgpfcd picks, and the RTR client connects to it
 with nothing else configured. bgpfcd restarts it with a back-off when it
 fails, keeping the last VRPs in use meanwhile, raises an alarm in `show
 rpki` and `show status` when it keeps failing, and stops it when bgpfcd
-stops; a bgpfcd that is killed takes it along. Routinator is a separate
-program that bgpfc neither bundles nor links; see "Routinator sidecar"
-under "Run". Its first validation run takes minutes from a cold cache, and
-bgpfcd does not wait for it: routes are used unvalidated until the first
-full set, then validated and acted on, and the wait is logged and shown
-([`docs/config.md`](docs/config.md), "Startup window", which also shows
-how to hold routes until then instead). An external validator (`mode
-external`) and no validation (`mode disabled`, or no `rpki` block) work as
-before, without Routinator on the host.
+stops; a bgpfcd that is killed takes Routinator along, though not an
+`rsync` Routinator runs, which systemd's `KillMode=mixed` ends instead
+([`docs/config.md`](docs/config.md), "Routinator sidecar"). Routinator is
+a separate program that bgpfc neither bundles nor links; see "Routinator
+sidecar" under "Run". Its first validation run takes minutes from a cold
+cache, and bgpfcd does not wait for it: routes are used unvalidated until
+the first full set, then validated and acted on, and the wait is logged
+and shown ([`docs/config.md`](docs/config.md), "Startup window", which
+also shows how to hold routes until then instead). An external validator
+(`mode external`) and no validation (`mode disabled`, or no `rpki` block)
+work as before, without Routinator on the host.
 
 ### Later
 
