@@ -43,6 +43,33 @@ fn sh(cmd: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Whether every directory from `/` down to `dir` lets others through
+/// (their mode has `o+x`), as a process that dropped to `nobody` needs to
+/// reach anything below it.
+fn others_can_reach(dir: &Path) -> bool {
+    dir.canonicalize().is_ok_and(|dir| {
+        dir.ancestors().all(|d| {
+            fs::metadata(d).is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o001 != 0)
+        })
+    })
+}
+
+/// Where a [`Lab`] keeps its scratch directory: the system's temporary
+/// directory if `nobody` can reach it, as a bgpfcd run with `--user nobody`
+/// must, and otherwise `/tmp`, as when `TMPDIR` names a directory only root
+/// may enter.
+fn scratch_base() -> PathBuf {
+    [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .into_iter()
+        .find(|base| others_can_reach(base))
+        .unwrap_or_else(|| {
+            panic!(
+                "neither TMPDIR nor /tmp lets nobody through; set TMPDIR to a directory every \
+                 user can reach"
+            )
+        })
+}
+
 /// Two network namespaces, `a` and `b`, on one /24 joined by a veth pair.
 pub struct Lab {
     /// Namespace name of side A.
@@ -77,7 +104,7 @@ impl Lab {
         let b = format!("bgpfc-{id}-b");
         let va = format!("v{id}a");
         let vb = format!("v{id}b");
-        let dir = std::env::temp_dir().join(format!("bgpfc-interop-{id}"));
+        let dir = scratch_base().join(format!("bgpfc-interop-{id}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         // Whatever the umask: a bgpfcd that dropped to `nobody` reads its
