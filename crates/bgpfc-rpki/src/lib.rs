@@ -12,13 +12,15 @@
 //! they change; a producer sends those through a [`ValidationSink`].
 //! [`NullSource`] is the source when validation is off. What the router
 //! then does with a route's state, beyond what policy does, is the
-//! operator's [`Enforcement`].
+//! operator's [`Enforcement`], and what it does with routes while
+//! validation waits for its first data, the operator's [`Startup`].
 //!
 //! Implements: RFC 6811 §2 (VRPs, the Route Origin ASN, Covered, Matched,
 //! the three validation states), §3 (how policy reads a state, see
 //! [`RovState::satisfies`]), §4 (re-validate the affected prefixes when
 //! VRPs change), §5 (drop Invalid routes or prefer Valid ones, see
-//! [`Enforcement`]); RFC 6483 §2 (validation outcome),
+//! [`Enforcement`]; routes held only as configured, see [`Startup`]);
+//! RFC 6483 §2 (validation outcome),
 //! §4 (an AS 0 ROA disavows origination); RFC 7607 §2 (AS 0 is never a
 //! valid origin); RFC 9319 §3 (a VRP authorises nothing longer than its
 //! maxLength); RFC 8210 §5.1, §5.6, §5.7 (bounds of Max Length; one VRP
@@ -31,6 +33,7 @@ mod index;
 pub mod origin;
 pub mod set;
 pub mod source;
+pub mod startup;
 pub mod state;
 pub mod vrp;
 
@@ -43,6 +46,7 @@ pub use enforcement::Enforcement;
 pub use origin::RouteOrigin;
 pub use set::VrpSet;
 pub use source::{NullSource, ValidationChange, ValidationSink, ValidationSource};
+pub use startup::Startup;
 pub use state::{AspaState, RovState};
 pub use vrp::Vrp;
 
@@ -70,6 +74,8 @@ pub enum RpkiError {
     UnknownState(String),
     /// Text that names no enforcement mode.
     UnknownEnforcement(String),
+    /// Text that names no startup setting.
+    UnknownStartup(String),
     /// The consumer of validation changes has gone away.
     SinkClosed,
 }
@@ -91,6 +97,7 @@ impl fmt::Display for RpkiError {
             }
             RpkiError::UnknownState(s) => write!(f, "unknown validation state {s:?}"),
             RpkiError::UnknownEnforcement(s) => write!(f, "unknown enforcement mode {s:?}"),
+            RpkiError::UnknownStartup(s) => write!(f, "unknown startup setting {s:?}"),
             RpkiError::SinkClosed => {
                 f.write_str("the consumer of validation changes has gone away")
             }
