@@ -627,7 +627,7 @@ data arrived; routes are validated from now on` with `waited=`, the
 seconds the routes waited; the RIB's `rib: validation states changed` line
 follows, with the routes held and released. Meanwhile `show rpki` says
 `validation waiting Ns for the first full set` (`docs/control.md`,
-"RPKI"). A reload from `mode disabled` opens the window again. A reload
+"RPKI"), and `show status` `validation waiting`. A reload from `mode disabled` opens the window again. A reload
 that restarts the client does not, since the data in use stays in use
 until the new set arrives.
 
@@ -705,9 +705,10 @@ The `sidecar` block takes these statements, each at most once:
 - `stop-timeout N`: how many seconds Routinator gets to stop after
   `SIGTERM` before bgpfcd kills it; 1–3600, 10 unless given.
 - `failure-threshold N`: after this many failures in a row the sidecar is
-  reported as failed, an alarm (`sidecar FAILED` in `show rpki`,
-  `docs/control.md`, "RPKI"), while bgpfcd keeps trying at the back-off's
-  cap (issue #70); at least 1, 5 unless given.
+  reported as failed, an alarm (`sidecar FAILED` in `show rpki`, `alarm
+  rpki sidecar failed` in `show status`; `docs/control.md`, "Alarms"),
+  while bgpfcd keeps trying at the back-off's cap (issue #70); at least
+  1, 5 unless given.
 
 With `mode sidecar`, bgpfcd also checks the block as Routinator would take
 it, and reports a problem at the block's position like any other error:

@@ -28,7 +28,7 @@ failure, 2 on a usage error.
 
 | Command | Effect |
 |---|---|
-| `show status` | version, local AS, router ID, neighbor counts, FIB mode |
+| `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
 | `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
@@ -92,7 +92,8 @@ connections are served at once (`503`); reads and writes time out after
 Example objects:
 
 ```json
-{"version":"0.1.0","local_as":65000,"router_id":"192.0.2.1","neighbors":2,"established":2,"fib_mode":"dry-run"}
+{"version":"0.1.0","local_as":65000,"router_id":"192.0.2.1","neighbors":2,"established":2,"fib_mode":"dry-run",
+ "rpki":{"mode":"sidecar","validation":"active"},"alarms":["rpki-sidecar-failed"]}
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
@@ -346,8 +347,8 @@ REASON`, come from the sidecar at each request:
 
 A Routinator that has failed `failure-threshold` times in a row is
 `failed`: `FAILED` in upper case, and `alarm` true (issue #70: repeated
-failures surface as an operational error, not only as log lines). bgpfcd
-also logs each of these failures at error (`RPKI sidecar keeps failing;
+failures surface as an operational error, not only as log lines);
+`show status` lists it among the [alarms](#alarms). bgpfcd also logs each of these failures at error (`RPKI sidecar keeps failing;
 the validator is not running, retrying at the backoff cap`), and keeps
 starting it at the `restart-backoff` cap. While such a retry runs, the
 state is `running` and `failures` keeps its count; once Routinator has run
@@ -357,6 +358,34 @@ stay in use until they expire (`expire in`; by default the Expire Interval
 of 7200 seconds that Routinator announces), and then every route is
 `not-found`, so that `drop-invalid` holds nothing (RFC 8210 §6). A failing
 Routinator is not restarted by a reload that leaves its block alone.
+
+## Alarms
+
+`show status` and `GET /v1/status` end with what needs an operator now:
+a line `alarm ...` for each alarm, and their names in `alarms`, an empty
+array when there is none. They are the one reply a monitoring system
+needs to poll; this is not a health check. There is one alarm:
+
+| Name | Line | Raised while |
+|---|---|---|
+| `rpki-sidecar-failed` | `alarm rpki sidecar failed: N failures in a row` | Routinator has failed `failure-threshold` times in a row and waits for its next start: the `failed` state of `show rpki` (see [RPKI](#rpki)) |
+
+Before the alarms, `show status` says `rpki MODE, validation STATE`, with
+the mode of the `rpki` block and `off`, `waiting` or `active` as `show
+rpki` has them; the JSON has `"rpki": {"mode": ..., "validation": ...}`.
+Both come from the thread that also applies a reload. If it does not
+answer within 10 seconds, as during a reload that waits for a slow
+Routinator to stop, the line is `rpki unknown`, and `rpki` and `alarms`
+are `null` in the JSON: not known, which an empty list would hide.
+
+```
+bgpfcd 0.1.0
+local-as AS65000 router-id 192.0.2.1
+neighbors 2 established 2
+fib mode dry-run
+rpki sidecar, validation active
+alarm rpki sidecar failed: 7 failures in a row
+```
 
 ## Reload
 

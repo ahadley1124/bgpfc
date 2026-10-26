@@ -388,6 +388,19 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
     }
 }
 
+/// What `show status` reports, as the threads answered.
+struct StatusReport {
+    local_as: Asn,
+    router_id: RouterId,
+    neighbors: usize,
+    established: usize,
+    /// `None` if the FIB thread did not answer in time.
+    fib_mode: Option<Mode>,
+    /// `None` if the coordinator did not answer in time, as while it
+    /// applies a reload that stops a slow Routinator.
+    rpki: Option<RpkiReport>,
+}
+
 fn status(ctx: &Ctx) -> Result<Reply, String> {
     let reports = peer_reports(ctx, None)?;
     let established = reports
@@ -395,38 +408,105 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
         .filter(|r| r.state == bgpfc_fsm::State::Established)
         .count();
     let (tx, rx) = sync_channel(1);
-    let mode = ctx
+    let fib_mode = ctx
         .fib
         .send(FibMsg::Mode(tx))
         .ok()
         .and_then(|()| rx.recv_timeout(QUERY_TIMEOUT).ok());
+    Ok(render_status(&StatusReport {
+        local_as: ctx.local_as,
+        router_id: ctx.router_id,
+        neighbors: reports.len(),
+        established,
+        fib_mode,
+        // Over CoordMsg::Rpki, as `show rpki` asks: the control threads
+        // read no shared state (AGENTS.md §3).
+        rpki: rpki_report(ctx).ok(),
+    }))
+}
+
+/// The alarms `show status` raises, as `GET /v1/status` names them: what
+/// needs an operator now. A Routinator that has failed `failure-threshold`
+/// times in a row may leave the speaker enforcing RPKI with a validator
+/// that is not running, which issue #70 wants surfaced "as an operational
+/// error, not just a log line"; the line gives its failures in a row.
+fn alarms(r: &RpkiReport) -> Vec<(&'static str, String)> {
+    let mut alarms = Vec::new();
+    if let Some(s) = &r.sidecar
+        && let SidecarState::Failed { failures: n, .. } = s.status.state
+    {
+        alarms.push((
+            "rpki-sidecar-failed",
+            format!("rpki sidecar failed: {} in a row", failures(n)),
+        ));
+    }
+    alarms
+}
+
+/// `show status`: the daemon, its neighbors, the FIB mode, where route
+/// origin validation stands, and the alarms: the one reply a monitoring
+/// system needs to poll (m14 design §4.6; not a health check, issue #73).
+/// A thread that did not answer is reported as unknown: `null` in the
+/// JSON, the alarms included, since none can be ruled out.
+fn render_status(s: &StatusReport) -> Reply {
+    let alarms = s.rpki.as_ref().map(alarms);
     let mut j = Json::new();
     j.begin_object()
         .field_str("version", env!("CARGO_PKG_VERSION"))
-        .field_num("local_as", ctx.local_as.0)
-        .field_display("router_id", ctx.router_id)
-        .field_num(
-            "neighbors",
-            u64::try_from(reports.len()).unwrap_or(u64::MAX),
-        )
-        .field_num(
-            "established",
-            u64::try_from(established).unwrap_or(u64::MAX),
-        )
-        .field_opt("fib_mode", mode)
-        .end_object();
-    Ok(Reply {
-        lines: vec![
-            format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
-            format!("local-as {} router-id {}", ctx.local_as, ctx.router_id),
-            format!("neighbors {} established {}", reports.len(), established),
-            format!(
-                "fib mode {}",
-                mode.map_or("unknown".to_owned(), |m| m.to_string())
-            ),
-        ],
+        .field_num("local_as", s.local_as.0)
+        .field_display("router_id", s.router_id)
+        .field_num("neighbors", num(s.neighbors))
+        .field_num("established", num(s.established))
+        .field_opt("fib_mode", s.fib_mode)
+        .key("rpki");
+    if let Some(r) = &s.rpki {
+        j.begin_object()
+            .field_display("mode", r.config.mode)
+            .field_str("validation", Validation::of(r).as_str())
+            .end_object();
+    } else {
+        j.null();
+    }
+    j.key("alarms");
+    if let Some(alarms) = &alarms {
+        j.begin_array();
+        for (name, _) in alarms {
+            j.string(name);
+        }
+        j.end_array();
+    } else {
+        j.null();
+    }
+    j.end_object();
+    let mut lines = vec![
+        format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
+        format!("local-as {} router-id {}", s.local_as, s.router_id),
+        format!("neighbors {} established {}", s.neighbors, s.established),
+        format!(
+            "fib mode {}",
+            s.fib_mode.map_or("unknown".to_owned(), |m| m.to_string())
+        ),
+        s.rpki.as_ref().map_or_else(
+            || "rpki unknown".to_owned(),
+            |r| {
+                format!(
+                    "rpki {}, validation {}",
+                    r.config.mode,
+                    Validation::of(r).as_str()
+                )
+            },
+        ),
+    ];
+    lines.extend(
+        alarms
+            .into_iter()
+            .flatten()
+            .map(|(_, text)| format!("alarm {text}")),
+    );
+    Reply {
+        lines,
         json: j.finish(),
-    })
+    }
 }
 
 fn clear_neighbor(
@@ -3237,6 +3317,137 @@ mod tests {
         for shape in shapes {
             assert_eq!(members(&shape.json), expected, "{}", shape.json);
         }
+    }
+
+    /// Two neighbors, one established, the FIB in dry-run, and `rpki`.
+    fn status_report(rpki: Option<RpkiReport>) -> StatusReport {
+        StatusReport {
+            local_as: Asn(65_000),
+            router_id: RouterId::new(0xC000_0201).unwrap(),
+            neighbors: 2,
+            established: 1,
+            fib_mode: Some(Mode::DryRun),
+            rpki,
+        }
+    }
+
+    #[test]
+    fn status_lists_the_sidecar_alarm() {
+        // Issue #70: a Routinator that keeps failing is an operational
+        // error, listed where a monitoring system polls (m14 design §4.6).
+        let now = Instant::now();
+        let version = env!("CARGO_PKG_VERSION");
+        let failed = sidecar_report(
+            now,
+            SidecarState::Failed {
+                until: now + Duration::from_secs(280),
+                failures: 7,
+            },
+        );
+        let r = render_status(&status_report(Some(failed)));
+        assert_eq!(
+            r.lines,
+            [
+                format!("bgpfcd {version}"),
+                "local-as AS65000 router-id 192.0.2.1".to_owned(),
+                "neighbors 2 established 1".to_owned(),
+                "fib mode dry-run".to_owned(),
+                "rpki sidecar, validation active".to_owned(),
+                "alarm rpki sidecar failed: 7 failures in a row".to_owned(),
+            ]
+        );
+        assert_eq!(
+            r.json,
+            format!(
+                "{{\"version\":\"{version}\",{}",
+                concat!(
+                    r#""local_as":65000,"router_id":"192.0.2.1","neighbors":2,"#,
+                    r#""established":1,"fib_mode":"dry-run","#,
+                    r#""rpki":{"mode":"sidecar","validation":"active"},"#,
+                    r#""alarms":["rpki-sidecar-failed"]}"#
+                )
+            )
+        );
+        let one = sidecar_report(
+            now,
+            SidecarState::Failed {
+                until: now,
+                failures: 1,
+            },
+        );
+        assert_eq!(
+            render_status(&status_report(Some(one))).lines[5],
+            "alarm rpki sidecar failed: 1 failure in a row"
+        );
+        // Below the threshold, or running again, there is no alarm, and
+        // the list is empty.
+        for state in [
+            SidecarState::BackingOff {
+                until: now,
+                failures: 4,
+            },
+            SidecarState::Running { pid: 7, since: now },
+            SidecarState::Starting,
+        ] {
+            let r = render_status(&status_report(Some(sidecar_report(now, state))));
+            assert_eq!(r.lines.len(), 5, "{:?}", r.lines);
+            assert_eq!(r.lines[4], "rpki sidecar, validation active");
+            assert!(
+                r.json
+                    .ends_with(r#""rpki":{"mode":"sidecar","validation":"active"},"alarms":[]}"#),
+                "{}",
+                r.json
+            );
+        }
+    }
+
+    #[test]
+    fn status_says_where_validation_stands() {
+        // m14 design §3.3: the mode and the validation state, in every
+        // mode, as `show rpki` has them.
+        let now = Instant::now();
+        let mut waiting = sidecar_report(now, SidecarState::Starting);
+        waiting.waiting_since = Some(now);
+        let disabled = RpkiReport {
+            config: bgpfc_config::ast::Rpki::default(),
+            status: None,
+            waiting_since: None,
+            sidecar: None,
+        };
+        for (report, line, json) in [
+            (
+                waiting,
+                "rpki sidecar, validation waiting",
+                r#""rpki":{"mode":"sidecar","validation":"waiting"},"alarms":[]}"#,
+            ),
+            (
+                rpki_report(now, &[]),
+                "rpki external, validation active",
+                r#""rpki":{"mode":"external","validation":"active"},"alarms":[]}"#,
+            ),
+            (
+                disabled,
+                "rpki disabled, validation off",
+                r#""rpki":{"mode":"disabled","validation":"off"},"alarms":[]}"#,
+            ),
+        ] {
+            let r = render_status(&status_report(Some(report)));
+            assert_eq!(r.lines[4..], [line]);
+            assert!(r.json.ends_with(json), "{}", r.json);
+        }
+        // A coordinator busy with a long reload: not known, rather than no
+        // alarm; and so for a FIB thread that does not answer.
+        let r = render_status(&StatusReport {
+            fib_mode: None,
+            ..status_report(None)
+        });
+        assert_eq!(r.lines[3..], ["fib mode unknown", "rpki unknown"]);
+        assert!(
+            r.json
+                .ends_with(r#""fib_mode":null,"rpki":null,"alarms":null}"#),
+            "{}",
+            r.json
+        );
     }
 
     /// Three routes that changed state, 12 s and 3 s before `now`, and
