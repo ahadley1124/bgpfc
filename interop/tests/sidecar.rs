@@ -1,0 +1,593 @@
+//! The Routinator sidecar of `bgpfcd` (AGENTS.md §9 step 14; issues #26,
+//! #70, #71, #72): `rpki { mode sidecar; }` starts Routinator after the
+//! privilege drop, wires the RTR client to it on loopback, supervises it,
+//! and stops it, for routes from BIRD 2 (AGENTS.md §5, `interop/` row).
+//!
+//! Routinator itself never runs (AGENTS.md §5). A [`FakeRoutinator`]
+//! stands in for it: a shell script that answers `--version` as Routinator
+//! 0.15.2, records the arguments bgpfcd derives from the block, and then
+//! becomes this crate's `rtr-stub` on the `--rtr` address, serving the VRPs
+//! of `rpki.rs` under a new Session ID at each start, as a restarted
+//! Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root with `--user
+//! nobody`, as README's Option B: it refuses to run Routinator as root, and
+//! Routinator is born as `nobody` with no capabilities.
+//!
+//! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`
+//! and `curl` on `PATH`, and a built `bgpfcd`. CI runs them with
+//! `--include-ignored` under sudo.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use interop::{
+    BgpfcdOpts, Bird, BirdOpts, Daemon, FakeRoutinator, Lab, NOBODY, NeighborOpts, RtrStub,
+    start_bgpfcd, wait_for,
+};
+
+const BGPFC_AS: u32 = 65_000;
+const BIRD_AS: u32 = 65_001;
+const ESTABLISH: Duration = Duration::from_secs(40);
+/// bgpfcd's HTTP API, inside its namespace.
+const HTTP: &str = "127.0.0.1:8179";
+
+/// The routes BIRD originates, as in `rpki.rs`.
+const ROUTES: [&str; 4] = [
+    "192.0.2.0/24",
+    "192.0.2.128/25",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+];
+
+/// The VRPs the fake Routinator serves, `rpki.rs`'s `FIRST`: (prefix, max
+/// length, origin AS).
+const FIRST: [(&str, u8, u32); 2] = [
+    ("192.0.2.0/24", 24, BIRD_AS),
+    ("198.51.100.0/24", 24, 64_999),
+];
+
+/// What RFC 6811 §2 makes of BIRD's routes with [`FIRST`]: Matched;
+/// Covered, but longer than the VRP's max length (RFC 9319 §3); Covered
+/// for another origin AS; not Covered.
+const VALIDATED: [(&str, &str); 4] = [
+    ("192.0.2.0/24", "valid"),
+    ("192.0.2.128/25", "invalid"),
+    ("198.51.100.0/24", "invalid"),
+    ("203.0.113.0/24", "not-found"),
+];
+
+/// The lines bgpfcd logs while it lost its cache: none of them may appear
+/// when it stops the client before Routinator.
+const LOST: [&str; 2] = [
+    "msg=\"rtr lost the cache",
+    "msg=\"rtr cache connection lost\"",
+];
+
+/// What a scenario runs.
+struct Opts {
+    /// Statements for the `rpki` block, after `mode sidecar`.
+    rpki: &'static str,
+    /// Statements for the `sidecar` block, after its binary and
+    /// repository directory.
+    sidecar: &'static str,
+    /// The import policy for BIRD, `policy NAME { ... }`; `None` accepts
+    /// everything.
+    import: Option<&'static str>,
+    /// Whether BIRD in B originates [`ROUTES`] to bgpfcd.
+    bird: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            rpki: "",
+            sidecar: "",
+            import: None,
+            bird: true,
+        }
+    }
+}
+
+/// bgpfcd in A, run with `--user nobody` and `rpki { mode sidecar; }`
+/// with a [`FakeRoutinator`]; BIRD in B sends it [`ROUTES`].
+struct Setup {
+    fake: FakeRoutinator,
+    bgpfcd: Daemon,
+    bird: Option<Bird>,
+    socket: PathBuf,
+    /// Last, so that the namespaces go after the daemons in them.
+    lab: Lab,
+}
+
+impl Setup {
+    /// Install the fake, let `prepare` set it up (a version, a delay,
+    /// failing), then start BIRD and bgpfcd as `opts` says.
+    fn start(tag: &str, subnet: u8, opts: &Opts, prepare: impl FnOnce(&FakeRoutinator)) -> Setup {
+        let lab = Lab::new(tag, subnet);
+        let fake = FakeRoutinator::install(&lab, &FIRST);
+        prepare(&fake);
+        let bird = opts.bird.then(|| start_bird(&lab));
+        let socket = lab.dir.join("ctl.sock");
+        let config = bgpfcd_opts(
+            &lab,
+            &socket,
+            &fake.block(opts.rpki, opts.sidecar),
+            opts,
+            true,
+        );
+        let ns_a = lab.a.clone();
+        let bgpfcd = start_bgpfcd(&lab, &ns_a, &config);
+        Setup {
+            fake,
+            bgpfcd,
+            bird,
+            socket,
+            lab,
+        }
+    }
+
+    fn ctl(&self, args: &[&str]) -> (String, bool) {
+        interop::bgpfcctl(&self.socket, args)
+    }
+
+    /// The body of `GET path` from bgpfcd's HTTP API.
+    fn http(&self, path: &str) -> String {
+        let mut cmd = self.lab.exec(&self.lab.a, "curl");
+        cmd.args(["-s", "--max-time", "5", &format!("http://{HTTP}{path}")]);
+        let out = cmd.output().expect("curl");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `show rpki`.
+    fn rpki(&self) -> String {
+        self.ctl(&["show", "rpki"]).0
+    }
+
+    /// Wait up to `timeout` for `show rpki` to have every line of `lines`;
+    /// what it said.
+    fn wait_for_rpki(&self, timeout: Duration, lines: &[&str]) -> String {
+        let mut out = String::new();
+        assert!(
+            wait_for(timeout, || {
+                out = self.rpki();
+                lines.iter().all(|l| out.contains(l))
+            }),
+            "not {lines:?} in:\n{out}\n{}",
+            self.report()
+        );
+        out
+    }
+
+    /// Where the sidecar serves RTR, as `show rpki` says: `sidecar rtr
+    /// ADDR, ...`.
+    fn rtr(&self) -> String {
+        let out = self.rpki();
+        out.lines()
+            .find_map(|l| l.strip_prefix("sidecar rtr "))
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("no sidecar rtr line:\n{out}"))
+            .to_owned()
+    }
+
+    /// What `show routes` says about each route it uses: its prefix and
+    /// validation state, sorted.
+    fn states(&self) -> Vec<(String, String)> {
+        let (out, _) = self.ctl(&["show", "routes"]);
+        let mut states: Vec<(String, String)> = out
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    words.first()?.trim_start_matches('*').to_owned(),
+                    (*words.get(5)?).to_owned(),
+                ))
+            })
+            .collect();
+        states.sort();
+        states
+    }
+
+    /// Wait up to `timeout` for `show routes` to give the routes `states`.
+    fn wait_for_states(&self, timeout: Duration, states: &[(&str, &str)]) {
+        let want = pairs(states);
+        assert!(
+            wait_for(timeout, || self.states() == want),
+            "not {want:?}\n{}",
+            self.report()
+        );
+    }
+
+    /// The routes `show routes held` lists: prefix, validation state and
+    /// what holds it, sorted.
+    fn held(&self) -> Vec<(String, String, String)> {
+        let (out, _) = self.ctl(&["show", "routes", "held"]);
+        let mut held: Vec<(String, String, String)> = out
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    words.first()?.strip_prefix('!')?.to_owned(),
+                    (*words.get(5)?).to_owned(),
+                    line.split_once(" held by ")?.1.to_owned(),
+                ))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// Where bgpfcd first logged `text`, as an offset into its log.
+    fn first(&self, text: &str) -> Option<usize> {
+        self.bgpfcd.log_text().find(text)
+    }
+
+    /// Everything a failed assertion needs.
+    fn report(&self) -> String {
+        let bird = self
+            .bird
+            .as_ref()
+            .map_or(String::new(), |b| b.daemon.log_text());
+        format!(
+            "{:?}\n--- invocations ---\n{:?}\n--- bgpfcd ---\n{}\n--- bird ---\n{bird}",
+            self.states(),
+            self.fake.invocations(),
+            self.bgpfcd.log_text(),
+        )
+    }
+}
+
+/// BIRD in B, which originates [`ROUTES`] and waits for bgpfcd to connect.
+fn start_bird(lab: &Lab) -> Bird {
+    Bird::start(
+        lab,
+        &lab.b,
+        &BirdOpts {
+            local_as: BIRD_AS,
+            local: lab.b_addr,
+            local_port: 179,
+            neighbor: lab.a_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: ROUTES.map(str::to_owned).to_vec(),
+            channel: String::new(),
+            protocol: String::new(),
+        },
+    )
+}
+
+/// bgpfcd's configuration: BIRD as its neighbor, the control socket and
+/// the HTTP API, `rpki` as the `rpki` block and the import policy of
+/// `opts`; started with `--user nobody` if `drop_root` says so.
+fn bgpfcd_opts(lab: &Lab, socket: &Path, rpki: &str, opts: &Opts, drop_root: bool) -> BgpfcdOpts {
+    let from_bird = NeighborOpts {
+        import: opts.import.map_or_else(
+            || "ANY".to_owned(),
+            |p| p.split_whitespace().nth(1).unwrap_or_default().to_owned(),
+        ),
+        ..NeighborOpts::new(lab.b_addr, BIRD_AS)
+    };
+    let mut bgpfcd_opts = BgpfcdOpts::single(BGPFC_AS, lab.a_addr, from_bird);
+    bgpfcd_opts.extra = format!(
+        "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{rpki}\n{}",
+        socket.display(),
+        opts.import.unwrap_or_default(),
+    );
+    if drop_root {
+        bgpfcd_opts.args = vec!["--user".to_owned(), "nobody".to_owned()];
+    }
+    bgpfcd_opts
+}
+
+/// `states` as owned pairs, sorted.
+fn pairs(states: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = states
+        .iter()
+        .map(|(p, s)| ((*p).to_owned(), (*s).to_owned()))
+        .collect();
+    p.sort();
+    p
+}
+
+/// Routes and their validation states: (prefix, state).
+type States<'a> = Vec<(&'a str, &'a str)>;
+
+/// `states` split into those of the routes `enforcement drop-invalid`
+/// uses, which `show routes` lists, and those of the routes it holds: the
+/// Invalid ones (RFC 6811 §5).
+fn split_invalid<'a>(states: &[(&'a str, &'a str)]) -> (States<'a>, States<'a>) {
+    states.iter().partition(|(_, rov)| *rov != "invalid")
+}
+
+/// What `show routes held` gives for routes in `states`, all held by `by`.
+fn held_by(states: &[(&str, &str)], by: &str) -> Vec<(String, String, String)> {
+    let mut held: Vec<(String, String, String)> = states
+        .iter()
+        .map(|(p, rov)| ((*p).to_owned(), (*rov).to_owned(), by.to_owned()))
+        .collect();
+    held.sort();
+    held
+}
+
+/// Whether process `pid` is alive: there, and not a zombie. An orphan
+/// that died waits as a zombie until whatever adopted it reaps it, which
+/// a container's init may do late.
+fn alive(pid: u32) -> bool {
+    let state = proc_status(pid, "State");
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// The `Name:` line of `/proc/PID/status`, without its name.
+fn proc_status(pid: u32, name: &str) -> String {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+impl Setup {
+    /// RFC 8210 §9 and issue #71: the sidecar's RTR port is open on
+    /// loopback, at `rtr`, and on no other address, so B is refused.
+    fn assert_loopback_only(&self, rtr: &str, port: u16) {
+        let mut ss = self.lab.exec(&self.lab.a, "ss");
+        ss.args(["-ltnH"]);
+        let listeners = String::from_utf8_lossy(&ss.output().expect("ss").stdout).into_owned();
+        let on_port: Vec<&str> = listeners
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(3))
+            .filter(|local| local.ends_with(&format!(":{port}")))
+            .collect();
+        assert_eq!(on_port, [rtr], "{listeners}");
+        let mut curl = self.lab.exec(&self.lab.b, "curl");
+        curl.args([
+            "-s",
+            "--max-time",
+            "3",
+            &format!("http://{}:{port}/", self.lab.a_addr),
+        ]);
+        // 7: "Failed to connect to host".
+        assert_eq!(curl.status().expect("curl").code(), Some(7));
+    }
+
+    /// Stop bgpfcd with `SIGTERM` and check that it stopped the client
+    /// before Routinator, whose process `pid` is, so that the client never
+    /// reported the cache lost, and that Routinator was not started again
+    /// and left nothing running (issue #70).
+    fn stop_in_order(&mut self, pid: u32) {
+        let starts = self.fake.invocations().len();
+        assert!(
+            self.bgpfcd.terminate(Duration::from_secs(20)),
+            "{}",
+            self.report()
+        );
+        let log = self.bgpfcd.log_text();
+        let at = |text: &str| {
+            log.find(text)
+                .unwrap_or_else(|| panic!("no `{text}`:\n{log}"))
+        };
+        let shutting = at("msg=\"shutting down\"");
+        let stopping = at("msg=\"stopping the RPKI sidecar\"");
+        let stopped = at("msg=\"RPKI sidecar stopped\"");
+        assert!(
+            shutting < stopping && stopping < stopped && stopped < at("msg=\"bgpfcd stopped\""),
+            "{log}"
+        );
+        for lost in LOST {
+            assert!(!log[shutting..].contains(lost), "{lost}:\n{log}");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(self.fake.invocations().len(), starts, "{}", self.report());
+        assert_eq!(self.fake.serving(), Vec::<u32>::new());
+        assert!(!alive(pid), "{pid} still runs");
+    }
+}
+
+/// Routinator, whose process `pid` is, was started after the privilege
+/// drop: it runs as `nobody`, with no capability at all, neither
+/// effective, permitted nor ambient (issue #70; m14 design §4.1).
+fn assert_started_after_the_drop(pid: u32) {
+    let nobody = format!("{NOBODY}\t{NOBODY}\t{NOBODY}\t{NOBODY}");
+    assert_eq!(proc_status(pid, "Uid"), nobody);
+    assert_eq!(proc_status(pid, "Gid"), nobody);
+    for caps in ["CapEff", "CapPrm", "CapAmb"] {
+        assert_eq!(proc_status(pid, caps), "0000000000000000", "{caps}");
+    }
+}
+
+/// Issues #26, #71 and #72: `rpki { mode sidecar; }` with a few
+/// Routinator settings starts Routinator with the arguments derived from
+/// them, the escape hatches passed through verbatim, after the privilege
+/// drop, so that it runs as `nobody` with no capabilities. The RTR client
+/// connects to it on a loopback port bgpfcd picked, which no other host
+/// can reach (RFC 8210 §9), with no cache configured; BIRD's routes are
+/// validated with its VRPs, and the Invalid ones held by the default
+/// `drop-invalid`. A `SIGTERM` stops the client, then Routinator, which is
+/// not restarted (issue #70), and leaves no process behind.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn the_sidecar_is_started_wired_and_validates() {
+    let opts = Opts {
+        sidecar: "accept-arin-rpa yes; global-args \"--strict\"; server-args \"--rtr-tcp-keepalive=30\";",
+        ..Opts::default()
+    };
+    let mut s = Setup::start("sa", 26, &opts, |_| {});
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+
+    // The arguments bgpfcd derived, on a port it picked: 0 in the block,
+    // so an unprivileged one.
+    let rtr = s.rtr();
+    let port: u16 = rtr
+        .strip_prefix("127.0.0.1:")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("{rtr}"));
+    assert!(port >= 1024, "{rtr}");
+    let repository = format!("--repository-dir={}", s.fake.repository.display());
+    let rtr_arg = format!("--rtr={rtr}");
+    assert_eq!(
+        s.fake.invocations(),
+        [vec![
+            repository.as_str(),
+            "--no-rir-tals",
+            "--tal=afrinic",
+            "--tal=apnic",
+            "--tal=arin",
+            "--tal=lacnic",
+            "--tal=ripe",
+            "--strict",
+            "server",
+            rtr_arg.as_str(),
+            "--refresh=600",
+            "--rtr-tcp-keepalive=30",
+        ]],
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.fake.version_checks(), 1);
+
+    let pid = s.fake.pid().expect("the fake's pid");
+    assert_eq!(s.fake.serving(), [pid]);
+    assert_started_after_the_drop(pid);
+
+    let out = s.wait_for_rpki(
+        Duration::ZERO,
+        &[
+            "mode sidecar\nenforcement drop-invalid\nvalidation active\n",
+            &format!("sidecar running pid {pid} for "),
+            &format!(", routinator 0.15.2 ({})\n", s.fake.binary.display()),
+            &format!("sidecar rtr {rtr}, restarts 0, failures 0\n"),
+            &format!("cache {rtr} (sidecar) preference 0, in use, current\n"),
+            "state idle, connected, version 1",
+            "vrps ipv4 2 ipv6 0",
+        ],
+    );
+    assert!(!out.contains("sidecar not running"), "{out}");
+    let body = s.http("/v1/rpki");
+    assert!(
+        body.contains("\"mode\":\"sidecar\"")
+            && body.contains("\"validation\":\"active\"")
+            && body.contains(&format!(
+                "\"state\":\"running\",\"alarm\":false,\"pid\":{pid},"
+            ))
+            && body.contains(&format!("\"rtr\":\"{rtr}\""))
+            && body.contains("\"version\":\"0.15.2\""),
+        "{body}"
+    );
+
+    s.assert_loopback_only(&rtr, port);
+
+    // Issue #71: the wait for the first full set is said, then its end.
+    let waiting = s
+        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\" mode=sidecar enforcement=drop-invalid hint=")
+        .unwrap_or_else(|| panic!("no waiting line:\n{}", s.report()));
+    let arrived = s
+        .first(
+            "INFO  msg=\"rpki: validation data arrived; routes are validated from now on\" waited=",
+        )
+        .unwrap_or_else(|| panic!("no arrival line:\n{}", s.report()));
+    assert!(waiting < arrived, "{}", s.report());
+
+    s.stop_in_order(pid);
+}
+
+/// Issues #60 and #72: a sidecar that cannot run stops the start, loudly
+/// and before any neighbor starts, as an external cache that cannot be
+/// found does. A Routinator of another release is refused after its
+/// `--version` and never started; a missing binary is named; and bgpfcd
+/// as root without `--user` refuses to run Routinator at all, before it
+/// even asks the binary its version.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_bad_sidecar_stops_the_start() {
+    let lab = Lab::new("sb", 27);
+    let fake = FakeRoutinator::install(&lab, &FIRST);
+    let socket = lab.dir.join("ctl.sock");
+    let opts = Opts {
+        bird: false,
+        ..Opts::default()
+    };
+    let ns_a = lab.a.clone();
+    let run = |block: &str, drop_root: bool| {
+        let mut bgpfcd = start_bgpfcd(
+            &lab,
+            &ns_a,
+            &bgpfcd_opts(&lab, &socket, block, &opts, drop_root),
+        );
+        let status = bgpfcd.wait(Duration::from_secs(15));
+        let log = bgpfcd.log_text();
+        assert_eq!(status.and_then(|s| s.code()), Some(1), "{log}");
+        assert!(!log.contains("session established"), "{log}");
+        log
+    };
+
+    // Another release: refused once `--version` has told it.
+    fake.set_version("Routinator 0.14.1");
+    let log = run(&fake.block("", ""), true);
+    assert!(
+        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: Routinator 0.14.1 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2\""),
+        "{log}"
+    );
+    assert_eq!(fake.version_checks(), 1);
+    assert_eq!(fake.invocations(), Vec::<Vec<String>>::new());
+    fake.set_version("Routinator 0.15.2");
+
+    // A binary that is not there.
+    let missing = lab.dir.join("missing").join("routinator");
+    let block = fake.block("", "").replace(
+        &format!("binary \"{}\"", fake.binary.display()),
+        &format!("binary \"{}\"", missing.display()),
+    );
+    assert!(block.contains(missing.to_str().expect("path")), "{block}");
+    let log = run(&block, true);
+    assert!(
+        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: ")
+            && log.contains(missing.to_str().expect("path")),
+        "{log}"
+    );
+
+    // Root without `--user`: refused before anything runs.
+    let log = run(&fake.block("", ""), false);
+    assert!(
+        log.contains("ERROR msg=\"mode sidecar would run Routinator as root\" hint="),
+        "{log}"
+    );
+    assert_eq!(fake.version_checks(), 1);
+    assert_eq!(fake.invocations(), Vec::<Vec<String>>::new());
+}
+
+/// Issue #70: "killing the parent with SIGKILL leaves no orphan". bgpfcd
+/// gets no chance to stop Routinator; the parent-death signal its
+/// supervisor thread set ends it (`PR_SET_PDEATHSIG`), and its RTR port is
+/// free again.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn sigkill_of_bgpfcd_leaves_no_orphan() {
+    let opts = Opts {
+        bird: false,
+        ..Opts::default()
+    };
+    let mut s = Setup::start("sc", 28, &opts, |_| {});
+    s.wait_for_rpki(ESTABLISH, &["validation active\n", "state idle, connected"]);
+    let rtr = s.rtr();
+    let pid = s.fake.pid().expect("the fake's pid");
+    assert_eq!(s.fake.serving(), [pid]);
+
+    s.bgpfcd.kill();
+    assert!(
+        wait_for(Duration::from_secs(5), || s.fake.serving().is_empty()),
+        "{:?} still serving\n{}",
+        s.fake.serving(),
+        s.report()
+    );
+    assert!(!alive(pid), "{pid} still runs");
+    // The port can be bound again: a stub listens on it.
+    let ns_a = s.lab.a.clone();
+    let _stub = RtrStub::start(&s.lab, &ns_a, &rtr, 9, &FIRST);
+}
