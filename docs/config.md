@@ -543,11 +543,11 @@ the timeouts, `max-expire`, `max-vrps` and `backoff`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
 Routinator 0.15.x, and is tested with 0.15.2.
 
-> **Not run yet.** This bgpfcd does not run the sidecar: `bgpfcd --check`
-> checks the `sidecar` block as described below, but the daemon refuses to
-> start with `mode sidecar` (`cannot start rpki`), and a reload that changes
-> an `rpki` block with `mode sidecar` before or after it fails, keeping the
-> running configuration.
+> **Not reloaded yet.** This bgpfcd runs the sidecar at start, but a
+> reload that changes an `rpki` block with `mode sidecar` before or after
+> it fails, keeping the running configuration; restart bgpfcd to apply
+> such a change. A reload that leaves the block alone, or changes only
+> `enforcement`, works.
 
 The smallest file that validates every route:
 
@@ -566,6 +566,33 @@ repositories. It validates with the trust anchors (TALs) of the Regional
 Internet Registries except ARIN's; `sidecar { accept-arin-rpa yes; }`
 adds ARIN's. The import and export policies are what every neighbor
 needs, not RPKI configuration.
+
+Routinator runs as the user bgpfcd runs as, with no capabilities: it
+fetches and parses data from the internet. bgpfcd starts it only after it
+has opened its privileged sockets and dropped root (README, "Run", Option
+B), and clears the ambient capabilities it holds itself (Option A) from
+Routinator's. A child of root would get every capability whatever bgpfcd
+holds, so with `mode sidecar` bgpfcd refuses to start as root without
+`--user` (`mode sidecar would run Routinator as root`). For the same reason
+`rtr-listen` takes a port of 1024 or more, or 0, and the repository
+directory must be writable by that user: bgpfcd creates it, with the
+parents it lacks, mode 0750, before it starts Routinator.
+
+At start, after the privilege drop and before any neighbor starts,
+bgpfcd creates the repository directory, runs `routinator --version`,
+which must name a 0.15 release within ten seconds, picks the RTR port if
+`rtr-listen` leaves it at 0, and starts Routinator; then its RTR client
+connects to Routinator's address. If one of these steps fails (a binary
+that is missing, does not run or is another release, or a repository
+directory that cannot be created), bgpfcd logs `cannot start rpki` with
+the reason and exits with status 1 (issue #60: fail loudly and early).
+Routinator's standard output is logged at info and its standard error,
+where it writes its warnings, at warn, each line with
+`sidecar=routinator`. When bgpfcd stops, it stops its RTR client, then
+Routinator: `SIGTERM`, and `SIGKILL` after `stop-timeout`. If bgpfcd dies
+without stopping it, the kernel kills Routinator too (`PR_SET_PDEATHSIG`).
+Nothing else in bgpfcd reaps child processes, which is what lets the
+sidecar keep track of its own.
 
 The `sidecar` block takes these statements, each at most once:
 

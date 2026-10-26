@@ -2,11 +2,14 @@
 //! external `rpki` block that has no address stops the start, naming the
 //! cache, before anything is opened (issue #60), while `--check` judges
 //! the file alone and looks nothing up (`docs/config.md`, "RPKI"); the
-//! start line names the `rpki` block's enforcement; and `--check` reports
+//! start line names the `rpki` block's enforcement; `--check` reports
 //! what Routinator's rules refuse in a `sidecar` block at its position,
-//! without running the binary (issue #72).
+//! without running the binary (issue #72); and a Routinator that cannot
+//! run stops the start (issue #60).
 
 use std::fs;
+use std::net::TcpListener;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -164,5 +167,57 @@ fn check_does_not_run_routinator() {
         !repository.exists(),
         "--check created the repository directory"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missing_routinator_stops_the_start() {
+    let dir = scratch("missing-routinator");
+    let binary = dir.join("routinator");
+    let config = dir.join("bgpfcd.conf");
+    // A free high port, so that no privilege is needed to listen.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .unwrap()
+        .port();
+    fs::write(
+        &config,
+        format!(
+            "router-id 192.0.2.1;\nlocal-as 65000;\n\
+             listen {{ address 127.0.0.1; port {port}; }}\nfib {{ mode dry-run; }}\n\
+             rpki {{ mode sidecar; sidecar {{ binary \"{}\"; repository-dir \"{}\"; }} }}\n",
+            binary.display(),
+            dir.join("repo").display()
+        ),
+    )
+    .unwrap();
+    let mut bgpfcd = Command::new(env!("CARGO_BIN_EXE_bgpfcd"));
+    bgpfcd.arg("-c").arg(&config);
+    // As root, bgpfcd refuses to run Routinator without --user (m14 design
+    // §4.2). So the test drops to nobody, as an operator would, and opens
+    // its scratch directory to nobody, who creates the repository
+    // directory there: the start then fails where it fails for an
+    // unprivileged run, at the binary.
+    if fs::metadata("/proc/self").unwrap().uid() == 0 {
+        bgpfcd.args(["--user", "nobody"]);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let out = bgpfcd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("msg=\"cannot start rpki\""))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(
+        line.contains(&format!(
+            "{} --version` could not be started",
+            binary.display()
+        )),
+        "{line}"
+    );
+    // The neighbors would start after it; none is configured, but the
+    // repository directory shows how far the start got.
+    assert!(dir.join("repo").is_dir(), "{stderr}");
     let _ = fs::remove_dir_all(&dir);
 }

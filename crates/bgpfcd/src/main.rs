@@ -5,7 +5,8 @@
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
-//! client of the `rpki` block, which feeds the RIB thread.
+//! client of the `rpki` block, which feeds the RIB thread, and since step
+//! 14, with `mode sidecar`, Routinator as the client's cache.
 #![forbid(unsafe_code)]
 
 mod args;
@@ -128,6 +129,11 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
 /// coordinator loop.
 fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::Engine) {
     // Signals first, so every thread inherits the handlers (AGENTS.md §3).
+    // Only the sidecar reaps its own child; nothing else in bgpfcd may reap
+    // or ignore SIGCHLD, or the sidecar loses its child (bgpfc-sidecar,
+    // `Sidecar`, "Threads"): no `waitpid(-1)`, no reaper thread, no
+    // `SIG_IGN` for SIGCHLD (m14 design §4.4). The self-pipe is
+    // close-on-exec, so no child inherits it.
     let signals = match bgpfc_sys::Signals::install() {
         Ok(s) => s,
         Err(e) => {
@@ -135,6 +141,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
             std::process::exit(1);
         }
     };
+    // Refuses `mode sidecar` as root without `--user` (m14 design §4.2).
     privileges::check(&config, opts.user.as_deref());
 
     // The netlink socket and the listeners are opened while still
@@ -191,8 +198,12 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
         Arc::clone(&table),
         fib_tx.clone(),
     );
-    // Before the peers, so that the VRPs often arrive before the routes
-    // and most routes are validated once, on arrival.
+    // After the privilege drop, so that Routinator, with `mode sidecar`,
+    // is born with the service user's credentials and no capabilities
+    // (m14 design §4.1); its version check may take up to ten seconds,
+    // which delays only the peers. Before the peers, so that the VRPs
+    // often arrive before the routes and most routes are validated once,
+    // on arrival.
     let rpki = start_rpki(&config, &rib_tx);
     for peer in peers {
         peer.start();
@@ -326,7 +337,8 @@ struct Coordinator<'a> {
     table: PeerTable,
     rib_tx: SyncSender<RibMsg>,
     fib_tx: SyncSender<FibMsg>,
-    /// The `rpki` block at work: the RTR client, if one runs.
+    /// The `rpki` block at work: the RTR client and Routinator, if they
+    /// run.
     rpki: rpki::Rpki,
 }
 
@@ -465,7 +477,7 @@ impl Coordinator<'_> {
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
     /// Shutdown), remove our routes from the kernel, then stop the RTR
-    /// client.
+    /// client and, after it, Routinator.
     fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
@@ -484,7 +496,8 @@ impl Coordinator<'_> {
             let _ = std::fs::remove_file(path);
         }
         // Last: neither the Ceases nor the FIB cleanup need it, and it may
-        // first have to hand the RIB thread a change (see `rpki`).
+        // first have to hand the RIB thread a change (see `rpki`). The
+        // client stops before Routinator, which may take `stop-timeout`.
         self.rpki.stop();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));

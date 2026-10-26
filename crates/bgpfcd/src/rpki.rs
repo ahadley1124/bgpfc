@@ -1,15 +1,31 @@
-//! Route origin validation from RPKI caches (AGENTS.md §9 step 12): the
-//! `rpki` block run as the RTR client of `bgpfc-rtr`, feeding the RIB
-//! thread.
+//! Route origin validation from RPKI caches (AGENTS.md §9 steps 12 and
+//! 14): the `rpki` block run as the RTR client of `bgpfc-rtr`, feeding the
+//! RIB thread, and with `mode sidecar` Routinator run by `bgpfc-sidecar`
+//! as that client's one cache (issues #26, #70-#72).
 //!
-//! With `mode external` the coordinator starts a [`Client`] whose sink
-//! hands every [`ValidationChange`] to the RIB thread as a
-//! [`RibMsg::Validation`] on the RIB's bounded channel. Like an UPDATE, a
-//! change waits behind what is queued: the client cannot outrun the RIB
-//! (AGENTS.md §3, "Backpressure"), and the RIB applies the changes in the
-//! order the client published them (RFC 6811 §4). The RIB starts with no
-//! source, every route `disabled`, and the client's first full set
-//! replaces that for every route.
+//! With `mode external` or `mode sidecar` the coordinator starts a
+//! [`Client`] whose sink hands every [`ValidationChange`] to the RIB
+//! thread as a [`RibMsg::Validation`] on the RIB's bounded channel. Like
+//! an UPDATE, a change waits behind what is queued: the client cannot
+//! outrun the RIB (AGENTS.md §3, "Backpressure"), and the RIB applies the
+//! changes in the order the client published them (RFC 6811 §4). The RIB
+//! starts with no source, every route `disabled`, and the client's first
+//! full set replaces that for every route.
+//!
+//! With `mode sidecar`, [`Rpki::start`] first creates Routinator's
+//! repository directory and starts a [`Sidecar`]: it checks the binary's
+//! version, picks the RTR port when the block leaves it to bgpfcd, and
+//! supervises Routinator from a thread of its own, which spawns every
+//! child (`PR_SET_PDEATHSIG` follows the spawning thread). Then the client
+//! starts with [`Sidecar::rtr_addr`] as its one cache, on loopback (RFC
+//! 8210 §9; issue #71: no operator configuration names it). That address
+//! stays the same for the life of the `Sidecar`, across every restart of
+//! Routinator, so the client's own reconnect finds a restarted Routinator
+//! with no special case (issue #71), and the data it holds stays in use
+//! meanwhile (RFC 8210 §10, §6). The coordinator starts the block after
+//! the privilege drop, so that Routinator, which fetches and parses data
+//! from the internet, is born with the service user's credentials and no
+//! capabilities (m14 design §4.1).
 //!
 //! A reload that changes the block stops the client and starts another
 //! with the new settings, which keeps the data the old one published until
@@ -26,23 +42,31 @@
 //! answer holds up neither. The thread may still be waiting for room on
 //! the RIB channel; the RIB thread makes that room, as it runs until the
 //! process exits, and waits for nothing that waits for the client. At
-//! shutdown the coordinator stops the client last, after the Ceases and
-//! the FIB cleanup, which do not need it.
+//! shutdown the coordinator stops the block last, after the Ceases and
+//! the FIB cleanup, which do not need it: the client first, so that it
+//! neither warns about the cache it loses nor publishes to a RIB whose FIB
+//! is gone, then Routinator (`SIGTERM`, `SIGKILL` after `stop-timeout`;
+//! the supervisor restarts nothing during a requested stop, issue #70).
 //!
-//! The client logs through `bgpfc_log`, so the daemon's `log { level }`
-//! applies to it: a lost cache is a warning, its return an info line,
-//! expired data an error.
+//! The client and the sidecar log through `bgpfc_log`, so the daemon's
+//! `log { level }` applies to them: a lost cache is a warning, its return
+//! an info line, expired data an error; Routinator's standard error is
+//! logged at warn, and a sidecar that keeps failing at error.
 //!
 //! Implements: RFC 8210 §6 (the Expire Interval cap and the reconnect
 //! back-off configured), §7 (the version offered first), §9 (unprotected
-//! TCP to the configured port, 323 by default), §10 (the cache list with
-//! preferences; the data kept across a new cache list); RFC 6811 §4 (each
-//! change of the VRPs reaches the RIB, which validates the affected routes
-//! again).
+//! TCP to the configured port, 323 by default; the sidecar's RTR on
+//! loopback only), §10 (the cache list with preferences; the data kept
+//! across a new cache list, and across a restart of Routinator); RFC 6811
+//! §4 (each change of the VRPs reaches the RIB, which validates the
+//! affected routes again).
 
 use std::ffi::OsString;
+use std::fs::DirBuilder;
 use std::io;
-use std::net::ToSocketAddrs as _;
+use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::os::unix::fs::DirBuilderExt as _;
+use std::path::Path;
 use std::sync::mpsc::SyncSender;
 
 use bgpfc_config::ast::{self, RpkiMode};
@@ -51,7 +75,7 @@ use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
 use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held, Status};
 use bgpfc_rtr::session;
-use bgpfc_sidecar::{BackoffConfig, SidecarConfig, TalConfig};
+use bgpfc_sidecar::{BackoffConfig, Sidecar, SidecarConfig, TalConfig};
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::RibMsg;
@@ -198,22 +222,46 @@ pub(crate) fn resolve(rpki: &ast::Rpki) -> Result<(), String> {
 }
 
 /// The client's configuration for `rpki`, or `None` in a mode without a
-/// client.
-pub(crate) fn client_config(rpki: &ast::Rpki, router_id: RouterId) -> Option<client::Config> {
-    if rpki.mode != RpkiMode::External {
-        return None;
-    }
-    let caches = rpki
-        .caches
-        .iter()
-        .map(|c| Cache {
-            host: c.host.clone(),
-            port: c.port,
-            preference: c.preference,
-        })
-        .collect();
+/// client. `sidecar` is where the running sidecar serves RTR, which with
+/// `mode sidecar` is the client's one cache, at preference 0 (issue #71:
+/// wired without operator configuration); `mode external` lists its
+/// caches itself.
+pub(crate) fn client_config(
+    rpki: &ast::Rpki,
+    router_id: RouterId,
+    sidecar: Option<SocketAddr>,
+) -> Option<client::Config> {
+    let caches = match rpki.mode {
+        RpkiMode::Disabled => return None,
+        RpkiMode::External => rpki
+            .caches
+            .iter()
+            .map(|c| Cache {
+                host: c.host.clone(),
+                port: c.port,
+                preference: c.preference,
+            })
+            .collect(),
+        RpkiMode::Sidecar => {
+            let Some(addr) = sidecar else {
+                debug_assert!(false, "mode sidecar without the sidecar's address");
+                return None;
+            };
+            // An address, so the client's lookup cannot fail; and on
+            // loopback, as the configuration crate and the sidecar crate
+            // both insist (RFC 8210 §9).
+            vec![Cache {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                preference: 0,
+            }]
+        }
+    };
     let mut config = client::Config::new(caches);
     config.connect_timeout = rpki.connect_timeout;
+    // With `mode sidecar` the block's default is `1 30` rather than
+    // `1 600` (`ast::Rpki::default_backoff`), so that the client finds
+    // Routinator soon after its first validation run lets it listen.
     config.backoff = Backoff {
         min: rpki.backoff_min,
         max: rpki.backoff_max,
@@ -238,6 +286,43 @@ pub(crate) fn client_config(rpki: &ast::Rpki, router_id: RouterId) -> Option<cli
     Some(config)
 }
 
+/// Create Routinator's repository directory, with the parents it lacks,
+/// as the user bgpfcd runs as: `0750`, for Routinator and bgpfcd's group
+/// alone. One that exists is left as it is.
+///
+/// # Errors
+/// The directory could not be created, naming it.
+fn create_repository_dir(path: &Path) -> Result<(), String> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(path)
+        .map_err(|e| {
+            format!(
+                "cannot create the rpki repository directory {}: {e}",
+                path.display()
+            )
+        })
+}
+
+/// Start Routinator as `s` says: its repository directory, then
+/// [`Sidecar::start`], which checks the binary's version (issue #72: a
+/// mismatch is reported at startup), picks the RTR port if `s` leaves it
+/// to bgpfcd, and starts supervising.
+///
+/// # Errors
+/// What failed, for `cannot start rpki` or a reload's notes.
+fn start_sidecar(s: &ast::RpkiSidecar) -> Result<Sidecar, String> {
+    create_repository_dir(&s.repository_dir)?;
+    bgpfc_log::info!(
+        "rpki: starting the routinator sidecar",
+        binary = s.binary.display(),
+        repository_dir = s.repository_dir.display(),
+        rtr_listen = s.rtr_listen
+    );
+    Sidecar::start(sidecar_config(s)).map_err(|e| format!("rpki sidecar: {e}"))
+}
+
 /// Where the client publishes: the RIB thread's bounded channel. A send
 /// waits while the channel is full, and fails once the RIB thread is
 /// gone, which stops the client.
@@ -248,50 +333,62 @@ fn sink(rib: SyncSender<RibMsg>) -> impl ValidationSink {
     }
 }
 
-/// The running `rpki` block: the RTR client, if its mode has one.
+/// The running `rpki` block: the RTR client, if its mode has one, and
+/// Routinator, with `mode sidecar`.
 #[derive(Debug)]
 pub(crate) struct Rpki {
     rib: SyncSender<RibMsg>,
     router_id: RouterId,
     client: Option<Client>,
+    /// Routinator, supervised; the client's one cache.
+    sidecar: Option<Sidecar>,
 }
 
 impl Rpki {
-    /// Start what `config` asks for, publishing to `rib`. The caller has
-    /// checked with [`resolve`] that the caches can be found.
+    /// Start what `config` asks for, publishing to `rib`: with `mode
+    /// sidecar`, the repository directory and Routinator, then the client
+    /// at Routinator's address. The caller has checked with [`resolve`]
+    /// that external caches can be found, and calls this after the
+    /// privilege drop, so that Routinator runs as the service user (m14
+    /// design §4.1).
     ///
     /// # Errors
-    /// The client thread could not be spawned, or `config` asks for the
-    /// sidecar, which this bgpfcd does not run yet: a file that asks for
-    /// validation must not run as if it had none (issue #60: fail loudly
-    /// and early).
+    /// What could not be started, for `cannot start rpki`: the repository
+    /// directory, Routinator (a binary that is missing, fails or reports
+    /// another release), or the client thread. A sidecar already started
+    /// is stopped again.
     pub(crate) fn start(
         config: &ast::Rpki,
         router_id: RouterId,
         rib: SyncSender<RibMsg>,
     ) -> Result<Rpki, String> {
-        if config.mode == RpkiMode::Sidecar {
-            return Err("mode sidecar is not supported by this bgpfcd yet".to_owned());
-        }
         let mut rpki = Rpki {
             rib,
             router_id,
             client: None,
+            sidecar: None,
         };
+        if config.mode == RpkiMode::Sidecar {
+            rpki.sidecar = Some(start_sidecar(&config.sidecar)?);
+        }
+        // On an error `rpki` is dropped, and with it the sidecar, which
+        // stops it.
         rpki.client = rpki
-            .spawn(config, None)
+            .spawn_client(config, None)
             .map_err(|e| format!("cannot start the rtr client: {e}"))?;
         Ok(rpki)
     }
 
-    /// A client for `config`, holding `held`, if its mode runs one.
-    fn spawn(&self, config: &ast::Rpki, held: Option<Held>) -> io::Result<Option<Client>> {
-        let Some(client_config) = client_config(config, self.router_id) else {
+    /// A client for `config`, holding `held`, if its mode runs one; with
+    /// `mode sidecar`, at the running sidecar's address.
+    fn spawn_client(&self, config: &ast::Rpki, held: Option<Held>) -> io::Result<Option<Client>> {
+        let sidecar = self.sidecar.as_ref().map(Sidecar::rtr_addr);
+        let Some(client_config) = client_config(config, self.router_id, sidecar) else {
             return Ok(None);
         };
         bgpfc_log::info!(
             "rpki: starting the rtr client",
-            caches = config
+            caches = client_config
                 .caches
                 .iter()
                 .map(ToString::to_string)
@@ -323,7 +420,7 @@ impl Rpki {
         }
         let ran = self.client.is_some();
         let held = self.stop_client();
-        match self.spawn(new, held) {
+        match self.spawn_client(new, held) {
             Ok(Some(client)) => {
                 self.client = Some(client);
                 Ok(if ran {
@@ -354,6 +451,15 @@ impl Rpki {
         client.status().held()
     }
 
+    /// Stop Routinator, if it runs, and return once it is gone: `SIGTERM`,
+    /// `SIGKILL` after `stop-timeout`, reaped with its process group, every
+    /// thread joined. The sidecar logs the stop itself.
+    fn stop_sidecar(&mut self) {
+        if let Some(sidecar) = self.sidecar.take() {
+            sidecar.stop();
+        }
+    }
+
     /// Turn validation off in the RIB: every route `disabled`.
     fn disable(&self) {
         bgpfc_log::info!("rpki: validation disabled; every route is disabled again");
@@ -363,10 +469,14 @@ impl Rpki {
             .send(RibMsg::Validation(ValidationChange::disabled()));
     }
 
-    /// Stop the client for good, at shutdown. It returns once the client
-    /// thread has ended; see the module documentation.
+    /// Stop the block for good, at shutdown: the client first, then
+    /// Routinator, so that the client neither warns about the cache it
+    /// loses nor publishes what it would read from a Routinator on its way
+    /// down (m14 design §4.3). It returns once both are gone; see the
+    /// module documentation.
     pub(crate) fn stop(&mut self) {
         self.stop_client();
+        self.stop_sidecar();
     }
 
     /// The client's status, if one runs.
@@ -379,8 +489,13 @@ impl Rpki {
 mod tests {
     use super::*;
 
+    use std::fs;
     use std::io::{ErrorKind, Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, sync_channel};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -388,6 +503,7 @@ mod tests {
     use bgpfc_config::Config;
     use bgpfc_rpki::{AffectedPrefixes, RouteOrigin, RovState, Vrp};
     use bgpfc_rtr::{Framer, Intervals, Pdu};
+    use bgpfc_sidecar::{SidecarState, TESTED_VERSION};
     use bgpfc_wire::types::Asn;
 
     const WAIT: Duration = Duration::from_secs(10);
@@ -527,7 +643,7 @@ mod tests {
                 max-expire 3600; max-vrps 1000; backoff 2 300;
             }",
         );
-        let c = client_config(&cfg.rpki, router_id).unwrap();
+        let c = client_config(&cfg.rpki, router_id, None).unwrap();
         assert_eq!(
             c.caches,
             [
@@ -560,7 +676,7 @@ mod tests {
         );
         // The block's defaults are the client's.
         let cfg = config("rpki { mode external; cache 192.0.2.10; }");
-        let c = client_config(&cfg.rpki, router_id).unwrap();
+        let c = client_config(&cfg.rpki, router_id, None).unwrap();
         let defaults = client::Config::new(vec![Cache::new("192.0.2.10")]);
         assert_eq!(c.caches, defaults.caches);
         assert_eq!(c.connect_timeout, defaults.connect_timeout);
@@ -570,9 +686,9 @@ mod tests {
         assert_eq!(ast::Rpki::MIN_EXPIRE, session::Config::MIN_EXPIRE);
         assert_eq!(ast::Rpki::MAX_EXPIRE, session::Config::MAX_EXPIRE);
         // No client without the block, or with `mode disabled`.
-        assert!(client_config(&config("").rpki, router_id).is_none());
+        assert!(client_config(&config("").rpki, router_id, None).is_none());
         let disabled = config("rpki { mode disabled; cache 192.0.2.10; }");
-        assert!(client_config(&disabled.rpki, router_id).is_none());
+        assert!(client_config(&disabled.rpki, router_id, None).is_none());
     }
 
     #[test]
@@ -779,16 +895,12 @@ mod tests {
         assert_eq!(errors[0].pos, Pos { line: 3, col: 8 });
     }
 
-    /// Until bgpfcd runs the sidecar, `mode sidecar` stops the start, and
-    /// a reload that changes a block with it fails before anything
-    /// changes: neither may leave validation silently off.
+    /// Until bgpfcd reloads the sidecar, a reload that changes a block
+    /// with `mode sidecar` fails before anything changes: applied, it would
+    /// leave validation silently off.
     #[test]
-    fn mode_sidecar_is_refused_until_bgpfcd_runs_it() {
-        let (tx, rx) = sync_channel(4);
+    fn a_reload_of_mode_sidecar_is_refused_until_bgpfcd_does_it() {
         let sidecar = config("rpki { mode sidecar; }");
-        let err = Rpki::start(&sidecar.rpki, sidecar.router_id, tx).unwrap_err();
-        assert_eq!(err, "mode sidecar is not supported by this bgpfcd yet");
-        assert!(rx.try_recv().is_err());
         let external = config("rpki { mode external; cache 127.0.0.1; }");
         let refused = "rpki: a reload that changes an rpki block with mode sidecar is not \
                        supported by this bgpfcd yet";
@@ -1108,6 +1220,312 @@ mod tests {
             stopping.elapsed()
         );
         assert!(rpki.status().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A directory of its own for one test, under the system's temporary
+    /// directory, removed afterwards.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("bgpfcd-rpki-{tag}-{}-{n}", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Scratch(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        /// An executable `#!/bin/sh` script `name` running `body`.
+        ///
+        /// Another process writes it, as bgpfc-sidecar's tests do: were
+        /// this process to hold it open for writing while a parallel test
+        /// forks, the forked child would hold it too until it executes,
+        /// and running the script meanwhile would fail with `ETXTBSY`.
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.join(name);
+            let status = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                    "sh",
+                ])
+                .arg(format!("#!/bin/sh\n{body}\n"))
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "writing {}", path.display());
+            path
+        }
+
+        /// A stub Routinator, never the real one (AGENTS.md §5): it
+        /// answers `--version` with `Routinator {version}` and otherwise
+        /// runs `body`.
+        fn routinator(&self, version: &str, body: &str) -> PathBuf {
+            let version =
+                format!("if [ \"$1\" = --version ]; then echo 'Routinator {version}'; exit 0; fi");
+            self.script("routinator", &format!("{version}\n{body}"))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The release the sidecar crate drives, as `--version` prints it.
+    fn tested() -> String {
+        TESTED_VERSION.to_string()
+    }
+
+    /// A block that runs `binary` with its repository in `repository`,
+    /// serving RTR on 127.0.0.1 at `port`, or at one picked at start for 0.
+    fn sidecar_block(binary: &Path, repository: &Path, port: u16) -> String {
+        format!(
+            "rpki {{ mode sidecar; sidecar {{ binary \"{}\"; repository-dir \"{}\"; \
+             rtr-listen 127.0.0.1 port {port}; }} }}",
+            binary.display(),
+            repository.display()
+        )
+    }
+
+    /// Routinator's process id, once it runs.
+    fn routinator_pid(rpki: &Rpki) -> u32 {
+        let sidecar = rpki.sidecar.as_ref().expect("a sidecar");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let SidecarState::Running { pid, .. } = sidecar.status().state {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "routinator did not start");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Whether process `pid` exists, if only as a zombie.
+    fn alive(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Issue #71: with `mode sidecar` the client's one cache is the
+    /// sidecar's loopback address, with the block's client settings and
+    /// the sidecar's own back-off default.
+    #[test]
+    fn the_client_uses_the_sidecar_alone() {
+        let router_id = RouterId::new(0xC000_0201).unwrap();
+        let cfg = config(
+            "rpki { mode sidecar; version 0; connect-timeout 5; response-timeout 30;
+             reply-timeout 600; max-expire 3600; max-vrps 1000; }",
+        );
+        let addr: SocketAddr = "127.0.0.1:3323".parse().unwrap();
+        let c = client_config(&cfg.rpki, router_id, Some(addr)).unwrap();
+        let sidecar = Cache {
+            host: "127.0.0.1".to_owned(),
+            port: 3323,
+            preference: 0,
+        };
+        assert_eq!(c.caches, [sidecar]);
+        // m14 design §3.4: `1 30`, so that the client finds Routinator
+        // soon after it starts to listen.
+        let backoff = Backoff {
+            min: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        };
+        assert_eq!(c.backoff, backoff);
+        assert_eq!(c.connect_timeout, Duration::from_secs(5));
+        assert_eq!(c.jitter_seed, 0xC000_0201);
+        assert_eq!(
+            c.session,
+            session::Config {
+                version: Version::V0,
+                max_expire: Duration::from_secs(3_600),
+                response_timeout: Duration::from_secs(30),
+                reply_timeout: Duration::from_secs(600),
+                max_vrps: 1_000,
+            }
+        );
+        let v6 = client_config(&cfg.rpki, router_id, Some("[::1]:3323".parse().unwrap())).unwrap();
+        assert_eq!(v6.caches[0].host, "::1");
+        assert_eq!(v6.caches[0].to_string(), "[::1]:3323");
+        // A written back-off is the block's.
+        let written = config("rpki { mode sidecar; backoff 2 5; }");
+        let c = client_config(&written.rpki, router_id, Some(addr)).unwrap();
+        assert_eq!(c.backoff.min, Duration::from_secs(2));
+        assert_eq!(c.backoff.max, Duration::from_secs(5));
+        // Only `mode sidecar` uses the sidecar's address.
+        let external = config("rpki { mode external; cache 192.0.2.10; }");
+        let c = client_config(&external.rpki, router_id, Some(addr)).unwrap();
+        assert_eq!(c.caches, [Cache::new("192.0.2.10")]);
+        let disabled = config("rpki { mode disabled; }");
+        assert!(client_config(&disabled.rpki, router_id, Some(addr)).is_none());
+    }
+
+    /// Issues #26 and #71: `mode sidecar` starts Routinator and wires the
+    /// client to it with no cache written; the data it serves reaches the
+    /// RIB; stopping ends the client, then Routinator. The stub sleeps,
+    /// and the module's cache serves the port it was told to use (m14
+    /// design §7.3), so this tests the wiring without an RTR server.
+    #[test]
+    fn the_sidecar_serves_the_rib() {
+        let dir = Scratch::new("serves");
+        let binary = dir.routinator(&tested(), "exec sleep 600");
+        let cache = StubCache::new();
+        let cfg = config(&sidecar_block(&binary, &dir.join("repo"), cache.port()));
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+        let rtr = SocketAddr::from((Ipv4Addr::LOCALHOST, cache.port()));
+        let sidecar = rpki.sidecar.as_ref().unwrap();
+        assert_eq!(sidecar.rtr_addr(), rtr);
+        assert_eq!(sidecar.status().rtr, rtr);
+        assert_eq!(sidecar.version(), TESTED_VERSION);
+        let pid = routinator_pid(&rpki);
+
+        let mut conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        let change = next_change(&rx);
+        assert_eq!(change.affected, AffectedPrefixes::All);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Valid);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_497), RovState::Invalid);
+        eventually("the client in sync", || {
+            rpki.status().is_some_and(|s| s.synced_at.is_some())
+        });
+        let status = rpki.status().unwrap();
+        assert_eq!(status.cache.to_string(), rtr.to_string());
+        assert_eq!(status.vrps_ipv4, 1);
+
+        rpki.stop();
+        assert!(closed(&mut conn), "no client is left");
+        assert!(!alive(pid), "routinator is gone");
+        assert!(rpki.sidecar.is_none());
+        assert!(rpki.status().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// m14 design §4.3: at shutdown the client lets go of Routinator
+    /// before Routinator gets its `SIGTERM`.
+    #[test]
+    fn the_client_stops_before_routinator() {
+        let dir = Scratch::new("order");
+        let (ready, termed) = (dir.join("ready"), dir.join("termed"));
+        // It marks the SIGTERM, then takes a second to exit: stopped
+        // first, it would see the client connected all that second.
+        let body = format!(
+            "trap 'touch \"{}\"; sleep 1; exit 0' TERM\ntouch \"{}\"\nsleep 600 &\nwait",
+            termed.display(),
+            ready.display()
+        );
+        let binary = dir.routinator(&tested(), &body);
+        let cache = StubCache::new();
+        let cfg = config(&sidecar_block(&binary, &dir.join("repo"), cache.port()));
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+        let pid = routinator_pid(&rpki);
+        let mut conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        next_change(&rx);
+        // From here on the stub has its trap.
+        eventually("the stub's trap", || ready.exists());
+        conn.set_nonblocking(true).unwrap();
+        let watcher = thread::spawn(move || {
+            let deadline = Instant::now() + WAIT;
+            while !termed.exists() {
+                assert!(Instant::now() < deadline, "routinator got no SIGTERM");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut buf = [0; 16];
+            match conn.read(&mut buf) {
+                Ok(n) => n == 0,
+                Err(e) => e.kind() == ErrorKind::ConnectionReset,
+            }
+        });
+        rpki.stop();
+        let client_gone = watcher.join().unwrap();
+        assert!(
+            client_gone,
+            "routinator was stopped under a connected client"
+        );
+        assert!(!alive(pid));
+    }
+
+    /// Issue #72: a version mismatch is reported clearly at startup, and
+    /// no server is started.
+    #[test]
+    fn a_routinator_of_another_release_stops_the_start() {
+        let dir = Scratch::new("release");
+        let served = dir.join("served");
+        let body = format!("touch '{}'\nexec sleep 600", served.display());
+        let binary = dir.routinator("0.14.1", &body);
+        let cfg = config(&sidecar_block(&binary, &dir.join("repo"), 0));
+        let (tx, rx) = sync_channel(4);
+        let err = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap_err();
+        assert!(
+            err.starts_with("rpki sidecar: Routinator 0.14.1 is not supported: "),
+            "{err}"
+        );
+        assert!(err.contains("0.15"), "{err}");
+        assert!(!served.exists(), "a server was started");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Issue #60: a binary that is not there stops the start, naming it.
+    #[test]
+    fn a_missing_routinator_stops_the_start() {
+        let dir = Scratch::new("missing");
+        let binary = dir.join("routinator");
+        let cfg = config(&sidecar_block(&binary, &dir.join("repo"), 0));
+        let (tx, rx) = sync_channel(4);
+        let err = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap_err();
+        let expected = format!(
+            "rpki sidecar: `{} --version` could not be started: ",
+            binary.display()
+        );
+        assert!(err.starts_with(&expected), "{err}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The repository directory is created with its parents, for
+    /// Routinator and bgpfcd's group alone; one that cannot be created
+    /// stops the start before Routinator runs at all.
+    #[test]
+    fn the_repository_directory_is_created() {
+        let dir = Scratch::new("repository");
+        let binary = dir.routinator(&tested(), "exec sleep 600");
+        let repository = dir.join("state/bgpfc/rpki");
+        let cfg = config(&sidecar_block(&binary, &repository, 0));
+        let (tx, _rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+        let meta = fs::metadata(&repository).unwrap();
+        assert!(meta.is_dir());
+        let mode = meta.permissions().mode() & 0o777;
+        // 0750, less what the umask takes away.
+        assert_eq!(mode & !0o750, 0, "{mode:o}");
+        // Port 0: one picked at start, on the configured address, which
+        // the client uses.
+        let rtr = rpki.sidecar.as_ref().unwrap().rtr_addr();
+        assert_eq!(rtr.ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(rtr.port(), 0);
+        assert_eq!(rpki.status().unwrap().cache.port, rtr.port());
+        rpki.stop();
+
+        let ran = dir.join("ran");
+        let body = format!("touch '{}'\necho 'Routinator {}'", ran.display(), tested());
+        let marking = dir.script("marking", &body);
+        fs::write(dir.join("file"), "").unwrap();
+        let blocked = dir.join("file/rpki");
+        let cfg = config(&sidecar_block(&marking, &blocked, 0));
+        let (tx, rx) = sync_channel(4);
+        let err = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap_err();
+        let expected = format!(
+            "cannot create the rpki repository directory {}: ",
+            blocked.display()
+        );
+        assert!(err.starts_with(&expected), "{err}");
+        assert!(!ran.exists(), "routinator ran");
         assert!(rx.try_recv().is_err());
     }
 }
