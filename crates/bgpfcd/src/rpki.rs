@@ -519,7 +519,8 @@ impl Rpki {
     /// Routinator or the client could not be started although the
     /// preflight passed, as when the binary changed in between. Validation
     /// is then off, as with `mode disabled`: with no client, nothing would
-    /// expire the data the old one left in the RIB.
+    /// expire the data the old one left in the RIB. [`Rpki::in_effect`] is
+    /// then `mode disabled`, so the next reload starts the block again.
     pub(crate) fn reconfigure(
         &mut self,
         old: &ast::Rpki,
@@ -580,6 +581,27 @@ impl Rpki {
                     "rpki: cannot start the rtr client ({e}); validation disabled"
                 ))
             }
+        }
+    }
+
+    /// The block in effect, for a reload to compare the new one with:
+    /// `config`, the running configuration's, while what it runs is
+    /// running, and otherwise `mode disabled`, which is what then holds:
+    /// after a reload that could not start Routinator or the client (see
+    /// [`Rpki::reconfigure`]), no client runs and every route is
+    /// `disabled`. So a later reload checks and starts what is missing even
+    /// when the file has not changed, rather than leave validation off
+    /// until the block is edited or bgpfcd restarted.
+    pub(crate) fn in_effect(&self, config: &ast::Rpki) -> ast::Rpki {
+        let running = match config.mode {
+            RpkiMode::Disabled => true,
+            RpkiMode::External => self.client.is_some(),
+            RpkiMode::Sidecar => self.client.is_some() && self.sidecar.is_some(),
+        };
+        if running {
+            config.clone()
+        } else {
+            ast::Rpki::defaults(RpkiMode::Disabled)
         }
     }
 
@@ -2105,16 +2127,44 @@ mod tests {
         assert!(r.rpki.sidecar.is_none() && r.rpki.status().is_none());
         let change = next_change(&r.rx);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
-        // A later reload with a block that works starts it again; the
-        // routes then wait for its first full set.
-        let back = r.with("", "");
+        // What is in effect now is `mode disabled`, which a reload compares
+        // the file with: one of the same file checks the block again, and
+        // fails while the binary is missing, ...
+        let off = ast::Rpki::defaults(RpkiMode::Disabled);
+        assert_eq!(r.rpki.in_effect(&new.rpki), off);
+        let err = preflight_as(&off, &new.rpki, false).unwrap_err();
+        assert!(err.contains("--version` could not be started"), "{err}");
+        // ... and starts it once the binary is there; the routes then wait
+        // for its first full set.
+        let version = format!(
+            "if [ \"$1\" = --version ]; then echo 'Routinator {}'; exit 0; fi\nexec sleep 600",
+            tested()
+        );
+        r.dir.script("missing", &version);
+        assert_eq!(preflight_as(&off, &new.rpki, false), Ok(()));
         assert_eq!(
-            r.rpki.reconfigure(&new.rpki, &back.rpki),
+            r.rpki.reconfigure(&off, &new.rpki),
             Ok("rpki: sidecar started")
         );
         let pid = routinator_pid(&r.rpki);
         assert!(waiting(&r.rpki).is_some());
+        assert_eq!(r.rpki.in_effect(&new.rpki), new.rpki);
         r.rpki.stop();
         assert!(!alive(pid));
+    }
+
+    /// What is in effect is the configured block while what it runs runs:
+    /// nothing for `mode disabled`, the client for `mode external`.
+    #[test]
+    fn the_block_in_effect_is_the_configured_one_while_it_runs() {
+        let cache = StubCache::new();
+        let (mut rpki, _rx, _conn) = in_sync(&cache, &[vrp("192.0.2.0/24", 24, 64_496)]);
+        let external = config(&cache.block());
+        assert_eq!(rpki.in_effect(&external.rpki), external.rpki);
+        rpki.stop();
+        let off = ast::Rpki::defaults(RpkiMode::Disabled);
+        assert_eq!(rpki.in_effect(&external.rpki), off);
+        let disabled = config("rpki { mode disabled; cache 192.0.2.10; }");
+        assert_eq!(rpki.in_effect(&disabled.rpki), disabled.rpki);
     }
 }

@@ -355,11 +355,15 @@ impl Coordinator<'_> {
     fn reload(&mut self) -> Result<String, String> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
+        // What the `rpki` block runs now: `mode disabled` if an earlier
+        // reload could not start it, so that this one starts it, from an
+        // unchanged file too.
+        let rpki = self.rpki.in_effect(&self.config.rpki);
         // Issue #60: a changed `rpki` block that cannot run, such as a new
         // cache that cannot be found or a Routinator that would not start
         // (issue #72), fails the reload before anything changes, as it
         // fails the start; a running Routinator goes on (m14 design §5.1).
-        rpki::preflight(&self.config.rpki, &new.rpki)?;
+        rpki::preflight(&rpki, &new.rpki)?;
         let mut notes = Vec::new();
         for g in &diff.global {
             match g {
@@ -369,10 +373,8 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
-                GlobalChange::Rpki => {
-                    let done = self.rpki.reconfigure(&self.config.rpki, &new.rpki);
-                    notes.push(done.map_or_else(|e| e, str::to_owned));
-                }
+                // Applied below, from the block in effect.
+                GlobalChange::Rpki => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
@@ -399,6 +401,12 @@ impl Coordinator<'_> {
                     }
                 }
             }
+        }
+        // A changed block, or an unchanged one an earlier reload could not
+        // start.
+        if !rpki.same_as(&new.rpki) {
+            let done = self.rpki.reconfigure(&rpki, &new.rpki);
+            notes.push(done.map_or_else(|e| e, str::to_owned));
         }
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.
