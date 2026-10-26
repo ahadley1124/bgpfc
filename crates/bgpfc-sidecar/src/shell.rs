@@ -206,21 +206,27 @@ impl Sidecar {
     ///
     /// A configured RTR port of 0 is replaced with a free one: bind the
     /// configured loopback address with port 0, read the port the kernel
-    /// chose, and close the socket again. Something else may bind that
-    /// port before Routinator does, and Routinator binds only after its
-    /// first validation run. That is acceptable: the port comes from the
+    /// chose, and close the socket again. Routinator binds its port only
+    /// after its first validation run, minutes from a cold cache, and
+    /// again after each restart; until then any process on this host may
+    /// bind the port, a picked one or a configured one alike, and the port
+    /// is no secret, being on Routinator's command line. Such a process
+    /// then serves RTR on it, so a client must not take whatever answers
+    /// there for Routinator: bgpfcd's RTR client uses a connection only if
+    /// the socket at its other end belongs to bgpfcd's user, as
+    /// Routinator's does. Routinator, finding the port taken, fails to
+    /// bind and exits, which the supervisor reports as failures and then
+    /// as the [`SidecarState::Failed`] alarm. A picked port comes from the
     /// ephemeral range, which the kernel hands out in rotation rather than
-    /// reusing at once; loopback is open to this host only; and if the
-    /// port is taken, Routinator fails to bind and exits, which the
-    /// supervisor reports as failures and then as the
-    /// [`SidecarState::Failed`] alarm, never silently. Handing Routinator
-    /// the bound socket instead (`--systemd-listen`) would need
-    /// `LISTEN_PID` set to the child's own id, which only the child knows,
-    /// after `fork`, where nothing may allocate. Configure a fixed port to
-    /// avoid the race. A fixed port is not bound here, but its address is,
-    /// with port 0, so that an address this host cannot bind at all, such
-    /// as `::1` without IPv6, fails the start rather than every start of
-    /// Routinator.
+    /// reusing at once, so a program that takes it by chance is unlikely;
+    /// a fixed port rules that out, though not a process that takes it on
+    /// purpose. Handing Routinator the bound socket instead
+    /// (`--systemd-listen`) would close the window, but needs `LISTEN_PID`
+    /// set to the child's own id, which only the child knows, after
+    /// `fork`, where nothing may allocate. A fixed port is not bound here,
+    /// but its address is, with port 0, so that an address this host
+    /// cannot bind at all, such as `::1` without IPv6, fails the start
+    /// rather than every start of Routinator.
     ///
     /// # Errors
     /// The [`SidecarError`] from [`SidecarConfig::validate`] or the
