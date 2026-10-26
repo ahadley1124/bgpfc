@@ -713,7 +713,9 @@ fn route_selection_waits_for_every_end_of_rib() {
 fn route_selection_does_not_wait_for_peers_that_will_not_send_a_marker() {
     // RFC 4724 §4.1: "excluding the ones with the "Restart State" bit set
     // in the received capability and excluding the ones that do not
-    // advertise the graceful restart capability".
+    // advertise the graceful restart capability". A peer that advertised
+    // it without the family sends the marker all the same (§4), so it is
+    // waited for.
     let t0 = now();
     let a = gr_peer("10.0.0.1", 65_001, 1);
     let restarting = {
@@ -731,12 +733,7 @@ fn route_selection_does_not_wait_for_peers_that_will_not_send_a_marker() {
         });
         i
     };
-    let unlisted = gr(peer("10.0.0.4", 65_004, 4), &[(V6, true)]);
-    for (label, other) in [
-        ("restarting", restarting),
-        ("no capability", silent),
-        ("family not listed", unlisted),
-    ] {
+    for (label, other) in [("restarting", restarting), ("no capability", silent)] {
         let mut rib = Rib::new(LOCAL_AS);
         rib.defer_selection(&Deferral {
             waiting: vec![(a.addr, vec![V4]), (other.addr, vec![V4])],
@@ -754,6 +751,28 @@ fn route_selection_does_not_wait_for_peers_that_will_not_send_a_marker() {
             "{label}"
         );
     }
+}
+
+#[test]
+fn a_peer_that_does_not_list_the_family_is_still_waited_for() {
+    let t0 = now();
+    let a = gr_peer("10.0.0.1", 65_001, 1);
+    let unlisted = gr(peer("10.0.0.4", 65_004, 4), &[(V6, true)]);
+    let mut rib = Rib::new(LOCAL_AS);
+    rib.defer_selection(&Deferral {
+        waiting: vec![(a.addr, vec![V4]), (unlisted.addr, vec![V4])],
+        until: t0 + RESTART,
+    });
+    rib.peer_up(a.clone(), t0, &mut Vec::new());
+    rib.peer_up(unlisted.clone(), t0, &mut Vec::new());
+    outputs(|o| rib.end_of_rib(a.addr, V4, t0, o));
+    assert_eq!(deferred(&rib), vec![(V4, 1)]);
+    let out = outputs(|o| rib.end_of_rib(unlisted.addr, V4, t0, o));
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, Output::SelectionDone { .. }))
+    );
+    assert_eq!(deferred(&rib), vec![]);
 }
 
 #[test]

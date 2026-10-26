@@ -75,11 +75,6 @@ pub struct PeerRestart {
 }
 
 impl PeerRestart {
-    /// Whether the peer listed `family`.
-    fn lists(&self, family: AddressFamily) -> bool {
-        self.families.iter().any(|(f, _)| *f == family)
-    }
-
     /// Whether the peer listed `family` with the Forwarding State bit.
     fn forwarding(&self, family: AddressFamily) -> bool {
         self.families.iter().any(|(f, fwd)| *f == family && *fwd)
@@ -569,12 +564,16 @@ impl Rib {
         let mut excluded = Vec::new();
         for (family, waiting) in self.s.deferral.iter() {
             if waiting.peers.contains(&addr) {
+                // A peer that advertised the capability sends the marker of
+                // every family it exchanges, whether or not its tuples
+                // list the family (§4: it is "to indicate its intention of
+                // generating the End-of-RIB marker").
                 let waits = info.speaks(family)
                     && info
                         .restart
                         .as_ref()
                         .and_then(|r| r.peer.as_ref())
-                        .is_some_and(|p| !p.restarting && p.lists(family));
+                        .is_some_and(|p| !p.restarting);
                 if !waits {
                     excluded.push(family);
                 }
