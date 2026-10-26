@@ -552,12 +552,6 @@ the timeouts, `max-expire`, `max-vrps` and `backoff`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
 Routinator 0.15.x, and is tested with 0.15.2.
 
-> **Not reloaded yet.** This bgpfcd runs the sidecar at start, but a
-> reload that changes an `rpki` block with `mode sidecar` before or after
-> it fails, keeping the running configuration; restart bgpfcd to apply
-> such a change. A reload that leaves the block alone, or changes only
-> `enforcement`, works.
-
 The smallest file that validates every route:
 
 ```
@@ -859,6 +853,41 @@ selection runs for every destination, so that what changes is installed
 and advertised, or withdrawn, with no UPDATE or route refresh (RFC 6811
 §5). The reload summary then says `rpki enforcement MODE`. A new cache
 whose name does not resolve fails the reload as it fails the start.
+
+With `mode sidecar`, a reload restarts only what changed, since every
+start of Routinator costs a validation run before it listens again:
+
+- A change to the client's settings (`version`, the timeouts,
+  `max-expire`, `max-vrps`, `backoff`) restarts the RTR client at the
+  same address and leaves Routinator running (`rpki: rtr client
+  restarted`).
+- A change to the `sidecar` block stops Routinator and starts it with
+  the new settings, which with `rtr-listen` port 0 picks a new port
+  (`rpki: sidecar restarted`). The VRPs in use stay in use until the new
+  Routinator has sent a full set, or until they expire (RFC 8210 §10,
+  §6), so the routes keep their states through its first validation run.
+- From `mode external`, Routinator starts and the external cache's VRPs
+  stay in use until its first full set (`rpki: sidecar started`); from
+  `mode disabled` it starts with nothing to hold, so the startup window
+  opens again (see **Startup window**).
+- To `mode external`, Routinator stops after the client, and its VRPs stay
+  in use until an external cache has sent a full set (`rpki: rtr client
+  restarted; sidecar stopped`); to `mode disabled`, it stops and every
+  route is `disabled` again (`rpki: validation disabled; sidecar
+  stopped`).
+
+Before anything changes, a reload that would start Routinator checks what
+the start checks: bgpfcd must not be root (it is not, after `--user`),
+the repository directory is created, and `routinator --version` must name
+a 0.15 release (issue #72). If one fails, the reload fails, the running
+configuration is kept, and the running Routinator goes on serving: a
+reload onto a binary that would not start never stops the one that works.
+Should Routinator still fail to start after that, as when the binary
+changes in between, the reload goes ahead with validation off, every
+route `disabled`, and its summary and an error line say so; a later
+reload that changes the block starts it again. A Routinator that keeps
+failing is not restarted by a reload that leaves its block alone: bgpfcd
+keeps retrying it at the back-off's cap.
 
 ## Command line
 

@@ -356,8 +356,9 @@ impl Coordinator<'_> {
         let (new, engine) = load_checked(self.opts)?;
         let diff = ConfigDiff::between(&self.config, &new);
         // Issue #60: a changed `rpki` block that cannot run, such as a new
-        // cache that cannot be found, fails the reload before anything
-        // changes, as it fails the start.
+        // cache that cannot be found or a Routinator that would not start
+        // (issue #72), fails the reload before anything changes, as it
+        // fails the start; a running Routinator goes on (m14 design §5.1).
         rpki::preflight(&self.config.rpki, &new.rpki)?;
         let mut notes = Vec::new();
         for g in &diff.global {

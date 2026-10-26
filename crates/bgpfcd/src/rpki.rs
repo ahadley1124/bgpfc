@@ -34,7 +34,13 @@
 //! a new set validates again only the routes it judges differently. A
 //! change to `mode disabled` sends [`ValidationChange::disabled`] instead,
 //! so that every route is `disabled` again. A reload that leaves the block
-//! alone leaves the client alone.
+//! alone leaves the client alone. Routinator is restarted only when its
+//! own settings change, since each start costs a validation run before it
+//! listens again, and the held data covers that gap; it is started and
+//! stopped as the mode comes to `sidecar` and leaves it (m14 design §5.2).
+//! [`preflight`] checks before anything changes what a start of
+//! Routinator would refuse, so that a reload onto a binary that would not
+//! start fails and the running one goes on.
 //!
 //! Stopping the client, at a reload or at shutdown, joins its thread,
 //! which a stop wakes from its sleep, its reads and writes, and its wait
@@ -81,6 +87,7 @@ use bgpfc_sidecar::{BackoffConfig, Sidecar, SidecarConfig, TalConfig};
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::RibMsg;
+use crate::privileges;
 
 /// The checks of the `rpki` block that need more than the configuration
 /// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
@@ -166,27 +173,48 @@ pub(crate) fn sidecar_config(s: &ast::RpkiSidecar) -> SidecarConfig {
 }
 
 /// What a reload checks before it changes anything, so that a reload that
-/// would fail fails with the running configuration kept: for a changed
-/// block in `mode external`, that every cache can be found (issue #60), as
-/// [`resolve`] checks at start.
+/// would fail fails with the running configuration kept (m14 design
+/// §5.1). A block that has not changed ([`ast::Rpki::same_as`]) needs
+/// nothing. Otherwise:
 ///
-/// This bgpfcd does not reload the Routinator sidecar yet, so a changed
-/// block with `mode sidecar` before or after the reload fails it: applied,
-/// it would leave validation silently off.
+/// - With `mode external`, every cache can be found, as [`resolve`]
+///   checks at start (issue #60).
+/// - When Routinator will start, because the mode becomes `sidecar` or
+///   the `sidecar` block changes: bgpfcd is not root, since root now means
+///   that no `--user` dropped it ([`privileges::sidecar_as_root`]); the
+///   repository directory can be created; and [`Sidecar::check`] passes,
+///   the settings and the binary's `--version` (issue #72). Without this,
+///   a reload onto a Routinator that cannot start would stop the running
+///   one first, and only then fail. A change to the client's settings
+///   alone starts no Routinator and checks none of this.
 ///
 /// # Errors
 /// What fails, for the reload's error.
 pub(crate) fn preflight(old: &ast::Rpki, new: &ast::Rpki) -> Result<(), String> {
+    preflight_as(old, new, bgpfc_sys::is_root())
+}
+
+/// [`preflight`] for a bgpfcd that is `root` or not.
+fn preflight_as(old: &ast::Rpki, new: &ast::Rpki, root: bool) -> Result<(), String> {
     if old.same_as(new) {
         return Ok(());
     }
-    if old.mode == RpkiMode::Sidecar || new.mode == RpkiMode::Sidecar {
-        return Err(
-            "rpki: a reload that changes an rpki block with mode sidecar is not supported by this bgpfcd yet"
-                .to_owned(),
-        );
+    match new.mode {
+        RpkiMode::Disabled => Ok(()),
+        RpkiMode::External => resolve(new),
+        RpkiMode::Sidecar if old.mode == RpkiMode::Sidecar && old.sidecar.same_as(&new.sidecar) => {
+            Ok(())
+        }
+        RpkiMode::Sidecar => {
+            if let Some(refused) = privileges::sidecar_as_root(root, None, new.mode) {
+                return Err(format!("{refused}: {}", privileges::SIDECAR_AS_ROOT_HINT));
+            }
+            create_repository_dir(&new.sidecar.repository_dir)?;
+            Sidecar::check(&sidecar_config(&new.sidecar))
+                .map_err(|e| format!("rpki sidecar: {e}"))?;
+            Ok(())
+        }
     }
-    resolve(new)
 }
 
 /// Look up every cache of an external `rpki` block, so that a name that
@@ -463,13 +491,33 @@ impl Rpki {
 
     /// Apply `new`, the block of a reloaded configuration, in place of
     /// `old`, the running one; what was done, for the reload's summary.
-    /// The caller has checked with [`preflight`] that the new caches can
-    /// be found, and that neither block runs the sidecar.
+    /// The caller has checked `new` with [`preflight`].
+    ///
+    /// A block that has not changed ([`ast::Rpki::same_as`]) changes
+    /// nothing; an `enforcement` alone is no change here, as the RIB
+    /// judges the routes again. Otherwise the client is restarted, holding
+    /// the data the old one published until a cache sends a full set or
+    /// the data expires (RFC 8210 §10, §6), and Routinator (m14 design
+    /// §5.2):
+    ///
+    /// - is left running when only the client's settings change: the new
+    ///   client connects to the same address;
+    /// - is stopped and started again when its own settings change. Its
+    ///   address may change with it; the held data covers the validation
+    ///   run before it listens again;
+    /// - is started when the mode becomes `sidecar`, from `external` with
+    ///   the external cache's data held, from `disabled` with nothing to
+    ///   hold, so that the routes wait for its first full set;
+    /// - is stopped when the mode leaves `sidecar`, after the client.
+    ///
+    /// A Routinator that keeps failing is not restarted by a reload that
+    /// leaves its block alone: its supervisor keeps retrying.
     ///
     /// # Errors
-    /// The new client thread could not be spawned. Validation is then
-    /// off, as with `mode disabled`, since nothing would expire the data
-    /// the old client left in the RIB.
+    /// Routinator or the client could not be started although the
+    /// preflight passed, as when the binary changed in between. Validation
+    /// is then off, as with `mode disabled`: with no client, nothing would
+    /// expire the data the old one left in the RIB.
     pub(crate) fn reconfigure(
         &mut self,
         old: &ast::Rpki,
@@ -478,24 +526,54 @@ impl Rpki {
         if old.same_as(new) {
             return Ok("rpki unchanged");
         }
+        let sidecar = new.mode == RpkiMode::Sidecar;
+        let had_sidecar = self.sidecar.is_some();
+        // Also when an earlier start failed and none runs.
+        let starting = sidecar && (!had_sidecar || !old.sidecar.same_as(&new.sidecar));
         let ran = self.client.is_some();
         let held = self.stop_client();
+        if starting || !sidecar {
+            self.stop_sidecar();
+        }
+        if starting {
+            match start_sidecar(&new.sidecar) {
+                Ok(started) => self.sidecar = Some(started),
+                Err(e) => {
+                    self.disable();
+                    bgpfc_log::error!("rpki: cannot start the sidecar", error = e);
+                    return Err(format!(
+                        "rpki: cannot start the sidecar ({e}); validation disabled"
+                    ));
+                }
+            }
+        }
+        let stopped = had_sidecar && !sidecar;
         match self.spawn_client(new, held) {
             Ok(Some(client)) => {
                 self.client = Some(client);
-                Ok(if ran {
-                    "rpki: rtr client restarted"
-                } else {
-                    "rpki: rtr client started"
+                Ok(match (starting, had_sidecar, stopped, ran) {
+                    (true, true, _, _) => "rpki: sidecar restarted",
+                    (true, false, _, _) => "rpki: sidecar started",
+                    (false, _, true, true) => "rpki: rtr client restarted; sidecar stopped",
+                    (false, _, true, false) => "rpki: rtr client started; sidecar stopped",
+                    (false, _, false, true) => "rpki: rtr client restarted",
+                    (false, _, false, false) => "rpki: rtr client started",
                 })
             }
-            Ok(None) if ran => {
+            Ok(None) if ran || stopped => {
                 self.disable();
-                Ok("rpki: validation disabled")
+                Ok(if stopped {
+                    "rpki: validation disabled; sidecar stopped"
+                } else {
+                    "rpki: validation disabled"
+                })
             }
             Ok(None) => Ok("rpki: validation stays disabled"),
             Err(e) => {
+                // A Routinator that no client reads is of no use.
+                self.stop_sidecar();
                 self.disable();
+                bgpfc_log::error!("rpki: cannot start the rtr client", error = e);
                 Err(format!(
                     "rpki: cannot start the rtr client ({e}); validation disabled"
                 ))
@@ -957,33 +1035,6 @@ mod tests {
         assert_eq!(errors[0].pos, Pos { line: 3, col: 8 });
     }
 
-    /// Until bgpfcd reloads the sidecar, a reload that changes a block
-    /// with `mode sidecar` fails before anything changes: applied, it would
-    /// leave validation silently off.
-    #[test]
-    fn a_reload_of_mode_sidecar_is_refused_until_bgpfcd_does_it() {
-        let sidecar = config("rpki { mode sidecar; }");
-        let external = config("rpki { mode external; cache 127.0.0.1; }");
-        let refused = "rpki: a reload that changes an rpki block with mode sidecar is not \
-                       supported by this bgpfcd yet";
-        assert_eq!(
-            preflight(&external.rpki, &sidecar.rpki),
-            Err(refused.to_owned())
-        );
-        assert_eq!(
-            preflight(&sidecar.rpki, &external.rpki),
-            Err(refused.to_owned())
-        );
-        // An unchanged block, or an `enforcement` alone, changes nothing.
-        let prefer = config("rpki { mode sidecar; enforcement prefer-valid; }");
-        assert_eq!(preflight(&sidecar.rpki, &prefer.rpki), Ok(()));
-        // External caches are looked up as at start; a block that has
-        // not changed is not looked up again.
-        let bad = config("rpki { mode external; cache rtr.invalid; }");
-        assert!(preflight(&external.rpki, &bad.rpki).is_err());
-        assert_eq!(preflight(&bad.rpki, &bad.rpki), Ok(()));
-    }
-
     #[test]
     fn the_cache_s_data_reaches_the_rib_channel() {
         let cache = StubCache::new();
@@ -1350,9 +1401,21 @@ mod tests {
     /// A block that runs `binary` with its repository in `repository`,
     /// serving RTR on 127.0.0.1 at `port`, or at one picked at start for 0.
     fn sidecar_block(binary: &Path, repository: &Path, port: u16) -> String {
+        sidecar_block_with(binary, repository, port, "", "")
+    }
+
+    /// [`sidecar_block`] with more statements: `rpki` in the `rpki` block,
+    /// `sidecar` in the `sidecar` block.
+    fn sidecar_block_with(
+        binary: &Path,
+        repository: &Path,
+        port: u16,
+        rpki: &str,
+        sidecar: &str,
+    ) -> String {
         format!(
-            "rpki {{ mode sidecar; sidecar {{ binary \"{}\"; repository-dir \"{}\"; \
-             rtr-listen 127.0.0.1 port {port}; }} }}",
+            "rpki {{ mode sidecar; {rpki} sidecar {{ binary \"{}\"; repository-dir \"{}\"; \
+             rtr-listen 127.0.0.1 port {port}; {sidecar} }} }}",
             binary.display(),
             repository.display()
         )
@@ -1650,5 +1713,306 @@ mod tests {
         assert!(err.starts_with(&expected), "{err}");
         assert!(!ran.exists(), "routinator ran");
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A Routinator stub that sleeps, in sync through the module's cache,
+    /// which served one VRP.
+    struct Running {
+        dir: Scratch,
+        binary: PathBuf,
+        cache: StubCache,
+        cfg: Config,
+        rpki: Rpki,
+        rx: Receiver<RibMsg>,
+        conn: TcpStream,
+        pid: u32,
+    }
+
+    impl Running {
+        fn new(tag: &str) -> Running {
+            let dir = Scratch::new(tag);
+            let binary = dir.routinator(&tested(), "exec sleep 600");
+            let cache = StubCache::new();
+            let cfg = config(&sidecar_block(&binary, &dir.join("repo"), cache.port()));
+            let (tx, rx) = sync_channel(4);
+            let rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+            let pid = routinator_pid(&rpki);
+            let conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+            next_change(&rx);
+            Running {
+                dir,
+                binary,
+                cache,
+                cfg,
+                rpki,
+                rx,
+                conn,
+                pid,
+            }
+        }
+
+        /// The block, with `rpki` and `sidecar` statements added.
+        fn with(&self, rpki: &str, sidecar: &str) -> Config {
+            let repository = self.dir.join("repo");
+            let block =
+                sidecar_block_with(&self.binary, &repository, self.cache.port(), rpki, sidecar);
+            config(&block)
+        }
+
+        /// The VRPs the client holds.
+        fn vrps(&self) -> Option<usize> {
+            self.rpki.status()?.vrps.map(|v| v.len())
+        }
+    }
+
+    /// m14 design §5.2: a block that has not changed, written another way,
+    /// or with another `enforcement`, which the RIB applies, touches
+    /// neither Routinator nor the client.
+    #[test]
+    fn an_unchanged_block_leaves_the_sidecar_alone() {
+        let mut r = Running::new("unchanged");
+        let respelled = r.with(
+            "enforcement prefer-valid; backoff 1 30;",
+            "refresh 600; rir-tals yes;",
+        );
+        assert_eq!(preflight_as(&r.cfg.rpki, &respelled.rpki, true), Ok(()));
+        let done = r.rpki.reconfigure(&r.cfg.rpki, &respelled.rpki);
+        assert_eq!(done, Ok("rpki unchanged"));
+        assert_eq!(routinator_pid(&r.rpki), r.pid);
+        assert!(r.rpki.status().is_some_and(|s| s.connected));
+        r.conn
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0; 16];
+        assert!(r.conn.read(&mut buf).is_err(), "the session goes on");
+        r.rpki.stop();
+        assert!(!alive(r.pid));
+    }
+
+    /// A change to the client's settings alone restarts the client at the
+    /// same address, holding its data, and leaves Routinator running; it
+    /// needs no check of Routinator, not even as root.
+    #[test]
+    fn a_client_setting_leaves_the_sidecar_running() {
+        let mut r = Running::new("client");
+        let new = r.with("backoff 1 3;", "");
+        assert_eq!(preflight_as(&r.cfg.rpki, &new.rpki, true), Ok(()));
+        let done = r.rpki.reconfigure(&r.cfg.rpki, &new.rpki);
+        assert_eq!(done, Ok("rpki: rtr client restarted"));
+        assert!(closed(&mut r.conn), "the old client is gone");
+        assert_eq!(routinator_pid(&r.rpki), r.pid, "the same routinator");
+        let (_conn, query) = r.cache.accept();
+        assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
+        assert_eq!(r.vrps(), Some(1), "the data is held");
+        assert_eq!(waiting(&r.rpki), None);
+        assert!(r.rx.try_recv().is_err());
+        r.rpki.stop();
+    }
+
+    /// RFC 8210 §10: a change to the `sidecar` block restarts Routinator,
+    /// and the client keeps the data in use until the new one has sent a
+    /// full set.
+    #[test]
+    fn a_sidecar_setting_restarts_it_and_keeps_the_data() {
+        let mut r = Running::new("restart");
+        let new = r.with("", "refresh 300;");
+        assert_eq!(preflight_as(&r.cfg.rpki, &new.rpki, false), Ok(()));
+        let done = r.rpki.reconfigure(&r.cfg.rpki, &new.rpki);
+        assert_eq!(done, Ok("rpki: sidecar restarted"));
+        assert!(closed(&mut r.conn));
+        assert!(!alive(r.pid), "the old routinator is gone");
+        let pid = routinator_pid(&r.rpki);
+        assert_ne!(pid, r.pid);
+        assert_eq!(r.vrps(), Some(1), "the data is held");
+        assert_eq!(waiting(&r.rpki), None);
+        // The new client asks the new Routinator, at the same fixed port.
+        let (_conn, query) = r.cache.accept();
+        assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
+        assert!(r.rx.try_recv().is_err(), "nothing changed for the RIB");
+        r.rpki.stop();
+        assert!(!alive(pid));
+    }
+
+    /// From `mode external` the external cache's data stays in use until
+    /// Routinator's first full set, so the routes never wait; that set
+    /// validates again only the routes the two judge differently.
+    #[test]
+    fn switching_from_external_keeps_the_data_until_routinator_answers() {
+        let external = StubCache::new();
+        let (a, b) = (
+            vrp("192.0.2.0/24", 24, 64_496),
+            vrp("198.51.100.0/24", 24, 64_497),
+        );
+        let (mut rpki, rx, mut old_conn) = in_sync(&external, &[a]);
+        let dir = Scratch::new("from-external");
+        let binary = dir.routinator(&tested(), "exec sleep 600");
+        let sidecar = StubCache::new();
+        let old = config(&external.block());
+        let new = config(&sidecar_block(&binary, &dir.join("repo"), sidecar.port()));
+        assert_eq!(preflight_as(&old.rpki, &new.rpki, false), Ok(()));
+        assert_eq!(
+            rpki.reconfigure(&old.rpki, &new.rpki),
+            Ok("rpki: sidecar started")
+        );
+        assert!(closed(&mut old_conn));
+        let pid = routinator_pid(&rpki);
+        let held = rpki.status().unwrap();
+        assert_eq!(held.vrps.as_deref().map(bgpfc_rpki::VrpSet::len), Some(1));
+        assert_eq!(waiting(&rpki), None, "no startup window");
+        assert!(rx.try_recv().is_err());
+        let _conn = sidecar.serve(&[a, b]);
+        let change = next_change(&rx);
+        let p = |s: &str| s.parse().unwrap();
+        assert!(!change.affected.covers(p("192.0.2.0/24")));
+        assert!(change.affected.covers(p("198.51.100.0/24")));
+        rpki.stop();
+        assert!(!alive(pid));
+    }
+
+    /// Leaving `mode sidecar` stops Routinator after the client: for
+    /// `mode disabled` every route is `disabled` again; for `mode
+    /// external` its data stays in use until an external cache answers.
+    #[test]
+    fn switching_to_disabled_stops_the_sidecar_and_disables() {
+        let mut r = Running::new("to-disabled");
+        let off = config("rpki { mode disabled; }");
+        assert_eq!(preflight_as(&r.cfg.rpki, &off.rpki, true), Ok(()));
+        assert_eq!(
+            r.rpki.reconfigure(&r.cfg.rpki, &off.rpki),
+            Ok("rpki: validation disabled; sidecar stopped")
+        );
+        assert!(closed(&mut r.conn));
+        assert!(!alive(r.pid));
+        assert!(r.rpki.sidecar.is_none() && r.rpki.status().is_none());
+        let change = next_change(&r.rx);
+        assert_eq!(change.affected, AffectedPrefixes::All);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
+
+        let mut r = Running::new("to-external");
+        let external = StubCache::new();
+        let new = config(&external.block());
+        assert_eq!(
+            r.rpki.reconfigure(&r.cfg.rpki, &new.rpki),
+            Ok("rpki: rtr client restarted; sidecar stopped")
+        );
+        assert!(!alive(r.pid));
+        assert!(r.rpki.sidecar.is_none());
+        let (_conn, query) = external.accept();
+        assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
+        assert_eq!(r.vrps(), Some(1), "the sidecar's data is held");
+        assert!(r.rx.try_recv().is_err());
+        r.rpki.stop();
+    }
+
+    /// Issue #72, m14 design §5.1: a Routinator that would not start fails
+    /// the reload before anything changes, and the running one goes on.
+    #[test]
+    fn a_sidecar_that_fails_its_check_fails_the_reload_before_anything_changes() {
+        let mut r = Running::new("preflight");
+        let old_release = r.dir.script(
+            "routinator-0.14",
+            "if [ \"$1\" = --version ]; then echo 'Routinator 0.14.1'; exit 0; fi\nexec sleep 600",
+        );
+        let repository = r.dir.join("repo");
+        let port = r.cache.port();
+        let new = config(&sidecar_block(&old_release, &repository, port));
+        let err = preflight_as(&r.cfg.rpki, &new.rpki, false).unwrap_err();
+        assert!(
+            err.starts_with("rpki sidecar: Routinator 0.14.1 is not supported: "),
+            "{err}"
+        );
+        assert_eq!(routinator_pid(&r.rpki), r.pid, "the running one goes on");
+        assert!(r.rpki.status().is_some_and(|s| s.connected));
+        r.conn
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0; 16];
+        assert!(r.conn.read(&mut buf).is_err(), "the client is untouched");
+
+        // A missing binary, and settings Routinator refuses, likewise.
+        let missing = config(&sidecar_block(&r.dir.join("missing"), &repository, port));
+        let err = preflight_as(&r.cfg.rpki, &missing.rpki, false).unwrap_err();
+        assert!(err.contains("--version` could not be started"), "{err}");
+        let tal = r.with("", "tals arin;");
+        let err = preflight_as(&r.cfg.rpki, &tal.rpki, false).unwrap_err();
+        assert!(
+            err.starts_with("rpki sidecar: the ARIN TAL is listed"),
+            "{err}"
+        );
+
+        // Into `mode sidecar` as root: refused before anything runs, even
+        // `--version`. Otherwise the repository directory is created.
+        let ran = r.dir.join("ran");
+        let body = format!("touch '{}'\necho 'Routinator {}'", ran.display(), tested());
+        let marking = r.dir.script("marking", &body);
+        let fresh = r.dir.join("fresh/rpki");
+        let into = config(&sidecar_block(&marking, &fresh, 0));
+        let off = config("rpki { mode disabled; }");
+        let err = preflight_as(&off.rpki, &into.rpki, true).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "mode sidecar would run Routinator as root: {}",
+                privileges::SIDECAR_AS_ROOT_HINT
+            )
+        );
+        assert!(!ran.exists() && !fresh.exists());
+        assert_eq!(preflight_as(&off.rpki, &into.rpki, false), Ok(()));
+        assert!(ran.exists() && fresh.is_dir());
+        assert!(r.rx.try_recv().is_err());
+        r.rpki.stop();
+    }
+
+    /// The preflight checks only what the reload will start: new external
+    /// caches are looked up, as at start; a block that has not changed, or
+    /// one that turns validation off, needs nothing, not even as root.
+    #[test]
+    fn the_preflight_checks_what_will_start() {
+        let external = config("rpki { mode external; cache 127.0.0.1; }");
+        let bad = config("rpki { mode external; cache rtr.invalid; }");
+        let err = preflight_as(&external.rpki, &bad.rpki, false).unwrap_err();
+        assert!(
+            err.starts_with("cannot resolve rpki cache rtr.invalid: "),
+            "{err}"
+        );
+        assert_eq!(preflight_as(&bad.rpki, &bad.rpki, false), Ok(()));
+        let sidecar = config("rpki { mode sidecar; }");
+        let prefer = config("rpki { mode sidecar; enforcement prefer-valid; }");
+        assert_eq!(preflight_as(&sidecar.rpki, &prefer.rpki, true), Ok(()));
+        let off = config("rpki { mode disabled; }");
+        assert_eq!(preflight_as(&sidecar.rpki, &off.rpki, true), Ok(()));
+        assert_eq!(preflight_as(&sidecar.rpki, &external.rpki, true), Ok(()));
+    }
+
+    /// A Routinator that passed the preflight but cannot start, as when
+    /// the binary went away in between, leaves validation off rather than
+    /// the old data unexpired.
+    #[test]
+    fn a_sidecar_that_fails_to_start_after_the_preflight_disables_validation() {
+        let mut r = Running::new("late");
+        let missing = r.dir.join("missing");
+        let new = config(&sidecar_block(&missing, &r.dir.join("repo"), 0));
+        let err = r.rpki.reconfigure(&r.cfg.rpki, &new.rpki).unwrap_err();
+        assert!(
+            err.starts_with("rpki: cannot start the sidecar (rpki sidecar: "),
+            "{err}"
+        );
+        assert!(err.ends_with("); validation disabled"), "{err}");
+        assert!(closed(&mut r.conn));
+        assert!(!alive(r.pid));
+        assert!(r.rpki.sidecar.is_none() && r.rpki.status().is_none());
+        let change = next_change(&r.rx);
+        assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
+        // A later reload with a block that works starts it again; the
+        // routes then wait for its first full set.
+        let back = r.with("", "");
+        assert_eq!(
+            r.rpki.reconfigure(&new.rpki, &back.rpki),
+            Ok("rpki: sidecar started")
+        );
+        let pid = routinator_pid(&r.rpki);
+        assert!(waiting(&r.rpki).is_some());
+        r.rpki.stop();
+        assert!(!alive(pid));
     }
 }
