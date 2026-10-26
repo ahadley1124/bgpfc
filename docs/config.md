@@ -470,13 +470,20 @@ EoRR (RFC 7313 §4 lets an implementation do that). It cannot be stated with
 
 A neighbor that did not advertise the capability gets RFC 2918's refresh,
 which replaces routes but removes none, and the Message Subtype of its
-ROUTE-REFRESH messages is ignored (RFC 2918 §3). A BoRR from a neighbor
-that advertised Graceful Restart, for a family whose End-of-RIB has not
-come, is ignored and logged (RFC 7313 §4); so is an EoRR with no BoRR
-before it, and a message of a Message Subtype other than 0, 1 or 2 (§5). A
-BoRR or EoRR that is not four octets long is answered with a NOTIFICATION,
-ROUTE-REFRESH Message Error / Invalid Message Length, carrying the whole
-message (§5).
+ROUTE-REFRESH messages is ignored (RFC 2918 §3). So does one that advertised
+the capability while `enhanced-refresh no;` is set, or without the Route
+Refresh capability, though RFC 7313 §4 would have bgpfcd send it a BoRR and
+an EoRR: a neighbor that was told nothing of our capability reads a BoRR as a
+request and would send its table again, and RFC 2918 §4 allows a
+ROUTE-REFRESH only to a neighbor that advertised Route Refresh.
+COMPLIANCE.md lists these as deviations.
+
+A BoRR from a neighbor that advertised Graceful Restart, for a family whose
+End-of-RIB has not come, is ignored and logged (RFC 7313 §4); so is an EoRR
+with no BoRR before it, and a message of a Message Subtype other than 0, 1
+or 2 (§5). A BoRR or EoRR that is not four octets long is answered with a
+NOTIFICATION, ROUTE-REFRESH Message Error / Invalid Message Length,
+carrying the message, or as much of it as a NOTIFICATION can hold (§5).
 
 **BGP Roles.** `role customer;` says that our Role on the session is
 Customer: the neighbor is our transit provider (RFC 9234 §4). The names
