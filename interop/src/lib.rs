@@ -1098,6 +1098,92 @@ impl RtrStub {
     }
 }
 
+/// A script that stands in for Routinator as `bgpfcd`'s sidecar
+/// (AGENTS.md §9 step 14), never the real one: it answers `--version` as
+/// the release the daemon drives, and run as `server --rtr=ADDR:PORT ...`
+/// it waits `delay` seconds, as Routinator does for its first validation
+/// run before it opens its RTR listener, and then becomes this crate's
+/// `rtr-stub` on that address.
+///
+/// Every start is a new session of the cache: the script counts its starts
+/// in a file and gives the stub the count as its Session ID (RFC 8210
+/// §5.1), so a restart after a kill looks to the router as a Routinator
+/// that restarted does, and the VRPs are read from a file at each start, so
+/// a test can change what the next start serves with
+/// [`set_vrps`](Self::set_vrps). What the script prints on standard error
+/// reaches `bgpfcd`'s log as the sidecar's output.
+pub struct StubRoutinator {
+    /// The script, for the `binary` statement.
+    pub binary: PathBuf,
+    /// A directory of its own, for the `repository-dir` statement.
+    pub repository: PathBuf,
+    vrps: PathBuf,
+}
+
+impl StubRoutinator {
+    /// Write the script and the VRPs it serves, (prefix, max length,
+    /// origin AS), in the lab's directory.
+    ///
+    /// # Panics
+    /// If the files cannot be written.
+    #[must_use]
+    pub fn new(lab: &Lab, delay: u32, vrps: &[(&str, u8, u32)]) -> StubRoutinator {
+        let binary = lab.dir.join("routinator");
+        let repository = lab.dir.join("repository");
+        fs::create_dir_all(&repository).expect("repository dir");
+        let stub = StubRoutinator {
+            binary,
+            repository,
+            vrps: lab.dir.join("routinator-vrps"),
+        };
+        stub.set_vrps(vrps);
+        let counter = lab.dir.join("routinator-starts");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo 'Routinator 0.15.2'; exit 0; fi\n\
+             echo \"routinator stub: $*\" >&2\n\
+             rtr=\n\
+             for a in \"$@\"; do case \"$a\" in --rtr=*) rtr=\"${{a#--rtr=}}\";; esac; done\n\
+             [ -n \"$rtr\" ] || {{ echo 'routinator stub: no --rtr' >&2; exit 2; }}\n\
+             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
+             n=$((n + 1))\n\
+             echo \"$n\" > '{counter}'\n\
+             sleep {delay}\n\
+             exec '{rtr_stub}' \"$rtr\" \"$n\" $(cat '{vrps}')\n",
+            counter = counter.display(),
+            rtr_stub = rtr_stub_path().display(),
+            vrps = stub.vrps.display(),
+        );
+        // Written and made executable by another process: this one has
+        // threads that fork, and a forked child holding the file open for
+        // writing makes running it fail with ETXTBSY.
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                "sh",
+                &script,
+            ])
+            .arg(&stub.binary)
+            .status()
+            .expect("sh");
+        assert!(status.success(), "writing {}", stub.binary.display());
+        stub
+    }
+
+    /// What the next start serves.
+    ///
+    /// # Panics
+    /// If the file cannot be written.
+    pub fn set_vrps(&self, vrps: &[(&str, u8, u32)]) {
+        let lines: Vec<String> = vrps
+            .iter()
+            .map(|(prefix, max_len, asn)| format!("{prefix}-{max_len}-{asn}"))
+            .collect();
+        fs::write(&self.vrps, lines.join("\n")).expect("vrps file");
+    }
+}
+
 /// Path to `rtr-stub`. Cargo builds a package's binaries for its
 /// integration tests and puts them in `target/<profile>/`, beside the
 /// `deps/` directory the test binary runs from.

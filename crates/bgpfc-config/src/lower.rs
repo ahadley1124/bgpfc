@@ -15,7 +15,10 @@
 //! RFC 1123 §2.1 (cache host names); RFC 9234 §4 (`role`, `role-strict`);
 //! RFC 6811 §3 (`match rpki` and `set rpki`: policy matches and sets the
 //! validation state), §5 (`invalid`: filter or demote the Invalid), and
-//! RFC 8481 §5 (no action on the state unless the operator names it).
+//! RFC 8481 §5 (no action on the state unless the operator names it);
+//! RFC 8210 §6 (`refresh` within the Refresh Interval's range, and below
+//! the Expire Interval), §9 (the sidecar's `rtr-listen` is a loopback
+//! address: unprotected TCP only on a trusted, controlled network).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -31,7 +34,7 @@ use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
 use crate::ast::{
     Action, AddPathSend, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, DEFAULT_RESTART_TIME,
     DEFAULT_STALE_TIME, Fib, FibMode, GracefulRestart, Http, Match, Neighbor, Policy, PrefixEntry,
-    PrefixList, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction, Term,
+    PrefixList, Routinator, Rpki, RpkiCache, RpkiMode, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -508,6 +511,55 @@ impl Lowerer {
             port: port.unwrap_or(Rpki::DEFAULT_PORT),
             preference: preference.unwrap_or(0),
         })
+    }
+
+    /// `routinator { ... }`: the statements are checked one by one; what
+    /// needs the sidecar crate's knowledge (TAL names, reserved
+    /// arguments) is checked by the daemon.
+    fn routinator(&mut self, s: &Statement) -> Option<Routinator> {
+        let mut b = RoutinatorBuilder::new();
+        for t in self.block(s, 0)? {
+            b.statement(self, t);
+        }
+        b.finish(self, s.pos)
+    }
+
+    /// An absolute path, as one argument.
+    fn absolute_path(&mut self, s: &Statement) -> Option<PathBuf> {
+        let a = self.arg(s)?;
+        if !PathBuf::from(&a.value).is_absolute() {
+            self.err(
+                a.pos,
+                format!(
+                    "{} must be an absolute path, found `{}`",
+                    s.keyword, a.value
+                ),
+            );
+            return None;
+        }
+        if a.value.contains('\0') {
+            self.err(a.pos, format!("{} must not contain a NUL byte", s.keyword));
+            return None;
+        }
+        Some(PathBuf::from(&a.value))
+    }
+
+    /// A whole number of seconds from `min` to `max`, as one argument.
+    fn secs_within(&mut self, s: &Statement, min: Duration, max: Duration) -> Option<Duration> {
+        let d = self.secs(s)?;
+        if !(min..=max).contains(&d) {
+            self.err(
+                s.args[0].pos,
+                format!(
+                    "{} must be between {} and {} seconds",
+                    s.keyword,
+                    min.as_secs(),
+                    max.as_secs()
+                ),
+            );
+            return None;
+        }
+        Some(d)
     }
 
     /// `max-expire N` within the range RFC 8210 §6 gives the Expire
@@ -1025,6 +1077,11 @@ struct RpkiBuilder {
     max_vrps: Once<u32>,
     backoff: Once<(Duration, Duration)>,
     invalid: Once<InvalidAction>,
+    routinator: Once<Routinator>,
+    /// Where the `routinator` block and the first `cache` statement are,
+    /// for the modes that exclude them.
+    routinator_pos: Option<Pos>,
+    cache_pos: Option<Pos>,
 }
 
 impl RpkiBuilder {
@@ -1041,6 +1098,9 @@ impl RpkiBuilder {
             max_vrps: Once::new("max-vrps"),
             backoff: Once::new("backoff"),
             invalid: Once::new("invalid"),
+            routinator: Once::new("routinator"),
+            routinator_pos: None,
+            cache_pos: None,
         }
     }
 
@@ -1050,10 +1110,11 @@ impl RpkiBuilder {
                 let v = l.arg(t).and_then(|a| match a.value.as_str() {
                     "disabled" => Some(RpkiMode::Disabled),
                     "external" => Some(RpkiMode::External),
+                    "sidecar" => Some(RpkiMode::Sidecar),
                     _ => {
                         l.err(
                             a.pos,
-                            format!("`{}` is not `disabled` or `external`", a.value),
+                            format!("`{}` is not `disabled`, `external` or `sidecar`", a.value),
                         );
                         None
                     }
@@ -1062,6 +1123,7 @@ impl RpkiBuilder {
             }
             "cache" => {
                 self.cache_seen = true;
+                self.cache_pos.get_or_insert(t.pos);
                 let Some(cache) = l.rpki_cache(t) else {
                     return;
                 };
@@ -1130,6 +1192,11 @@ impl RpkiBuilder {
                 });
                 self.invalid.set(l, t.pos, v);
             }
+            "routinator" => {
+                self.routinator_pos.get_or_insert(t.pos);
+                let v = l.routinator(t);
+                self.routinator.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`rpki`"),
         }
     }
@@ -1138,13 +1205,27 @@ impl RpkiBuilder {
         // Issue #60: where validation data comes from is one setting the
         // operator states, never something implied by what else is there.
         if !self.mode.seen {
-            l.err(pos, "`rpki` needs a `mode` (`disabled` or `external`)");
+            l.err(
+                pos,
+                "`rpki` needs a `mode` (`disabled`, `external` or `sidecar`)",
+            );
         }
         let d = Rpki::default();
-        let (backoff_min, backoff_max) =
-            self.backoff.value.unwrap_or((d.backoff_min, d.backoff_max));
+        let mode = self.mode.value?;
+        // RFC 8210 §6 sets the Retry Interval of a cache that is up; here
+        // the cache is a child that may not be up yet, so the default
+        // waits less between attempts than for a remote cache.
+        let default_backoff = (
+            d.backoff_min,
+            if mode == RpkiMode::Sidecar {
+                Rpki::DEFAULT_SIDECAR_BACKOFF_MAX
+            } else {
+                d.backoff_max
+            },
+        );
+        let (backoff_min, backoff_max) = self.backoff.value.unwrap_or(default_backoff);
         let rpki = Rpki {
-            mode: self.mode.value?,
+            mode,
             caches: self.caches,
             version: self.version.value.unwrap_or(d.version),
             connect_timeout: self.connect_timeout.value.unwrap_or(d.connect_timeout),
@@ -1155,18 +1236,46 @@ impl RpkiBuilder {
             backoff_min,
             backoff_max,
             invalid: self.invalid.value.unwrap_or(d.invalid),
+            routinator: self.routinator.value,
         };
         if rpki.mode == RpkiMode::External && !self.cache_seen {
             l.err(pos, "`mode external` needs at least one `cache`");
         }
+        // The two sources of VRPs are alternatives, and the one in use is
+        // the one the mode names. A statement for the other would be
+        // quietly ignored, so it is an error, except under `mode disabled`,
+        // which keeps whatever is written and uses none of it (so that a
+        // block can be switched off and on again by its mode alone).
+        if rpki.mode == RpkiMode::Sidecar {
+            if !self.routinator.seen {
+                l.err(pos, "`mode sidecar` needs a `routinator` block");
+            }
+            if let Some(at) = self.cache_pos {
+                l.err(
+                    at,
+                    "`cache` is not used with `mode sidecar`: the RTR client connects to the sidecar's own listener (`rtr-listen`)",
+                );
+            }
+        }
+        if rpki.mode == RpkiMode::External
+            && let Some(at) = self.routinator_pos
+        {
+            l.err(
+                at,
+                "`routinator` is used only with `mode sidecar`; `mode external` takes its VRPs from the `cache` list",
+            );
+        }
         // RFC 8481 §5: "Absent specific operator configuration, policy
         // MUST NOT be applied." What becomes of Invalid routes is stated,
         // as where the VRPs come from is (issue #60), not implied by a
-        // cache being there.
-        if rpki.mode == RpkiMode::External && !self.invalid.seen {
+        // cache being there, or by a validator the daemon runs itself.
+        if matches!(rpki.mode, RpkiMode::External | RpkiMode::Sidecar) && !self.invalid.seen {
             l.err(
                 pos,
-                "`mode external` needs an `invalid` statement: `drop`, `prefer-valid` or `policy`",
+                format!(
+                    "`mode {}` needs an `invalid` statement: `drop`, `prefer-valid` or `policy`",
+                    rpki.mode
+                ),
             );
         }
         // The client would quietly cut the one to the other; say so instead.
@@ -1191,6 +1300,211 @@ impl RpkiBuilder {
             );
         }
         Some(rpki)
+    }
+}
+
+/// `restart-backoff INITIAL CAP`, each within 1 s and an hour.
+fn restart_backoff_of(l: &mut Lowerer, s: &Statement) -> Option<(Duration, Duration)> {
+    let [initial, cap] = l.args(s, 2)? else {
+        return None;
+    };
+    let bound = |l: &mut Lowerer, a: &Arg| {
+        let n: u32 = l.parse(a, "a number of seconds")?;
+        let d = Duration::from_secs(u64::from(n));
+        if d.is_zero() || d > Routinator::MAX_DELAY {
+            l.err(
+                a.pos,
+                format!(
+                    "a restart delay must be between 1 and {} seconds",
+                    Routinator::MAX_DELAY.as_secs()
+                ),
+            );
+            return None;
+        }
+        Some(d)
+    };
+    let initial = bound(l, initial);
+    let cap = bound(l, cap);
+    let (initial, cap) = (initial?, cap?);
+    if cap < initial {
+        l.err(
+            s.pos,
+            format!(
+                "restart-backoff cap {}s is below its initial delay {}s",
+                cap.as_secs(),
+                initial.as_secs()
+            ),
+        );
+        return None;
+    }
+    Some((initial, cap))
+}
+
+/// The statements of the `routinator` block, each at most once but `tal`,
+/// `global-arg` and `server-arg`.
+struct RoutinatorBuilder {
+    binary: Once<PathBuf>,
+    repository_dir: Once<PathBuf>,
+    rtr_listen: Once<SocketAddr>,
+    rir_tals: Once<bool>,
+    tals: Vec<String>,
+    tal_dir: Once<PathBuf>,
+    accept_arin_rpa: Once<bool>,
+    refresh: Once<Duration>,
+    config_file: Once<PathBuf>,
+    global_args: Vec<String>,
+    server_args: Vec<String>,
+    restart_backoff: Once<(Duration, Duration)>,
+    stable_after: Once<Duration>,
+    stop_timeout: Once<Duration>,
+    failure_threshold: Once<u32>,
+}
+
+impl RoutinatorBuilder {
+    fn new() -> Self {
+        RoutinatorBuilder {
+            binary: Once::new("binary"),
+            repository_dir: Once::new("repository-dir"),
+            rtr_listen: Once::new("rtr-listen"),
+            rir_tals: Once::new("rir-tals"),
+            tals: Vec::new(),
+            tal_dir: Once::new("tal-dir"),
+            accept_arin_rpa: Once::new("accept-arin-rpa"),
+            refresh: Once::new("refresh"),
+            config_file: Once::new("config-file"),
+            global_args: Vec::new(),
+            server_args: Vec::new(),
+            restart_backoff: Once::new("restart-backoff"),
+            stable_after: Once::new("stable-after"),
+            stop_timeout: Once::new("stop-timeout"),
+            failure_threshold: Once::new("failure-threshold"),
+        }
+    }
+
+    fn statement(&mut self, l: &mut Lowerer, t: &Statement) {
+        match t.keyword.as_str() {
+            "binary" => {
+                let v = l.absolute_path(t);
+                self.binary.set(l, t.pos, v);
+            }
+            "repository-dir" => {
+                let v = l.absolute_path(t);
+                self.repository_dir.set(l, t.pos, v);
+            }
+            "rtr-listen" => {
+                // RFC 8210 §9: unprotected TCP only between a cache and a
+                // router on a trusted, controlled network; the sidecar's
+                // cache is on the router itself, and nothing else may
+                // reach it.
+                let v = l
+                    .parse_arg::<SocketAddr>(t, "an `address:port`")
+                    .filter(|a| {
+                        let ok = a.ip().is_loopback();
+                        if !ok {
+                            l.err(
+                                t.pos,
+                                format!(
+                                    "rtr-listen address {a} is not a loopback address (RFC 8210 §9)"
+                                ),
+                            );
+                        }
+                        ok
+                    });
+                self.rtr_listen.set(l, t.pos, v);
+            }
+            "rir-tals" => {
+                let v = l.yes_no(t);
+                self.rir_tals.set(l, t.pos, v);
+            }
+            "tal" => {
+                if let Some(a) = l.arg(t) {
+                    if self.tals.contains(&a.value) {
+                        l.err(a.pos, format!("tal `{}` is listed twice", a.value));
+                    } else {
+                        self.tals.push(a.value.clone());
+                    }
+                }
+            }
+            "tal-dir" => {
+                let v = l.absolute_path(t);
+                self.tal_dir.set(l, t.pos, v);
+            }
+            "accept-arin-rpa" => {
+                let v = l.yes_no(t);
+                self.accept_arin_rpa.set(l, t.pos, v);
+            }
+            "refresh" => {
+                // RFC 8210 §6: the Refresh Interval is at least 1 s, and
+                // the Expire Interval must be larger than it.
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_REFRESH);
+                self.refresh.set(l, t.pos, v);
+            }
+            "config-file" => {
+                let v = l.absolute_path(t);
+                self.config_file.set(l, t.pos, v);
+            }
+            "global-arg" => {
+                if let Some(a) = l.arg(t) {
+                    self.global_args.push(a.value.clone());
+                }
+            }
+            "server-arg" => {
+                if let Some(a) = l.arg(t) {
+                    self.server_args.push(a.value.clone());
+                }
+            }
+            "restart-backoff" => {
+                let v = restart_backoff_of(l, t);
+                self.restart_backoff.set(l, t.pos, v);
+            }
+            "stable-after" => {
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_STABLE_AFTER);
+                self.stable_after.set(l, t.pos, v);
+            }
+            "stop-timeout" => {
+                let v = l.secs_within(t, Duration::from_secs(1), Routinator::MAX_DELAY);
+                self.stop_timeout.set(l, t.pos, v);
+            }
+            "failure-threshold" => {
+                let v = l.arg(t).and_then(|a| {
+                    let n: u32 = l.parse(a, "a number of failures (1-4294967295)")?;
+                    if n == 0 {
+                        l.err(a.pos, "failure-threshold must be at least 1");
+                        return None;
+                    }
+                    Some(n)
+                });
+                self.failure_threshold.set(l, t.pos, v);
+            }
+            _ => l.unknown(t, "`routinator`"),
+        }
+    }
+
+    fn finish(self, l: &mut Lowerer, pos: Pos) -> Option<Routinator> {
+        if !self.binary.seen {
+            l.err(pos, "`routinator` needs a `binary`");
+        }
+        if !self.repository_dir.seen {
+            l.err(pos, "`routinator` needs a `repository-dir`");
+        }
+        let mut r = Routinator::new(self.binary.value?, self.repository_dir.value?);
+        r.rtr_listen = self.rtr_listen.value.unwrap_or(r.rtr_listen);
+        r.rir_tals = self.rir_tals.value.unwrap_or(r.rir_tals);
+        r.tals = self.tals;
+        r.tal_dir = self.tal_dir.value;
+        r.accept_arin_rpa = self.accept_arin_rpa.value.unwrap_or(r.accept_arin_rpa);
+        r.refresh = self.refresh.value.unwrap_or(r.refresh);
+        r.config_file = self.config_file.value;
+        r.global_args = self.global_args;
+        r.server_args = self.server_args;
+        if let Some((initial, cap)) = self.restart_backoff.value {
+            r.restart_backoff_initial = initial;
+            r.restart_backoff_cap = cap;
+        }
+        r.stable_after = self.stable_after.value.unwrap_or(r.stable_after);
+        r.stop_timeout = self.stop_timeout.value.unwrap_or(r.stop_timeout);
+        r.failure_threshold = self.failure_threshold.value.unwrap_or(r.failure_threshold);
+        Some(r)
     }
 }
 

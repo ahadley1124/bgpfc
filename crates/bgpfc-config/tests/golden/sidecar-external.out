@@ -1,0 +1,3 @@
+sidecar-external.conf:8:5: `routinator` is used only with `mode sidecar`; `mode external` takes its VRPs from the `cache` list
+      routinator { binary /usr/bin/routinator; repository-dir /var/lib/bgpfc/rpki; }
+      ^

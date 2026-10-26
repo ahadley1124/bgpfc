@@ -112,7 +112,7 @@ value-errors.conf:36:20: `ipv4` is not `ipv4-unicast` or `ipv6-unicast`
 value-errors.conf:38:5: `maximum-prefix` is given more than once for ipv6-unicast
       maximum-prefix ipv6-unicast 20;
       ^
-value-errors.conf:41:10: `sometimes` is not `disabled` or `external`
+value-errors.conf:41:10: `sometimes` is not `disabled`, `external` or `sidecar`
       mode sometimes;
            ^
 value-errors.conf:42:26: `0` is not a port number (1-65535)
@@ -184,7 +184,7 @@ value-errors.conf:62:5: `backoff` is given more than once
 value-errors.conf:63:5: unknown statement `frobnicate` in `rpki`
       frobnicate yes;
       ^
-value-errors.conf:65:1: `rpki` needs a `mode` (`disabled` or `external`)
+value-errors.conf:65:1: `rpki` needs a `mode` (`disabled`, `external` or `sidecar`)
   rpki { cache 192.0.2.9; }
   ^
 value-errors.conf:65:1: `rpki` is given more than once

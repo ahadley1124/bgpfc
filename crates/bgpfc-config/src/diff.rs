@@ -56,10 +56,12 @@ pub enum GlobalChange {
     /// The `control` block.
     Control,
     /// The `rpki` block, an absent one counting as `mode disabled` with
-    /// the defaults: the RTR client starts, stops or restarts. A block
-    /// that only spells something differently, such as a default written
-    /// out or a cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)),
-    /// is no change.
+    /// the defaults: the RTR client starts, stops or restarts, and so may
+    /// the sidecar (the `routinator` block, see
+    /// [`Rpki::sidecar`](crate::ast::Rpki::sidecar)). A block that only
+    /// spells something differently, such as a default written out or a
+    /// cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)), is
+    /// no change.
     Rpki,
     /// What the RIB does with Invalid routes by itself, the `invalid`
     /// statement of the `rpki` block: applied to the running RIB, which
@@ -602,5 +604,83 @@ mod tests {
             ConfigDiff::between(&two, &swapped).global,
             vec![GlobalChange::Rpki]
         );
+    }
+
+    #[test]
+    fn a_sidecar_block_changes_when_anything_it_asks_for_does() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let sidecar = |body: &str| {
+            with(&format!(
+                "rpki {{ mode sidecar; invalid drop; routinator {{ binary /usr/bin/routinator; \
+                 repository-dir /var/lib/rpki; {body} }} }}"
+            ))
+        };
+        let base = sidecar("");
+        assert!(base.rpki.sidecar().is_some());
+        // Spelling out the defaults, or reordering the statements, is no
+        // change: the running sidecar is left alone.
+        for same in [
+            "rtr-listen 127.0.0.1:0; rir-tals yes; accept-arin-rpa no; refresh 600;",
+            "restart-backoff 1 300; stable-after 300; stop-timeout 10; failure-threshold 5;",
+        ] {
+            assert!(
+                ConfigDiff::between(&base, &sidecar(same)).is_empty(),
+                "{same}"
+            );
+        }
+        // Everything else asks for another Routinator.
+        for other in [
+            "rtr-listen 127.0.0.1:3323;",
+            "rir-tals no; tal ripe;",
+            "tal ripe-pilot;",
+            "tal-dir /etc/tals;",
+            "refresh 300;",
+            "config-file /etc/routinator.conf;",
+            "global-arg \"--strict\";",
+            "server-arg \"--http=127.0.0.1:8323\";",
+            "restart-backoff 2 300;",
+            "stable-after 60;",
+            "stop-timeout 20;",
+            "failure-threshold 3;",
+        ] {
+            assert_eq!(
+                ConfigDiff::between(&base, &sidecar(other)).global,
+                vec![GlobalChange::Rpki],
+                "{other}"
+            );
+        }
+        let moved = with(
+            "rpki { mode sidecar; invalid drop; routinator { repository-dir /var/lib/rpki; \
+             binary /opt/routinator; } }",
+        );
+        assert_eq!(
+            ConfigDiff::between(&base, &moved).global,
+            vec![GlobalChange::Rpki]
+        );
+        // The action for Invalid routes is the RIB's alone.
+        let prefer = with(
+            "rpki { mode sidecar; invalid prefer-valid; routinator { binary /usr/bin/routinator; \
+             repository-dir /var/lib/rpki; } }",
+        );
+        assert_eq!(
+            ConfigDiff::between(&base, &prefer).global,
+            vec![GlobalChange::RpkiInvalid]
+        );
+        // The mode: to `external` and back, and off.
+        let external = with("rpki { mode external; invalid drop; cache 127.0.0.1 port 3323; }");
+        assert_eq!(
+            ConfigDiff::between(&base, &external).global,
+            vec![GlobalChange::Rpki]
+        );
+        let disabled = with(
+            "rpki { mode disabled; invalid drop; routinator { binary /usr/bin/routinator; \
+             repository-dir /var/lib/rpki; } }",
+        );
+        assert_eq!(
+            ConfigDiff::between(&base, &disabled).global,
+            vec![GlobalChange::Rpki]
+        );
+        // Only `mode sidecar` runs the block.
+        assert!(disabled.rpki.sidecar().is_none() && external.rpki.sidecar().is_none());
     }
 }

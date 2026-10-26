@@ -95,6 +95,13 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   forbids acting on the state unless the operator says so. A route `drop`
   refuses is held, shown by `show routes PREFIX`, and used again when a VRP
   change admits it, with no UPDATE from the neighbor.
+- An optional Routinator sidecar (`rpki { mode sidecar; ... }`): bgpfcd runs
+  Routinator, an executable you install, as a supervised child process,
+  restarts it with backoff and raises a `failed` alarm when it keeps failing,
+  and reads its VRPs over RTR on the loopback. `bgpfcctl show rpki` and the
+  HTTP API report its state; a reload that changes its block runs a new
+  child, after checking that the new binary would start; a shutdown stops it
+  and a crash of bgpfcd kills it.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -137,7 +144,7 @@ that exchange several paths (ADD-PATH, RFC 7911, added after v1). Linux only.
 
 ### Next: RPKI route origin validation
 
-In progress ([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14). Every route
+([`AGENTS.md`](AGENTS.md) §9, steps 11 to 14.) Every route
 carries its RFC 6811 origin validation state (step 11), which the RIB
 validates again in place when the VRPs change, and which `bgpfcctl show
 routes` and the HTTP API show. With an `rpki { mode external; ... }` block
@@ -174,9 +181,37 @@ says that absent specific operator configuration policy MUST NOT be
 applied, so an `external` block without `invalid` is a configuration
 error. Interop tests drive all three against StayRTR and BIRD.
 
-Next, bgpfcd will be able to start and supervise an optional Routinator as a
-child process (step 14). Routinator is a separate program; bgpfc neither
-bundles nor links it.
+bgpfcd can also run and supervise a Routinator itself (step 14) and read its
+VRPs from it, instead of from caches you run and name:
+
+```
+rpki {
+    mode sidecar;
+    invalid drop;
+    routinator {
+        binary /usr/bin/routinator;       # never looked up on PATH
+        repository-dir /var/lib/bgpfc/rpki;
+        rtr-listen 127.0.0.1:3323;        # loopback only; port 0 picks one
+    }
+}
+```
+
+Routinator is a separate program; bgpfc neither bundles nor links it, and
+bgpfcd drives the 0.15 series (it asks the binary for `--version` before it
+runs it). bgpfcd starts it with a command line derived from the block, in an
+environment of two variables, without capabilities and in a process group of
+its own, and logs what it prints. A child that exits is restarted after a
+doubling delay, and after `failure-threshold` failures in a row `show rpki`
+reports the `failed` alarm while the retries go on. The RTR client connects
+to the address the sidecar serves on, which Routinator opens only after its
+first validation run, so every route is `disabled` until then. The child
+never outlives the daemon: a `SIGTERM` stops it while the sessions close,
+and a daemon that is killed takes it down through the parent-death signal.
+`invalid` is required here as it is with caches. Start the daemon as an
+unprivileged user (`contrib/bgpfcd.service` does, with `KillMode=mixed`):
+a child of root would have every capability. The tests use shell scripts
+and this repository's `rtr-stub` in Routinator's place; no real Routinator
+is run by them.
 
 ### BGP roles and Only to Customer
 
@@ -218,12 +253,15 @@ crates/
   bgpfc-control  Unix-socket protocol, HTTP/1.1 server, JSON writer
   bgpfc-rpki     VRP set, RFC 6811 origin validation, validation sources (no I/O)
   bgpfc-rtr      RTR (RFC 8210/6810): PDU codec, session machine, client thread
+  bgpfc-sidecar  Routinator supervision: settings, command line, version check,
+                 restart backoff, supervisor state machine, child process shell
   bgpfc-prof     profiling counters and histograms (only with --features profiling)
   bgpfc-bench    load generator, benchmark harness, micro-benchmarks (dev tooling)
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
-interop/         tests against BIRD / FRR / GoBGP and the StayRTR cache (dev-only)
+interop/         tests against BIRD / FRR / GoBGP, the StayRTR cache and a stub
+                 Routinator (dev-only)
 ```
 
 ## Build

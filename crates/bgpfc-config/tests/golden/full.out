@@ -57,6 +57,7 @@ Config {
         backoff_min: 2s,
         backoff_max: 300s,
         invalid: PreferValid,
+        routinator: None,
     },
     prefix_lists: [
         PrefixList {

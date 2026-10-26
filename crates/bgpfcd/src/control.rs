@@ -31,13 +31,14 @@ use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
 use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_sidecar::SidecarState;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
     FibMsg, FibReport, PAGE, PeerInput, PeerReport, RestartReport, RibMsg, RibQuery, RibReply,
-    RouteReport, RpkiReport,
+    RouteReport, RpkiReport, SidecarReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -558,6 +559,9 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
             if current(status, c) { ", current" } else { "" }
         ));
     }
+    if let Some(sidecar) = &r.sidecar {
+        sidecar_lines(sidecar, now, &mut lines);
+    }
     let Some(s) = status else {
         return lines;
     };
@@ -608,6 +612,82 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     lines
 }
 
+/// How the sidecar's supervision stands, for a line: the state and what
+/// goes with it. The alarm of `docs/control.md` is the `failed` state.
+fn sidecar_state(state: SidecarState, now: Instant) -> String {
+    match state {
+        SidecarState::Stopped => "stopped".to_owned(),
+        SidecarState::Starting => "starting".to_owned(),
+        SidecarState::Running { pid, since } => {
+            format!("running, pid {pid}, up {}s", seconds_between(since, now))
+        }
+        SidecarState::BackingOff { until, failures } | SidecarState::Failed { until, failures } => {
+            format!(
+                "{state}, next attempt in {}s after {failures} failures in a row",
+                seconds_between(now, until)
+            )
+        }
+        SidecarState::ShuttingDown { pid: Some(pid) } => format!("shutting-down, pid {pid}"),
+        SidecarState::ShuttingDown { pid: None } => "shutting-down".to_owned(),
+    }
+}
+
+/// The `sidecar` lines of `show rpki`: the Routinator that bgpfcd runs
+/// (`docs/control.md`, "RPKI").
+fn sidecar_lines(r: &SidecarReport, now: Instant, lines: &mut Vec<String>) {
+    let s = &r.status;
+    lines.push(format!("sidecar state {}", sidecar_state(s.state, now)));
+    lines.push(format!(
+        "sidecar routinator {} {}, rtr {}",
+        r.version,
+        r.binary.display(),
+        s.rtr
+    ));
+    lines.push(format!(
+        "sidecar restarts {} failures {}",
+        s.restarts, s.consecutive_failures
+    ));
+    if let Some(exit) = &s.last_exit {
+        // A spawn error is the operating system's words, with the path.
+        lines.push(format!("sidecar last exit {}", one_line(&exit.to_string())));
+    }
+}
+
+/// The `sidecar` member of `show rpki`: `null` without a sidecar.
+fn write_sidecar(j: &mut Json, r: Option<&SidecarReport>, now: Instant) {
+    let Some(r) = r else {
+        j.null();
+        return;
+    };
+    let s = &r.status;
+    let (up, retry) = match s.state {
+        SidecarState::Running { since, .. } => (Some(seconds_between(since, now)), None),
+        SidecarState::BackingOff { until, .. } | SidecarState::Failed { until, .. } => {
+            (None, Some(seconds_between(now, until)))
+        }
+        SidecarState::Stopped | SidecarState::Starting | SidecarState::ShuttingDown { .. } => {
+            (None, None)
+        }
+    };
+    j.begin_object()
+        .field_str("state", s.state.name())
+        .field_bool("failed", matches!(s.state, SidecarState::Failed { .. }))
+        .field_opt_num("pid", s.pid)
+        .field_opt_num("up_seconds", up)
+        .field_opt_num("next_attempt_seconds", retry)
+        .field_num("restarts", s.restarts)
+        .field_num("failures", s.consecutive_failures)
+        .field_opt("last_exit", s.last_exit.as_ref())
+        .field_display("binary", r.binary.display())
+        .field_display("version", &r.version)
+        .key("rtr")
+        .begin_object()
+        .field_display("host", s.rtr.ip())
+        .field_num("port", s.rtr.port())
+        .end_object()
+        .end_object();
+}
+
 /// `text` with its control characters escaped (`\n`, `\r`, `\t`,
 /// `\u{001b}`), for a line of a reply. The line protocol of
 /// `docs/control.md` ends a line at a newline and a reply at a line of a
@@ -651,7 +731,8 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
             .field_bool("current", current(status, c))
             .end_object();
     }
-    j.end_array();
+    j.end_array().key("sidecar");
+    write_sidecar(j, r.sidecar.as_ref(), now);
     let Some(s) = status else {
         // The same members without a client, so that a reader needs no
         // second shape.
@@ -2919,6 +3000,7 @@ mod tests {
                 last_error_at: now.checked_sub(Duration::from_secs(30)),
                 running: true,
             }),
+            sidecar: None,
         }
     }
 
@@ -2950,7 +3032,7 @@ mod tests {
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
                 r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
-                r#""current":true}],"#,
+                r#""current":true}],"sidecar":null,"#,
                 r#""running":true,"state":"idle","connected":true,"version":1,"#,
                 r#""session_id":4242,"serial":17,"synced_seconds_ago":12,"#,
                 r#""expires_in_seconds":7188,"#,
@@ -2959,6 +3041,149 @@ mod tests {
                 r#""last_error":"rtr cache connection timed out cache=127.0.0.1:3323","#,
                 r#""last_error_seconds_ago":30}"#
             )
+        );
+    }
+
+    /// The report of a sidecar in `state`, the child's last exit being
+    /// `last_exit`.
+    fn sidecar_report(
+        state: bgpfc_sidecar::SidecarState,
+        last_exit: Option<bgpfc_sidecar::ExitReason>,
+    ) -> RpkiReport {
+        let pid = match state {
+            bgpfc_sidecar::SidecarState::Running { pid, .. } => Some(pid),
+            bgpfc_sidecar::SidecarState::ShuttingDown { pid } => pid,
+            _ => None,
+        };
+        let mut report = RpkiReport {
+            config: rpki_block(
+                "rpki { mode sidecar; invalid drop; routinator {
+                 binary /usr/bin/routinator; repository-dir /var/lib/rpki; } }",
+            ),
+            status: None,
+            sidecar: None,
+        };
+        report.sidecar = Some(SidecarReport {
+            status: bgpfc_sidecar::SidecarStatus {
+                state,
+                pid,
+                restarts: 2,
+                consecutive_failures: 5,
+                last_exit,
+                rtr: "127.0.0.1:3323".parse().unwrap(),
+            },
+            version: bgpfc_sidecar::parse_version("Routinator 0.15.2").unwrap(),
+            binary: "/usr/bin/routinator".into(),
+        });
+        report
+    }
+
+    #[test]
+    fn the_sidecar_is_shown_in_every_state() {
+        use bgpfc_sidecar::{ExitReason, SidecarState};
+        let now = Instant::now();
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        let ago = |secs: u64| now.checked_sub(Duration::from_secs(secs)).unwrap();
+
+        // Running: the child, how long it has been up, the numbers.
+        let running = sidecar_report(
+            SidecarState::Running {
+                pid: 4242,
+                since: ago(35),
+            },
+            Some(ExitReason::Code(1)),
+        );
+        let r = render_rpki(&running, now);
+        assert_eq!(
+            r.lines,
+            [
+                "mode sidecar",
+                "invalid drop",
+                "sidecar state running, pid 4242, up 35s",
+                "sidecar routinator 0.15.2 /usr/bin/routinator, rtr 127.0.0.1:3323",
+                "sidecar restarts 2 failures 5",
+                "sidecar last exit exited with status 1",
+            ]
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#""caches":[],"sidecar":{"state":"running","failed":false,"pid":4242,"#,
+                r#""up_seconds":35,"next_attempt_seconds":null,"restarts":2,"failures":5,"#,
+                r#""last_exit":"exited with status 1","binary":"/usr/bin/routinator","#,
+                r#""version":"0.15.2","rtr":{"host":"127.0.0.1","port":3323}},"running":false"#,
+            )),
+            "{}",
+            r.json
+        );
+
+        // Backing off, and the alarm: the next attempt, and that it is
+        // the alarm.
+        let backing = sidecar_report(
+            SidecarState::BackingOff {
+                until: at(4),
+                failures: 2,
+            },
+            Some(ExitReason::Signal {
+                number: 9,
+                core_dumped: false,
+            }),
+        );
+        let r = render_rpki(&backing, now);
+        assert_eq!(
+            r.lines[2],
+            "sidecar state backing-off, next attempt in 4s after 2 failures in a row"
+        );
+        assert_eq!(r.lines[5], "sidecar last exit killed by signal 9 (SIGKILL)");
+        assert!(r.json.contains(r#""state":"backing-off","failed":false,"pid":null,"up_seconds":null,"next_attempt_seconds":4,"#));
+        let failed = sidecar_report(
+            SidecarState::Failed {
+                until: at(300),
+                failures: 7,
+            },
+            Some(ExitReason::SpawnFailed(
+                "No such file\nor directory".to_owned(),
+            )),
+        );
+        let r = render_rpki(&failed, now);
+        assert_eq!(
+            r.lines[2],
+            "sidecar state failed, next attempt in 300s after 7 failures in a row"
+        );
+        // What the operating system said stays on its line.
+        assert_eq!(
+            r.lines[5],
+            "sidecar last exit could not be started: No such file\\nor directory"
+        );
+        assert!(r.json.contains(r#""state":"failed","failed":true,"#));
+        assert!(
+            r.json
+                .contains(r#""last_exit":"could not be started: No such file\nor directory""#)
+        );
+
+        // The rest: the state alone, and a stop with and without its child.
+        for (state, line) in [
+            (SidecarState::Stopped, "stopped"),
+            (SidecarState::Starting, "starting"),
+            (
+                SidecarState::ShuttingDown { pid: Some(77) },
+                "shutting-down, pid 77",
+            ),
+            (SidecarState::ShuttingDown { pid: None }, "shutting-down"),
+        ] {
+            let r = render_rpki(&sidecar_report(state, None), now);
+            assert_eq!(r.lines[2], format!("sidecar state {line}"));
+            assert_eq!(r.lines.len(), 5, "no last exit: {:?}", r.lines);
+            assert!(r.json.contains(r#""last_exit":null"#));
+        }
+
+        // Without a sidecar the member is there and null.
+        let mut none = sidecar_report(SidecarState::Stopped, None);
+        none.sidecar = None;
+        let r = render_rpki(&none, now);
+        assert_eq!(r.lines, ["mode sidecar", "invalid drop"]);
+        assert!(
+            r.json
+                .contains(r#""caches":[],"sidecar":null,"running":false"#)
         );
     }
 
@@ -3003,6 +3228,7 @@ mod tests {
         let report = RpkiReport {
             config: rpki_block("rpki { mode disabled; cache 192.0.2.10; }"),
             status: None,
+            sidecar: None,
         };
         let r = render_rpki(&report, now);
         assert_eq!(
@@ -3017,7 +3243,7 @@ mod tests {
             r.json,
             concat!(
                 r#"{"mode":"disabled","invalid":"policy","caches":[{"host":"192.0.2.10","port":323,"#,
-                r#""preference":0,"in_use":false,"current":false}],"#,
+                r#""preference":0,"in_use":false,"current":false}],"sidecar":null,"#,
                 r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
                 r#""synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"#,
@@ -3027,6 +3253,7 @@ mod tests {
         let none = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            sidecar: None,
         };
         assert_eq!(
             render_rpki(&none, now).lines,
@@ -3212,6 +3439,7 @@ mod tests {
         let off = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            sidecar: None,
         };
         let r = render_validation(&off, p("192.0.2.0/24"), Asn(64_496));
         assert_eq!(

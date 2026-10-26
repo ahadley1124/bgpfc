@@ -5,7 +5,8 @@
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
-//! client of the `rpki` block, which feeds the RIB thread. Since step 16 a
+//! client of the `rpki` block, which feeds the RIB thread, and since step
+//! 14 the Routinator sidecar that `mode sidecar` has it read from. Since step 16 a
 //! daemon that restarts in install mode keeps the kernel routes of its
 //! protocol number for the families of the neighbors with
 //! `graceful-restart yes` until their End-of-RIB (RFC 4724 §4.1, see
@@ -120,6 +121,13 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
             std::process::exit(1);
         }
     };
+    // What the sidecar crate knows and the configuration crate does not: a
+    // TAL Routinator does not bundle, an argument bgpfcd reserves. No file
+    // is read and nothing is run, so `--check` can say.
+    if let Err(e) = rpki::validate(&config.rpki) {
+        eprintln!("{}: {e}", opts.config.display());
+        std::process::exit(1);
+    }
     if let Some(level) = opts.log_level {
         config.log_level = level;
     }
@@ -300,13 +308,20 @@ fn defer_selection(
     restart.set_restarting(true);
 }
 
-/// Run the `rpki` block, publishing to the RIB thread; exits if the RTR
-/// client cannot be started.
+/// Run the `rpki` block, publishing to the RIB thread; exits if the
+/// sidecar or the RTR client cannot be started. A sidecar is started here,
+/// after the privileges were dropped, from the main thread that lives as
+/// long as the daemon (see [`rpki`]).
 fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpki::Rpki {
     match rpki::Rpki::start(&config.rpki, config.router_id, rib_tx.clone()) {
         Ok(r) => r,
         Err(e) => {
-            bgpfc_log::error!("cannot start the rtr client", error = e);
+            bgpfc_log::error!("cannot start", error = e);
+            // The control socket is open already; it is not left behind
+            // for a daemon that is not there.
+            if let Some(path) = &config.control.socket {
+                let _ = std::fs::remove_file(path);
+            }
             std::process::exit(1);
         }
     }
@@ -426,8 +441,11 @@ impl Coordinator<'_> {
         let diff = ConfigDiff::between(&self.config, &new);
         // Issue #60: a new cache that cannot be found fails the reload
         // before anything changes, as it fails the start.
+        // A new sidecar whose binary does not pass its version check fails
+        // it too, while the old one still runs.
         if diff.global.contains(&GlobalChange::Rpki) {
             rpki::resolve(&new.rpki)?;
+            rpki::check_reload(&self.config.rpki, &new.rpki)?;
         }
         let mut notes = Vec::new();
         for g in &diff.global {
@@ -551,12 +569,14 @@ impl Coordinator<'_> {
         messages::RpkiReport {
             config: self.config.rpki.clone(),
             status: self.rpki.status(),
+            sidecar: self.rpki.sidecar_report(),
         }
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
-    /// Shutdown), remove our routes from the kernel, then stop the RTR
-    /// client.
+    /// Shutdown), remove our routes from the kernel, and stop the RTR
+    /// client and the Routinator sidecar. The sidecar is asked to stop
+    /// first, so that it stops while the rest goes on, and waited for last.
     fn shutdown(&mut self) {
         if let Ok(t) = self.table.read() {
             for handle in t.values() {
@@ -565,6 +585,9 @@ impl Coordinator<'_> {
                     .try_send(PeerInput::Stop(CeaseSubcode::AdministrativeShutdown));
             }
         }
+        // After the Ceases are on their way: stopping the client can wait
+        // for the RIB thread (see `rpki`), and the neighbors should not.
+        self.rpki.begin_stop();
         // Give the peer threads a moment to write their NOTIFICATIONs.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let (done_tx, done_rx) = sync_channel(1);
@@ -574,8 +597,7 @@ impl Coordinator<'_> {
         if let Some(path) = &self.config.control.socket {
             let _ = std::fs::remove_file(path);
         }
-        // Last: neither the Ceases nor the FIB cleanup need it, and it may
-        // first have to hand the RIB thread a change (see `rpki`).
+        // Last: the child may still be stopping (see `rpki`).
         self.rpki.stop();
         #[cfg(feature = "profiling")]
         profiling::emit(&profiling::report("shutdown", |_| {}));
@@ -594,6 +616,7 @@ fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+    rpki::validate(&config.rpki).map_err(|e| format!("{}: {e}", opts.config.display()))?;
     if let Some(level) = opts.log_level {
         config.log_level = level;
     }

@@ -12,7 +12,9 @@
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
 //! the cache list with preferences); RFC 9234 §4, §4.2 (`role`,
 //! `role-strict`); RFC 6811 §3 (`match rpki` and `set rpki`), §5
-//! (`invalid`); RFC 8481 §5 (`invalid` is required with `mode external`).
+//! (`invalid`); RFC 8481 §5 (`invalid` is required with `mode external`
+//! and `mode sidecar`); RFC 8210 §9 (the sidecar's `rtr-listen` is a
+//! loopback address) and §6 (its `refresh`).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;

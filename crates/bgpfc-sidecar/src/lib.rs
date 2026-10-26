@@ -8,6 +8,9 @@
 //!   port, and spawns, restarts, signals and reaps Routinator on one
 //!   long-lived supervisor thread, logging what it prints and publishing
 //!   a [`SidecarStatus`].
+//! - [`check_binary`]: the settings and version checks of the start alone,
+//!   for a reload that must not stop the running sidecar for a binary
+//!   that would not start.
 //! - [`SidecarConfig`]: what to run and how to supervise it, checked by
 //!   [`SidecarConfig::validate`]: an absolute binary path that is never
 //!   looked up on `PATH` (issue #70), RTR on loopback only (issue #71).
@@ -52,7 +55,7 @@ pub use args::routinator_args;
 pub use backoff::{Backoff, BackoffConfig};
 pub use config::{SidecarConfig, TalConfig};
 pub use error::SidecarError;
-pub use shell::Sidecar;
+pub use shell::{Sidecar, check_binary};
 pub use status::{ExitReason, SidecarState, SidecarStatus};
 pub use supervisor::{Action, Event, LogField, Supervisor};
 pub use version::{TESTED_VERSION, Version, check_compatible, check_version_output, parse_version};
