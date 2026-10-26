@@ -430,10 +430,14 @@ impl Rib {
             .flatten()
             .filter_map(|p| {
                 let s = p.stale.as_ref()?;
+                // In the order of the families, whatever order the tables
+                // were made in.
+                let mut pending = s.pending.clone();
+                pending.sort();
                 Some(StalePeer {
                     addr: p.info.addr,
                     down: p.leaving,
-                    pending: s.pending.clone(),
+                    pending,
                     restart_in: left(s.back_by),
                     stale_in: left(s.expires),
                 })
@@ -448,7 +452,8 @@ impl Rib {
         let Some(id) = self.s.id(addr) else {
             return Vec::new();
         };
-        self.tables
+        let mut counts: Vec<_> = self
+            .tables
             .iter()
             .map(|(family, table)| {
                 let n = table
@@ -458,7 +463,9 @@ impl Rib {
                 (family, n)
             })
             .filter(|(_, n)| *n > 0)
-            .collect()
+            .collect();
+        counts.sort();
+        counts
     }
 
     /// A session came up for a peer that has stale routes from an earlier

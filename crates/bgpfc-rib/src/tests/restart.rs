@@ -155,6 +155,32 @@ fn a_retained_peers_routes_stay_stale_in_the_tables_and_the_fib() {
 }
 
 #[test]
+fn stale_families_are_listed_in_order_whichever_table_was_made_first() {
+    // The control plane shows them as the RIB lists them: IPv4 first,
+    // though the IPv6 table is the older one here.
+    let mut rib = Rib::new(LOCAL_AS);
+    let a = gr_peer("10.0.0.1", 65_001, 1);
+    let t0 = now();
+    let mut out = Vec::new();
+    rib.peer_up(a.clone(), t0, &mut out);
+    rib.update(
+        a.addr,
+        &announce(&["2001:db8:1::/48"], &attrs(&[65_001], "2001:db8::1")),
+        t0,
+        &mut out,
+    );
+    rib.update(
+        a.addr,
+        &announce(&["192.0.2.0/24"], &attrs(&[65_001], "10.0.0.1")),
+        t0,
+        &mut out,
+    );
+    rib.peer_retain(a.addr, &retention(false), t0, &mut out);
+    assert_eq!(rib.stale_peers(t0)[0].pending, vec![V4, V6]);
+    assert_eq!(rib.stale_routes(a.addr), vec![(V4, 1), (V6, 1)]);
+}
+
+#[test]
 fn nothing_is_kept_for_a_peer_that_sent_nothing() {
     let mut l = lab(&[]);
     let out = outputs(|o| assert_eq!(l.rib.peer_retain(l.a.addr, &retention(false), l.t0, o), 0));
