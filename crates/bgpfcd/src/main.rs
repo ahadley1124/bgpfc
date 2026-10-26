@@ -317,6 +317,11 @@ fn start_rpki(config: &bgpfc_config::Config, rib_tx: &SyncSender<RibMsg>) -> rpk
         Ok(r) => r,
         Err(e) => {
             bgpfc_log::error!("cannot start", error = e);
+            // The control socket is open already; it is not left behind
+            // for a daemon that is not there.
+            if let Some(path) = &config.control.socket {
+                let _ = std::fs::remove_file(path);
+            }
             std::process::exit(1);
         }
     }
