@@ -10,7 +10,10 @@
 //! against the prefix limit); RFC 8210 §10 (the cache list, the cache
 //! whose data is in use, marked as to source, and the one the client talks
 //! to); RFC 6811 §2 (a route's validation state against the VRPs in use,
-//! with the VRPs that Cover and Match it).
+//! with the VRPs that Cover and Match it); RFC 8538 §3 (`clear neighbor`
+//! can send a Hard Reset); RFC 4724 §3, §4.1, §4.2 (a neighbor's Graceful
+//! Restart capability, its stale routes and the timers that end them, the
+//! families whose route selection is deferred).
 
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -33,8 +36,8 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
-    RpkiReport,
+    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RestartReport, RibMsg, RibQuery, RibReply,
+    RouteReport, RpkiReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -75,6 +78,21 @@ pub(crate) struct Ctx {
     pub(crate) token: Option<String>,
 }
 
+/// Which reset `clear neighbor` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clear {
+    /// Cease / Administrative Reset, then start again (RFC 4486 §4). Where
+    /// the neighbor exchanged the Graceful Notification bit this is a
+    /// graceful reset: both sides keep the other's routes as stale ones
+    /// (RFC 8538 §4).
+    Session,
+    /// ROUTE-REFRESH for every family and a full resend (RFC 2918 §4).
+    Soft,
+    /// Cease / Hard Reset (RFC 8538 §3) with the Administrative Reset in
+    /// its data: the neighbor deletes our routes at once, and so do we its.
+    Hard,
+}
+
 /// A parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -93,7 +111,7 @@ pub(crate) enum Command {
     },
     ClearNeighbor {
         addr: IpAddr,
-        soft: bool,
+        clear: Clear,
         message: Option<String>,
     },
     Reload,
@@ -150,21 +168,22 @@ impl Command {
             }),
             ["clear", "neighbor", a, rest @ ..] => {
                 let addr = parse_addr(a)?;
-                let (soft, rest) = match rest {
-                    ["soft", r @ ..] => (true, r),
-                    r => (false, r),
+                let (clear, rest) = match rest {
+                    ["soft", r @ ..] => (Clear::Soft, r),
+                    ["hard-reset", r @ ..] => (Clear::Hard, r),
+                    r => (Clear::Session, r),
                 };
                 let message = match rest {
                     [] => None,
                     [m] => Some(check_communication(m)?),
                     _ => return Err("too many arguments".to_owned()),
                 };
-                if soft && message.is_some() {
+                if clear == Clear::Soft && message.is_some() {
                     return Err("a soft reset sends no message".to_owned());
                 }
                 Ok(Command::ClearNeighbor {
                     addr,
-                    soft,
+                    clear,
                     message,
                 })
             }
@@ -222,14 +241,25 @@ impl Command {
             ("POST", ["v1", "reload"]) => Ok(Command::Reload),
             ("POST", ["v1", "neighbors", a, "clear"]) => {
                 let addr = parse_addr(a).map_err(|e| (400, e))?;
-                let soft = matches!(r.param("soft"), Some("1" | "true" | "yes"));
+                let flag = |name| matches!(r.param(name), Some("1" | "true" | "yes"));
+                let clear = match (flag("soft"), flag("hard")) {
+                    (false, false) => Clear::Session,
+                    (true, false) => Clear::Soft,
+                    (false, true) => Clear::Hard,
+                    (true, true) => {
+                        return Err((400, "soft and hard exclude each other".to_owned()));
+                    }
+                };
                 let message = r
                     .param("message")
                     .map(|m| check_communication(m).map_err(|e| (400, e)))
                     .transpose()?;
+                if clear == Clear::Soft && message.is_some() {
+                    return Err((400, "a soft reset sends no message".to_owned()));
+                }
                 Ok(Command::ClearNeighbor {
                     addr,
-                    soft,
+                    clear,
                     message,
                 })
             }
@@ -297,7 +327,8 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         Command::ShowNeighbors => {
             let reports = peer_reports(ctx, None)?;
             let stats = rib_peers(ctx)?;
-            Ok(render_neighbors(&reports, &stats))
+            let restart = rib_restart(ctx)?;
+            Ok(render_neighbors(&reports, &stats, &restart))
         }
         Command::ShowNeighbor(addr) => {
             let reports = peer_reports(ctx, Some(*addr))?;
@@ -305,7 +336,8 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
                 return Err(format!("no neighbor {addr}"));
             }
             let stats = rib_peers(ctx)?;
-            Ok(render_neighbor(&reports[0], &stats))
+            let restart = rib_restart(ctx)?;
+            Ok(render_neighbor(&reports[0], &stats, &restart))
         }
         // One destination and every candidate route to it. Without one,
         // execute answers with a listing.
@@ -321,9 +353,9 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         }
         Command::ClearNeighbor {
             addr,
-            soft,
+            clear,
             message,
-        } => clear_neighbor(ctx, *addr, *soft, message.as_deref()),
+        } => clear_neighbor(ctx, *addr, *clear, message.as_deref()),
         Command::Reload => {
             let (tx, rx) = sync_channel(1);
             ctx.coord
@@ -366,6 +398,7 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
         .send(FibMsg::Mode(tx))
         .ok()
         .and_then(|()| rx.recv_timeout(QUERY_TIMEOUT).ok());
+    let restart = rib_restart(ctx)?;
     let mut j = Json::new();
     j.begin_object()
         .field_str("version", env!("CARGO_PKG_VERSION"))
@@ -379,18 +412,40 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
             "established",
             u64::try_from(established).unwrap_or(u64::MAX),
         )
-        .field_opt("fib_mode", mode)
-        .end_object();
+        .field_opt("fib_mode", mode);
+    // RFC 4724 §4.1: the families whose routes are not selected, and so
+    // not installed or advertised, until the End-of-RIB markers are in.
+    j.key("graceful_restart")
+        .begin_object()
+        .key("deferred")
+        .begin_array();
+    for (family, waiting, left) in &restart.deferred {
+        j.begin_object()
+            .field_display("family", family)
+            .field_num("waiting_for", u64::try_from(*waiting).unwrap_or(u64::MAX))
+            .field_num("seconds_left", left.as_secs())
+            .end_object();
+    }
+    j.end_array().end_object().end_object();
+    let mut lines = vec![
+        format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
+        format!("local-as {} router-id {}", ctx.local_as, ctx.router_id),
+        format!("neighbors {} established {}", reports.len(), established),
+        format!(
+            "fib mode {}",
+            mode.map_or("unknown".to_owned(), |m| m.to_string())
+        ),
+    ];
+    for (family, waiting, left) in &restart.deferred {
+        lines.push(format!(
+            "graceful restart: route selection for {family} waits for {waiting} neighbor{} \
+             to send End-of-RIB, at most {}s more",
+            if *waiting == 1 { "" } else { "s" },
+            left.as_secs()
+        ));
+    }
     Ok(Reply {
-        lines: vec![
-            format!("bgpfcd {}", env!("CARGO_PKG_VERSION")),
-            format!("local-as {} router-id {}", ctx.local_as, ctx.router_id),
-            format!("neighbors {} established {}", reports.len(), established),
-            format!(
-                "fib mode {}",
-                mode.map_or("unknown".to_owned(), |m| m.to_string())
-            ),
-        ],
+        lines,
         json: j.finish(),
     })
 }
@@ -398,7 +453,7 @@ fn status(ctx: &Ctx) -> Result<Reply, String> {
 fn clear_neighbor(
     ctx: &Ctx,
     addr: IpAddr,
-    soft: bool,
+    clear: Clear,
     message: Option<&str>,
 ) -> Result<Reply, String> {
     let handle = ctx
@@ -408,18 +463,24 @@ fn clear_neighbor(
         .get(&addr)
         .cloned()
         .ok_or_else(|| format!("no neighbor {addr}"))?;
-    let input = if soft {
-        PeerInput::SoftReset
-    } else {
-        PeerInput::Reset(message.map(str::to_owned))
+    let input = match clear {
+        Clear::Soft => PeerInput::SoftReset,
+        Clear::Session | Clear::Hard => PeerInput::Reset {
+            message: message.map(str::to_owned),
+            hard: clear == Clear::Hard,
+        },
     };
     handle
         .tx
         .try_send(input)
         .map_err(|_| format!("neighbor {addr} is busy"))?;
     Ok(ok_reply(&format!(
-        "{} reset of {addr} requested",
-        if soft { "soft" } else { "hard" }
+        "{} of {addr} requested",
+        match clear {
+            Clear::Soft => "soft reset",
+            Clear::Session => "reset",
+            Clear::Hard => "hard reset",
+        }
     )))
 }
 
@@ -746,6 +807,20 @@ fn rib_peers(ctx: &Ctx) -> Result<Vec<(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats
     }
 }
 
+/// Graceful Restart as the RIB has it: the deferred families and the
+/// peers with stale routes.
+fn rib_restart(ctx: &Ctx) -> Result<RestartReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(RibQuery::Restart, tx))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::Restart(r)) => Ok(r),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
+    }
+}
+
 fn counts(stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)], addr: IpAddr) -> (usize, usize) {
     stats
         .iter()
@@ -806,6 +881,7 @@ fn write_neighbor(
     j: &mut Json,
     r: &PeerReport,
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
 ) {
     let (received, advertised) = counts(stats, r.addr);
     j.begin_object()
@@ -884,7 +960,140 @@ fn write_neighbor(
             j.null();
         }
     }
+    write_graceful_restart(j, r, restart);
     j.end_object();
+}
+
+/// The `graceful_restart` member of a neighbor: `null` without
+/// `graceful-restart yes`; otherwise the Restart Time we advertise, what
+/// the neighbor's capability said if the session is up, and the stale
+/// routes kept, if any (RFC 4724 §3, §4.2).
+fn write_graceful_restart(j: &mut Json, r: &PeerReport, restart: &RestartReport) {
+    j.key("graceful_restart");
+    let Some(ours) = r.restart_time else {
+        j.null();
+        return;
+    };
+    j.begin_object()
+        .field_num("restart_time", ours.secs())
+        .key("neighbor");
+    match r
+        .session
+        .as_ref()
+        .and_then(bgpfc_fsm::Session::peer_restart)
+    {
+        Some(p) => {
+            j.begin_object()
+                .field_num("restart_time", p.restart_time.secs())
+                .field_bool("restarting", p.restarting)
+                .field_bool("notification", p.notification)
+                .key("families")
+                .begin_array();
+            for (family, forwarding) in &p.families {
+                j.begin_object()
+                    .field_display("family", family)
+                    .field_bool("forwarding", *forwarding)
+                    .end_object();
+            }
+            j.end_array().end_object();
+        }
+        None => {
+            j.null();
+        }
+    }
+    j.key("stale");
+    match restart.stale.iter().find(|s| s.peer.addr == r.addr) {
+        Some(s) => {
+            j.begin_object()
+                .field_bool("session_down", s.peer.down)
+                .field_opt_num(
+                    "restart_timer_seconds",
+                    s.peer.restart_in.map(|d| d.as_secs()),
+                )
+                .field_opt_num("stale_timer_seconds", s.peer.stale_in.map(|d| d.as_secs()))
+                .key("awaiting_end_of_rib")
+                .begin_array();
+            for family in &s.peer.pending {
+                j.display(family);
+            }
+            j.end_array().key("routes").begin_array();
+            for (family, routes) in &s.routes {
+                j.begin_object()
+                    .field_display("family", family)
+                    .field_num("routes", u64::try_from(*routes).unwrap_or(u64::MAX))
+                    .end_object();
+            }
+            j.end_array().end_object();
+        }
+        None => {
+            j.null();
+        }
+    }
+    j.end_object();
+}
+
+/// `ipv4-unicast,ipv6-unicast` for a line; `none` if empty.
+fn family_list(families: impl IntoIterator<Item = AddressFamily>) -> String {
+    let list: Vec<String> = families.into_iter().map(|f| f.to_string()).collect();
+    if list.is_empty() {
+        "none".to_owned()
+    } else {
+        list.join(",")
+    }
+}
+
+/// The lines of `show neighbor` about Graceful Restart.
+fn graceful_restart_lines(r: &PeerReport, restart: &RestartReport) -> Vec<String> {
+    let Some(ours) = r.restart_time else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "  graceful-restart restart-time {}s, advertised with the Graceful Notification bit",
+        ours.secs()
+    )];
+    if let Some(p) = r
+        .session
+        .as_ref()
+        .and_then(bgpfc_fsm::Session::peer_restart)
+    {
+        lines.push(format!(
+            "  graceful-restart neighbor restart-time {}s notification {} restarting {} forwarding {} without {}",
+            p.restart_time.secs(),
+            if p.notification { "yes" } else { "no" },
+            if p.restarting { "yes" } else { "no" },
+            family_list(p.families.iter().filter(|(_, f)| *f).map(|(f, _)| *f)),
+            family_list(p.families.iter().filter(|(_, f)| !*f).map(|(f, _)| *f)),
+        ));
+    }
+    if let Some(s) = restart.stale.iter().find(|s| s.peer.addr == r.addr) {
+        let routes: Vec<String> = s
+            .routes
+            .iter()
+            .map(|(family, n)| format!("{family}={n}"))
+            .collect();
+        let mut parts = vec![
+            format!(
+                "stale routes {}",
+                if routes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    routes.join(",")
+                }
+            ),
+            format!(
+                "awaiting end-of-rib {}",
+                family_list(s.peer.pending.iter().copied())
+            ),
+        ];
+        if let Some(left) = s.peer.restart_in {
+            parts.push(format!("session due back in {}s", left.as_secs()));
+        }
+        if let Some(left) = s.peer.stale_in {
+            parts.push(format!("stale timer {}s", left.as_secs()));
+        }
+        lines.push(format!("  {}", parts.join("; ")));
+    }
+    lines
 }
 
 /// The `role` member of a session: our BGP Role and the one the neighbor
@@ -913,6 +1122,7 @@ fn peer_role(s: &bgpfc_fsm::Session) -> Option<bgpfc_wire::role::Role> {
 fn render_neighbors(
     reports: &[PeerReport],
     stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
 ) -> Reply {
     let mut lines = vec![format!(
         "{:<40} {:>10} {:<12} {:>9} {:>9} {:>9}",
@@ -932,7 +1142,7 @@ fn render_neighbors(
             received,
             advertised
         ));
-        write_neighbor(&mut j, r, stats);
+        write_neighbor(&mut j, r, stats, restart);
     }
     j.end_array();
     Reply {
@@ -941,7 +1151,11 @@ fn render_neighbors(
     }
 }
 
-fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)]) -> Reply {
+fn render_neighbor(
+    r: &PeerReport,
+    stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::PeerStats)],
+    restart: &RestartReport,
+) -> Reply {
     let (received, advertised) = counts(stats, r.addr);
     let mut lines = vec![
         format!("neighbor {}", r.addr),
@@ -1026,8 +1240,9 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
                 .join(" ")
         ));
     }
+    lines.extend(graceful_restart_lines(r, restart));
     let mut j = Json::new();
-    write_neighbor(&mut j, r, stats);
+    write_neighbor(&mut j, r, stats, restart);
     Reply {
         lines,
         json: j.finish(),
@@ -1077,6 +1292,9 @@ fn route_line(r: &RouteReport) -> String {
         .map_or(String::new(), |id| format!(" id {}", id.0))
         + &a.otc.map_or(String::new(), |asn| format!(" otc {}", asn.0))
         + if r.held { " held" } else { "" }
+        // RFC 4724 §4.2: its peer's session ended, and the route is kept
+        // until the peer sends it again.
+        + if r.stale { " stale" } else { "" }
 }
 
 fn route_json(j: &mut Json, r: &RouteReport) {
@@ -1096,6 +1314,7 @@ fn route_json(j: &mut Json, r: &RouteReport) {
     }
     j.field_bool("best", r.best)
         .field_bool("held", r.held)
+        .field_bool("stale", r.stale)
         .field_str("rov", r.rov.as_str())
         .key("as_path")
         .begin_array();
@@ -1650,6 +1869,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         };
         let mut report = PeerReport {
@@ -1662,8 +1882,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  extended-next-hop receive ipv4-unicast send ipv4-unicast".to_owned()),
@@ -1680,7 +1901,7 @@ mod tests {
         // RFC 8950 §4 advertised by us alone: taken, not sent.
         session.extended_next_hop_send.clear();
         report.session = Some(session.clone());
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  extended-next-hop receive ipv4-unicast send none".to_owned()),
@@ -1696,7 +1917,7 @@ mod tests {
         // Not at all: no line, empty lists.
         session.extended_next_hop_receive.clear();
         report.session = Some(session);
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(!r.lines.iter().any(|l| l.contains("extended-next-hop")));
         assert!(
             r.json
@@ -1769,6 +1990,7 @@ mod tests {
             add_path_receive: vec![v4],
             add_path_send: vec![v4, v6],
             role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         };
         let report = PeerReport {
@@ -1781,6 +2003,7 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
         let info = bgpfc_rib::PeerInfo {
             addr,
@@ -1801,12 +2024,13 @@ mod tests {
                 (v6, bgpfc_rib::PathLimit::Best(2)),
             ],
             role: None,
+            restart: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 2), (v6, 0)],
             advertised: vec![(v4, 5), (v6, 3)],
         };
-        let r = render_neighbor(&report, &[(info, stats)]);
+        let r = render_neighbor(&report, &[(info, stats)], &RestartReport::default());
         assert!(
             r.lines.contains(
                 &"  add-path receive ipv4-unicast send ipv4-unicast=all,ipv6-unicast=2".to_owned()
@@ -1827,7 +2051,7 @@ mod tests {
             s.add_path_receive.clear();
             s.add_path_send.clear();
         }
-        let r = render_neighbor(&plain, &[]);
+        let r = render_neighbor(&plain, &[], &RestartReport::default());
         assert!(
             !r.lines.iter().any(|l| l.contains("add-path")),
             "{:?}",
@@ -1862,6 +2086,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: None,
+            restart: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
@@ -1888,14 +2113,16 @@ mod tests {
                 add_path_receive: Vec::new(),
                 add_path_send: Vec::new(),
                 role: None,
+                restart: None,
                 peer_capabilities: Vec::new(),
             }),
             updates_in: 7,
             updates_out: 1,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[(info, stats)]);
+        let r = render_neighbor(&report, &[(info, stats)], &RestartReport::default());
         // RFC 4271 §6.7: what the limit counts, next to the limit.
         for line in [
             "  routes received 15 advertised 4",
@@ -1912,7 +2139,7 @@ mod tests {
             r.json
         );
         // Not up in the RIB: no families.
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(r.json.contains(r#""prefixes":[]"#), "{}", r.json);
     }
 
@@ -1928,8 +2155,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(!r.lines.iter().any(|l| l.contains("restart limit")));
         assert!(
             r.json.contains(r#""restart_limit_reached":false"#),
@@ -1938,7 +2166,7 @@ mod tests {
         );
         // RFC 4486 §4: the operator must act, and is told how.
         report.restart_limit_reached = true;
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines.contains(
                 &"  restart limit reached: idle until `bgpfcctl clear neighbor`".to_owned()
@@ -1965,8 +2193,9 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
-        let r = render_neighbors(&[report], &[]);
+        let r = render_neighbors(&[report], &[], &RestartReport::default());
         assert_eq!(
             r.lines[1],
             format!(
@@ -2051,6 +2280,7 @@ mod tests {
             path_id: None,
             best: false,
             held: false,
+            stale: false,
             rov: RovState::Disabled,
         }
     }
@@ -2076,6 +2306,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: Some(Role::Customer),
+            restart: None,
             peer_capabilities: vec![Capability::Role(Role::Provider)],
         };
         let mut report = PeerReport {
@@ -2088,9 +2319,10 @@ mod tests {
             updates_out: 0,
             admin_down: false,
             restart_limit_reached: false,
+            restart_time: None,
         };
         // RFC 9234 §4.1: our Role and the one the neighbor sent.
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  role customer (neighbor sent provider)".to_owned()),
@@ -2108,7 +2340,7 @@ mod tests {
             peer_capabilities: Vec::new(),
             ..session.clone()
         });
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(
             r.lines
                 .contains(&"  role customer (neighbor sent none)".to_owned()),
@@ -2126,9 +2358,160 @@ mod tests {
             role: None,
             ..session
         });
-        let r = render_neighbor(&report, &[]);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
         assert!(!r.lines.iter().any(|l| l.contains("role")));
         assert!(r.json.contains(r#""role":null"#), "{}", r.json);
+    }
+
+    #[test]
+    fn neighbor_detail_shows_graceful_restart_and_the_stale_routes() {
+        use crate::messages::StaleReport;
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RestartTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let session = bgpfc_fsm::Session {
+            peer_as: Asn(65_001),
+            peer_router_id: RouterId::new(2).unwrap(),
+            peer: bgpfc_wire::update::PeerKind::External,
+            hold_time: HoldTime::new(90).unwrap(),
+            keepalive_time: Duration::from_secs(30),
+            four_octet_as: true,
+            extended_messages: false,
+            route_refresh: true,
+            families: vec![v4, v6],
+            receive_families: vec![v4, v6],
+            extended_next_hop_receive: Vec::new(),
+            extended_next_hop_send: Vec::new(),
+            add_path_receive: Vec::new(),
+            add_path_send: Vec::new(),
+            role: None,
+            restart: Some(Box::new(bgpfc_fsm::Restart {
+                peer: Some(bgpfc_fsm::PeerRestart {
+                    restart_time: RestartTime::new(90).unwrap(),
+                    restarting: false,
+                    notification: true,
+                    families: vec![(v4, true), (v6, false)],
+                }),
+            })),
+            peer_capabilities: Vec::new(),
+        };
+        let report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(session),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: Some(RestartTime::new(120).unwrap()),
+        };
+        let stale = RestartReport {
+            deferred: Vec::new(),
+            stale: vec![StaleReport {
+                peer: bgpfc_rib::StalePeer {
+                    addr,
+                    down: false,
+                    pending: vec![v4],
+                    restart_in: None,
+                    stale_in: Some(Duration::from_secs(340)),
+                },
+                routes: vec![(v4, 12)],
+            }],
+        };
+        // RFC 4724 §3: what we advertise and what the neighbor did, with
+        // the Forwarding State bit per family; §4.2: the stale routes, the
+        // families still awaiting an End-of-RIB and the timer.
+        let r = render_neighbor(&report, &[], &stale);
+        for line in [
+            "  graceful-restart restart-time 120s, advertised with the Graceful Notification bit",
+            "  graceful-restart neighbor restart-time 90s notification yes restarting no forwarding ipv4-unicast without ipv6-unicast",
+            "  stale routes ipv4-unicast=12; awaiting end-of-rib ipv4-unicast; stale timer 340s",
+        ] {
+            assert!(r.lines.contains(&line.to_owned()), "{line}\n{:?}", r.lines);
+        }
+        assert!(
+            r.json.contains(concat!(
+                r#""graceful_restart":{"restart_time":120,"neighbor":{"restart_time":90,"#,
+                r#""restarting":false,"notification":true,"families":[{"family":"ipv4-unicast","#,
+                r#""forwarding":true},{"family":"ipv6-unicast","forwarding":false}]},"#,
+                r#""stale":{"session_down":false,"restart_timer_seconds":null,"#,
+                r#""stale_timer_seconds":340,"awaiting_end_of_rib":["ipv4-unicast"],"#,
+                r#""routes":[{"family":"ipv4-unicast","routes":12}]}}"#
+            )),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_of_a_neighbor_that_is_down_shows_only_the_stale_routes() {
+        use crate::messages::StaleReport;
+        use bgpfc_wire::types::{AddressFamily, Asn, RestartTime};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut report = PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Active,
+            since: Duration::from_secs(5),
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: Some(RestartTime::new(120).unwrap()),
+        };
+        // A neighbor whose session is down, its routes kept and its timer
+        // running; the session is not there to report what it said.
+        report.state = bgpfc_fsm::State::Active;
+        let down = RestartReport {
+            deferred: Vec::new(),
+            stale: vec![StaleReport {
+                peer: bgpfc_rib::StalePeer {
+                    addr,
+                    down: true,
+                    pending: vec![v4, v6],
+                    restart_in: Some(Duration::from_secs(98)),
+                    stale_in: None,
+                },
+                routes: vec![(v4, 12), (v6, 3)],
+            }],
+        };
+        let r = render_neighbor(&report, &[], &down);
+        assert!(
+            r.lines.contains(
+                &"  stale routes ipv4-unicast=12,ipv6-unicast=3; awaiting end-of-rib \
+                   ipv4-unicast,ipv6-unicast; session due back in 98s"
+                    .to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("graceful-restart neighbor"))
+        );
+        assert!(
+            r.json.contains(
+                r#""session_down":true,"restart_timer_seconds":98,"stale_timer_seconds":null"#
+            ),
+            "{}",
+            r.json
+        );
+        // Without `graceful-restart yes` there is nothing to show.
+        report.restart_time = None;
+        let r = render_neighbor(&report, &[], &down);
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("graceful") || l.contains("stale"))
+        );
+        assert!(r.json.contains(r#""graceful_restart":null"#), "{}", r.json);
     }
 
     #[test]
@@ -2204,6 +2587,8 @@ mod tests {
         best.rov = RovState::Valid;
         let mut other = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, Some(50));
         other.rov = RovState::Invalid;
+        // RFC 4724 §4.2: a route kept from a session that ended says so.
+        other.stale = true;
         let r = render_routes(&[best, other]);
         // Every column starts where its header does; `*` marks the best.
         assert_eq!(
@@ -2218,7 +2603,7 @@ mod tests {
                     "*192.0.2.0/24", "198.51.100.1", "igp", "100", "-", "valid"
                 ),
                 format!(
-                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2",
+                    "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64497 via 198.51.100.2 stale",
                     " 192.0.2.0/24", "198.51.100.2", "igp", "-", "50", "invalid"
                 ),
             ]
@@ -2230,11 +2615,11 @@ mod tests {
             concat!(
                 r#"[{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","#,
                 r#""local_pref":100,"med":null,"otc":null,"peer":"198.51.100.1","best":true,"held":false,"#,
-                r#""rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
+                r#""stale":false,"rov":"valid","as_path":[64511,64496],"communities":["64511:100"],"#,
                 r#""large_communities":[]},"#,
                 r#"{"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","#,
                 r#""local_pref":null,"med":50,"otc":null,"peer":"198.51.100.2","best":false,"held":false,"#,
-                r#""rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
+                r#""stale":true,"rov":"invalid","as_path":[64497],"communities":["64511:100"],"#,
                 r#""large_communities":[]}]"#
             )
         );
@@ -2282,9 +2667,12 @@ mod tests {
         );
         assert!(
             r.json
-                .contains(r#""best":false,"held":true,"rov":"invalid""#)
+                .contains(r#""best":false,"held":true,"stale":false,"rov":"invalid""#)
         );
-        assert!(r.json.contains(r#""best":true,"held":false,"rov":"valid""#));
+        assert!(
+            r.json
+                .contains(r#""best":true,"held":false,"stale":false,"rov":"valid""#)
+        );
     }
 
     #[test]
@@ -2315,8 +2703,31 @@ mod tests {
             Command::parse(&words("clear neighbor 10.0.0.1 soft")),
             Ok(Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: true,
+                clear: Clear::Soft,
                 message: None
+            })
+        );
+        // RFC 8538 §3: a Hard Reset, with or without a communication in it.
+        assert_eq!(
+            Command::parse(&words("clear neighbor 10.0.0.1 hard-reset")),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: None
+            })
+        );
+        assert_eq!(
+            Command::parse(&[
+                "clear".into(),
+                "neighbor".into(),
+                "10.0.0.1".into(),
+                "hard-reset".into(),
+                "bye".into()
+            ]),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: Some("bye".into())
             })
         );
         let m = Command::parse(&[
@@ -2330,7 +2741,7 @@ mod tests {
             m,
             Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: false,
+                clear: Clear::Session,
                 message: Some("bye now".into())
             }
         );
@@ -2346,6 +2757,7 @@ mod tests {
             "show neighbor nope",
             "show routes ipv7",
             "clear neighbor 10.0.0.1 soft msg",
+            "clear neighbor 10.0.0.1 soft hard-reset",
             "clear neighbor 10.0.0.1 a b",
             "fib mode maybe",
         ] {
@@ -2406,10 +2818,25 @@ mod tests {
             Command::from_http(&post("/v1/neighbors/10.0.0.1/clear?soft=1")),
             Ok(Command::ClearNeighbor {
                 addr: "10.0.0.1".parse().unwrap(),
-                soft: true,
+                clear: Clear::Soft,
                 message: None
             })
         );
+        // RFC 8538 §3: a Hard Reset, with a message inside it.
+        assert_eq!(
+            Command::from_http(&post("/v1/neighbors/10.0.0.1/clear?hard=1&message=bye")),
+            Ok(Command::ClearNeighbor {
+                addr: "10.0.0.1".parse().unwrap(),
+                clear: Clear::Hard,
+                message: Some("bye".into())
+            })
+        );
+        for bad in [
+            "/v1/neighbors/10.0.0.1/clear?soft=1&hard=1",
+            "/v1/neighbors/10.0.0.1/clear?soft=1&message=bye",
+        ] {
+            assert_eq!(Command::from_http(&post(bad)).unwrap_err().0, 400, "{bad}");
+        }
         assert_eq!(Command::from_http(&get("/v1/nope")).unwrap_err().0, 404);
         assert_eq!(
             Command::from_http(&get("/v1/routes?family=x"))

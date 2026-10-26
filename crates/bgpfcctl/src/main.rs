@@ -25,7 +25,9 @@ commands:
   show status
   show rpki
   show rpki validate PREFIX ASN
-  clear neighbor ADDR [soft] [MESSAGE]
+  clear neighbor ADDR [MESSAGE]
+  clear neighbor ADDR soft
+  clear neighbor ADDR hard-reset [MESSAGE]
   reload
   fib mode dry-run|install
   stats                     (bgpfcd built with --features profiling)
@@ -80,4 +82,25 @@ fn talk(socket: &str, words: &[String]) -> std::io::Result<Response> {
     stream.flush()?;
     let mut reader = BufReader::new(stream);
     Response::read_from(&mut reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    /// The forms `bgpfcd` accepts for `clear neighbor` (its `Command::parse`,
+    /// `docs/control.md`), including the RFC 8538 §3 Hard Reset.
+    #[test]
+    fn the_usage_lists_every_form_of_clear_neighbor() {
+        for form in [
+            "clear neighbor ADDR [MESSAGE]",
+            "clear neighbor ADDR soft",
+            "clear neighbor ADDR hard-reset [MESSAGE]",
+        ] {
+            assert!(
+                USAGE.lines().any(|l| l.trim() == form),
+                "`{form}` is not in the usage:\n{USAGE}"
+            );
+        }
+    }
 }

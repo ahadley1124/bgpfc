@@ -115,6 +115,9 @@ neighbor-item
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
              | "add-path" "receive" family yes-no ";"                  (* once per family; default no *)
              | "add-path" "send" family ( u32 | "all" | "off" ) ";"    (* once per family; u32 is 1-4294967295; default off *)
+             | "graceful-restart" yes-no ";"         (* default no *)
+             | "restart-time" u16 ";"                (* 0-4095; default 120; needs graceful-restart yes *)
+             | "stale-time" u16 ";"                  (* 1-65535; default 360; needs graceful-restart yes *)
              | "role" role ";"                       (* default none; external sessions only *)
              | "role-strict" yes-no ";"              (* default no; needs a role *)
              | "passive" yes-no ";"                  (* default no *)
@@ -362,6 +365,79 @@ loses a collision (RFC 4271 §6.8), after which the session goes on with the
 other one; neither counts toward the limit or ends a run. `0` never
 restarts after a damped failure; `off` always does.
 
+**Graceful Restart.** `graceful-restart yes;` makes the neighbor take part
+in Graceful Restart (RFC 4724) with the Graceful Notification of RFC 8538:
+bgpfcd advertises the capability with the N bit, a Restart Time and a
+tuple for each of the neighbor's `families`, and follows the Receiving
+Speaker procedures for a neighbor that advertised it too. It is off by
+default, and a neighbor without it is treated as RFC 4271 has it: no
+capability, no End-of-RIB, and the routes of a session that ended are
+deleted. `restart-time` is the Restart Time advertised, the time in
+seconds the neighbor should allow our session to come back in after we
+restart (RFC 4724 §3): 0 to 4095, the most its twelve bits hold, 120 by
+default as BIRD and FRR have it. `stale-time` is how long the stale
+routes of a neighbor that restarted are kept once its session is back,
+waiting for its End-of-RIB (RFC 8538 §4.1): 1 to 65535 seconds, 360 by
+default as FRR has it (`bgp graceful-restart stalepath-time`). Both need
+`graceful-restart yes`; stating `graceful-restart no` is the default.
+
+As a Receiving Speaker bgpfcd keeps the routes of the neighbor as stale
+ones when its session ends by a TCP failure (RFC 4724 §4.2), by a Hold
+Timer or Send Hold Timer expiry (RFC 8538 §4; bgpfcd does so also when the
+neighbor sent no N bit, as the text reads), and, where both sides sent
+the N bit, after any NOTIFICATION but a Hard Reset (RFC 8538 §4). A stale
+route is in the RIB, the kernel and what other neighbors were told like any
+other. It is replaced when the neighbor sends the route again, and deleted
+when the neighbor's End-of-RIB for the family comes, when the neighbor's
+Restart Time from before has run out with the session still down, when the
+`stale-time` has run out with the session back but the End-of-RIB not
+there, and at once when the session comes back without the capability or
+without the Forwarding State bit for the family. The `stale-time` starts
+with the first session that is back, and a session that ends again does not
+start it afresh (RFC 8538 §9). Routes still stale when a session ends again
+are deleted, unless both sides sent the N bit (RFC 8538 §4.1). A neighbor
+that a reload removes loses its stale routes at once. `bgpfcctl show
+neighbor` and `show routes` show what is stale ([`docs/control.md`](control.md),
+"Graceful Restart"). With ADD-PATH each path is kept and replaced under its
+own Path Identifier, which need not be the same after the neighbor restarts
+(RFC 7911 §5).
+
+The End-of-RIB marker (RFC 4724 §2) follows the initial update of each
+family sent to a neighbor with `graceful-restart yes`; one received from
+any neighbor is recognised.
+
+As a Restarting Speaker bgpfcd acts in install mode only. At the start, the
+routes of the `fib` protocol number it finds in the kernel, for the families
+of the neighbors with `graceful-restart yes`, are the forwarding state that
+a restart kept (RFC 4724 §4.1), and are left where they are instead of being
+removed as stale. Until every such neighbor has sent its End-of-RIB for a
+family, or the longest `restart-time` among them has passed since the start
+(the Selection_Deferral_Timer, which `restart-time` also configures; FRR
+and BIRD have a setting of their own for it), bgpfcd selects no route of that
+family: it installs and advertises nothing for it, and the kernel's routes
+forward meanwhile. A neighbor whose capability has the Restart State bit is
+not waited for, nor is one that advertised no capability (RFC 4724 §4.1);
+FRR without zebra sets the bit for as long as its own startup lasts. Then
+the kernel is brought in line with the RIB for the family, which removes
+only the routes not learned again and replaces those with another next hop,
+and every neighbor is sent its table and the End-of-RIB marker. While route
+selection is deferred, and until it is done for every family, the OPENs set
+the Restart State bit. The Forwarding State bit of a family is set while the
+kernel holds routes of it in install mode, so never in dry-run mode, where
+nothing is installed; a neighbor that gets it clear from a restarted bgpfcd
+removes the routes it kept at once (RFC 4724 §4.2). A `SIGTERM` is an
+administrative shutdown, not a restart: bgpfcd sends the neighbors a Hard
+Reset, where they sent the N bit, and takes its routes out of the kernel.
+
+bgpfcd sends a Hard Reset (RFC 8538 §3), a Cease whose data is another
+NOTIFICATION, to a neighbor that sent the N bit when it shuts down, when a
+reload removes the neighbor, when the neighbor exceeds its `maximum-prefix`,
+and when `bgpfcctl clear neighbor ADDR hard-reset` asks for one; RFC 8538 §5.1
+suggests a Hard Reset for those reasons. Other Ceases, such as the Other
+Configuration Change of a reload that resets a session, and a plain `clear
+neighbor`, are graceful ones: both sides keep the other's routes as stale
+ones.
+
 **BGP Roles.** `role customer;` says that our Role on the session is
 Customer: the neighbor is our transit provider (RFC 9234 §4). The names
 are those of RFC 9234 §4.1, and the Role is ours, the one the OPEN
@@ -559,8 +635,10 @@ has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
 family in `families`; a `role` only on an external session, and
-`role-strict yes` only with a `role`; an `rpki` block has a `mode`, at least one `cache` and an `invalid`
-statement with `mode external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`role-strict yes` only with a `role`; `restart-time` and `stale-time` only
+with `graceful-restart yes`; an `rpki` block has a `mode`, at least one
+`cache` and an `invalid` statement with `mode external`, no cache twice,
+`connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN.
 
@@ -570,9 +648,10 @@ Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`, and the number of paths
-`add-path send` sends; `restart-limit`, `role` and `role-strict` included,
-and so are the families `add-path` is on for, since the capability is in
-the OPEN) reset with Cease / Other Configuration Change and start again, and
+`add-path send` sends; `restart-limit`, `role`, `role-strict`,
+`graceful-restart`, `restart-time` and `stale-time` included, and so are
+the families `add-path` is on for, since the capability is in the OPEN)
+reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer
 supports it. A changed `advertisement-interval` applies to the running

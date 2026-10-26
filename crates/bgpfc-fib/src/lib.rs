@@ -196,6 +196,21 @@ impl Fib {
     /// A dump failure; nothing is changed then.
     #[cfg(not(miri))]
     pub fn sync(&mut self) -> Result<Vec<Applied>, FibError> {
+        self.sync_keeping(&[])
+    }
+
+    /// [`Fib::sync`], except that the routes of the families in `keep` stay
+    /// where they are: the forwarding state a restarted daemon preserved
+    /// (RFC 4724 §4.1). They are believed installed, so that the first
+    /// change for a prefix replaces or deletes the route, and
+    /// [`Fib::installed_count`] says how many there are. They are removed
+    /// when the family is reconciled with the RIB's routes, which removes
+    /// "only the routes not learned again" ([`Merge::of`]).
+    ///
+    /// # Errors
+    /// A dump failure; nothing is changed then.
+    #[cfg(not(miri))]
+    pub fn sync_keeping(&mut self, keep: &[Afi]) -> Result<Vec<Applied>, FibError> {
         let mut installed = Table::new();
         for afi in [Afi::Ipv4, Afi::Ipv6] {
             for r in self.dump(afi)? {
@@ -207,8 +222,21 @@ impl Fib {
                 }
             }
         }
-        self.routes.set_installed(&installed);
-        Ok(self.clear())
+        Ok(self.adopt(&installed, keep))
+    }
+
+    /// Take `kernel` as what is installed, and remove the routes of the
+    /// families `keep` does not name.
+    fn adopt(&mut self, kernel: &Table, keep: &[Afi]) -> Vec<Applied> {
+        self.routes.set_installed(kernel);
+        let ops = self.routes.delete_except(keep);
+        self.run(&ops)
+    }
+
+    /// How many routes of `afi` are believed installed.
+    #[must_use]
+    pub fn installed_count(&self, afi: Afi) -> usize {
+        self.routes.count(afi)
     }
 
     /// Apply one change of the RIB's route for a prefix: at most one
@@ -566,6 +594,82 @@ mod tests {
     }
 
     #[test]
+    fn adopting_the_kernels_routes_keeps_the_families_asked_for() {
+        let kernel: Table = [
+            (p("10.0.0.0/8"), ip("192.0.2.1")),
+            (p("10.1.0.0/16"), ip("192.0.2.1")),
+            (p("2001:db8::/32"), ip("fe80::1")),
+        ]
+        .into_iter()
+        .collect();
+        let delete = |prefix: &str, gateway: &str| Op::Delete {
+            prefix: p(prefix),
+            gateway: ip(gateway),
+        };
+        // Nothing kept: every route of ours goes, as `sync` has it.
+        let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let ops: Vec<Op> = fib.adopt(&kernel, &[]).into_iter().map(|a| a.op).collect();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(fib.installed_count(Afi::Ipv4), 2);
+        // IPv4 kept: only IPv6 goes (reported, in dry-run), and the
+        // routes kept are believed installed.
+        let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let ops: Vec<Op> = fib
+            .adopt(&kernel, &[Afi::Ipv4])
+            .into_iter()
+            .map(|a| a.op)
+            .collect();
+        assert_eq!(ops, vec![delete("2001:db8::/32", "fe80::1")]);
+        assert_eq!(fib.installed_count(Afi::Ipv4), 2);
+        assert_eq!(fib.installed_count(Afi::Ipv6), 1);
+        assert_eq!(fib.installed_count(Afi::Unknown(7)), 0);
+        // Everything kept: nothing to do.
+        let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        assert!(fib.adopt(&kernel, &[Afi::Ipv4, Afi::Ipv6]).is_empty());
+    }
+
+    #[test]
+    fn a_family_reconcile_leaves_the_other_family_alone() {
+        let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
+        let kernel: Table = [
+            (p("10.0.0.0/8"), ip("192.0.2.1")),
+            (p("10.1.0.0/16"), ip("192.0.2.1")),
+            (p("2001:db8::/32"), ip("fe80::1")),
+            (p("2001:db8:1::/48"), ip("fe80::1")),
+        ]
+        .into_iter()
+        .collect();
+        fib.adopt(&kernel, &[Afi::Ipv4, Afi::Ipv6]);
+        // IPv6 first: the RIB wants one route, the other is not learned
+        // again. The IPv4 routes are not touched.
+        let mut merge = Merge::of(Afi::Ipv6);
+        let mut out = Vec::new();
+        fib.reconcile(
+            &mut merge,
+            &[(p("2001:db8:1::/48"), ip("fe80::1"))],
+            &mut out,
+        );
+        fib.reconcile_end(merge, &mut out);
+        let ops: Vec<Op> = out.into_iter().map(|a| a.op).collect();
+        assert_eq!(
+            ops,
+            vec![Op::Delete {
+                prefix: p("2001:db8::/32"),
+                gateway: ip("fe80::1")
+            }]
+        );
+        // IPv4 with nothing wanted: both go, in a family of their own.
+        let merge = Merge::of(Afi::Ipv4);
+        let mut out = Vec::new();
+        fib.reconcile_end(merge, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter()
+                .all(|a| matches!(a.op, Op::Delete { prefix, .. } if prefix.afi() == Afi::Ipv4))
+        );
+    }
+
+    #[test]
     fn a_dry_run_reconcile_reports_against_what_is_installed() {
         let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
         let mut merge = Merge::default();
@@ -662,6 +766,14 @@ mod tests {
         assert_eq!(out.len(), 1 + 288);
         let kernel = installed();
         assert_eq!(kernel.into_iter().collect::<Vec<_>>(), want);
+        // A manager started over these routes keeps the IPv4 ones when
+        // asked to (RFC 4724 §4.1), and removes them when not.
+        let mut restarted = Fib::new(Mode::Install, TABLE, route::RTPROT_BGP);
+        restarted.open().unwrap();
+        assert!(restarted.sync_keeping(&[Afi::Ipv4]).unwrap().is_empty());
+        assert_eq!(restarted.installed_count(Afi::Ipv4), want.len());
+        assert_eq!(restarted.installed_count(Afi::Ipv6), 0);
+        assert_eq!(installed().len(), want.len());
         assert!(fib.clear().iter().all(|a| a.result.is_ok()));
         assert_eq!(installed().len(), 0);
     }

@@ -683,6 +683,7 @@ mod tests {
         let (tx, rx) = sync_channel(1);
         tx.send(RibMsg::PeerDown {
             peer: "192.0.2.2".parse().unwrap(),
+            retain: None,
         })
         .unwrap();
         let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();

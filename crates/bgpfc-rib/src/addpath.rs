@@ -553,6 +553,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: vec![(V4, PathLimit::All)],
             role: None,
+            restart: None,
         }
     }
 

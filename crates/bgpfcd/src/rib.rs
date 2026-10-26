@@ -9,6 +9,14 @@
 //! so is what a change of the validation source did to the routes' RFC
 //! 6811 states, in one line per change.
 //!
+//! Graceful Restart (RFC 4724): a session that ended with its routes kept
+//! leaves them in the RIB as stale ones, the peer's End-of-RIB marker
+//! arrives as [`RibMsg::EndOfRib`], and the RIB's timers for both run from
+//! the loop below. A Restarting Speaker's deferred route selection ends
+//! with [`Output::SelectionDone`]: the FIB is then brought in line with the
+//! RIB's routes of the family, which removes the kernel routes that were
+//! kept across the restart and not learned again (AGENTS.md §3, "FIB").
+//!
 //! Changes of the validation source arrive on the same channel, as
 //! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
 //! the RIB validates the affected routes again, and what follows is
@@ -16,7 +24,8 @@
 //! route `disabled`) and keeps it until a change says otherwise.
 
 use std::net::IpAddr;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,9 +38,11 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, RibMsg, RibQuery, RibReply, RibSettings, RouteReport,
+    FibMsg, Intervals, PAGE, PeerInput, RestartReport, RibMsg, RibQuery, RibReply, RibSettings,
+    RouteReport, StaleReport,
 };
 use crate::peer::SendError;
+use crate::restart::{self, RestartState};
 
 /// Start the RIB thread on `rib`, with the configured per-neighbor
 /// settings.
@@ -41,10 +52,11 @@ pub(crate) fn spawn(
     rx: Receiver<RibMsg>,
     peers: PeerTable,
     fib: SyncSender<FibMsg>,
+    restart: Arc<RestartState>,
 ) {
     thread::Builder::new()
         .name("rib".to_owned())
-        .spawn(move || run(rib, settings, &rx, &peers, &fib))
+        .spawn(move || run(rib, settings, &rx, &peers, &fib, &restart))
         .expect("spawning the rib thread");
 }
 
@@ -54,11 +66,13 @@ fn run(
     rx: &Receiver<RibMsg>,
     peers: &PeerTable,
     fib: &SyncSender<FibMsg>,
+    restart: &RestartState,
 ) {
     let mut out = Deliver {
         peers,
         fib,
         changes: Vec::new(),
+        selected: Vec::new(),
     };
     #[cfg(feature = "profiling")]
     let mut loads = crate::profiling::Loads::from_env();
@@ -81,6 +95,7 @@ fn run(
         // that a busy channel cannot starve the deadlines.
         rib.flush(now, &mut out);
         out.flush();
+        selection_done(&rib, &mut out, restart);
         #[cfg(feature = "profiling")]
         if let Some(seen) = seen {
             loads.after(seen, &rib);
@@ -122,7 +137,14 @@ fn handle(
             peer,
             local_addr,
             session,
-        } => peer_up(rib, settings, (peer, local_addr, &session), now, out),
+            stale_time,
+        } => peer_up(
+            rib,
+            settings,
+            (peer, local_addr, &session, stale_time),
+            now,
+            out,
+        ),
         RibMsg::Update { peer, update, .. } => {
             log_update(peer, &update);
             rib.update(peer, &update, now, out);
@@ -131,15 +153,11 @@ fn handle(
             bgpfc_log::info!("rib: route refresh", peer = peer, family = family);
             rib.refresh(peer, family, now, out);
         }
-        RibMsg::PeerDown { peer } => {
-            let stats = rib.peer_stats(peer).unwrap_or_default();
-            bgpfc_log::info!(
-                "rib: peer down",
-                peer = peer,
-                routes_deleted = stats.received.iter().map(|(_, n)| n).sum::<usize>()
-            );
-            rib.peer_down(peer, now, out);
+        RibMsg::EndOfRib { peer, family } => {
+            bgpfc_log::info!("rib: end-of-rib", peer = peer, family = family);
+            rib.end_of_rib(peer, family, now, out);
         }
+        RibMsg::PeerDown { peer, retain } => peer_down(rib, peer, retain.as_ref(), now, out),
         RibMsg::Query(q, reply) => {
             let _ = reply.send(answer(rib, &q));
         }
@@ -190,7 +208,7 @@ fn handle(
 fn peer_up(
     rib: &mut Rib,
     settings: &RibSettings,
-    (peer, local_addr, session): (IpAddr, IpAddr, &Session),
+    (peer, local_addr, session, stale_time): (IpAddr, IpAddr, &Session, Option<Duration>),
     now: Instant,
     out: &mut impl Sink,
 ) {
@@ -219,6 +237,7 @@ fn peer_up(
     );
     let mut info = peer_info(peer, local_addr, session, interval);
     info.prefix_limits = limits;
+    info.restart = restart::rib_restart(session, stale_time);
     info.add_path_send = add_path_send(settings, peer, &session.add_path_send);
     if !info.add_path_receive.is_empty() || !info.add_path_send.is_empty() {
         bgpfc_log::info!(
@@ -245,30 +264,109 @@ fn set_invalid_action(rib: &mut Rib, action: InvalidAction, now: Instant, out: &
     );
 }
 
+/// The session of `peer` left Established: its routes go, or, where the FSM
+/// names them, stay as stale ones until the peer is back or a timer runs out
+/// (RFC 4724 §4.2, RFC 8538 §4).
+fn peer_down(
+    rib: &mut Rib,
+    peer: IpAddr,
+    retain: Option<&bgpfc_fsm::Retain>,
+    now: Instant,
+    out: &mut impl Sink,
+) {
+    let stats = rib.peer_stats(peer).unwrap_or_default();
+    let routes = stats.received.iter().map(|(_, n)| n).sum::<usize>();
+    if let Some(retain) = retain {
+        let kept = rib.peer_retain(peer, &restart::retention(retain), now, out);
+        bgpfc_log::info!(
+            "rib: peer down, routes kept as stale",
+            peer = peer,
+            routes_kept = kept,
+            routes_deleted = routes.saturating_sub(kept),
+            restart_time = retain.restart_time.secs()
+        );
+    } else {
+        bgpfc_log::info!("rib: peer down", peer = peer, routes_deleted = routes);
+        rib.peer_down(peer, now, out);
+    }
+}
+
 /// Routes in one `FibMsg::Reconcile`.
 const RECONCILE_BATCH: usize = 4096;
 
 /// Switch the FIB's mode. Going to install, the FIB reconciles what is
 /// installed against every route the RIB has (README, "FIB dry-run"),
 /// which go to it in batches through the bounded queue rather than as one
-/// table-sized list.
+/// table-sized list. A family whose route selection is still deferred
+/// (RFC 4724 §4.1) is left out: its routes are not all learned yet, and
+/// the FIB is brought in line with them when the deferral ends.
 fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: SyncSender<usize>) {
     let send = |msg| fib.send(msg).is_ok();
     let mut ok = send(FibMsg::SetMode(mode));
     if mode == bgpfc_fib::Mode::Install {
-        let mut batch = Vec::with_capacity(RECONCILE_BATCH);
-        for route in rib.fib_routes() {
-            batch.push(route);
-            if batch.len() == RECONCILE_BATCH {
-                ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
-                batch.reserve(RECONCILE_BATCH);
+        let deferred = rib.deferred();
+        if deferred.is_empty() {
+            ok &= send(FibMsg::ReconcileFamily(None));
+            ok &= send_routes(fib, rib.fib_routes());
+        } else {
+            for family in [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST] {
+                if deferred.iter().all(|(f, ..)| *f != family) {
+                    ok &= send(FibMsg::ReconcileFamily(Some(family.afi)));
+                    ok &= send_routes(fib, rib.fib_routes_of(family));
+                }
             }
         }
-        ok &= send(FibMsg::Reconcile(batch));
     }
     ok &= send(FibMsg::ReconcileEnd(reply));
     if !ok {
         bgpfc_log::error!("fib thread gone");
+    }
+}
+
+/// `routes` to the FIB thread, in batches.
+fn send_routes(fib: &SyncSender<FibMsg>, routes: impl Iterator<Item = (Prefix, IpAddr)>) -> bool {
+    let mut ok = true;
+    let mut batch = Vec::with_capacity(RECONCILE_BATCH);
+    for route in routes {
+        batch.push(route);
+        if batch.len() == RECONCILE_BATCH {
+            ok &= fib
+                .send(FibMsg::Reconcile(std::mem::take(&mut batch)))
+                .is_ok();
+            batch.reserve(RECONCILE_BATCH);
+        }
+    }
+    ok & fib.send(FibMsg::Reconcile(batch)).is_ok()
+}
+
+/// RFC 4724 §4.1: route selection for the families in `out.selected` has
+/// just stopped being deferred. "The forwarding state of the speaker MUST
+/// be updated and any previously marked stale information MUST be
+/// removed": the FIB reconciles each family against the RIB's routes, which
+/// replaces the kernel routes that differ and removes the ones kept across
+/// the restart that were not learned again (AGENTS.md §3, "FIB"). When no
+/// family is deferred any more the restart is over, and the OPENs no longer
+/// say so.
+fn selection_done(rib: &Rib, out: &mut Deliver<'_>, restart: &RestartState) {
+    if out.selected.is_empty() {
+        return;
+    }
+    for family in std::mem::take(&mut out.selected) {
+        bgpfc_log::info!("rib: route selection no longer deferred", family = family);
+        let (done, _) = sync_channel(1);
+        let ok = out
+            .fib
+            .send(FibMsg::ReconcileFamily(Some(family.afi)))
+            .is_ok()
+            && send_routes(out.fib, rib.fib_routes_of(family))
+            && out.fib.send(FibMsg::ReconcileEnd(done)).is_ok();
+        if !ok {
+            bgpfc_log::error!("fib thread gone");
+        }
+    }
+    if rib.deferred().is_empty() && restart.restarting() {
+        restart.set_restarting(false);
+        bgpfc_log::info!("graceful restart finished: route selection is no longer deferred");
     }
 }
 
@@ -453,6 +551,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         add_path_receive: s.add_path_receive.clone(),
         add_path_send: Vec::new(),
         role: s.role,
+        restart: None,
     }
 }
 
@@ -466,6 +565,10 @@ struct Deliver<'a> {
     peers: &'a PeerTable,
     fib: &'a SyncSender<FibMsg>,
     changes: Vec<FibChange>,
+    /// Families whose route selection stopped being deferred while the
+    /// input was handled (RFC 4724 §4.1): [`selection_done`] takes them
+    /// once the changes before them have gone to the FIB.
+    selected: Vec<AddressFamily>,
 }
 
 impl Deliver<'_> {
@@ -485,6 +588,31 @@ impl Deliver<'_> {
 
     fn handle(&self, peer: IpAddr) -> Option<crate::peer::PeerHandle> {
         self.peers.read().ok().and_then(|t| t.get(&peer).cloned())
+    }
+
+    /// A peer is over its prefix limit (RFC 4271 §6.7): log it and tell the
+    /// peer thread to end the session.
+    fn prefix_limit_exceeded(&self, peer: IpAddr, family: AddressFamily, limit: u32) {
+        bgpfc_log::error!(
+            "rib: prefix limit exceeded, routes dropped",
+            peer = peer,
+            family = family,
+            limit = limit
+        );
+        let Some(handle) = self.handle(peer) else {
+            return;
+        };
+        // RFC 4271 §6.7: the session must end. A full queue means the peer
+        // thread is busy and checks the slot after its current input; the
+        // RIB never blocks on a peer (AGENTS.md §3).
+        match handle.tx.try_send(PeerInput::PrefixLimit { family, limit }) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                if let Ok(mut slot) = handle.prefix_limit.lock() {
+                    *slot = Some((family, limit));
+                }
+            }
+        }
     }
 }
 
@@ -521,29 +649,7 @@ impl Sink for Deliver<'_> {
                 peer,
                 family,
                 limit,
-            } => {
-                bgpfc_log::error!(
-                    "rib: prefix limit exceeded, routes dropped",
-                    peer = peer,
-                    family = family,
-                    limit = limit
-                );
-                let Some(handle) = self.handle(peer) else {
-                    return;
-                };
-                // RFC 4271 §6.7: the session must end. A full queue means
-                // the peer thread is busy and checks the slot after its
-                // current input; the RIB never blocks on a peer
-                // (AGENTS.md §3).
-                match handle.tx.try_send(PeerInput::PrefixLimit { family, limit }) {
-                    Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                    Err(TrySendError::Full(_)) => {
-                        if let Ok(mut slot) = handle.prefix_limit.lock() {
-                            *slot = Some((family, limit));
-                        }
-                    }
-                }
-            }
+            } => self.prefix_limit_exceeded(peer, family, limit),
             Output::InvalidNextHop {
                 peer,
                 family,
@@ -580,6 +686,24 @@ impl Sink for Deliver<'_> {
                     first = first
                 );
             }
+            Output::StaleRemoved {
+                peer,
+                family,
+                routes,
+                why,
+            } => {
+                // RFC 4724 §4.2: the routes of a restarted neighbor that
+                // were kept and are now deleted. The FIB changes and the
+                // UPDATEs for other peers have come out with it.
+                bgpfc_log::info!(
+                    "rib: stale routes removed",
+                    peer = peer,
+                    family = family.map_or_else(|| "all".to_owned(), |f| f.to_string()),
+                    routes = routes,
+                    why = why
+                );
+            }
+            Output::SelectionDone { family } => self.selected.push(family),
             Output::Revalidated(r) => {
                 // RFC 6811 §4: the routes a change of the validation source
                 // moved, counted. One line per change, however many routes
@@ -704,6 +828,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     path_id: c.path_id,
                     best: !held && best == Some((c.peer, c.path_id)),
                     held,
+                    stale: c.stale,
                     rov: c.rov,
                 };
                 RibReply::Routes(
@@ -724,6 +849,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         path_id: b.path_id,
                         best: true,
                         held: false,
+                        stale: b.stale,
                         rov: b.rov,
                     })
                     .collect(),
@@ -732,6 +858,26 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
         RibQuery::FibRoutes { after } => {
             RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
         }
+        RibQuery::Restart => RibReply::Restart(restart_report(rib, Instant::now())),
+    }
+}
+
+/// Graceful Restart as the RIB has it at `now` (RFC 4724 §4.1, §4.2).
+fn restart_report(rib: &Rib, now: Instant) -> RestartReport {
+    RestartReport {
+        deferred: rib
+            .deferred()
+            .into_iter()
+            .map(|(family, peers, until)| (family, peers, until.saturating_duration_since(now)))
+            .collect(),
+        stale: rib
+            .stale_peers(now)
+            .into_iter()
+            .map(|peer| StaleReport {
+                routes: rib.stale_routes(peer.addr),
+                peer,
+            })
+            .collect(),
     }
 }
 
@@ -763,6 +909,7 @@ mod tests {
             peers,
             fib,
             changes: Vec::new(),
+            selected: Vec::new(),
         };
         for o in outputs {
             out.put(o);
@@ -791,6 +938,7 @@ mod tests {
             add_path_receive: Vec::new(),
             add_path_send: Vec::new(),
             role: None,
+            restart: None,
             peer_capabilities: Vec::new(),
         }
     }
@@ -800,6 +948,7 @@ mod tests {
             peer: ip(peer),
             local_addr: ip("192.0.2.254"),
             session: session(peer_as, kind),
+            stale_time: None,
         }
     }
 
@@ -1034,6 +1183,7 @@ mod tests {
                 peer: ip(peer),
                 local_addr: ip("192.0.2.254"),
                 session: s,
+                stale_time: None,
             };
             handle(&mut rib, &mut settings, msg, now);
         }
@@ -1269,9 +1419,10 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            stale_time: None,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
-        let (h, peer) = crate::peer::prepare(cfg, rib_tx);
+        let (h, peer) = crate::peer::prepare(cfg, rib_tx, Arc::default());
         let table: PeerTable = std::sync::Arc::new(std::sync::RwLock::new(
             std::collections::HashMap::from([(addr, h.clone())]),
         ));
@@ -1296,7 +1447,11 @@ mod tests {
         ));
         // The same through the slot a full queue falls back to: a clear
         // starts the peer again, and the next input it handles finds it.
-        h.tx.send(PeerInput::Reset(None)).unwrap();
+        h.tx.send(PeerInput::Reset {
+            message: None,
+            hard: false,
+        })
+        .unwrap();
         let mut conn = establish(&listener, &rib_rx);
         *h.prefix_limit.lock().unwrap() = Some((V4, 1000));
         let (report, _) = sync_channel(1);
@@ -1338,9 +1493,10 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            stale_time: None,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
-        let (h, peer) = crate::peer::prepare(cfg, rib_tx);
+        let (h, peer) = crate::peer::prepare(cfg, rib_tx, Arc::default());
         peer.start();
         let mut conn = establish(&listener, &rib_rx);
         let route: bgpfc_wire::prefix::Prefix = "198.51.100.0/24".parse().unwrap();
@@ -1411,6 +1567,7 @@ mod tests {
         let (tx, rx) = sync_channel(4);
         let down = || RibMsg::PeerDown {
             peer: ip("192.0.2.1"),
+            retain: None,
         };
         tx.send(down()).unwrap();
         assert!(matches!(next(&rx, None), Ok(Some(RibMsg::PeerDown { .. }))));
@@ -1458,6 +1615,255 @@ mod tests {
                 .collect(),
             other => panic!("asked for routes, got {other:?}"),
         }
+    }
+
+    /// A session with Graceful Restart on whose peer listed IPv4 unicast
+    /// with the Forwarding State bit.
+    fn gr_up(peer: &str, peer_as: u32, restarting: bool) -> RibMsg {
+        let mut s = session(peer_as, PeerKind::External);
+        s.restart = Some(Box::new(bgpfc_fsm::Restart {
+            peer: Some(bgpfc_fsm::PeerRestart {
+                restart_time: bgpfc_wire::types::RestartTime::new(120).unwrap(),
+                restarting,
+                notification: false,
+                families: vec![(V4, true)],
+            }),
+        }));
+        RibMsg::PeerUp {
+            peer: ip(peer),
+            local_addr: ip("192.0.2.254"),
+            session: s,
+            stale_time: Some(Duration::from_secs(200)),
+        }
+    }
+
+    fn retain() -> bgpfc_fsm::Retain {
+        bgpfc_fsm::Retain {
+            families: vec![V4],
+            restart_time: bgpfc_wire::types::RestartTime::new(120).unwrap(),
+            notification: false,
+        }
+    }
+
+    #[test]
+    fn a_session_that_ends_gracefully_leaves_stale_routes_until_end_of_rib() {
+        // RFC 4724 §4.2 through the RIB thread's messages: the FSM's
+        // retention reaches the RIB, which keeps the routes, tells nobody,
+        // and shows them as stale; the returning session replaces them and
+        // the End-of-RIB message removes the rest.
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let peer = ip("192.0.2.1");
+        handle(
+            &mut rib,
+            &mut settings,
+            gr_up("192.0.2.1", 65_001, false),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.2", 65_002, PeerKind::External),
+            now,
+        );
+        assert_eq!(out, vec![]);
+        // The capability reaches the RIB, with the stale timer of the
+        // neighbor.
+        let info = rib.peer(peer).unwrap();
+        let restart = info.restart.as_ref().unwrap();
+        assert_eq!(restart.stale_time, Duration::from_secs(200));
+        assert!(restart.peer.as_ref().is_some_and(|p| !p.restarting));
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::PeerDown {
+                peer,
+                retain: Some(retain()),
+            },
+            now,
+        );
+        // Kept: nothing goes to the FIB or to the other peer.
+        assert_eq!(out, vec![]);
+        assert_eq!(rib.loc_rib(V4).count(), 2);
+        let report = match answer(&rib, &RibQuery::Restart) {
+            RibReply::Restart(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(report.deferred, vec![]);
+        assert_eq!(report.stale.len(), 1);
+        assert!(report.stale[0].peer.down);
+        assert_eq!(report.stale[0].routes, vec![(V4, 2)]);
+        let q = RibQuery::Routes {
+            family: V4,
+            prefix: None,
+            after: None,
+        };
+        match answer(&rib, &q) {
+            RibReply::Routes(r) => assert!(r.iter().all(|r| r.stale) && r.len() == 2),
+            other => panic!("{other:?}"),
+        }
+        // The peer is back and sends one route again, then its End-of-RIB.
+        let t1 = now + Duration::from_secs(5);
+        handle(
+            &mut rib,
+            &mut settings,
+            gr_up("192.0.2.1", 65_001, false),
+            t1,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            t1,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::EndOfRib { peer, family: V4 },
+            t1,
+        );
+        let removed: Vec<_> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::StaleRemoved { routes, why, .. } => Some((*routes, *why)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec![(1, bgpfc_rib::StaleEnd::EndOfRib)]);
+        assert_eq!(rib.loc_rib(V4).count(), 1);
+        match answer(&rib, &q) {
+            RibReply::Routes(r) => assert!(r.iter().all(|r| !r.stale)),
+            other => panic!("{other:?}"),
+        }
+        // A session without a retention deletes at once, as RFC 4271 has it.
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::PeerDown { peer, retain: None },
+            t1,
+        );
+        assert_eq!(rib.loc_rib(V4).count(), 0);
+    }
+
+    #[test]
+    fn deferred_route_selection_ends_with_the_fib_reconciled_by_family() {
+        // RFC 4724 §4.1 and AGENTS.md §3, "FIB": while selection is
+        // deferred the FIB hears nothing; at the End-of-RIB of the peer
+        // waited for it is brought in line with the RIB's routes of the
+        // family, which removes the kernel routes not learned again, and
+        // the restart is over.
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let peer = ip("192.0.2.1");
+        rib.defer_selection(&bgpfc_rib::Deferral {
+            waiting: vec![(peer, vec![V4])],
+            until: now + Duration::from_secs(120),
+        });
+        let restart = RestartState::default();
+        restart.set_restarting(true);
+        handle(
+            &mut rib,
+            &mut settings,
+            gr_up("192.0.2.1", 65_001, false),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        assert_eq!(out, vec![]);
+        assert_eq!(rib.deferred().len(), 1);
+        let (fib_tx, fib_rx) = sync_channel(16);
+        let peers = PeerTable::default();
+        let mut out = Deliver {
+            peers: &peers,
+            fib: &fib_tx,
+            changes: Vec::new(),
+            selected: Vec::new(),
+        };
+        let outputs = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::EndOfRib { peer, family: V4 },
+            now,
+        );
+        for o in outputs {
+            out.put(o);
+        }
+        out.flush();
+        // Nothing is reconciled until the thread has handed the changes on.
+        assert!(restart.restarting());
+        selection_done(&rib, &mut out, &restart);
+        assert!(!restart.restarting());
+        let sent: Vec<FibMsg> = fib_rx.try_iter().collect();
+        assert!(
+            matches!(
+                &sent[..],
+                [
+                    FibMsg::ReconcileFamily(Some(bgpfc_wire::types::Afi::Ipv4)),
+                    FibMsg::Reconcile(routes),
+                    FibMsg::ReconcileEnd(_),
+                ] if routes.len() == 1
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(rib.deferred(), vec![]);
+    }
+
+    #[test]
+    fn a_switch_to_install_leaves_out_a_family_still_deferred() {
+        // RFC 4724 §4.1: its routes are not all learned yet; the FIB is
+        // reconciled when the deferral ends. The other family goes as
+        // usual, and a switch with nothing deferred is one reconcile of
+        // everything.
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let (fib_tx, fib_rx) = sync_channel(16);
+        let switch = |rib: &Rib| {
+            let (reply, _) = sync_channel(1);
+            fib_mode(rib, &fib_tx, bgpfc_fib::Mode::Install, reply);
+            fib_rx.try_iter().collect::<Vec<_>>()
+        };
+        let sent = switch(&rib);
+        assert!(
+            matches!(
+                &sent[..],
+                [
+                    FibMsg::SetMode(bgpfc_fib::Mode::Install),
+                    FibMsg::ReconcileFamily(None),
+                    FibMsg::Reconcile(_),
+                    FibMsg::ReconcileEnd(_),
+                ]
+            ),
+            "{sent:?}"
+        );
+        rib.defer_selection(&bgpfc_rib::Deferral {
+            waiting: vec![(ip("192.0.2.1"), vec![V4])],
+            until: now + Duration::from_secs(120),
+        });
+        let sent = switch(&rib);
+        assert!(
+            matches!(
+                &sent[..],
+                [
+                    FibMsg::SetMode(_),
+                    FibMsg::ReconcileFamily(Some(bgpfc_wire::types::Afi::Ipv6)),
+                    FibMsg::Reconcile(_),
+                    FibMsg::ReconcileEnd(_),
+                ]
+            ),
+            "{sent:?}"
+        );
     }
 
     /// The changes of state reported among `out`.
@@ -1566,6 +1972,7 @@ mod tests {
             rx,
             PeerTable::default(),
             fib_tx,
+            Arc::default(),
         );
         let query = |tx: &SyncSender<RibMsg>| {
             let (reply, answer) = sync_channel(1);
@@ -1640,6 +2047,7 @@ mod tests {
             rx,
             PeerTable::default(),
             fib_tx,
+            Arc::default(),
         );
         let query = |tx: &SyncSender<RibMsg>| {
             let (reply, answer) = sync_channel(1);

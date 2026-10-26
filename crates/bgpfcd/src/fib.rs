@@ -1,39 +1,79 @@
 //! The FIB thread: owns the netlink socket through `bgpfc_fib::Fib` and
 //! follows the Loc-RIB (AGENTS.md §3, "FIB thread"; README, "FIB
 //! dry-run").
+//!
+//! Implements: RFC 4724 §4.1 (a daemon that restarted with graceful
+//! restart on keeps the routes of its protocol number that are in the
+//! kernel, in the families it may learn again, until its RIB reconciles
+//! them; the thread also says which families have forwarding state, for
+//! the Forwarding State bit).
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
 use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
+use bgpfc_wire::types::{AddressFamily, Afi};
 
 use crate::messages::{FibMsg, FibReport, PAGE};
+use crate::restart::RestartState;
 
 /// Batches of changes the RIB thread may queue before it blocks. A batch
 /// is one RIB input's changes, or [`crate::rib::FIB_BATCH`] of a long one.
 const QUEUE: usize = 64;
 
 /// Open the socket, flush stale routes (AGENTS.md §3: only those with
-/// our protocol number), and start the thread.
+/// our protocol number), and start the thread. The routes of the families
+/// in `keep` are left where they are, believed installed: the forwarding
+/// state a restart preserved, which RFC 4724 §4.1 has the daemon replace
+/// only once it has learned its routes again. The families among `keep`
+/// that have some are returned. `state` is told which families have
+/// forwarding state, now and as the routes change.
 ///
 /// # Errors
 /// If the socket cannot be opened or the startup dump fails.
-pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibError> {
+pub(crate) fn start(
+    mut fib: Fib,
+    keep: &[Afi],
+    state: Arc<RestartState>,
+) -> Result<(SyncSender<FibMsg>, Vec<AddressFamily>), bgpfc_fib::FibError> {
     fib.open()?;
-    let flushed = fib.sync()?;
+    let flushed = fib.sync_keeping(keep)?;
     report(&flushed);
+    let kept: Vec<AddressFamily> = keep
+        .iter()
+        .filter(|afi| fib.installed_count(**afi) > 0)
+        .map(|afi| AddressFamily {
+            afi: *afi,
+            safi: bgpfc_wire::types::Safi::Unicast,
+        })
+        .collect();
+    publish(&fib, &state);
     let (tx, rx) = sync_channel(QUEUE);
     thread::Builder::new()
         .name("fib".to_owned())
-        .spawn(move || run(fib, &rx))
+        .spawn(move || run(fib, &rx, &state))
         .expect("spawning the fib thread");
-    Ok(tx)
+    Ok((tx, kept))
 }
 
-fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
+/// Tell the peer threads which families have forwarding state: routes of
+/// ours installed in the kernel, which only install mode does (RFC 4724
+/// §4.1: the Forwarding State bit "can be set only if the forwarding state
+/// has indeed been preserved").
+fn publish(fib: &Fib, state: &RestartState) {
+    let install = fib.mode() == Mode::Install;
+    state.set_forwarding(
+        install && fib.installed_count(Afi::Ipv4) > 0,
+        install && fib.installed_count(Afi::Ipv6) > 0,
+    );
+}
+
+fn run(mut fib: Fib, rx: &Receiver<FibMsg>, state: &RestartState) {
     // Kept between batches, so that applying one allocates nothing.
     let mut applied = Vec::new();
-    // A switch to install in progress, and the operations it took.
+    // A reconcile in progress, and the operations taken since the mode
+    // was set.
     let mut merge: Option<Merge> = None;
     let mut ops = 0;
     while let Ok(msg) = rx.recv() {
@@ -50,8 +90,14 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
             FibMsg::SetMode(mode) => {
                 bgpfc_log::info!("fib: mode", mode = mode);
                 fib.set_mode(mode);
-                merge = (mode == Mode::Install).then(Merge::default);
+                merge = None;
                 ops = 0;
+            }
+            FibMsg::ReconcileFamily(family) => {
+                if let Some(m) = merge.take() {
+                    fib.reconcile_end(m, &mut applied);
+                }
+                merge = Some(family.map_or_else(Merge::default, Merge::of));
             }
             FibMsg::Reconcile(routes) => {
                 if let Some(m) = &mut merge {
@@ -62,8 +108,12 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
                 if let Some(m) = merge.take() {
                     fib.reconcile_end(m, &mut applied);
                 }
-                let _ = reply.send(ops + applied.len());
+                ops += applied.len();
+                report(&applied);
+                publish(&fib, state);
+                let _ = reply.send(ops);
                 ops = 0;
+                continue;
             }
             FibMsg::Mode(reply) => {
                 let _ = reply.send(fib.mode());
@@ -82,6 +132,7 @@ fn run(mut fib: Fib, rx: &Receiver<FibMsg>) {
         }
         ops += applied.len();
         report(&applied);
+        publish(&fib, state);
     }
 }
 

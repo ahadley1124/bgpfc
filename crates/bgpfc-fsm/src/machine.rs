@@ -9,7 +9,8 @@
 use std::time::{Duration, Instant};
 
 use bgpfc_wire::capability::{
-    Capability, NextHopEncoding, add_path_abilities, next_hop_encodings, roles,
+    Capability, GracefulRestart as GracefulRestartCapability, GracefulRestartFamily,
+    NextHopEncoding, add_path_abilities, graceful_restart, next_hop_encodings, roles,
 };
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, FsmSubcode, OpenSubcode};
 use bgpfc_wire::header::MessageType;
@@ -20,7 +21,10 @@ use bgpfc_wire::types::{AddressFamily, HoldTime};
 use bgpfc_wire::update::PeerKind;
 
 use crate::timers::{Jitter, Timer};
-use crate::{Action, Config, Event, SendHoldTime, Session, State, TimerKind};
+use crate::{
+    Action, Config, Event, PeerRestart, Restart, RestartAdvert, Retain, SendHoldTime, Session,
+    State, TimerKind,
+};
 
 /// NOTIFICATION error code "Send Hold Timer Expired" (RFC 9687 §9).
 pub const SEND_HOLD_TIMER_EXPIRED: ErrorCode = ErrorCode::Unknown(8);
@@ -52,6 +56,27 @@ pub struct Fsm {
     /// A `ManualStartPassive` asked for one passive attempt.
     passive_once: bool,
     session: Option<Session>,
+    /// What the next OPEN says of a restart (RFC 4724 §3).
+    restart_advert: RestartAdvert,
+}
+
+/// How an Established session ended, as far as the Graceful Restart
+/// procedures care (RFC 4724 §4.2, RFC 8538 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// The TCP connection failed or was closed: RFC 4724 §4.2 keeps the
+    /// routes.
+    Transport,
+    /// The Hold Timer or the Send Hold Timer expired: RFC 8538 §4 has the
+    /// routes kept, "subsequently" to the NOTIFICATION.
+    Timeout,
+    /// A NOTIFICATION was received or sent. RFC 4724 §4 has "the normal
+    /// BGP procedures" followed, and RFC 8538 §4 keeps the routes if the
+    /// Graceful Notification bit was exchanged, unless it was a Hard Reset.
+    Notification {
+        /// The NOTIFICATION is a Hard Reset.
+        hard_reset: bool,
+    },
 }
 
 impl Fsm {
@@ -79,6 +104,7 @@ impl Fsm {
             admin_down: false,
             passive_once: false,
             session: None,
+            restart_advert: RestartAdvert::default(),
         }
     }
 
@@ -111,6 +137,14 @@ impl Fsm {
     #[must_use]
     pub const fn is_admin_down(&self) -> bool {
         self.admin_down
+    }
+
+    /// Set what the next OPEN says of a restart: the Restart State bit and
+    /// the families whose Forwarding State bit is set (RFC 4724 §3, §4.1).
+    /// Only has an effect on a configuration with
+    /// [`Config::graceful_restart`].
+    pub fn set_restart_advert(&mut self, advert: RestartAdvert) {
+        self.restart_advert = advert;
     }
 
     /// `AllowAutomaticStart` (RFC 4271 §8.1.1): false once consecutive
@@ -583,21 +617,29 @@ impl Fsm {
 
     fn in_established(&mut self, event: Event, now: Instant, actions: &mut Vec<Action>) {
         match event {
-            // RFC 4271 §8.2.2 Established: ManualStop deletes routes too.
+            // RFC 4271 §8.2.2 Established: ManualStop deletes routes too;
+            // RFC 8538 §4: the NOTIFICATION's sender "MUST also follow the
+            // rules for the Receiving Speaker", unless it is a Hard Reset.
             Event::ManualStop(cease) => {
+                let end = End::Notification {
+                    hard_reset: cease.is_hard_reset(),
+                };
                 actions.push(Action::SendNotification(cease));
-                actions.push(Action::SessionDown);
+                actions.push(self.session_end(end));
                 self.manual_stop(now, actions);
             }
             Event::AutomaticStop(cease) => {
+                let end = End::Notification {
+                    hard_reset: cease.is_hard_reset(),
+                };
                 actions.push(Action::SendNotification(cease));
-                self.session_down(now, true, actions);
+                self.session_down(now, true, end, actions);
             }
             Event::HoldTimerExpires => {
                 actions.push(Action::SendNotification(
                     NotificationMessage::hold_timer_expired(),
                 ));
-                self.session_down(now, true, actions);
+                self.session_down(now, true, End::Timeout, actions);
             }
             // RFC 4271 §8.2.2 Established: KeepaliveTimer_Expires, restart
             // unless the negotiated Hold Time is zero.
@@ -607,6 +649,22 @@ impl Fsm {
             }
             Event::OpenCollisionDump if self.config.collision_detect_established => {
                 self.collision_dump(now, true, actions);
+            }
+            // RFC 4724 §4.2, §5: a connection from a peer whose Graceful
+            // Restart capability listed families, while the session is
+            // established, "MUST" be treated "as an indication of the
+            // termination of the old TCP session": the routes are kept, the
+            // old connection is dropped without a NOTIFICATION, and the FSM
+            // goes to Connect with the new one to follow as event 17. This
+            // replaces the §6.8 tracking of a second connection.
+            Event::TcpCrAcked | Event::TcpConnectionConfirmed if self.restart_session() => {
+                actions.push(self.session_end(End::Transport));
+                actions.push(Action::DropConnection);
+                self.release_resources();
+                self.connect_retry_counter = 0;
+                let retry = self.jitter.apply(self.config.connect_retry_time);
+                self.connect_retry.start(now, retry);
+                self.state = State::Connect;
             }
             // Start events are ignored; a second TCP connection (events 14,
             // 16, 17) is tracked by the coordinator per §6.8 and an invalid
@@ -627,9 +685,20 @@ impl Fsm {
             // RFC 4271 §8.2.2 Established: NOTIFICATION or TCP failure; no
             // damping named. RFC 4486 §4 RECOMMENDS damping after some
             // received Cease subcodes, though.
-            Event::NotifMsg(n) => self.session_down(now, damped_cease(&n), actions),
-            Event::NotifMsgVerErr | Event::TcpConnectionFails => {
-                self.session_down(now, false, actions);
+            Event::NotifMsg(n) => {
+                let end = End::Notification {
+                    hard_reset: n.is_hard_reset(),
+                };
+                self.session_down(now, damped_cease(&n), end, actions);
+            }
+            Event::NotifMsgVerErr => {
+                let end = End::Notification { hard_reset: false };
+                self.session_down(now, false, end, actions);
+            }
+            // RFC 4724 §5: a TCP failure keeps the routes of a peer that
+            // listed families in its capability.
+            Event::TcpConnectionFails => {
+                self.session_down(now, false, End::Transport, actions);
             }
             // RFC 4271 §8.2.2 Established: KEEPALIVE / UPDATE restart the
             // HoldTimer when the negotiated Hold Time is non-zero.
@@ -649,7 +718,8 @@ impl Fsm {
                 actions.push(Action::SendNotification(
                     NotificationMessage::from_decode_error(e),
                 ));
-                self.session_down(now, true, actions);
+                let end = End::Notification { hard_reset: false };
+                self.session_down(now, true, end, actions);
             }
             // RFC 9687 §4.3: SendHoldTimer_Expires.
             Event::SendHoldTimerExpires => {
@@ -659,7 +729,11 @@ impl Fsm {
                     data: Vec::new(),
                 }));
                 actions.push(Action::LogError("send hold timer expired"));
-                self.session_down(now, true, actions);
+                // RFC 9687 says nothing of Graceful Restart. The session
+                // is lost to a peer that stopped reading, which is a
+                // failure of the transport as a Hold Timer expiry is, and
+                // is handled as one (RFC 8538 §4).
+                self.session_down(now, true, End::Timeout, actions);
             }
             // RFC 4271 §8.2.2 Established: any other event (9, 12–13, 22).
             other => {
@@ -723,9 +797,35 @@ impl Fsm {
 
     /// Our OPEN (RFC 4271 §4.2; RFC 6793 §3 adds the Four-octet AS
     /// capability and `AS_TRANS`; RFC 7607 §2 never AS 0, which the config
-    /// type cannot express; RFC 9234 §4.1 adds the BGP Role).
+    /// type cannot express; RFC 9234 §4.1 adds the BGP Role; RFC 4724 §3
+    /// the Graceful Restart capability).
     fn build_open(&self) -> OpenMessage {
         let mut capabilities = self.config.capabilities.clone();
+        // RFC 4724 §3: "A BGP speaker MUST NOT include more than one
+        // instance of the Graceful Restart Capability".
+        if let Some(gr) = &self.config.graceful_restart
+            && !capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::GracefulRestart(_)))
+        {
+            capabilities.push(Capability::GracefulRestart(GracefulRestartCapability {
+                restarting: self.restart_advert.restarting,
+                // RFC 8538 §2: "A BGP speaker indicates support for the
+                // procedures in this document by advertising a Graceful
+                // Restart Capability with its "N" bit set".
+                notification: true,
+                restart_time: gr.restart_time,
+                // RFC 4724 §3: a tuple for each family we support
+                // Graceful Restart for, and §4: every family we exchange.
+                families: advertised_families(&self.config.capabilities)
+                    .into_iter()
+                    .map(|family| GracefulRestartFamily {
+                        family,
+                        forwarding: self.restart_advert.forwarding.contains(&family),
+                    })
+                    .collect(),
+            }));
+        }
         // RFC 9234 §4.1: "If the BGP Role is locally configured, the eBGP
         // speaker MUST advertise the BGP Role Capability" and "MUST NOT
         // advertise multiple versions of" it.
@@ -862,6 +962,7 @@ impl Fsm {
         };
         let (add_path_receive, add_path_send) =
             negotiate_add_path(ours, &open.capabilities, &families);
+        let restart = self.negotiate_restart(&open.capabilities, &receive_families);
         if families.is_empty() {
             // RFC 5492 §5: Unsupported Capability, Data = the capabilities
             // we require, encoded as in the OPEN.
@@ -897,8 +998,37 @@ impl Fsm {
             add_path_receive,
             add_path_send,
             role,
+            restart,
             peer_capabilities: open.capabilities.clone(),
         })
+    }
+
+    /// RFC 4724 §4.2 and RFC 8538 §4: what the peer's Graceful Restart
+    /// capability makes of the session, if ours is on too. Without ours
+    /// the Receiving Speaker procedures are not followed, and the routes of
+    /// the peer are deleted when the session ends, as RFC 4271 has it.
+    fn negotiate_restart(
+        &self,
+        theirs: &[Capability],
+        receive_families: &[AddressFamily],
+    ) -> Option<Box<Restart>> {
+        self.config.graceful_restart?;
+        // RFC 4724 §3: only the last instance counts.
+        let peer = graceful_restart(theirs).map(|theirs| PeerRestart {
+            restart_time: theirs.restart_time,
+            restarting: theirs.restarting,
+            // RFC 8538 §2, §4: the bit is exchanged when both sides set it;
+            // ours is set whenever the capability is advertised.
+            notification: theirs.notification,
+            // Families we take no routes of have none to keep.
+            families: theirs
+                .families
+                .iter()
+                .filter(|f| receive_families.contains(&f.family))
+                .map(|f| (f.family, f.forwarding))
+                .collect(),
+        });
+        Some(Box::new(Restart { peer }))
     }
 
     /// RFC 4271 §8.2.2 `OpenSent` event 19: start the `KeepaliveTimer` and set
@@ -964,7 +1094,8 @@ impl Fsm {
             CeaseSubcode::ConnectionCollisionResolution,
         )));
         if established {
-            self.session_down(now, false, actions);
+            let end = End::Notification { hard_reset: false };
+            self.session_down(now, false, end, actions);
         } else {
             self.connect_retry.stop();
             self.go_idle(now, true, false, actions);
@@ -998,19 +1129,89 @@ impl Fsm {
         actions.push(Action::SendNotification(notification));
         actions.push(Action::LogError("unexpected event for state"));
         if established {
-            self.session_down(now, true, actions);
+            let end = End::Notification { hard_reset: false };
+            self.session_down(now, true, end, actions);
         } else {
             self.connect_retry.stop();
             self.go_idle(now, true, true, actions);
         }
     }
 
-    /// Leave Established: delete routes, then the common Idle path.
-    fn session_down(&mut self, now: Instant, damp: bool, actions: &mut Vec<Action>) {
-        actions.push(Action::SessionDown);
+    /// Leave Established: tell the RIB what became of the routes, then the
+    /// common Idle path.
+    fn session_down(&mut self, now: Instant, damp: bool, end: End, actions: &mut Vec<Action>) {
+        actions.push(self.session_end(end));
         self.connect_retry.stop();
         self.forget_stable_session(now);
         self.go_idle(now, true, damp, actions);
+    }
+
+    /// The action that ends the session, with the routes to keep, if any
+    /// (RFC 4724 §4.2, RFC 8538 §4.1).
+    fn session_end(&self, end: End) -> Action {
+        Action::SessionDown {
+            retain: self.retain(end),
+        }
+    }
+
+    /// Whether the routes of the session that ended as `end` are kept as
+    /// stale ones. That needs the Receiving Speaker procedures to be on
+    /// (ours is advertised and the peer's received), the peer to have
+    /// listed a family ("with one or more AFIs/SAFIs", RFC 4724 §4.2 and
+    /// §5), and the end to be one they cover.
+    fn retain(&self, end: End) -> Option<Retain> {
+        let restart = self.session.as_ref()?.peer_restart()?;
+        if restart.families.is_empty() {
+            return None;
+        }
+        let graceful = match end {
+            // RFC 4724 §5: "TcpConnectionFails ... Graceful Restart
+            // Capability with one or more AFIs/SAFIs has been received".
+            // RFC 8538 §4: "When a BGP speaker resets its session due to a
+            // HOLDTIME expiry, it should generate the relevant BGP
+            // NOTIFICATION message ... but subsequently MUST follow the
+            // rules for the Receiving Speaker".
+            //
+            // NOTE(interop): the Hold Timer sentence of RFC 8538 §4 does
+            // not mention the N bit, and it is read so: the routes are
+            // kept after a Hold Timer or Send Hold Timer expiry also when
+            // the peer sent no N bit, as long as it advertised the
+            // capability with a family. RFC 4724 §4, which the sentence
+            // updates, leaves a session that ends with a NOTIFICATION, as
+            // this one does, to the normal procedures.
+            End::Transport | End::Timeout => true,
+            // RFC 4724 §4: "the normal BGP procedures MUST be followed
+            // when the TCP session terminates due to the sending or
+            // receiving of a BGP NOTIFICATION message", which RFC 8538 §4
+            // changes for the peers that exchanged the N bit, for "a
+            // BGP NOTIFICATION message other than a Hard Reset", received
+            // or sent.
+            End::Notification { hard_reset } => restart.notification && !hard_reset,
+        };
+        graceful.then(|| Retain {
+            families: restart.families.iter().map(|(f, _)| *f).collect(),
+            restart_time: restart.restart_time,
+            notification: restart.notification,
+        })
+    }
+
+    /// Whether a TCP connection from the peer, while the session is
+    /// Established, ends it and keeps its routes (RFC 4724 §4.2, §5): the
+    /// peer has restarted without our knowing. The FSM then drops the old
+    /// connection and goes to Connect, and the caller gives it the event of
+    /// the new connection again, which Connect takes.
+    #[must_use]
+    pub fn takes_over_on_connection(&self) -> bool {
+        self.state == State::Established && self.restart_session()
+    }
+
+    /// Whether the session was set up with a peer whose Graceful Restart
+    /// capability listed a family (RFC 4724 §5).
+    fn restart_session(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(Session::peer_restart)
+            .is_some_and(|r| !r.families.is_empty())
     }
 
     /// A session that stayed Established for `forget_after` ends the run
@@ -1111,6 +1312,11 @@ impl Fsm {
 // NOTIFICATION message with a subcode of "Administrative Shutdown", "Peer
 // De-configured", "Connection Rejected", or "Out of Resources"."
 fn damped_cease(n: &NotificationMessage) -> bool {
+    // RFC 8538 §3.1: a Hard Reset carries the NOTIFICATION that says why,
+    // which is the one RFC 4486 §4 judges.
+    if let Some(inner) = n.hard_reset_inner() {
+        return damped_cease(&inner);
+    }
     n.code == ErrorCode::Cease
         && [
             CeaseSubcode::AdministrativeShutdown,

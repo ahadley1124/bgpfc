@@ -7,14 +7,17 @@
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
 //! The `add_path` group is the cost of RFC 7911: three paths to every
-//! prefix from one peer, and the same sent to a peer that takes them.
+//! prefix from one peer, and the same sent to a peer that takes them. The
+//! `restart` group is the cost of RFC 4724 §4.2: a session that ends with
+//! its table kept as stale routes, the table sent again, and the sweep at
+//! the End-of-RIB marker.
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathLimit, PeerInfo, Rib};
+use bgpfc_rib::{Output, PathLimit, PeerInfo, PeerRestart, Restart, Retention, Rib};
 use bgpfc_rpki::{
     AffectedPrefixes, InvalidAction, ValidationChange, ValidationSource, Vrp, VrpSet,
 };
@@ -68,6 +71,7 @@ fn peer(i: u8) -> PeerInfo {
         add_path_receive: Vec::new(),
         add_path_send: Vec::new(),
         role: None,
+        restart: None,
     }
 }
 
@@ -248,6 +252,97 @@ fn bench(c: &mut Criterion) {
     enforcement(c, routes, &v4, &v6);
     add_path_receive(c, routes);
     add_path_send(c, routes);
+    restart(c, routes, &v4, &v6);
+}
+
+/// A peer that advertised Graceful Restart for both families, with the
+/// Forwarding State bit.
+fn gr_peer(i: u8) -> PeerInfo {
+    PeerInfo {
+        restart: Some(Restart {
+            peer: Some(PeerRestart {
+                restarting: false,
+                families: vec![
+                    (AddressFamily::IPV4_UNICAST, true),
+                    (AddressFamily::IPV6_UNICAST, true),
+                ],
+            }),
+            stale_time: Duration::from_secs(360),
+        }),
+        ..peer(i)
+    }
+}
+
+/// RFC 4724 §4.2 at scale, against `insert_*_from_one_peer_to_one_peer`
+/// (the table sent again where the routes are not there) and
+/// `withdraw_*_on_peer_down` (the routes deleted): keeping the table as
+/// stale routes when the session ends, replacing each stale route as the
+/// peer sends it again, and removing what is left at its End-of-RIB.
+fn restart(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let mut group = c.benchmark_group("restart");
+    group.sample_size(10);
+    let retention = Retention {
+        families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
+        restart_time: Duration::from_secs(120),
+        notification: false,
+    };
+    let loaded = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(gr_peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        (rib, now)
+    };
+    let retained = || {
+        let (mut rib, now) = loaded();
+        outputs(|o| {
+            rib.peer_retain(peer(1).addr, &retention, now, o);
+        });
+        (rib, now)
+    };
+    group.bench_function(format!("keep_{routes}_as_stale_on_session_end"), |b| {
+        b.iter_batched(
+            loaded,
+            |(mut rib, now)| {
+                black_box(outputs(|o| {
+                    rib.peer_retain(peer(1).addr, &retention, now, o);
+                }));
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("send_{routes}_again_over_stale_routes"), |b| {
+        b.iter_batched(
+            retained,
+            |(mut rib, now)| {
+                let mut out = Vec::new();
+                outputs(|o| rib.peer_up(gr_peer(1), now, o));
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("remove_{routes}_stale_at_end_of_rib"), |b| {
+        b.iter_batched(
+            || {
+                let (mut rib, now) = retained();
+                outputs(|o| rib.peer_up(gr_peer(1), now, o));
+                (rib, now)
+            },
+            |(mut rib, now)| {
+                for family in [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST] {
+                    black_box(outputs(|o| rib.end_of_rib(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.finish();
 }
 
 /// RFC 9234 §5 at scale, against the first case above, which is the same

@@ -37,7 +37,13 @@
 //! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
 //! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
 //! attribute is added and checked on the way out, see [`otc`] and
-//! [`export`]).
+//! [`export`]);
+//! RFC 4724 §2, §4, §4.1, §4.2 and RFC 8538 §4.1, §9 (the routes of a
+//! session that ended gracefully stay as stale ones until the peer sends
+//! them again, its End-of-RIB comes or a timer runs out, see
+//! [`Rib::peer_retain`]; a Restarting Speaker defers route selection, see
+//! [`Rib::defer_selection`]; each initial update ends with the End-of-RIB
+//! marker, see [`export::end_of_rib`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -57,6 +63,7 @@ pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod restart;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -80,6 +87,7 @@ pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::{PathLimit, PeerInfo};
+pub use restart::{Deferral, PeerRestart, Restart, Retention, StaleEnd, StalePeer};
 pub use validation::{Enforcement, Revalidation};
 
 use addpath::{Sent, Sync};
@@ -263,6 +271,28 @@ pub enum Output {
     /// routes it moved. The caller logs it. The state a route gets on
     /// arrival is its first, not a change, and is not reported.
     Revalidated(Revalidation),
+    /// Stale routes of a peer were removed (RFC 4724 §4.2): the caller
+    /// logs it. The FIB and the other peers have been told through the
+    /// outputs that came with it.
+    StaleRemoved {
+        /// The peer.
+        peer: IpAddr,
+        /// The family, or `None` for all the peer had.
+        family: Option<AddressFamily>,
+        /// How many routes.
+        routes: usize,
+        /// Why.
+        why: StaleEnd,
+    },
+    /// Route selection for `family` is no longer deferred (RFC 4724
+    /// §4.1): the Loc-RIB is complete for it. The RIB has kept the FIB
+    /// and the peers out of it until now; the caller brings the FIB in
+    /// line with [`Rib::fib_routes_of`] (the routes it holds that the
+    /// Loc-RIB does not go), and the peers are sent their tables after it.
+    SelectionDone {
+        /// The family.
+        family: AddressFamily,
+    },
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -296,6 +326,9 @@ pub struct RouteRef<'a> {
     /// The Path Identifier its peer sent it with (RFC 7911 §3): `Some` for
     /// a route of a family the peer sends with them, zero included.
     pub path_id: Option<PathId>,
+    /// The session it came over ended and it is kept until its peer sends
+    /// it again (RFC 4724 §4.2).
+    pub stale: bool,
 }
 
 struct PeerState {
@@ -323,8 +356,12 @@ struct PeerState {
     /// sent several paths of (RFC 7911 §5); empty for any other.
     sent: FamilyMap<Sent>,
     /// The session is going down: its routes are being removed, and it is
-    /// sent nothing more.
+    /// sent nothing more. Stays set for a session that is down while its
+    /// routes are kept as stale (RFC 4724 §4.2).
     leaving: bool,
+    /// The routes of the peer kept as stale, and the timers that end it
+    /// (RFC 4724 §4.2); `None` for a peer none of whose routes are.
+    stale: Option<restart::Stale>,
 }
 
 impl PeerState {
@@ -393,6 +430,14 @@ struct Sessions {
     /// Pending sweeps of a peer's pacing for a family, earliest first,
     /// one live entry each likewise.
     sweeps: BinaryHeap<Reverse<(Tick, PeerId, AddressFamily)>>,
+    /// Wake-ups for Graceful Restart (RFC 4724 §4): the time a session has
+    /// to come back in, the time stale routes are kept, and the time route
+    /// selection is deferred, earliest first. An entry that no longer
+    /// matches what it wakes is ignored when due, as with `deadlines`.
+    restart_timers: BinaryHeap<Reverse<restart::Timer>>,
+    /// The families whose route selection is deferred while we are
+    /// restarting (RFC 4724 §4.1), and for what.
+    deferral: FamilyMap<restart::Waiting>,
     /// Pacing time, counted from the first instant the RIB was given.
     clock: Option<Clock>,
     /// The time of the input being handled ([`Sessions::tick`]).
@@ -516,6 +561,8 @@ impl Rib {
                 path_senders: 0,
                 deadlines: BinaryHeap::new(),
                 sweeps: BinaryHeap::new(),
+                restart_timers: BinaryHeap::new(),
+                deferral: FamilyMap::default(),
                 clock: None,
                 at: Now::default(),
                 jitter: Jitter::new(0),
@@ -545,7 +592,7 @@ impl Rib {
     ) {
         let old = std::mem::replace(&mut self.s.cx.policies, policies);
         for addr in reexport {
-            let Some(id) = self.s.id(*addr) else {
+            let Some(id) = self.s.up_id(*addr) else {
                 continue;
             };
             let families = self.s.peer(id).info.families.clone();
@@ -563,11 +610,16 @@ impl Rib {
 
     /// A session reached Established: remember the peer and send it the
     /// Loc-RIB for every negotiated family (RFC 4271 §9.2: the initial
-    /// Adj-RIB-Out). These first advertisements are not held back.
+    /// Adj-RIB-Out). These first advertisements are not held back. With
+    /// Graceful Restart on, each family's table is followed by the
+    /// End-of-RIB marker (RFC 4724 §4), and the routes kept from the
+    /// peer's earlier session go on as stale where it says it preserved
+    /// forwarding state, and are deleted where it does not (RFC 4724
+    /// §4.2).
     pub fn peer_up(&mut self, info: PeerInfo, now: Instant, out: &mut impl Sink) {
         let addr = info.addr;
         let families = info.families.clone();
-        self.s.add(PeerState {
+        let mut state = PeerState {
             neighbor: Neighbor::of(&info),
             info,
             disabled: Vec::new(),
@@ -576,10 +628,23 @@ impl Rib {
             pacing: FamilyMap::default(),
             sent: FamilyMap::default(),
             leaving: false,
-        });
-        for family in families {
-            self.refresh(addr, family, now, out);
+            stale: None,
+        };
+        // The routes the peer sent before stay in the tables under its
+        // slot, which the new session takes over with their count.
+        let retained = self.s.take_retained(addr);
+        if let Some(old) = retained {
+            state.adj_in_count = old.adj_in_count;
+            state.stale = old.stale;
         }
+        self.s.add(state);
+        self.resume_stale(addr, now, out);
+        for family in families {
+            if !self.s.deferred(family) {
+                self.start_family(addr, family, now, out);
+            }
+        }
+        self.note_peer_up(addr, now, out);
     }
 
     /// The session left Established: forget the peer and its routes.
@@ -590,6 +655,9 @@ impl Rib {
         #[cfg(feature = "profiling")]
         let _span = bgpfc_prof::Timer::start(&bgpfc_prof::metrics::RIB_PEER_DOWN);
         let Some(id) = self.s.id(addr) else {
+            // RFC 4724 §4.1: nothing waits for a peer that is gone, whether
+            // or not its session ever came up.
+            self.forget_waiting(addr, now, out);
             return;
         };
         self.s.tick(now);
@@ -606,6 +674,7 @@ impl Rib {
         }
         self.s.emit(&mut batches, out);
         self.s.remove(addr);
+        self.forget_waiting(addr, now, out);
     }
 
     /// Change the prefix limits of peer `addr` (RFC 4271 §6.7), as a reload
@@ -618,7 +687,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let state = self.s.peer_mut(id);
@@ -682,10 +751,12 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
-        if !self.s.peer(id).info.speaks(family) {
+        // RFC 4724 §4.1: nothing is advertised for a family while route
+        // selection is deferred; the end of the deferral sends it all.
+        if !self.s.peer(id).info.speaks(family) || self.s.deferred(family) {
             return;
         }
         let now = self.s.tick(now);
@@ -754,7 +825,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        if !self.s.peer(id).info.speaks(family) {
+        if !self.s.peer(id).info.speaks(family) || self.s.deferred(family) {
             return;
         }
         self.s.tick(now);
@@ -779,6 +850,10 @@ impl Rib {
     /// Loc-RIB, every destination, paced like any other change (RFC 7911
     /// §5, RFC 4271 §9.2.1.1).
     fn resync_paths(&mut self, id: PeerId, family: AddressFamily, out: &mut impl Sink) {
+        // RFC 4724 §4.1: nothing is sent while route selection is deferred.
+        if self.s.deferred(family) {
+            return;
+        }
         let mut batch = Batch::default();
         if let Some(table) = self.tables.get(family) {
             for (prefix, dest) in table.iter() {
@@ -801,7 +876,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let mut changed = Vec::new();
@@ -829,7 +904,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let pace_now = self.s.tick(now);
@@ -870,10 +945,13 @@ impl Rib {
     /// calls it then. Stale wake-ups make this early at worst, never late.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        let clock = self.s.clock?;
-        let release = self.s.deadlines.peek().map(|Reverse(d)| d.at);
-        let sweep = self.s.sweeps.peek().map(|Reverse((at, ..))| *at);
-        clock.instant(release.into_iter().chain(sweep).min()?)
+        let restart = self.s.restart_timers.peek().map(|Reverse(t)| t.at);
+        let pacing = self.s.clock.and_then(|clock| {
+            let release = self.s.deadlines.peek().map(|Reverse(d)| d.at);
+            let sweep = self.s.sweeps.peek().map(|Reverse((at, ..))| *at);
+            clock.instant(release.into_iter().chain(sweep).min()?)
+        });
+        restart.into_iter().chain(pacing).min()
     }
 
     /// Send what the interval held back and may go out by `now`: for each
@@ -882,6 +960,9 @@ impl Rib {
     /// caused it, is offered to each peer's pacing; what it holds back
     /// comes out here.
     pub fn flush(&mut self, now: Instant, out: &mut impl Sink) {
+        // RFC 4724 §4: the time a session has to come back in, the time
+        // stale routes are kept and the time route selection is deferred.
+        self.expire_restart(now, out);
         if self.s.clock.is_none() {
             return;
         }
@@ -945,7 +1026,7 @@ impl Rib {
     /// What the RIB knows about peer `addr`, if it is up.
     #[must_use]
     pub fn peer(&self, addr: IpAddr) -> Option<&PeerInfo> {
-        self.s.id(addr).map(|id| &self.s.peer(id).info)
+        self.s.up_id(addr).map(|id| &self.s.peer(id).info)
     }
 
     /// An UPDATE from `addr`: disable the families its incorrect MP
@@ -962,7 +1043,7 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return;
         };
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -1285,7 +1366,7 @@ impl Rib {
         addr: IpAddr,
         family: AddressFamily,
     ) -> std::vec::IntoIter<(Prefix, Arc<PathAttrs>)> {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return Vec::new().into_iter();
         };
         if self.s.peer(id).info.path_limit(family).is_some() {
@@ -1334,7 +1415,7 @@ impl Rib {
         addr: IpAddr,
         family: AddressFamily,
     ) -> Vec<(Prefix, PathId, Arc<PathAttrs>)> {
-        let Some(id) = self.s.id(addr) else {
+        let Some(id) = self.s.up_id(addr) else {
             return Vec::new();
         };
         let Some(sent) = self.s.peer(id).sent.get(family) else {
@@ -1355,7 +1436,7 @@ impl Rib {
     /// Route counts for `addr`.
     #[must_use]
     pub fn peer_stats(&self, addr: IpAddr) -> Option<PeerStats> {
-        let p = self.s.peer(self.s.id(addr)?);
+        let p = self.s.peer(self.s.up_id(addr)?);
         let mut stats = PeerStats::default();
         let mut taken: Vec<AddressFamily> = p
             .info
@@ -1379,7 +1460,12 @@ impl Rib {
 
     /// Peers currently up.
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
-        self.s.peers.iter().flatten().map(|p| &p.info)
+        self.s
+            .peers
+            .iter()
+            .flatten()
+            .filter(|p| !p.leaving)
+            .map(|p| &p.info)
     }
 
     /// Distinct attribute sets held.
@@ -1395,8 +1481,17 @@ impl Sessions {
         Phase2::new(&self.peers, self.cx.invalid)
     }
 
+    /// The slot of `addr`, whether its session is up or only its routes
+    /// are kept (RFC 4724 §4.2).
     fn id(&self, addr: IpAddr) -> Option<PeerId> {
         self.by_addr.get(&addr).copied()
+    }
+
+    /// The slot of `addr` if its session is up: the one inputs about a
+    /// session are for.
+    fn up_id(&self, addr: IpAddr) -> Option<PeerId> {
+        let id = self.id(addr)?;
+        (!self.peer(id).leaving).then_some(id)
     }
 
     fn peer(&self, id: PeerId) -> &PeerState {
@@ -1443,24 +1538,33 @@ impl Sessions {
         let Some(id) = self.by_addr.remove(&addr) else {
             return;
         };
-        if let Some(state) = self.peers[id.index()].take() {
-            self.path_senders -= usize::from(!state.info.add_path_send.is_empty());
-            // The attribute sets of the paths it was sent.
-            for sent in state.sent.into_values() {
-                for (_, paths) in sent.into_entries() {
-                    for p in paths.into_vec() {
-                        self.cx.interner.release(p.attrs);
-                    }
-                }
-            }
-            for pacing in state.pacing.into_values() {
-                for h in pacing.into_held() {
-                    if let Some(has) = h.has {
-                        self.cx.interner.release(has);
-                    }
+        if let Some(mut state) = self.peers[id.index()].take() {
+            self.release_session(&mut state, id);
+        }
+        self.cancel_peer_timers(id);
+    }
+
+    /// Give back what a session of peer `id` holds, so that the peer has
+    /// none of it: the attribute sets of the paths it was sent and of the
+    /// destinations pacing holds for it, and the wake-ups for them.
+    fn release_session(&mut self, state: &mut PeerState, id: PeerId) {
+        self.path_senders -= usize::from(!state.info.add_path_send.is_empty());
+        // The attribute sets of the paths it was sent.
+        for sent in std::mem::take(&mut state.sent).into_values() {
+            for (_, paths) in sent.into_entries() {
+                for p in paths.into_vec() {
+                    self.cx.interner.release(p.attrs);
                 }
             }
         }
+        for pacing in std::mem::take(&mut state.pacing).into_values() {
+            for h in pacing.into_held() {
+                if let Some(has) = h.has {
+                    self.cx.interner.release(has);
+                }
+            }
+        }
+        state.advertised = FamilyMap::default();
         self.deadlines.retain(|Reverse(d)| d.peer != id);
         shrink_heap(&mut self.deadlines);
         self.sweeps.retain(|Reverse((_, peer, _))| *peer != id);
@@ -1507,6 +1611,7 @@ impl Sessions {
             rov: r.rov,
             aspa: r.aspa,
             path_id: peer.info.receives_paths(family).then_some(PathId(id)),
+            stale: r.stale,
         }
     }
 
@@ -1574,6 +1679,13 @@ impl Sessions {
         batches: &mut Batches,
         out: &mut impl Sink,
     ) {
+        // RFC 4724 §4.1: while route selection for the family is deferred
+        // the speaker "has no routes to advertise to its peers and no
+        // routes to update the forwarding state"; the end of the deferral
+        // brings both up to date from the tables as they are then.
+        if self.deferred(family) {
+            return;
+        }
         let (route_changed, state_changed) = match (old, new) {
             (None, None) => (false, false),
             (Some(a), Some(b)) => (!a.same(b), !a.same_state(b)),
@@ -2220,6 +2332,9 @@ fn announce_in<K: Ord>(
                         == route.received.as_ref().map(Arc::as_ptr)
                     && r.same_state(&route)
                     && r.held == route.held
+                    // A stale route the peer sends again is no longer
+                    // stale, though it is the same route (RFC 4724 §4.2).
+                    && !r.stale
                 {
                     // An implicit re-announcement of the same route.
                     return;
@@ -2343,6 +2458,8 @@ impl Judged {
             lookup,
             aspa,
             held,
+            // The peer has just sent it: not a stale route (RFC 4724 §4.2).
+            stale: false,
         })
     }
 }

@@ -63,6 +63,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = d.withdrawals().count();
         let _ = d.withdrawn_paths().count();
         let _ = d.announcements().count();
+        // RFC 4724 §2: a marker announces and withdraws nothing.
+        if d.message.end_of_rib_family().is_some() {
+            assert!(!d.message.has_reachable());
+            assert_eq!(d.withdrawals().count() + d.announcements().count(), 0);
+        }
         if d.treated_as_withdraw.is_some() || !d.discarded.is_empty() {
             continue;
         }

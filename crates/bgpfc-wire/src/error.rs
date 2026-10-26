@@ -140,7 +140,7 @@ pub enum FsmSubcode {
     UnexpectedInEstablished = 3,
 }
 
-/// Cease subcodes (RFC 4486 §3).
+/// Cease subcodes (RFC 4486 §3, RFC 8538 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum CeaseSubcode {
@@ -160,10 +160,15 @@ pub enum CeaseSubcode {
     ConnectionCollisionResolution = 7,
     /// Out of Resources.
     OutOfResources = 8,
+    /// Hard Reset: the session is to be fully terminated, none of the
+    /// Graceful Restart procedures applying; the Data field encapsulates
+    /// the NOTIFICATION that says why (RFC 8538 §3, §3.1).
+    HardReset = 9,
 }
 
 /// Human-readable name of a `(code, subcode)` pair for logs, from the
-/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3 and RFC 4486 §3 tables.
+/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3, RFC 4486 §3 and RFC 8538 §8
+/// tables.
 /// `None` when the subcode is not defined for that code.
 #[must_use]
 pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
@@ -202,6 +207,7 @@ pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
         (ErrorCode::Cease, 6) => "Other Configuration Change",
         (ErrorCode::Cease, 7) => "Connection Collision Resolution",
         (ErrorCode::Cease, 8) => "Out of Resources",
+        (ErrorCode::Cease, 9) => "Hard Reset",
         _ => return None,
     })
 }

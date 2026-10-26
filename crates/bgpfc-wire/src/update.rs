@@ -23,7 +23,8 @@
 //! each NLRI tuple of the Withdrawn Routes field, the NLRI field,
 //! `MP_REACH_NLRI` and `MP_UNREACH_NLRI`, only for the families and the
 //! direction ADD-PATH was negotiated for); RFC 9234 §5 (a malformed Only to
-//! Customer attribute is treat-as-withdraw).
+//! Customer attribute is treat-as-withdraw); RFC 4724 §2 (the End-of-RIB
+//! marker, built and recognised).
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -265,6 +266,52 @@ impl UpdateMessage {
         match self.attribute(code::NEXT_HOP) {
             Some(PathAttribute::NextHop(a)) => Some(*a),
             _ => None,
+        }
+    }
+
+    /// The End-of-RIB marker for `family` (RFC 4724 §2): for IPv4 unicast
+    /// "an UPDATE message with the minimum length", with no withdrawn
+    /// routes, attributes or NLRI; for any other family "an UPDATE message
+    /// that contains only the `MP_UNREACH_NLRI` attribute with no withdrawn
+    /// routes for that <AFI, SAFI>".
+    #[must_use]
+    pub fn end_of_rib(family: AddressFamily) -> UpdateMessage {
+        if family == AddressFamily::IPV4_UNICAST {
+            return UpdateMessage::default();
+        }
+        UpdateMessage {
+            mp_unreach: Some(MpUnreach {
+                family,
+                withdrawn: Vec::new(),
+            }),
+            ..UpdateMessage::default()
+        }
+    }
+
+    /// The family this UPDATE is the End-of-RIB marker of, if it is one
+    /// (RFC 4724 §2): it withdraws and announces nothing. The empty UPDATE
+    /// is IPv4 unicast's; one with only an empty `MP_UNREACH_NLRI` is that
+    /// attribute's family's.
+    ///
+    /// NOTE(interop): an empty `MP_UNREACH_NLRI` for IPv4 unicast is taken
+    /// as IPv4 unicast's marker too, as RFC 4724 §2 names none but the
+    /// minimum-length UPDATE for it and a sender using the attribute for
+    /// every family means the same.
+    #[must_use]
+    pub fn end_of_rib_family(&self) -> Option<AddressFamily> {
+        // The cheap tests first: an UPDATE with NLRI, the usual one, is out
+        // after the first.
+        if !self.nlri.is_empty()
+            || !self.withdrawn.is_empty()
+            || self.mp_reach.is_some()
+            || !self.attributes.is_empty()
+        {
+            return None;
+        }
+        match &self.mp_unreach {
+            None => Some(AddressFamily::IPV4_UNICAST),
+            Some(u) if u.withdrawn.is_empty() => Some(u.family),
+            Some(_) => None,
         }
     }
 
@@ -1193,6 +1240,78 @@ mod tests {
         let mut shuffled = ANNOUNCE.to_vec();
         shuffled[4..31].rotate_left(4);
         assert_eq!(UpdateMessage::decode(&shuffled, &EBGP2).unwrap().message, m);
+    }
+
+    #[test]
+    fn end_of_rib_markers_follow_rfc_4724_section_2() {
+        let v4 = AddressFamily::IPV4_UNICAST;
+        let v6 = AddressFamily::IPV6_UNICAST;
+        // IPv4 unicast: the UPDATE of minimum length, four octets of body
+        // (the two length fields), 23 with the header.
+        let eor4 = UpdateMessage::end_of_rib(v4);
+        assert_eq!(eor4.encode(&ENC4).unwrap(), [0, 0, 0, 0]);
+        let d = UpdateMessage::decode(&[0, 0, 0, 0], &EBGP4).unwrap();
+        assert_eq!(d.message.end_of_rib_family(), Some(v4));
+        // Any other family: only an MP_UNREACH_NLRI (optional,
+        // non-transitive, type 15) holding the AFI and SAFI.
+        let eor6 = UpdateMessage::end_of_rib(v6);
+        let wire6 = [0, 0, 0, 6, 0x80, 15, 3, 0, 2, 1];
+        assert_eq!(eor6.encode(&ENC4).unwrap(), wire6);
+        let d = UpdateMessage::decode(&wire6, &EBGP4).unwrap();
+        assert_eq!(d.message, eor6);
+        assert_eq!(d.message.end_of_rib_family(), Some(v6));
+        // A family the decoder does not speak is still a marker of its
+        // own; it round-trips and names its family.
+        let other = AddressFamily {
+            afi: Afi::Unknown(25),
+            safi: Safi::Unknown(65),
+        };
+        let m = UpdateMessage::end_of_rib(other);
+        assert_eq!(m.end_of_rib_family(), Some(other));
+        // NOTE(interop): an empty MP_UNREACH_NLRI for IPv4 unicast counts.
+        let m = UpdateMessage {
+            mp_unreach: Some(MpUnreach {
+                family: v4,
+                withdrawn: vec![],
+            }),
+            ..UpdateMessage::default()
+        };
+        assert_eq!(m.end_of_rib_family(), Some(v4));
+        // Anything announced or withdrawn is no marker.
+        assert_eq!(announce().end_of_rib_family(), None);
+        let withdraw = |m: UpdateMessage| m.end_of_rib_family();
+        assert_eq!(
+            withdraw(UpdateMessage {
+                withdrawn: vec![p("10.0.0.0/8")],
+                ..UpdateMessage::default()
+            }),
+            None
+        );
+        assert_eq!(
+            withdraw(UpdateMessage {
+                mp_unreach: Some(MpUnreach {
+                    family: v6,
+                    withdrawn: vec![p("2001:db8::/32")],
+                }),
+                ..UpdateMessage::default()
+            }),
+            None
+        );
+        // Attributes beside the attribute make it something else.
+        assert_eq!(
+            withdraw(UpdateMessage {
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                ..eor6.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            withdraw(UpdateMessage {
+                attributes: vec![PathAttribute::Origin(Origin::Igp)],
+                ..UpdateMessage::default()
+            }),
+            None
+        );
     }
 
     #[test]

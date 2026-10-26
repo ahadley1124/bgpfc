@@ -4,7 +4,8 @@
 //! logged, never answered), §6.5 (Hold Timer Expired), §6.7 (Cease);
 //! RFC 4486 §4 (Cease subcode usage and the Maximum Prefixes data field);
 //! RFC 9003 §2 and §4 (Shutdown Communication); RFC 8654 §5 (4096-octet
-//! limit towards peers without Extended Message).
+//! limit towards peers without Extended Message); RFC 8538 §3, §5.2 (Cease
+//! / Hard Reset, which carries another NOTIFICATION).
 
 use std::fmt;
 
@@ -84,6 +85,56 @@ impl NotificationMessage {
             subcode: subcode as u8,
             data,
         })
+    }
+
+    /// Cease / Hard Reset (RFC 8538 §3.1) carrying `inner`: "the data
+    /// portion of the NOTIFICATION message is encoded" as the error code
+    /// and subcode of `inner` followed by its data, so that the Hard Reset
+    /// "encapsulates another NOTIFICATION message in its data portion".
+    #[must_use]
+    pub fn hard_reset(inner: &NotificationMessage) -> Self {
+        let mut data = Vec::with_capacity(2 + inner.data.len());
+        data.put_u8(inner.code.to_u8());
+        data.put_u8(inner.subcode);
+        data.put_bytes(&inner.data);
+        NotificationMessage {
+            code: ErrorCode::Cease,
+            subcode: CeaseSubcode::HardReset as u8,
+            data,
+        }
+    }
+
+    /// Whether this is a Cease / Hard Reset (RFC 8538 §3), whatever it
+    /// carries: the one NOTIFICATION that keeps the Graceful Restart
+    /// procedures from applying (RFC 8538 §4).
+    #[must_use]
+    pub fn is_hard_reset(&self) -> bool {
+        self.code == ErrorCode::Cease && self.subcode == CeaseSubcode::HardReset as u8
+    }
+
+    /// The NOTIFICATION a Hard Reset encapsulates (RFC 8538 §3.1): the
+    /// first two octets of its data are the error code and subcode, the
+    /// rest the data. `None` when this is no Hard Reset or its data cannot
+    /// hold even the code and subcode; it is a Hard Reset all the same.
+    #[must_use]
+    pub fn hard_reset_inner(&self) -> Option<NotificationMessage> {
+        let (code, subcode, data) = self.hard_reset_parts()?;
+        Some(NotificationMessage {
+            code,
+            subcode,
+            data: data.to_vec(),
+        })
+    }
+
+    /// The error code, subcode and data a Hard Reset carries, borrowed.
+    fn hard_reset_parts(&self) -> Option<(ErrorCode, u8, &[u8])> {
+        if !self.is_hard_reset() {
+            return None;
+        }
+        match self.data.as_slice() {
+            [code, subcode, data @ ..] => Some((ErrorCode::from_u8(*code), *subcode, data)),
+            _ => None,
+        }
     }
 
     /// Hold Timer Expired (RFC 4271 §6.5); it has no subcodes.
@@ -175,7 +226,9 @@ impl NotificationMessage {
     }
 
     /// The Shutdown Communication of a Cease / Administrative Shutdown or
-    /// Reset (RFC 9003 §2), if any.
+    /// Reset (RFC 9003 §2), if any; also of one a Hard Reset encapsulates,
+    /// which "MUST subsequently be processed according to" RFC 8203
+    /// (RFC 8538 §5.2).
     ///
     /// `None` when this is not such a Cease or the length octet is zero.
     /// `Some(Err(_))` when the field is malformed: the length does not match
@@ -183,16 +236,19 @@ impl NotificationMessage {
     /// interpreting and §4 asks to log.
     #[must_use]
     pub fn shutdown_communication(&self) -> Option<Result<&str, ShutdownCommunicationError>> {
-        if self.code != ErrorCode::Cease
+        let (code, subcode, data) =
+            self.hard_reset_parts()
+                .unwrap_or((self.code, self.subcode, &self.data));
+        if code != ErrorCode::Cease
             || !matches!(
-                self.subcode,
+                subcode,
                 s if s == CeaseSubcode::AdministrativeShutdown as u8
                     || s == CeaseSubcode::AdministrativeReset as u8
             )
         {
             return None;
         }
-        let (&len, text) = self.data.split_first()?;
+        let (&len, text) = data.split_first()?;
         if len == 0 {
             return None;
         }
@@ -237,6 +293,12 @@ impl fmt::Display for NotificationMessage {
         };
         match subcode_name(self.code, self.subcode) {
             Some(name) if self.subcode == 0 && name == code => f.write_str(code),
+            // RFC 8538 §6: reported as Cease and Hard Reset, with what it
+            // carries beside it.
+            Some(name) if self.is_hard_reset() => match self.hard_reset_inner() {
+                Some(inner) => write!(f, "{code}/{name} ({inner})"),
+                None => write!(f, "{code}/{name}"),
+            },
             Some(name) => write!(f, "{code}/{name}"),
             None => write!(f, "{code}/subcode {}", self.subcode),
         }
@@ -323,9 +385,9 @@ mod tests {
         assert_eq!(m.code, ErrorCode::Unknown(9));
         assert!(!m.is_recognised());
         assert_eq!(m.to_string(), "code 9/subcode 4");
-        let m = NotificationMessage::decode(&[6, 9]).unwrap();
+        let m = NotificationMessage::decode(&[6, 10]).unwrap();
         assert!(!m.is_recognised());
-        assert_eq!(m.to_string(), "Cease/subcode 9");
+        assert_eq!(m.to_string(), "Cease/subcode 10");
         assert!(NotificationMessage::cease(CeaseSubcode::AdministrativeReset).is_recognised());
         assert_eq!(NotificationMessage::decode(&[6]), Err(Truncated));
     }
@@ -433,6 +495,81 @@ mod tests {
         );
         let m = NotificationMessage::decode(&[6, 4, 1, b'a', b'b']).unwrap();
         assert!(matches!(m.shutdown_communication(), Some(Err(_))));
+    }
+
+    #[test]
+    fn hard_reset_encapsulates_another_notification() {
+        // RFC 8538 §3.1: Cease (6), subcode 9, and in the data the error
+        // code, subcode and data of the NOTIFICATION that gives the reason.
+        let inner = NotificationMessage::cease(CeaseSubcode::AdministrativeReset);
+        let m = NotificationMessage::hard_reset(&inner);
+        round_trip(&m, &[6, 9, 6, 4]);
+        assert!(m.is_hard_reset() && m.is_recognised());
+        assert_eq!(m.hard_reset_inner(), Some(inner));
+        assert_eq!(
+            m.to_string(),
+            "Cease/Hard Reset (Cease/Administrative Reset)"
+        );
+        // Data goes along: a Maximum Number of Prefixes Reached with its
+        // Figure 1 (RFC 4486 §4).
+        let inner = NotificationMessage::max_prefixes_reached(AddressFamily::IPV4_UNICAST, 10);
+        let m = NotificationMessage::hard_reset(&inner);
+        round_trip(&m, &[6, 9, 6, 1, 0, 1, 1, 0, 0, 0, 10]);
+        assert_eq!(m.hard_reset_inner(), Some(inner));
+        // Not a Hard Reset: nothing to unwrap.
+        let plain = NotificationMessage::cease(CeaseSubcode::AdministrativeShutdown);
+        assert!(!plain.is_hard_reset());
+        assert_eq!(plain.hard_reset_inner(), None);
+        assert!(!NotificationMessage::hold_timer_expired().is_hard_reset());
+        // A subcode 9 of another code is no Hard Reset either.
+        assert!(
+            !NotificationMessage::decode(&[3, 9, 6, 2])
+                .unwrap()
+                .is_hard_reset()
+        );
+    }
+
+    #[test]
+    fn hard_reset_without_a_reason_is_still_a_hard_reset() {
+        // RFC 8538 §3.1 asks for the code and subcode; a sender that gives
+        // less still sends a Hard Reset, and RFC 4271 §6.4 has the
+        // receiver log what it cannot read, not reject it.
+        for wire in [&[6, 9][..], &[6, 9, 6][..]] {
+            let m = NotificationMessage::decode(wire).unwrap();
+            assert!(m.is_hard_reset(), "{wire:?}");
+            assert_eq!(m.hard_reset_inner(), None);
+            assert_eq!(m.to_string(), "Cease/Hard Reset");
+            assert_eq!(m.shutdown_communication(), None);
+        }
+    }
+
+    #[test]
+    fn a_shutdown_communication_inside_a_hard_reset_is_read() {
+        // RFC 8538 §5.2: "the subcode of the outermost Cease MUST be Hard
+        // Reset, with the Administrative Shutdown or Administrative Reset
+        // subcodes encapsulated within. The encapsulated message MUST
+        // subsequently be processed according to [RFC8203]."
+        let text = "maintenance window";
+        for subcode in [
+            CeaseSubcode::AdministrativeShutdown,
+            CeaseSubcode::AdministrativeReset,
+        ] {
+            let inner = NotificationMessage::shutdown(subcode, text).unwrap();
+            let m = NotificationMessage::hard_reset(&inner);
+            let mut wire = vec![6, 9, 6, subcode as u8, u8::try_from(text.len()).unwrap()];
+            wire.extend_from_slice(text.as_bytes());
+            round_trip(&m, &wire);
+            assert_eq!(m.shutdown_communication(), Some(Ok(text)));
+        }
+        // A malformed one inside is as malformed as outside.
+        let m = NotificationMessage::decode(&[6, 9, 6, 2, 3, b'a']).unwrap();
+        assert!(matches!(m.shutdown_communication(), Some(Err(_))));
+        // Another reason inside carries none.
+        let inner = NotificationMessage::cease(CeaseSubcode::PeerDeconfigured);
+        assert_eq!(
+            NotificationMessage::hard_reset(&inner).shutdown_communication(),
+            None
+        );
     }
 
     #[test]
