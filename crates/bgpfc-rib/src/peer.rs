@@ -5,7 +5,8 @@
 //! per-family prefix limit), §6.3 a) (our own address is no next hop);
 //! RFC 7911 §5 (the families sent and taken with Path Identifiers, and how
 //! many paths are sent); RFC 9234 §4 (our BGP Role on the session);
-//! RFC 4724 §4, §4.2 (Graceful Restart on the session).
+//! RFC 4724 §4, §4.2 (Graceful Restart on the session); RFC 7313 §4
+//! (Enhanced Route Refresh on the session).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -88,6 +89,25 @@ pub struct PeerInfo {
     /// as stale when the session ends (§4.2). `None` leaves the session as
     /// RFC 4271 has it.
     pub restart: Option<Restart>,
+    /// Enhanced Route Refresh (RFC 7313), when both sides advertised the
+    /// capability: a route refresh we make is bracketed by `BoRR` and `EoRR`
+    /// (§4), and a peer's purges the routes it does not send again. `None`
+    /// leaves ROUTE-REFRESH as RFC 2918 has it.
+    pub enhanced_refresh: Option<EnhancedRefresh>,
+}
+
+/// Enhanced Route Refresh on a session (RFC 7313 §4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnhancedRefresh {
+    /// The longest the routes a peer's refresh marked as stale wait for its
+    /// `EoRR`: "an implementation MAY impose a locally configurable upper
+    /// bound on how long it would retain any stale routes" (§4).
+    pub stale_time: Duration,
+    /// The peer advertised Graceful Restart: "A BGP speaker that has
+    /// received the Graceful Restart Capability from its neighbor MUST
+    /// ignore any `BoRR`s for an `<AFI, SAFI>` from the neighbor before the
+    /// speaker receives the `EoR` for the given `<AFI, SAFI>`" (§4).
+    pub peer_graceful_restart: bool,
 }
 
 impl PeerInfo {

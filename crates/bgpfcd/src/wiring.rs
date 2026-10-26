@@ -38,6 +38,11 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         .map(|f| Capability::Multiprotocol(*f))
         .chain([Capability::RouteRefresh, Capability::ExtendedMessage])
         .collect();
+    // RFC 7313 §3.1, §4: a speaker that supports the message subtypes
+    // SHOULD advertise the capability; `enhanced-refresh no` does not.
+    if n.enhanced_refresh.is_some() {
+        fsm.capabilities.push(Capability::EnhancedRouteRefresh);
+    }
     // RFC 8950 §4: one triple per `extended-next-hop` family, each with an
     // IPv6 next hop, in one capability.
     if !n.extended_next_hop.is_empty() {
@@ -76,6 +81,7 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
         fsm,
         allow_as_set: n.allow_as_set,
         stale_time: n.graceful_restart.map(|gr| gr.stale_time),
+        refresh_stale_time: n.enhanced_refresh.map(|e| e.stale_time),
     }
 }
 
@@ -206,6 +212,7 @@ mod tests {
                 Capability::Multiprotocol(AddressFamily::IPV6_UNICAST),
                 Capability::RouteRefresh,
                 Capability::ExtendedMessage,
+                Capability::EnhancedRouteRefresh,
             ]
         );
         assert_ne!(p.fsm.jitter_seed, 0);
@@ -218,7 +225,7 @@ mod tests {
         );
         assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
-        assert_eq!(q.fsm.capabilities.len(), 4);
+        assert_eq!(q.fsm.capabilities.len(), 5);
     }
 
     #[test]
@@ -243,6 +250,33 @@ mod tests {
         let q = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
         assert_eq!(q.fsm.graceful_restart, None);
         assert_eq!(q.stale_time, None);
+    }
+
+    #[test]
+    fn enhanced_route_refresh_is_advertised_unless_turned_off() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; refresh-stale-time 90; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; enhanced-refresh no; }",
+        )
+        .unwrap();
+        let on = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[0]);
+        // RFC 7313 §3.1: capability 70, with the stale time for the RIB.
+        assert!(
+            on.fsm
+                .capabilities
+                .contains(&Capability::EnhancedRouteRefresh)
+        );
+        assert_eq!(on.refresh_stale_time, Some(Duration::from_secs(90)));
+        let off = peer_config(cfg.local_as, cfg.router_id, &cfg.neighbors[1]);
+        assert!(
+            !off.fsm
+                .capabilities
+                .contains(&Capability::EnhancedRouteRefresh)
+        );
+        assert_eq!(off.refresh_stale_time, None);
     }
 
     #[test]

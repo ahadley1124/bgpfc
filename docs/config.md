@@ -141,6 +141,8 @@ neighbor-item
              | "graceful-restart" yes-no ";"         (* default no *)
              | "restart-time" u16 ";"                (* 0-4095; default 120; needs graceful-restart yes *)
              | "stale-time" u16 ";"                  (* 1-65535; default 360; needs graceful-restart yes *)
+             | "enhanced-refresh" yes-no ";"         (* default yes *)
+             | "refresh-stale-time" u16 ";"          (* 1-65535; default 360; not with enhanced-refresh no *)
              | "role" role ";"                       (* default none; external sessions only *)
              | "role-strict" yes-no ";"              (* default no; needs a role *)
              | "passive" yes-no ";"                  (* default no *)
@@ -461,6 +463,51 @@ Configuration Change of a reload that resets a session, and a plain `clear
 neighbor`, are graceful ones: both sides keep the other's routes as stale
 ones.
 
+**Enhanced Route Refresh.** `enhanced-refresh yes;`, the default, has bgpfcd
+advertise the Enhanced Route Refresh capability (RFC 7313 §3.1, code 70),
+as RFC 7313 §4 has a speaker that supports it do; `enhanced-refresh no;`
+turns it off. Its procedures apply to a session on which both sides
+advertised it, and the Route Refresh capability of RFC 2918 as well.
+
+When the neighbor asks for our routes with a ROUTE-REFRESH, or `bgpfcctl
+clear neighbor ADDR soft` has us send them again, bgpfcd sends a BoRR, the
+Adj-RIB-Out of the family, and an EoRR (§4). When the neighbor begins a
+refresh with a BoRR, whether in answer to the ROUTE-REFRESH that a `soft`
+reset or the reload of an import policy sends it, or on its own, bgpfcd
+marks the neighbor's routes of the family as stale. Each route the
+neighbor sends again replaces its stale one, and the routes still stale at
+its EoRR are removed (§4). They are routes the neighbor no longer
+advertises that it never withdrew, so a refresh also clears up a
+disagreement between the two Adj-RIBs. Until then they are in the RIB,
+the kernel and what other neighbors were told like any other route, as
+the stale routes of Graceful Restart are, and `bgpfcctl show routes`
+marks them. With ADD-PATH each path is replaced under its own Path
+Identifier, and those not sent again go.
+
+`refresh-stale-time` is how long the stale routes of a refresh wait for
+the EoRR: 1 to 65535 seconds, 360 by default as FRR has it (its `bgp
+graceful-restart stalepath-time` bounds the wait for an EoRR too; BIRD has
+no setting for it). Past it the routes still stale are removed without the
+EoRR (RFC 7313 §4 lets an implementation do that). It cannot be stated with
+`enhanced-refresh no`.
+
+A neighbor that did not advertise the capability gets RFC 2918's refresh,
+which replaces routes but removes none, and the Message Subtype of its
+ROUTE-REFRESH messages is ignored (RFC 2918 §3). So does one that advertised
+the capability while `enhanced-refresh no;` is set, or without the Route
+Refresh capability, though RFC 7313 §4 would have bgpfcd send it a BoRR and
+an EoRR: a neighbor that was told nothing of our capability reads a BoRR as a
+request and would send its table again, and RFC 2918 §4 allows a
+ROUTE-REFRESH only to a neighbor that advertised Route Refresh.
+COMPLIANCE.md lists these as deviations.
+
+A BoRR from a neighbor that advertised Graceful Restart, for a family whose
+End-of-RIB has not come, is ignored and logged (RFC 7313 §4); so is an EoRR
+with no BoRR before it, and a message of a Message Subtype other than 0, 1
+or 2 (§5). A BoRR or EoRR that is not four octets long is answered with a
+NOTIFICATION, ROUTE-REFRESH Message Error / Invalid Message Length,
+carrying the message, or as much of it as a NOTIFICATION can hold (§5).
+
 **BGP Roles.** `role customer;` says that our Role on the session is
 Customer: the neighbor is our transit provider (RFC 9234 §4). The names
 are those of RFC 9234 §4.1, and the Role is ours, the one the OPEN
@@ -739,10 +786,11 @@ loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
 family in `families`; a `role` only on an external session, and
 `role-strict yes` only with a `role`; `restart-time` and `stale-time` only
-with `graceful-restart yes`; an `rpki` block has a `mode`, at least one
-`cache` with `mode external`, a `routinator` block and no `cache` with `mode
-sidecar` (and no `routinator` block with `mode external`), an `invalid`
-statement with either, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+with `graceful-restart yes`; `refresh-stale-time` not with `enhanced-refresh
+no`; an `rpki` block has a `mode`, at least one `cache` with `mode
+external`, a `routinator` block and no `cache` with `mode sidecar` (and no
+`routinator` block with `mode external`), an `invalid` statement with
+either, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN; a `routinator` block has a `binary` and a `repository-dir`, every
 path absolute, `rtr-listen` a loopback address, every number in its range
@@ -759,8 +807,9 @@ ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`, and the number of paths
 `add-path send` sends; `restart-limit`, `role`, `role-strict`,
-`graceful-restart`, `restart-time` and `stale-time` included, and so are
-the families `add-path` is on for, since the capability is in the OPEN)
+`graceful-restart`, `restart-time`, `stale-time`, `enhanced-refresh` and
+`refresh-stale-time` included, and so are the families `add-path` is on for,
+since the capability is in the OPEN)
 reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset, using route refresh where the peer

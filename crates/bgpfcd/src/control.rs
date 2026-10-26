@@ -995,7 +995,8 @@ fn write_neighbor(
                 .field_num("keepalive_time", s.keepalive_time.as_secs())
                 .field_bool("four_octet_as", s.four_octet_as)
                 .field_bool("extended_messages", s.extended_messages)
-                .field_bool("route_refresh", s.route_refresh);
+                .field_bool("route_refresh", s.route_refresh.peer_advertised())
+                .field_bool("enhanced_route_refresh", s.route_refresh.enhanced());
             write_role(j, s);
             j.key("families").begin_array();
             for f in &s.families {
@@ -1042,7 +1043,50 @@ fn write_neighbor(
         }
     }
     write_graceful_restart(j, r, restart);
+    write_refreshing(j, r, restart);
     j.end_object();
+}
+
+/// The `refreshing` member of a neighbor: the route refreshes it has begun
+/// and not ended, each with how many routes of the family are still stale
+/// and the time left before they go without an `EoRR` (RFC 7313 §4).
+fn write_refreshing(j: &mut Json, r: &PeerReport, restart: &RestartReport) {
+    j.key("refreshing").begin_array();
+    for s in restart
+        .refreshing
+        .iter()
+        .filter(|s| s.refresh.addr == r.addr)
+    {
+        j.begin_object()
+            .field_display("family", s.refresh.family)
+            .field_num("stale_routes", u64::try_from(s.routes).unwrap_or(u64::MAX))
+            .field_opt_num(
+                "stale_timer_seconds",
+                s.refresh.stale_in.map(|d| d.as_secs()),
+            )
+            .end_object();
+    }
+    j.end_array();
+}
+
+/// The lines of `show neighbor` about the route refreshes the neighbor has
+/// begun and not ended (RFC 7313 §4).
+fn refreshing_lines(r: &PeerReport, restart: &RestartReport) -> Vec<String> {
+    restart
+        .refreshing
+        .iter()
+        .filter(|s| s.refresh.addr == r.addr)
+        .map(|s| {
+            let timer = s
+                .refresh
+                .stale_in
+                .map_or(String::new(), |d| format!(", stale timer {}s", d.as_secs()));
+            format!(
+                "  route refresh under way for {}: {} stale routes{timer}",
+                s.refresh.family, s.routes
+            )
+        })
+        .collect()
 }
 
 /// The `graceful_restart` member of a neighbor: `null` without
@@ -1266,8 +1310,11 @@ fn render_neighbor(
             s.keepalive_time.as_secs()
         ));
         lines.push(format!(
-            "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
-            s.four_octet_as, s.extended_messages, s.route_refresh
+            "  capabilities four-octet-as={} extended-messages={} route-refresh={} enhanced-route-refresh={}",
+            s.four_octet_as,
+            s.extended_messages,
+            s.route_refresh.peer_advertised(),
+            s.route_refresh.enhanced()
         ));
         if let Some(local) = s.role {
             lines.push(format!(
@@ -1322,6 +1369,7 @@ fn render_neighbor(
         ));
     }
     lines.extend(graceful_restart_lines(r, restart));
+    lines.extend(refreshing_lines(r, restart));
     let mut j = Json::new();
     write_neighbor(&mut j, r, stats, restart);
     Reply {
@@ -1942,7 +1990,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: true,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
@@ -2063,7 +2111,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: true,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![v4, v6],
             receive_families: vec![v4, v6],
             extended_next_hop_receive: Vec::new(),
@@ -2106,6 +2154,7 @@ mod tests {
             ],
             role: None,
             restart: None,
+            enhanced_refresh: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 2), (v6, 0)],
@@ -2168,6 +2217,7 @@ mod tests {
             add_path_send: Vec::new(),
             role: None,
             restart: None,
+            enhanced_refresh: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],
@@ -2186,7 +2236,7 @@ mod tests {
                 keepalive_time: Duration::from_secs(30),
                 four_octet_as: true,
                 extended_messages: false,
-                route_refresh: true,
+                route_refresh: bgpfc_fsm::RouteRefresh::Supported,
                 families: vec![v4, v6],
                 receive_families: vec![v4, v6],
                 extended_next_hop_receive: Vec::new(),
@@ -2366,6 +2416,146 @@ mod tests {
         }
     }
 
+    /// A neighbor up with Enhanced Route Refresh negotiated, and its report.
+    fn enhanced_neighbor(route_refresh: bgpfc_fsm::RouteRefresh, addr: IpAddr) -> PeerReport {
+        use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
+        let v4 = AddressFamily::IPV4_UNICAST;
+        PeerReport {
+            addr,
+            remote_as: Asn(65_001),
+            state: bgpfc_fsm::State::Established,
+            since: Duration::from_secs(5),
+            session: Some(bgpfc_fsm::Session {
+                peer_as: Asn(65_001),
+                peer_router_id: RouterId::new(2).unwrap(),
+                peer: bgpfc_wire::update::PeerKind::External,
+                hold_time: HoldTime::new(90).unwrap(),
+                keepalive_time: Duration::from_secs(30),
+                four_octet_as: true,
+                extended_messages: false,
+                route_refresh,
+                families: vec![v4],
+                receive_families: vec![v4],
+                extended_next_hop_receive: Vec::new(),
+                extended_next_hop_send: Vec::new(),
+                add_path_receive: Vec::new(),
+                add_path_send: Vec::new(),
+                role: None,
+                restart: None,
+                peer_capabilities: Vec::new(),
+            }),
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+            restart_time: None,
+        }
+    }
+
+    #[test]
+    fn neighbor_detail_shows_whether_enhanced_route_refresh_is_in_use() {
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        // RFC 7313 §3.1: both sides advertised the capability.
+        let report = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Enhanced, addr);
+        let r = render_neighbor(&report, &[], &RestartReport::default());
+        assert!(
+            r.lines
+                .iter()
+                .any(|l| l.contains("route-refresh=true enhanced-route-refresh=true")),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json
+                .contains(r#""route_refresh":true,"enhanced_route_refresh":true"#),
+            "{}",
+            r.json
+        );
+        // No refresh under way: no line, an empty list.
+        assert!(
+            !r.lines
+                .iter()
+                .any(|l| l.contains("route refresh under way"))
+        );
+        assert!(r.json.contains(r#""refreshing":[]"#), "{}", r.json);
+        // Only the neighbor that advertised plain Route Refresh.
+        let plain = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Supported, addr);
+        let r = render_neighbor(&plain, &[], &RestartReport::default());
+        assert!(
+            r.json
+                .contains(r#""route_refresh":true,"enhanced_route_refresh":false"#)
+        );
+        assert!(
+            r.lines
+                .iter()
+                .any(|l| l.contains("enhanced-route-refresh=false"))
+        );
+    }
+
+    #[test]
+    fn neighbor_detail_shows_a_refresh_under_way() {
+        use crate::messages::RefreshingReport;
+        let v4 = bgpfc_wire::types::AddressFamily::IPV4_UNICAST;
+        let addr: IpAddr = "192.0.2.2".parse().unwrap();
+        let report = enhanced_neighbor(bgpfc_fsm::RouteRefresh::Enhanced, addr);
+        // RFC 7313 §4: one begun and not ended, with the routes still stale
+        // and the time left for its EoRR; another neighbor's does not show
+        // here.
+        let refreshing = |addr: IpAddr, left: Option<u64>| RefreshingReport {
+            refresh: bgpfc_rib::RefreshReport {
+                addr,
+                family: v4,
+                stale_in: left.map(Duration::from_secs),
+            },
+            routes: 12,
+        };
+        let restart = RestartReport {
+            refreshing: vec![
+                refreshing(addr, Some(340)),
+                refreshing("192.0.2.9".parse().unwrap(), Some(1)),
+            ],
+            ..RestartReport::default()
+        };
+        let r = render_neighbor(&report, &[], &restart);
+        assert!(
+            r.lines.contains(
+                &"  route refresh under way for ipv4-unicast: 12 stale routes, stale timer 340s"
+                    .to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(
+            r.lines.iter().filter(|l| l.contains("under way")).count(),
+            1
+        );
+        assert!(
+            r.json.contains(
+                r#""refreshing":[{"family":"ipv4-unicast","stale_routes":12,"stale_timer_seconds":340}]"#
+            ),
+            "{}",
+            r.json
+        );
+        // A refresh that marked nothing has no timer.
+        let idle = RestartReport {
+            refreshing: vec![refreshing(addr, None)],
+            ..RestartReport::default()
+        };
+        let r = render_neighbor(&report, &[], &idle);
+        assert!(
+            r.lines.contains(
+                &"  route refresh under way for ipv4-unicast: 12 stale routes".to_owned()
+            ),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(r#""stale_timer_seconds":null"#),
+            "{}",
+            r.json
+        );
+    }
+
     #[test]
     fn neighbor_detail_shows_the_roles() {
         use bgpfc_wire::capability::Capability;
@@ -2379,7 +2569,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: false,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_receive: Vec::new(),
@@ -2459,7 +2649,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: false,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![v4, v6],
             receive_families: vec![v4, v6],
             extended_next_hop_receive: Vec::new(),
@@ -2490,6 +2680,7 @@ mod tests {
             restart_time: Some(RestartTime::new(120).unwrap()),
         };
         let stale = RestartReport {
+            refreshing: Vec::new(),
             deferred: Vec::new(),
             stale: vec![StaleReport {
                 peer: bgpfc_rib::StalePeer {
@@ -2550,6 +2741,7 @@ mod tests {
         // running; the session is not there to report what it said.
         report.state = bgpfc_fsm::State::Active;
         let down = RestartReport {
+            refreshing: Vec::new(),
             deferred: Vec::new(),
             stale: vec![StaleReport {
                 peer: bgpfc_rib::StalePeer {

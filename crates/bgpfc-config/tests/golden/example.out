@@ -185,6 +185,11 @@ Config {
             add_path_receive: [],
             add_path_send: [],
             graceful_restart: None,
+            enhanced_refresh: Some(
+                EnhancedRefresh {
+                    stale_time: 360s,
+                },
+            ),
             role: None,
         },
     ],

@@ -11,7 +11,7 @@ use bgpfc_wire::role::{LocalRole, Role};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, RestartTime, RouterId};
 
 use super::*;
-use crate::{Damping, PeerKind};
+use crate::{Damping, PeerKind, RouteRefresh};
 
 const LOCAL_AS: Asn = Asn(65_000);
 const PEER_AS: Asn = Asn(65_001);
@@ -446,7 +446,9 @@ fn open_negotiation() {
     assert!(s.four_octet_as);
     // RFC 8654 §4: only we advertised Extended Message.
     assert!(!s.extended_messages);
-    assert!(s.route_refresh);
+    // RFC 2918 §2: the peer advertised Route Refresh. RFC 7313 §4: only
+    // we advertised Enhanced Route Refresh, if either.
+    assert_eq!(s.route_refresh, RouteRefresh::Supported);
     // RFC 4760 §8: only IPv4 unicast on both sides; we take IPv6 unicast
     // routes too, since we advertised it.
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
@@ -478,6 +480,94 @@ fn open_negotiation() {
 }
 
 #[test]
+fn enhanced_route_refresh_needs_both_sides() {
+    // RFC 7313 §4: the procedures apply to a speaker that has received the
+    // capability, and a peer applies them to a speaker it received it from:
+    // negotiated when both advertised it, whichever way they are.
+    let with_err = |c: &mut Config| c.capabilities.push(Capability::EnhancedRouteRefresh);
+    let peer_with_err = || {
+        let mut open = peer_open();
+        open.capabilities.push(Capability::EnhancedRouteRefresh);
+        open
+    };
+    for (ours, theirs, negotiated) in [
+        (false, false, RouteRefresh::Supported),
+        (true, false, RouteRefresh::Supported),
+        (false, true, RouteRefresh::Supported),
+        (true, true, RouteRefresh::Enhanced),
+    ] {
+        let mut cfg = config();
+        if ours {
+            with_err(&mut cfg);
+        }
+        let (mut f, now) = fsm_at(State::OpenSent, cfg);
+        let open = if theirs { peer_with_err() } else { peer_open() };
+        f.handle(Event::BgpOpen(open), now);
+        let s = f.session().unwrap();
+        assert_eq!(s.route_refresh, negotiated, "ours {ours} theirs {theirs}");
+        assert_eq!(negotiated.enhanced(), ours && theirs);
+        assert!(s.route_refresh.peer_advertised());
+    }
+    // The procedures refresh a Route Refresh: a peer with the enhanced
+    // capability alone is sent no ROUTE-REFRESH at all.
+    let mut cfg = config();
+    with_err(&mut cfg);
+    let (mut f, now) = fsm_at(State::OpenSent, cfg);
+    f.handle(
+        Event::BgpOpen(OpenMessage::new(
+            PEER_AS,
+            hold(30),
+            rid(2),
+            vec![
+                Capability::Multiprotocol(AddressFamily::IPV4_UNICAST),
+                Capability::EnhancedRouteRefresh,
+            ],
+        )),
+        now,
+    );
+    assert_eq!(
+        f.session().unwrap().route_refresh,
+        RouteRefresh::Unsupported
+    );
+}
+
+#[test]
+fn our_open_carries_enhanced_route_refresh_when_configured() {
+    // RFC 7313 §4: a speaker that supports the subtypes SHOULD advertise
+    // the capability, once (RFC 5492 §4).
+    let mut cfg = config();
+    cfg.capabilities.push(Capability::EnhancedRouteRefresh);
+    let (mut f, now) = fsm_at(State::Idle, cfg);
+    let sent = f
+        .handle(Event::ManualStart, now)
+        .into_iter()
+        .chain(f.handle(Event::TcpCrAcked, now))
+        .find_map(|a| match a {
+            Action::SendOpen(open) => Some(open),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        sent.capabilities
+            .iter()
+            .filter(|c| **c == Capability::EnhancedRouteRefresh)
+            .count(),
+        1
+    );
+    let (mut f, now) = fsm_at(State::Idle, config());
+    let sent = f
+        .handle(Event::ManualStart, now)
+        .into_iter()
+        .chain(f.handle(Event::TcpCrAcked, now))
+        .find_map(|a| match a {
+            Action::SendOpen(open) => Some(open),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!sent.has(&Capability::EnhancedRouteRefresh));
+}
+
+#[test]
 fn internal_session_and_old_speaker() {
     let mut cfg = config();
     cfg.remote_as = LOCAL_AS;
@@ -493,7 +583,7 @@ fn internal_session_and_old_speaker() {
     let s = f.session().unwrap();
     assert_eq!(s.peer, PeerKind::Internal);
     assert!(!s.four_octet_as);
-    assert!(!s.route_refresh);
+    assert_eq!(s.route_refresh, RouteRefresh::Unsupported);
     assert_eq!(s.hold_time, hold(90));
     assert_eq!(s.families, vec![AddressFamily::IPV4_UNICAST]);
 }

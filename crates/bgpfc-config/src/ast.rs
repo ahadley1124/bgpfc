@@ -652,6 +652,24 @@ pub const DEFAULT_RESTART_TIME: u16 = 120;
 /// to 240.
 pub const DEFAULT_STALE_TIME: u16 = 360;
 
+/// `enhanced-refresh yes` (the default) and what goes with it (RFC 7313).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnhancedRefresh {
+    /// `refresh-stale-time`: the longest the routes of a neighbor that
+    /// began a route refresh stay stale while its end is awaited (RFC 7313
+    /// §4: "an implementation MAY impose a locally configurable upper
+    /// bound on how long it would retain any stale routes").
+    /// [`DEFAULT_REFRESH_STALE_TIME`] seconds when not given.
+    pub stale_time: Duration,
+}
+
+/// The `refresh-stale-time` of a neighbor that sets none, in seconds: 360.
+///
+/// NOTE(interop): RFC 7313 §4 names no value. FRR bounds the wait for an
+/// `EoRR` with its `bgp graceful-restart stalepath-time`, 360 seconds by
+/// default, and bgpfcd follows it. BIRD has no setting for it.
+pub const DEFAULT_REFRESH_STALE_TIME: u16 = 360;
+
 /// A `neighbor` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Neighbor {
@@ -718,6 +736,14 @@ pub struct Neighbor {
     /// session ends the way RFC 4724 §4.2 and RFC 8538 §4 describe. `None`,
     /// the default, advertises nothing and keeps RFC 4271's rules.
     pub graceful_restart: Option<GracefulRestart>,
+    /// `enhanced-refresh`, with `refresh-stale-time`: the Enhanced Route
+    /// Refresh capability is advertised, and where the neighbor advertised
+    /// it too a route refresh is bracketed by `BoRR` and `EoRR` and the routes
+    /// a neighbor does not send again in one are purged (RFC 7313 §3.1,
+    /// §4). On by default, as RFC 7313 §4 has a speaker that supports it
+    /// advertise it; `None` for `enhanced-refresh no`, which keeps RFC 2918's
+    /// rules.
+    pub enhanced_refresh: Option<EnhancedRefresh>,
     /// `role` and `role-strict`: our BGP Role on the session (RFC 9234
     /// §4), with strict mode (§4.2) if asked for. `None` by default: no
     /// Role is advertised and the Only to Customer procedures (§5) do not
@@ -757,6 +783,9 @@ impl Neighbor {
             // RFC 4724 §3: the capability is in the OPEN with the Restart
             // Time, and the stale time is read when a session comes up.
             && self.graceful_restart == other.graceful_restart
+            // RFC 7313 §3.1: the capability is in the OPEN, and the stale
+            // time is read when a session comes up.
+            && self.enhanced_refresh == other.enhanced_refresh
             && self
                 .add_path_send
                 .iter()

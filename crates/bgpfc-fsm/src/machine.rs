@@ -22,8 +22,8 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::timers::{Jitter, Timer};
 use crate::{
-    Action, Config, Event, PeerRestart, Restart, RestartAdvert, Retain, SendHoldTime, Session,
-    State, TimerKind,
+    Action, Config, Event, PeerRestart, Restart, RestartAdvert, Retain, RouteRefresh, SendHoldTime,
+    Session, State, TimerKind,
 };
 
 /// NOTIFICATION error code "Send Hold Timer Expired" (RFC 9687 §9).
@@ -923,7 +923,22 @@ impl Fsm {
         let extended_messages =
             ours.contains(&Capability::ExtendedMessage) && open.has(&Capability::ExtendedMessage);
         // RFC 2918 §4: send ROUTE-REFRESH only if the peer advertised it.
-        let route_refresh = open.has(&Capability::RouteRefresh);
+        // RFC 7313 §4: "The following procedures are applicable only if a
+        // BGP speaker has received the Enhanced Route Refresh Capability
+        // from a peer", and a peer applies them only to a speaker it
+        // received the capability from, so both must have advertised it.
+        // The procedures refresh a Route Refresh (RFC 7313 §1), so they
+        // ride on the plain capability too.
+        // NOTE(interop): BIRD and FRR advertise the two together.
+        let route_refresh = if !open.has(&Capability::RouteRefresh) {
+            RouteRefresh::Unsupported
+        } else if ours.contains(&Capability::EnhancedRouteRefresh)
+            && open.has(&Capability::EnhancedRouteRefresh)
+        {
+            RouteRefresh::Enhanced
+        } else {
+            RouteRefresh::Supported
+        };
         let role = self.negotiate_role(open)?;
         let families = negotiate_families(ours, &open.capabilities);
         // RFC 4760 §8 asks both sides to advertise a family only for "a

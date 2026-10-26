@@ -24,6 +24,7 @@ use crate::{FibChange, Output, Rib};
 mod add_path;
 mod adj_rib_in;
 mod invalid_drop;
+mod refresh;
 mod restart;
 mod roles;
 mod roles_add_path;
@@ -117,6 +118,7 @@ pub(crate) fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     }
 }
 

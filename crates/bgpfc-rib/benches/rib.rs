@@ -10,14 +10,18 @@
 //! prefix from one peer, and the same sent to a peer that takes them. The
 //! `restart` group is the cost of RFC 4724 §4.2: a session that ends with
 //! its table kept as stale routes, the table sent again, and the sweep at
-//! the End-of-RIB marker.
+//! the End-of-RIB marker. The `refresh` group is the cost of RFC 7313 §4,
+//! the same three steps for a route refresh of a session that stays up,
+//! and the table sent to a peer that takes the brackets.
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathLimit, PeerInfo, PeerRestart, Restart, Retention, Rib};
+use bgpfc_rib::{
+    EnhancedRefresh, Output, PathLimit, PeerInfo, PeerRestart, Restart, Retention, Rib,
+};
 use bgpfc_rpki::{
     AffectedPrefixes, InvalidAction, ValidationChange, ValidationSource, Vrp, VrpSet,
 };
@@ -72,6 +76,7 @@ fn peer(i: u8) -> PeerInfo {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     }
 }
 
@@ -253,6 +258,7 @@ fn bench(c: &mut Criterion) {
     add_path_receive(c, routes);
     add_path_send(c, routes);
     restart(c, routes, &v4, &v6);
+    refresh(c, routes, &v4, &v6);
 }
 
 /// A peer that advertised Graceful Restart for both families, with the
@@ -342,6 +348,125 @@ fn restart(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUp
             criterion::BatchSize::LargeInput,
         );
     });
+    group.finish();
+}
+
+/// A peer that negotiated Enhanced Route Refresh.
+fn refresh_peer(i: u8) -> PeerInfo {
+    PeerInfo {
+        enhanced_refresh: Some(EnhancedRefresh {
+            stale_time: Duration::from_secs(360),
+            peer_graceful_restart: false,
+        }),
+        ..peer(i)
+    }
+}
+
+/// RFC 7313 §4 at scale, against the `restart` group (the same steps for a
+/// session that ended): the peer's `BoRR` marking its table as stale, the
+/// table sent again over the stale routes, its `EoRR` removing what is
+/// left (everything, and nothing); and our table sent to a peer with the
+/// capability, against a peer without it, where only two small messages
+/// differ.
+fn refresh(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let (v4_family, v6_family) = (AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST);
+    let mut group = c.benchmark_group("refresh");
+    group.sample_size(10);
+    let loaded = || {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        outputs(|o| rib.peer_up(refresh_peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        (rib, now)
+    };
+    let begun = || {
+        let (mut rib, now) = loaded();
+        for family in [v4_family, v6_family] {
+            outputs(|o| {
+                rib.refresh_begin(peer(1).addr, family, now, o);
+            });
+        }
+        (rib, now)
+    };
+    group.bench_function(format!("mark_{routes}_as_stale_at_borr"), |b| {
+        b.iter_batched(
+            loaded,
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| {
+                        rib.refresh_begin(peer(1).addr, family, now, o);
+                    }));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("send_{routes}_again_over_stale_routes"), |b| {
+        b.iter_batched(
+            begun,
+            |(mut rib, now)| {
+                let mut out = Vec::new();
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("remove_{routes}_stale_at_eorr"), |b| {
+        b.iter_batched(
+            begun,
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| rib.refresh_end(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("end_with_none_of_{routes}_stale_at_eorr"), |b| {
+        b.iter_batched(
+            || {
+                let (mut rib, now) = begun();
+                let mut out = Vec::new();
+                feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+                (rib, now)
+            },
+            |(mut rib, now)| {
+                for family in [v4_family, v6_family] {
+                    black_box(outputs(|o| rib.refresh_end(peer(1).addr, family, now, o)));
+                }
+                rib
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    // Our side: a refresh to a peer that asked for it, with the brackets
+    // and without.
+    for (label, to) in [("with", refresh_peer(3)), ("without", peer(3))] {
+        group.bench_function(
+            format!("send_{routes}_to_a_peer_{label}_the_brackets"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let (mut rib, now) = loaded();
+                        outputs(|o| rib.peer_up(to.clone(), now, o));
+                        (rib, now)
+                    },
+                    |(mut rib, now)| {
+                        for family in [v4_family, v6_family] {
+                            black_box(outputs(|o| rib.refresh(peer(3).addr, family, now, o)));
+                        }
+                        rib
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
     group.finish();
 }
 

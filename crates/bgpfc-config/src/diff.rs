@@ -416,6 +416,30 @@ mod tests {
     }
 
     #[test]
+    fn enhanced_refresh_is_a_session_parameter() {
+        let a = cfg(BASE);
+        let with = |extra: &str| {
+            cfg(&BASE.replace("remote-as 65002;", &format!("remote-as 65002; {extra}")))
+        };
+        // RFC 7313 §3.1: the capability is in the OPEN and the stale time is
+        // read when a session comes up, so turning it off, or changing the
+        // time, resets the session.
+        let off = with("enhanced-refresh no;");
+        let d = ConfigDiff::between(&a, &off);
+        assert_eq!(d.reset, vec![addr("192.0.2.3")]);
+        assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
+        assert_eq!(ConfigDiff::between(&off, &a).reset, vec![addr("192.0.2.3")]);
+        let d = ConfigDiff::between(&a, &with("refresh-stale-time 90;"));
+        assert_eq!(d.reset, vec![addr("192.0.2.3")]);
+        // On is the default, and so is 360 seconds.
+        assert!(ConfigDiff::between(&a, &with("enhanced-refresh yes;")).is_empty());
+        assert!(
+            ConfigDiff::between(&a, &with("enhanced-refresh yes; refresh-stale-time 360;"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn add_path_resets_for_a_family_but_not_for_how_many_paths() {
         let a = cfg(BASE);
         let with = |extra: &str| {

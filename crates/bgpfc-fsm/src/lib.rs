@@ -23,7 +23,9 @@
 //! capability, the allowed pairs of Roles, strict mode and Role Mismatch);
 //! RFC 4724 §3, §4, §4.2, §5 and RFC 8538 §2, §4, §4.1 (the Graceful
 //! Restart capability, and which routes a session that ends leaves as
-//! stale for the Receiving Speaker procedures).
+//! stale for the Receiving Speaker procedures); RFC 7313 §3.1, §4 (the
+//! Enhanced Route Refresh capability, which both sides must advertise for
+//! its procedures to apply).
 #![forbid(unsafe_code)]
 
 mod machine;
@@ -302,6 +304,37 @@ pub struct RestartAdvert {
     pub forwarding: Vec<AddressFamily>,
 }
 
+/// What the OPEN exchange made of Route Refresh (RFC 2918 §2, RFC 7313
+/// §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteRefresh {
+    /// The peer did not advertise Route Refresh: it is sent no
+    /// ROUTE-REFRESH (RFC 2918 §4).
+    Unsupported,
+    /// The peer advertised Route Refresh (RFC 2918 §2), and no enhanced
+    /// procedures are in use: the Message Subtype of a ROUTE-REFRESH is
+    /// ignored, as RFC 2918 §3 has it ignore the octet it was.
+    Supported,
+    /// Both sides advertised Route Refresh and Enhanced Route Refresh
+    /// (RFC 7313 §3.1): a route refresh is bracketed by `BoRR` and `EoRR`,
+    /// and the routes a peer does not send again in one are purged (§4).
+    Enhanced,
+}
+
+impl RouteRefresh {
+    /// Whether the peer takes a ROUTE-REFRESH from us (RFC 2918 §4).
+    #[must_use]
+    pub const fn peer_advertised(self) -> bool {
+        !matches!(self, RouteRefresh::Unsupported)
+    }
+
+    /// Whether the procedures of RFC 7313 §4 apply.
+    #[must_use]
+    pub const fn enhanced(self) -> bool {
+        matches!(self, RouteRefresh::Enhanced)
+    }
+}
+
 /// Parameters agreed in the OPEN exchange, fixed for the session's life.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
@@ -320,8 +353,8 @@ pub struct Session {
     pub four_octet_as: bool,
     /// Both sides advertised Extended Message (RFC 8654 §4).
     pub extended_messages: bool,
-    /// The peer advertised Route Refresh (RFC 2918 §4).
-    pub route_refresh: bool,
+    /// What the session does with ROUTE-REFRESH messages.
+    pub route_refresh: RouteRefresh,
     /// Families both sides advertised (RFC 4760 §8), or IPv4 unicast alone
     /// when neither side used the Multiprotocol capability: they go both
     /// ways. Only these are sent to the peer.

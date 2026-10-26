@@ -18,7 +18,6 @@ use bgpfc_wire::error::{CeaseSubcode, DecodeError};
 use bgpfc_wire::notification::NotificationMessage;
 use bgpfc_wire::open::OpenMessage;
 use bgpfc_wire::prefix::Prefix;
-use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::DecodedUpdate;
 
@@ -48,8 +47,10 @@ pub(crate) enum Inbound {
     Notification(NotificationMessage),
     /// A KEEPALIVE.
     Keepalive,
-    /// A ROUTE-REFRESH.
-    RouteRefresh(RouteRefreshMessage),
+    /// The body of a ROUTE-REFRESH; decoded by the peer thread, which knows
+    /// whether Enhanced Route Refresh was negotiated, on which the error for
+    /// a body of the wrong length depends (RFC 7313 §5).
+    RouteRefresh(Vec<u8>),
 }
 
 /// Everything that can wake a peer thread.
@@ -268,7 +269,19 @@ pub(crate) struct StaleReport {
     pub(crate) routes: Vec<(AddressFamily, usize)>,
 }
 
-/// The Graceful Restart state of the RIB (RFC 4724 §4.1, §4.2).
+/// A route refresh a peer has begun and not ended, with how many routes
+/// are still stale in it (RFC 7313 §4).
+#[derive(Clone, Debug)]
+pub(crate) struct RefreshingReport {
+    /// What the RIB knows of it.
+    pub(crate) refresh: bgpfc_rib::RefreshReport,
+    /// Routes of the family still stale.
+    pub(crate) routes: usize,
+}
+
+/// The Graceful Restart state of the RIB (RFC 4724 §4.1, §4.2), and the
+/// route refreshes under way (RFC 7313 §4), which leave routes stale the
+/// same way.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RestartReport {
     /// Families whose route selection is deferred, with how many peers
@@ -276,6 +289,8 @@ pub(crate) struct RestartReport {
     pub(crate) deferred: Vec<(AddressFamily, usize, Duration)>,
     /// Peers with stale routes.
     pub(crate) stale: Vec<StaleReport>,
+    /// Route refreshes begun and not ended.
+    pub(crate) refreshing: Vec<RefreshingReport>,
 }
 
 /// What the coordinator reports about the `rpki` block.
@@ -338,6 +353,9 @@ pub(crate) enum RibMsg {
         /// The neighbor's `stale-time` (RFC 8538 §4.1) when it has
         /// `graceful-restart yes`.
         stale_time: Option<Duration>,
+        /// The neighbor's `refresh-stale-time` (RFC 7313 §4) when it has
+        /// `enhanced-refresh yes`.
+        refresh_stale_time: Option<Duration>,
     },
     /// A decoded UPDATE (announcements, withdrawals, treat-as-withdraw, and
     /// the families an incorrect MP attribute disabled, RFC 4760 §7).
@@ -353,6 +371,22 @@ pub(crate) enum RibMsg {
     },
     /// The peer asked for its Adj-RIB-Out of a family again (RFC 2918 §4).
     RouteRefresh {
+        /// Peer address.
+        peer: IpAddr,
+        /// The family.
+        family: AddressFamily,
+    },
+    /// The peer began a route refresh of a family with a `BoRR` (RFC 7313
+    /// §4).
+    RefreshBegin {
+        /// Peer address.
+        peer: IpAddr,
+        /// The family.
+        family: AddressFamily,
+    },
+    /// The peer ended a route refresh of a family with an `EoRR` (RFC 7313
+    /// §4).
+    RefreshEnd {
         /// Peer address.
         peer: IpAddr,
         /// The family.

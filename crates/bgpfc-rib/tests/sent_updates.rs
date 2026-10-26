@@ -57,6 +57,7 @@ fn peers() -> Vec<PeerInfo> {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     };
     vec![
         peer("10.0.0.1", "10.0.0.254", 65_001, 1, false),
