@@ -10,15 +10,50 @@
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A directory of its own for one test, under the system's temporary
 /// directory.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bgpfcd-test-{}-{name}", std::process::id()));
+    scratch_in(&std::env::temp_dir(), name)
+}
+
+/// A directory of its own for one test under `base`.
+fn scratch_in(base: &Path, name: &str) -> PathBuf {
+    let dir = base.join(format!("bgpfcd-test-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Whether every directory from `/` down to `dir` lets others through
+/// (their mode has `o+x`), as a process that dropped to `nobody` needs to
+/// reach anything below it.
+fn others_can_reach(dir: &Path) -> bool {
+    dir.canonicalize().is_ok_and(|dir| {
+        dir.ancestors().all(|d| {
+            fs::metadata(d).is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o001 != 0)
+        })
+    })
+}
+
+/// A directory of its own for one test that a bgpfcd run as root with
+/// `--user nobody` can work in: mode 0777, under the system's temporary
+/// directory if `nobody` can reach it, and otherwise under `/tmp`, as when
+/// `TMPDIR` names a directory only root may enter.
+fn scratch_for_nobody(name: &str) -> PathBuf {
+    let base = [std::env::temp_dir(), PathBuf::from("/tmp")]
+        .into_iter()
+        .find(|base| others_can_reach(base))
+        .unwrap_or_else(|| {
+            panic!(
+                "neither TMPDIR nor /tmp lets nobody through; set TMPDIR to a directory \
+                 every user can reach"
+            )
+        });
+    let dir = scratch_in(&base, name);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
     dir
 }
 
@@ -172,7 +207,12 @@ fn check_does_not_run_routinator() {
 
 #[test]
 fn a_missing_routinator_stops_the_start() {
-    let dir = scratch("missing-routinator");
+    let root = fs::metadata("/proc/self").unwrap().uid() == 0;
+    let dir = if root {
+        scratch_for_nobody("missing-routinator")
+    } else {
+        scratch("missing-routinator")
+    };
     let binary = dir.join("routinator");
     let config = dir.join("bgpfcd.conf");
     // A free high port, so that no privilege is needed to listen.
@@ -194,13 +234,12 @@ fn a_missing_routinator_stops_the_start() {
     let mut bgpfcd = Command::new(env!("CARGO_BIN_EXE_bgpfcd"));
     bgpfcd.arg("-c").arg(&config);
     // As root, bgpfcd refuses to run Routinator without --user (m14 design
-    // §4.2). So the test drops to nobody, as an operator would, and opens
-    // its scratch directory to nobody, who creates the repository
-    // directory there: the start then fails where it fails for an
+    // §4.2). So the test drops to nobody, as an operator would, in a
+    // scratch directory that nobody can reach and write, where it creates
+    // the repository directory: the start then fails where it fails for an
     // unprivileged run, at the binary.
-    if fs::metadata("/proc/self").unwrap().uid() == 0 {
+    if root {
         bgpfcd.args(["--user", "nobody"]);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
     }
     let out = bgpfcd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
