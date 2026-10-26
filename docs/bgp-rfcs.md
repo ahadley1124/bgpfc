@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 25 are `done`, 7 `partial`,
+Of the 154 RFCs below, 24 are `done`, 8 `partial`,
 14 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 6811, 7313, 7606, 7607, 7911, 8092, 8212, 8481, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 6811, 7606, 7607, 7911, 8092, 8212, 8481, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -48,6 +48,16 @@ Of the 154 RFCs below, 25 are `done`, 7 `partial`,
 - RFC 6286: §2.2 (our own identifier from an internal peer is Bad BGP
   Identifier) and §2.3 (equal identifiers in a collision: the larger AS
   keeps its connection).
+- RFC 7313: Enhanced Route Refresh is done as a sender and receiver on a
+  session where both sides advertised the capability and the peer advertised
+  Route Refresh (AGENTS.md §9 step 17). Four MUST rows deviate. RFC 7313 §4
+  and §5 make the procedures follow from the capability received from the
+  peer alone; bgpfc also needs ours (`enhanced-refresh no;` turns it off) and
+  the peer's Route Refresh (RFC 2918 §4 allows a ROUTE-REFRESH only to a peer
+  that advertised it), so a peer that advertised the capability gets RFC
+  2918's refresh, with no BoRR or EoRR, on those two kinds of session. And a
+  ROUTE-REFRESH too long for the Data field of any NOTIFICATION (over 4075
+  octets, or 65514 with Extended Message) is echoed cut to what fits (§5).
 - RFC 7454 (BCP 194): GTSM (RFC 5082).
 - RFC 9234: the Role capability and the Only to Customer procedures are
   done (§4, §5). The one MUST row left is §3.1: a Customer, RS-Client or
@@ -116,7 +126,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [2842](https://datatracker.ietf.org/doc/html/rfc2842) | Capabilities Advertisement with BGP-4 | PS; obsoleted by 3392 | `n/a` |  |
 | [8810](https://datatracker.ietf.org/doc/html/rfc8810) | Revision to Capability Codes Registration Procedures | PS | `n/a` | IANA procedure. |
 | [2918](https://datatracker.ietf.org/doc/html/rfc2918) | Route Refresh Capability for BGP-4 | PS; updated by 7313 | `done` |  |
-| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `done` | AGENTS.md §9 step 17. The stale routes of a refresh wait for the EoRR for `refresh-stale-time`, 360 s (a MAY in §4). |
+| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `partial` | AGENTS.md §9 step 17. Four MUST rows deviate (see above). The stale routes of a refresh wait for the EoRR for `refresh-stale-time`, 360 s (a MAY in §4). |
 | [4486](https://datatracker.ietf.org/doc/html/rfc4486) | Subcodes for BGP Cease Notification Message | PS; updated by 8203, 9003 | `done` |  |
 | [8203](https://datatracker.ietf.org/doc/html/rfc8203) | BGP Administrative Shutdown Communication | PS; obsoleted by 9003 | `n/a` |  |
 | [9003](https://datatracker.ietf.org/doc/html/rfc9003) | Extended BGP Administrative Shutdown Communication | PS | `done` |  |

@@ -11,8 +11,7 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811, 8481, 8538 and
-> 7313.
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811, 8481 and 8538.
 > RFC 4271 has six rows open. Two need the host's interfaces and routes, which
 > bgpfc does not track, so the kernel's verdict is logged instead: next-hop
 > resolvability (§9.1.2), and a next hop on a shared subnet for one-hop EBGP
@@ -31,7 +30,16 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > session with no BGP Role carries no Only to Customer mark (§3.1). So has RFC
 > 4724: the Restart State bit is set after a restart that kept forwarding
 > state, and a restart that kept none is not told from a first start (§4.1).
-> Nothing else is claimed.
+> RFC 7313 has four deviating rows, from two causes. It follows the procedures
+> on a session where both sides advertised Enhanced Route Refresh and the peer
+> advertised Route Refresh, where the RFC has them follow from the capability
+> received from the peer alone. A peer that advertised the capability gets
+> RFC 2918's refresh, with no BoRR or EoRR, from a neighbor with
+> `enhanced-refresh no;`, and so does one that advertised it without Route
+> Refresh; their BoRR and EoRR are read as requests (§4, §5). And a
+> ROUTE-REFRESH too long for the Data field of any NOTIFICATION is echoed in
+> part, as the size limits of RFC 4271 and RFC 8654 leave no room for all of
+> it (§5). Nothing else is claimed.
 
 ### What works
 
@@ -66,7 +74,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   with the Role Mismatch NOTIFICATION and an optional strict mode; interop
   tests against BIRD 2.14.
 - Enhanced Route Refresh (RFC 7313), advertised unless a neighbor has
-  `enhanced-refresh no;` and used on sessions where both sides advertised it:
+  `enhanced-refresh no;` and used on sessions where both sides advertised it
+  and the peer advertised Route Refresh as well:
   a route refresh bgpfcd makes (the table a neighbor asked for, or `bgpfcctl
   clear neighbor ADDR soft`) is a BoRR, the Adj-RIB-Out and an EoRR, and a
   neighbor's marks all its routes of the family stale at the BoRR and removes
