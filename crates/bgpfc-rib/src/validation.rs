@@ -475,8 +475,11 @@ impl<'a> Pass<'a> {
         };
         route.lookup = lookup;
         route.aspa = aspa;
-        // Always found: the Adj-RIBs-In hold routes only of peers that are
-        // up, as a peer's routes go with it.
+        // Always found: the Adj-RIBs-In hold routes only of peers with a
+        // slot, as a peer's routes go with it. A peer whose session ended
+        // with its routes kept as stale keeps its slot and the session's
+        // settings (RFC 4724 §4.2), so its stale routes are judged again
+        // like any other (RFC 6811 §4).
         let Some(peer) = self.peers[route.peer.index()].as_mut() else {
             return;
         };
