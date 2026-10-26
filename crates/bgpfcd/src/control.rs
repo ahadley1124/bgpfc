@@ -25,7 +25,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -550,11 +550,24 @@ fn ok_reply(message: &str) -> Reply {
 }
 
 /// Ask the coordinator about the `rpki` block.
+///
+/// The coordinator also applies reloads, and one that stops a slow
+/// Routinator holds it for up to `stop-timeout`. The question waits up to
+/// [`QUERY_TIMEOUT`] for the answer, but never for room on the
+/// coordinator's queue: a question that timed out stays queued until the
+/// coordinator gets to it, so a monitoring system that polls `show status`
+/// through such a reload would fill the queue, and every request after
+/// that would wait, holding one of the HTTP server's few connections. A
+/// full queue is answered at once instead, as a coordinator that did not
+/// answer is.
 fn rpki_report(ctx: &Ctx) -> Result<RpkiReport, String> {
     let (tx, rx) = sync_channel(1);
     ctx.coord
-        .send(CoordMsg::Rpki(tx))
-        .map_err(|_| "coordinator gone".to_owned())?;
+        .try_send(CoordMsg::Rpki(tx))
+        .map_err(|e| match e {
+            TrySendError::Full(_) => "coordinator busy".to_owned(),
+            TrySendError::Disconnected(_) => "coordinator gone".to_owned(),
+        })?;
     rx.recv_timeout(QUERY_TIMEOUT)
         .map_err(|_| "coordinator did not answer".to_owned())
 }
@@ -3399,6 +3412,47 @@ mod tests {
                 r.json
             );
         }
+    }
+
+    /// A busy coordinator, as during a reload that waits for a slow
+    /// Routinator to stop, with its queue full of questions that timed
+    /// out: `show status` still answers at once, with `rpki unknown`, and
+    /// `show rpki` with an error, rather than waiting for room on the
+    /// queue (docs/control.md, "Alarms").
+    #[test]
+    fn a_busy_coordinator_leaves_the_rpki_unknown_at_once() {
+        let (coord, _queue) = sync_channel(1);
+        coord
+            .try_send(CoordMsg::Signal(bgpfc_sys::Signal::Hup))
+            .unwrap();
+        // A FIB thread that is gone, so that its mode is unknown at once.
+        let (fib, _) = sync_channel(1);
+        let (rib, _rib) = sync_channel(1);
+        let ctx = Ctx {
+            peers: PeerTable::default(),
+            rib,
+            fib,
+            coord,
+            local_as: Asn(65_000),
+            router_id: RouterId::new(0xC000_0201).unwrap(),
+            writes: false,
+            token: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send((status(&ctx), super::rpki_report(&ctx).err()));
+        });
+        let (reply, rpki) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("show status waited for room on the coordinator's queue");
+        let reply = reply.unwrap();
+        assert_eq!(reply.lines[3..], ["fib mode unknown", "rpki unknown"]);
+        assert!(
+            reply.json.ends_with(r#""rpki":null,"alarms":null}"#),
+            "{}",
+            reply.json
+        );
+        assert_eq!(rpki.as_deref(), Some("coordinator busy"));
     }
 
     #[test]

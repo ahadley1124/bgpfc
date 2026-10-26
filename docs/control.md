@@ -376,7 +376,12 @@ rpki` has them; the JSON has `"rpki": {"mode": ..., "validation": ...}`.
 Both come from the thread that also applies a reload. If it does not
 answer within 10 seconds, as during a reload that waits for a slow
 Routinator to stop, the line is `rpki unknown`, and `rpki` and `alarms`
-are `null` in the JSON: not known, which an empty list would hide.
+are `null` in the JSON: not known, which an empty list would hide. A
+question that got no answer stays queued for that thread until it is
+free; once 16 are queued, `show status` says `rpki unknown` at once,
+rather than wait for room, and `show rpki` fails with `coordinator busy`,
+so that polling through a long reload neither hangs nor holds the HTTP
+API's connections.
 
 ```
 bgpfcd 0.1.0
