@@ -958,6 +958,15 @@ fn a_graceful_reset_keeps_the_routes_of_both_sides_and_a_hard_reset_deletes_them
 
     // RFC 8538 §3.2: the Hard Reset ends the session as RFC 4271 has it.
     // The routes of both sides go at once, and come back with the session.
+    // NOTE(interop): FRR 8.4 reads a NOTIFICATION that arrives along with
+    // the FIN in one pass of its I/O thread, queues the closing of the
+    // connection for its main thread and never processes the NOTIFICATION:
+    // RFC 4724 §4.2 has it keep the routes of a failed TCP connection for
+    // its restart time. bgpfcd leaves the connection open until FRR closes
+    // it (`Linger` in bgpfcd/src/peer.rs) and connects again after that, so
+    // the Hard Reset reaches FRR as one and the new OPEN does not meet an
+    // Established session (RFC 4271 §6.8, which FRR answers with Cease /
+    // Connection Collision Resolution, leaving bgpfcd Idle for seconds).
     let before = p.sessions();
     p.clear(&["hard-reset"]);
     assert!(

@@ -708,3 +708,111 @@ fn the_stale_routes_of_a_neighbor_that_is_removed_go_at_once() {
     assert_eq!(got.withdrawn.len(), 3);
     assert!(!d.ask("show routes").join("\n").contains(" stale"));
 }
+
+/// Whether the daemon has connected to `listener` since it was last asked.
+fn connected(listener: &TcpListener) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    listener.accept().is_ok()
+}
+
+#[test]
+fn a_hard_reset_waits_for_the_neighbor_to_close_before_the_connection_is_closed() {
+    let (d, la, lb) = lab("gr-linger");
+    let gr = Gr {
+        restart_time: 90,
+        forwarding: true,
+    };
+    let (mut a, _b) = established(&d, &la, &lb, gr, &ROUTES);
+    d.ask("clear neighbor 127.0.0.1 hard-reset");
+    let n = a
+        .read_until(&d, |_| false)
+        .unwrap_err()
+        .expect("a NOTIFICATION");
+    assert!(n.is_hard_reset(), "{n}");
+    // RFC 4724 §4.2: a neighbor that reads the end of the connection along
+    // with the NOTIFICATION may take it for a failure of the transport and
+    // keep the routes the Hard Reset (RFC 8538 §3.2) is there to delete. The
+    // daemon closes after the neighbor has, and connects again after that:
+    // the neighbor has then dealt with the old session (RFC 4271 §6.8).
+    assert!(
+        a.is_quiet_for(Duration::from_millis(700)),
+        "the daemon closed first:\n{}",
+        d.log()
+    );
+    assert!(!connected(&la), "the daemon connected too early");
+    let closed = Instant::now();
+    drop(a);
+    let a = Stub::accept(
+        &la,
+        65_001,
+        0xc000_0201,
+        Some(Gr {
+            restart_time: 90,
+            forwarding: true,
+        }),
+        &d,
+    );
+    assert!(
+        closed.elapsed() < Duration::from_secs(2),
+        "the daemon waited out its limit: {:?}",
+        closed.elapsed()
+    );
+    drop(a);
+}
+
+#[test]
+fn a_neighbor_that_does_not_close_after_the_notification_is_closed_by_the_daemon() {
+    let (d, la, lb) = lab("gr-linger-limit");
+    let gr = Gr {
+        restart_time: 90,
+        forwarding: true,
+    };
+    let (mut a, _b) = established(&d, &la, &lb, gr, &ROUTES);
+    d.ask("clear neighbor 127.0.0.1");
+    let n = a
+        .read_until(&d, |_| false)
+        .unwrap_err()
+        .expect("a NOTIFICATION");
+    assert!(!n.is_hard_reset(), "{n}");
+    // The wait is bounded: a neighbor that never closes does not hold the
+    // daemon off for good.
+    let waited = Instant::now();
+    assert_eq!(a.read_until(&d, |_| false).unwrap_err(), None);
+    let waited = waited.elapsed();
+    assert!(waited >= Duration::from_secs(1), "closed after {waited:?}");
+    assert!(waited < Duration::from_secs(10), "closed after {waited:?}");
+    let _a = Stub::accept(
+        &la,
+        65_001,
+        0xc000_0201,
+        Some(Gr {
+            restart_time: 90,
+            forwarding: true,
+        }),
+        &d,
+    );
+}
+
+#[test]
+fn a_neighbor_without_graceful_restart_sees_the_connection_close_at_once() {
+    let (d, la, lb) = lab("gr-no-linger");
+    let gr = Gr {
+        restart_time: 90,
+        forwarding: true,
+    };
+    let (_a, mut b) = established(&d, &la, &lb, gr, &ROUTES);
+    d.ask("clear neighbor 127.0.0.3");
+    b.read_until(&d, |_| false)
+        .unwrap_err()
+        .expect("a NOTIFICATION");
+    // Without the capability there is no difference between a NOTIFICATION
+    // and a failure of the transport to tell (RFC 4724 §4.2), and the
+    // connection is closed as RFC 4271 §4.5 has it.
+    let waited = Instant::now();
+    assert_eq!(b.read_until(&d, |_| false).unwrap_err(), None);
+    assert!(
+        waited.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        waited.elapsed()
+    );
+}

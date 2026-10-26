@@ -2,7 +2,8 @@
 //! peer's FSM, turns bytes and timers into events, and executes the
 //! actions the FSM returns (AGENTS.md §3).
 //!
-//! Implements: RFC 4271 §6.8 (collision resolution between this peer's two
+//! Implements: RFC 4271 §1, §4.5 (a NOTIFICATION is delivered before the TCP
+//! connection is closed), §6.8 (collision resolution between this peer's two
 //! connections), §8.2.1 (one FSM per connection; a second connection is
 //! tracked until its OPEN), §8.2.2 (Idle refuses connections); RFC 4760 §7
 //! (AFI/SAFI disable is reported to the RIB, the session kept); RFC 2918
@@ -44,6 +45,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Inputs a peer thread will queue before its producers block.
 const INPUT_QUEUE: usize = 256;
+
+/// How long the connection of an Established session stays open after the
+/// NOTIFICATION that ends it, for the neighbor to read the NOTIFICATION
+/// and close first; see [`Linger`].
+const NOTIFICATION_LINGER: Duration = Duration::from_secs(3);
 
 /// Octets of UPDATEs that may wait for a peer thread to write them. More
 /// means the peer has fallen too far behind, and its session is reset
@@ -160,6 +166,31 @@ struct Conn {
     initiator: Initiator,
 }
 
+/// A connection a NOTIFICATION was written on, kept open until the
+/// neighbor closes it or `until` passes.
+///
+/// RFC 4271 §4.5 closes the connection after a NOTIFICATION, and RFC 4724
+/// §4.2 has a neighbor that sees the TCP connection fail keep our routes
+/// where it would delete them on a NOTIFICATION. Closing at once puts the
+/// FIN right behind the NOTIFICATION, and a neighbor that reads both in
+/// one go may take the end for a failure of the transport: the Hard Reset
+/// of RFC 8538 §3.2, which exists to have the routes deleted, is then
+/// lost. The neighbor closes when it has processed the NOTIFICATION
+/// (RFC 4271 §6), so waiting for that close delivers the NOTIFICATION
+/// as such. A reader thread goes on reading the connection and reports its
+/// end, which is also what keeps unread data from turning our close into
+/// a reset.
+///
+/// NOTE(interop): FRR 8.4 reads the NOTIFICATION and the FIN in one pass
+/// of its I/O thread under load, queues the connection closing for its main
+/// thread and never processes the NOTIFICATION behind it: it keeps the
+/// routes for its restart time after a Hard Reset that came with the FIN.
+struct Linger {
+    id: ConnId,
+    stream: TcpStream,
+    until: Instant,
+}
+
 /// One neighbour's thread state.
 pub(crate) struct Peer {
     cfg: PeerConfig,
@@ -172,6 +203,15 @@ pub(crate) struct Peer {
     /// A second connection, tracked until its OPEN arrives (RFC 4271
     /// §8.2.2 OpenSent/OpenConfirm) and then resolved per §6.8.
     pending: Option<Conn>,
+    /// The connection of the session that just ended with a NOTIFICATION
+    /// of ours, while it waits for the neighbor to close it.
+    lingering: Option<Linger>,
+    /// An outgoing connection the FSM asked for while `lingering`: made
+    /// once the old connection is gone, so that the neighbor has dealt
+    /// with the old session when the new OPEN reaches it (RFC 4271 §6.8
+    /// would otherwise have it resolve a collision with a session that is
+    /// ending).
+    connect_waits: bool,
     next_conn: ConnId,
     attempt: u64,
     session: Option<Session>,
@@ -218,6 +258,8 @@ pub(crate) fn prepare(
         rib,
         conn: None,
         pending: None,
+        lingering: None,
+        connect_waits: false,
         next_conn: 1,
         attempt: 0,
         session: None,
@@ -249,12 +291,16 @@ impl Peer {
         self.event(Event::ManualStart, Instant::now());
         loop {
             let now = Instant::now();
-            let timeout = self
-                .fsm
-                .next_deadline()
-                .map_or(Duration::from_secs(60), |d| {
-                    d.saturating_duration_since(now)
-                });
+            let deadline = [
+                self.fsm.next_deadline(),
+                self.lingering.as_ref().map(|l| l.until),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let timeout = deadline.map_or(Duration::from_secs(60), |d| {
+                d.saturating_duration_since(now)
+            });
             match self.rx.recv_timeout(timeout) {
                 Ok(input) => {
                     if !self.input(input) {
@@ -265,6 +311,7 @@ impl Peer {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             let now = Instant::now();
+            self.expire_linger(now);
             // Every timer expiry either stops or restarts its timer, so a
             // handful of rounds drains them; the bound guards a bug.
             for _ in 0..8 {
@@ -322,10 +369,19 @@ impl Peer {
     }
 
     fn apply(&mut self, actions: Vec<Action>, _now: Instant) {
+        // The session is over by the time the connection is dropped (the
+        // `SessionDown` action comes first), so whether the NOTIFICATION
+        // ends an Established session is settled here.
+        let was_up = self.session.is_some();
+        let mut notified = false;
         for action in actions {
             match action {
+                Action::Connect if self.lingering.is_some() => self.connect_waits = true,
                 Action::Connect => self.start_connect(),
-                Action::DropConnection => self.drop_conn(),
+                Action::DropConnection => {
+                    self.drop_conn(notified && was_up && self.lingers_after_notification());
+                    notified = false;
+                }
                 Action::RejectConnection => {}
                 Action::SendOpen(open) => {
                     #[cfg(feature = "profiling")]
@@ -342,22 +398,7 @@ impl Peer {
                     }
                 }
                 Action::SendKeepalive => self.write_raw(&KEEPALIVE),
-                Action::SendNotification(n) => {
-                    bgpfc_log::warn!(
-                        "sending notification",
-                        peer = self.cfg.addr,
-                        notification = n
-                    );
-                    let extended = self.session.as_ref().is_some_and(|s| s.extended_messages);
-                    match n.encode(extended) {
-                        Ok(body) => self.write_message(MessageType::Notification, &body),
-                        Err(e) => bgpfc_log::error!(
-                            "cannot encode NOTIFICATION",
-                            peer = self.cfg.addr,
-                            error = e
-                        ),
-                    }
-                }
+                Action::SendNotification(n) => notified |= self.send_notification(&n),
                 Action::SessionUp(session) => {
                     #[cfg(feature = "profiling")]
                     self.open_timer.established();
@@ -418,6 +459,31 @@ impl Peer {
         }
     }
 
+    /// Write a NOTIFICATION on the FSM's connection. Whether it was framed
+    /// and written.
+    fn send_notification(&mut self, n: &NotificationMessage) -> bool {
+        bgpfc_log::warn!(
+            "sending notification",
+            peer = self.cfg.addr,
+            notification = n
+        );
+        let extended = self.session.as_ref().is_some_and(|s| s.extended_messages);
+        match n.encode(extended) {
+            Ok(body) => {
+                self.write_message(MessageType::Notification, &body);
+                true
+            }
+            Err(e) => {
+                bgpfc_log::error!(
+                    "cannot encode NOTIFICATION",
+                    peer = self.cfg.addr,
+                    error = e
+                );
+                false
+            }
+        }
+    }
+
     /// Handle one input; `false` when the thread should end.
     fn input(&mut self, input: PeerInput) -> bool {
         let now = Instant::now();
@@ -451,6 +517,9 @@ impl Peer {
                     self.event(Event::TcpConnectionFails, now);
                 } else if self.pending.as_ref().is_some_and(|c| c.id == conn) {
                     self.pending = None;
+                } else if self.lingering.as_ref().is_some_and(|l| l.id == conn) {
+                    // The neighbor has read the NOTIFICATION and closed.
+                    self.end_linger();
                 }
             }
             // The outbox is written below, after every input.
@@ -463,7 +532,8 @@ impl Peer {
                 // nothing is damped or counted toward the restart limit.
                 let cease = self.hard_if_suggested(NotificationMessage::cease(subcode));
                 self.event(Event::ManualStop(cease), now);
-                self.drop_conn();
+                self.drop_conn(false);
+                self.finish_linger();
                 return false;
             }
             PeerInput::Reset { message, hard } => {
@@ -620,7 +690,7 @@ impl Peer {
             State::Connect | State::Active => {
                 if self.conn.is_some() {
                     // Cannot happen: the FSM has no connection in these states.
-                    self.drop_conn();
+                    self.drop_conn(false);
                 }
                 self.conn = Some(self.new_conn(stream, initiator));
                 let event = match initiator {
@@ -739,12 +809,78 @@ impl Peer {
         }
     }
 
-    fn drop_conn(&mut self) {
+    /// Close the FSM's connection, or with `linger` leave it open for the
+    /// neighbor to close first (see [`Linger`]).
+    fn drop_conn(&mut self, linger: bool) {
         #[cfg(feature = "profiling")]
         self.open_timer.reset();
-        if let Some(c) = self.conn.take() {
+        let Some(c) = self.conn.take() else {
+            return;
+        };
+        if linger && !self.write_failed {
+            // One at a time: an older one, still waiting, goes now.
+            if let Some(old) = self.lingering.take() {
+                let _ = old.stream.shutdown(Shutdown::Both);
+            }
+            self.lingering = Some(Linger {
+                id: c.id,
+                stream: c.stream,
+                until: Instant::now() + NOTIFICATION_LINGER,
+            });
+        } else {
             let _ = c.stream.shutdown(Shutdown::Both);
         }
+    }
+
+    /// Whether the connection of a session that ends with our NOTIFICATION
+    /// waits for the neighbor to close it. Only a neighbor with Graceful
+    /// Restart on can tell the NOTIFICATION from a failure of the
+    /// transport (RFC 4724 §4.2), and for the others the close is as
+    /// before.
+    fn lingers_after_notification(&self) -> bool {
+        self.cfg.fsm.graceful_restart.is_some()
+    }
+
+    /// Close the connection that waited for the neighbor, and make the
+    /// connection the FSM asked for meanwhile.
+    fn end_linger(&mut self) {
+        if let Some(l) = self.lingering.take() {
+            let _ = l.stream.shutdown(Shutdown::Both);
+        }
+        if std::mem::take(&mut self.connect_waits) && self.fsm.state() == State::Connect {
+            self.start_connect();
+        }
+    }
+
+    /// Close the connection that waited for the neighbor if the time is up.
+    fn expire_linger(&mut self, now: Instant) {
+        if self.lingering.as_ref().is_some_and(|l| l.until <= now) {
+            bgpfc_log::debug!(
+                "the neighbor did not close after the notification, closing",
+                peer = self.cfg.addr
+            );
+            self.end_linger();
+        }
+    }
+
+    /// Before the thread ends: give the neighbor the time to close, as
+    /// the thread would otherwise close the connection at once.
+    fn finish_linger(&mut self) {
+        while let Some(until) = self.lingering.as_ref().map(|l| l.until) {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(PeerInput::Closed { conn })
+                    if self.lingering.as_ref().is_some_and(|l| l.id == conn) =>
+                {
+                    break;
+                }
+                // The thread is ending; nothing else is of interest.
+                Ok(_) if !left.is_zero() => {}
+                _ => break,
+            }
+        }
+        self.connect_waits = false;
+        self.end_linger();
     }
 
     /// Write the UPDATEs waiting in the outbox, or drop them outside
@@ -1329,6 +1465,167 @@ mod tests {
         );
         fsm.handle(Event::BgpOpen(open), now);
         fsm.session().cloned().unwrap()
+    }
+
+    /// A peer thread's state, not running, whose neighbor is `listener`.
+    fn idle_peer(graceful_restart: bool) -> (Peer, std::net::TcpListener) {
+        use bgpfc_wire::types::{Asn, RestartTime, RouterId};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        if graceful_restart {
+            fsm.graceful_restart = Some(bgpfc_fsm::GracefulRestart {
+                restart_time: RestartTime::new(120).unwrap(),
+            });
+        }
+        let cfg = PeerConfig {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+            stale_time: None,
+        };
+        let (rib, _) = sync_channel(4);
+        let (_, peer) = prepare(cfg, rib, Arc::default());
+        (peer, listener)
+    }
+
+    /// Give `peer` a connection to `listener` as the FSM's, with the
+    /// neighbor's end of it.
+    fn connect(peer: &mut Peer, listener: &std::net::TcpListener) -> (ConnId, TcpStream) {
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (theirs, _) = listener.accept().unwrap();
+        let conn = peer.new_conn(ours, Initiator::Local);
+        let id = conn.id;
+        peer.conn = Some(conn);
+        (id, theirs)
+    }
+
+    /// Whether `theirs` has been closed by the other end (EOF or reset)
+    /// within `wait`, whatever was sent before.
+    fn closed_within(theirs: &mut TcpStream, wait: Duration) -> bool {
+        use std::io::Read;
+        theirs.set_read_timeout(Some(wait)).unwrap();
+        loop {
+            match theirs.read(&mut [0; 64]) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) => {
+                    return !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lingering_connection_stays_open_until_the_neighbor_closes_it() {
+        let (mut peer, listener) = idle_peer(true);
+        let (id, mut theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        assert!(peer.conn.is_none());
+        assert!(peer.lingering.as_ref().is_some_and(|l| l.id == id));
+        assert!(!closed_within(&mut theirs, Duration::from_millis(200)));
+        // The reader thread reports the neighbor's close, which ends the
+        // wait, and the connection goes with it.
+        drop(theirs);
+        let closed = peer.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(closed, PeerInput::Closed { conn } if conn == id));
+        assert!(peer.input(closed));
+        assert!(peer.lingering.is_none());
+    }
+
+    #[test]
+    fn a_lingering_connection_is_closed_when_its_time_is_up() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, mut theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        let until = peer.lingering.as_ref().unwrap().until;
+        peer.expire_linger(Instant::now());
+        assert!(peer.lingering.is_some());
+        assert!(!closed_within(&mut theirs, Duration::from_millis(100)));
+        peer.expire_linger(until);
+        assert!(peer.lingering.is_none());
+        assert!(closed_within(&mut theirs, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_connection_is_made_after_the_lingering_one_is_gone() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, _theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        // RFC 4271 §8.2.2: the start brings the FSM to Connect and asks for
+        // a connection, which waits for the neighbor to close the old one.
+        peer.event(Event::ManualStart, Instant::now());
+        assert_eq!(peer.fsm.state(), State::Connect);
+        assert!(peer.connect_waits);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err());
+        peer.end_linger();
+        assert!(!peer.connect_waits);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listener.accept().is_err() {
+            assert!(Instant::now() < deadline, "no connection was made");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn no_connection_is_made_after_the_fsm_has_gone_idle() {
+        let (mut peer, listener) = idle_peer(true);
+        let (_, _theirs) = connect(&mut peer, &listener);
+        peer.drop_conn(true);
+        peer.event(Event::ManualStart, Instant::now());
+        let stop = NotificationMessage::cease(CeaseSubcode::AdministrativeShutdown);
+        peer.event(Event::ManualStop(stop), Instant::now());
+        assert_eq!(peer.fsm.state(), State::Idle);
+        assert!(peer.connect_waits);
+        peer.end_linger();
+        assert!(!peer.connect_waits);
+        listener.set_nonblocking(true).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn only_a_notification_that_ends_an_established_session_of_a_gr_neighbor_lingers() {
+        use bgpfc_wire::capability::Capability;
+        let session = negotiated(
+            vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)],
+            vec![Capability::Multiprotocol(AddressFamily::IPV4_UNICAST)],
+        );
+        let stop = || NotificationMessage::cease(CeaseSubcode::AdministrativeReset);
+        // (graceful restart on, session up, NOTIFICATION sent, lingers)
+        for (gr, up, notified, lingers) in [
+            (true, true, true, true),
+            // RFC 4724 §4.2: without the capability a NOTIFICATION and a
+            // failure of the transport are the same to the neighbor.
+            (false, true, true, false),
+            // Nothing is kept of a session that never came up.
+            (true, false, true, false),
+            // A failure of the transport has no NOTIFICATION to deliver.
+            (true, true, false, false),
+        ] {
+            let (mut peer, listener) = idle_peer(gr);
+            let (_, mut theirs) = connect(&mut peer, &listener);
+            peer.session = up.then(|| session.clone());
+            let mut actions = Vec::new();
+            if notified {
+                actions.push(Action::SendNotification(stop()));
+            }
+            actions.push(Action::SessionDown { retain: None });
+            actions.push(Action::DropConnection);
+            peer.apply(actions, Instant::now());
+            let case = (gr, up, notified);
+            assert_eq!(peer.lingering.is_some(), lingers, "{case:?}");
+            assert_eq!(
+                closed_within(&mut theirs, Duration::from_millis(200)),
+                !lingers,
+                "{case:?}"
+            );
+        }
     }
 
     #[test]
