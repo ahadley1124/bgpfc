@@ -72,6 +72,8 @@ fn decode(kind: MessageType, body: &[u8]) -> Result<Inbound, DecodeError> {
             NotificationMessage::decode(body).map_or(Inbound::Keepalive, Inbound::Notification)
         }
         MessageType::Keepalive => Inbound::Keepalive,
-        MessageType::RouteRefresh => Inbound::RouteRefresh(RouteRefreshMessage::decode(body)?),
+        MessageType::RouteRefresh => {
+            Inbound::RouteRefresh(RouteRefreshMessage::decode(body, false)?)
+        }
     })
 }

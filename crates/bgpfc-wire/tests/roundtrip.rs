@@ -28,7 +28,7 @@ use bgpfc_wire::prefix::{
 };
 use bgpfc_wire::reader::Reader;
 use bgpfc_wire::role::Role;
-use bgpfc_wire::route_refresh::RouteRefreshMessage;
+use bgpfc_wire::route_refresh::{ROUTE_REFRESH_LEN, RefreshSubtype, RouteRefreshMessage};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn, HoldTime, PathId, RestartTime, RouterId, Safi};
 use bgpfc_wire::update::{
     AddPathFamilies, DecodeContext, EncodeContext, PathIds, PeerKind, UpdateMessage,
@@ -144,6 +144,7 @@ fn capability() -> impl Strategy<Value = Capability> {
         address_family().prop_map(Capability::Multiprotocol),
         Just(Capability::RouteRefresh),
         Just(Capability::ExtendedMessage),
+        Just(Capability::EnhancedRouteRefresh),
         any::<u32>().prop_map(|a| Capability::FourOctetAs(Asn(a))),
         // RFC 9234 §4.1: any Role Value, assigned or not.
         any::<u8>().prop_map(|v| Capability::Role(Role::from_u8(v))),
@@ -155,7 +156,7 @@ fn capability() -> impl Strategy<Value = Capability> {
         (
             any::<u8>().prop_filter("known code", |c| !matches!(
                 c,
-                1 | 2 | 5 | 6 | 9 | 64 | 65 | 69
+                1 | 2 | 5 | 6 | 9 | 64 | 65 | 69 | 70
             )),
             vec(any::<u8>(), 0..=255)
         )
@@ -743,9 +744,43 @@ proptest! {
     }
 
     #[test]
-    fn route_refresh_round_trip(f in address_family()) {
-        let m = RouteRefreshMessage { family: f };
-        prop_assert_eq!(RouteRefreshMessage::decode(&m.encode()).unwrap(), m);
+    fn route_refresh_round_trip(f in address_family(), subtype in any::<u8>(), enhanced in any::<bool>()) {
+        // RFC 7313 §3.2: any subtype value survives, assigned or not.
+        let m = RouteRefreshMessage { family: f, subtype: RefreshSubtype::from_u8(subtype) };
+        prop_assert_eq!(RouteRefreshMessage::decode(&m.encode(), enhanced).unwrap(), m);
+        // And the framed message is a header and those four octets.
+        let framed = m.frame();
+        let h = Header::decode(&framed, false).unwrap();
+        prop_assert_eq!(h.kind, MessageType::RouteRefresh);
+        prop_assert_eq!(&framed[19..], &m.encode()[..]);
+    }
+
+    #[test]
+    fn route_refresh_bytes_round_trip(body in vec(any::<u8>(), ROUTE_REFRESH_LEN..=ROUTE_REFRESH_LEN), enhanced in any::<bool>()) {
+        // encode(decode(b)) == b for every canonical (four-octet) body.
+        let m = RouteRefreshMessage::decode(&body, enhanced).unwrap();
+        prop_assert_eq!(m.encode(), body);
+    }
+
+    #[test]
+    fn route_refresh_of_any_other_length_is_an_error_naming_the_message(
+        body in vec(any::<u8>(), 0..=300).prop_filter("not four octets", |b| b.len() != ROUTE_REFRESH_LEN),
+    ) {
+        // RFC 7313 §5: with the capability, a BoRR or EoRR of another
+        // length is ROUTE-REFRESH Message Error / Invalid Message Length
+        // carrying the whole message; any other message of another length
+        // (and any at all without the capability) is Bad Message Length.
+        let e = RouteRefreshMessage::decode(&body, true).unwrap_err();
+        let begin_or_end = body.get(2).is_some_and(|v| matches!(v, 1 | 2));
+        if begin_or_end {
+            prop_assert_eq!((e.code, e.subcode), (ErrorCode::RouteRefresh, 1));
+            prop_assert_eq!(e.data, frame(MessageType::RouteRefresh, &body).unwrap());
+        } else {
+            prop_assert_eq!((e.code, e.subcode), (ErrorCode::MessageHeader, 2));
+            prop_assert_eq!(e.data, u16::try_from(body.len() + 19).unwrap().to_be_bytes().to_vec());
+        }
+        let e = RouteRefreshMessage::decode(&body, false).unwrap_err();
+        prop_assert_eq!((e.code, e.subcode), (ErrorCode::MessageHeader, 2));
     }
 
     #[test]
@@ -1099,7 +1134,7 @@ proptest! {
         let _ = Header::decode(&bytes, flag);
         let _ = OpenMessage::decode(&bytes);
         let _ = NotificationMessage::decode(&bytes);
-        let _ = RouteRefreshMessage::decode(&bytes);
+        let _ = RouteRefreshMessage::decode(&bytes, flag);
         let _ = UpdateMessage::decode(&bytes, &IBGP4);
         let _ = UpdateMessage::decode(&bytes, &IBGP2);
         let _ = UpdateMessage::decode(&bytes, &EBGP4);

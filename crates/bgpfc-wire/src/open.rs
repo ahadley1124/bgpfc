@@ -361,8 +361,9 @@ mod tests {
         // Captured from BIRD 2.14, AS 65001, `local role provider`, to a
         // neighbor in AS 65000: Multiprotocol, Route Refresh, the Role
         // (RFC 9234 §4.1: 9, 1, 0), Graceful Restart, 4-octet AS, Enhanced
-        // Route Refresh and Long-lived Graceful Restart. The ones this
-        // implementation does not know are kept as they came (RFC 5492 §5).
+        // Route Refresh (RFC 7313 §3.1: 70, 0) and Long-lived Graceful
+        // Restart. The ones this implementation does not know are kept as
+        // they came (RFC 5492 §5).
         let wire = [
             4, 0xfd, 0xe9, 0, 30, 10, 77, 0, 2, // version, AS, hold, ID
             27, 2, 25, // optional parameters: a Capabilities parameter
@@ -377,6 +378,11 @@ mod tests {
         let m = OpenMessage::decode(&wire).unwrap();
         assert_eq!(m.asn(), Asn(65_001));
         assert!(m.has(&Capability::Role(Role::Provider)));
+        assert!(m.has(&Capability::EnhancedRouteRefresh));
+        assert!(m.has(&Capability::Unknown {
+            code: 71,
+            value: vec![]
+        }));
         assert_eq!(m.capabilities.len(), 7);
         assert_eq!(m.encode().unwrap(), wire);
     }

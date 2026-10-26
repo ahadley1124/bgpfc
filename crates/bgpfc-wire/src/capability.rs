@@ -6,7 +6,7 @@
 //! Encoding, code 5); RFC 8654 §3 (Extended Message, code 6); RFC 9234
 //! §4.1 (BGP Role, code 9); RFC 4724 §3 and RFC 8538 §2 (Graceful Restart,
 //! code 64); RFC 6793 §3 (Four-octet AS, code 65); RFC 7911 §4 (ADD-PATH,
-//! code 69).
+//! code 69); RFC 7313 §3.1 (Enhanced Route Refresh, code 70).
 
 use crate::error::{DecodeError, EncodeError, OpenSubcode};
 use crate::reader::{Reader, WriteBytes as _};
@@ -38,6 +38,10 @@ pub enum Capability {
     /// send multiple paths (RFC 7911 §4). A speaker lists all its families
     /// in one instance; the tuples of several instances add up.
     AddPath(Vec<AddPathTuple>),
+    /// Enhanced Route Refresh: the speaker supports the ROUTE-REFRESH
+    /// message subtypes and the procedures that go with them (RFC 7313
+    /// §3.1).
+    EnhancedRouteRefresh,
     /// A capability this implementation does not understand. Kept so that
     /// the OPEN round-trips; the FSM ignores it (RFC 5492 §5).
     Unknown {
@@ -61,6 +65,7 @@ impl Capability {
             Capability::GracefulRestart(_) => 64,
             Capability::FourOctetAs(_) => 65,
             Capability::AddPath(_) => 69,
+            Capability::EnhancedRouteRefresh => 70,
             Capability::Unknown { code, .. } => *code,
         }
     }
@@ -82,7 +87,10 @@ impl Capability {
                 out.put_u8(0);
                 out.put_u8(af.safi.to_u8());
             }
-            Capability::RouteRefresh | Capability::ExtendedMessage => out.put_u8(0),
+            // RFC 2918 §2, RFC 8654 §3, RFC 7313 §3.1: length zero.
+            Capability::RouteRefresh
+            | Capability::ExtendedMessage
+            | Capability::EnhancedRouteRefresh => out.put_u8(0),
             Capability::ExtendedNextHop(triples) => {
                 // RFC 8950 §4: six octets per <NLRI AFI, NLRI SAFI,
                 // Nexthop AFI> triple, each field two octets.
@@ -220,7 +228,10 @@ impl Capability {
                     }
                 }
             }
-            1 | 2 | 5 | 6 | 9 | 64 | 65 | 69 => return Err(malformed()),
+            // RFC 7313 §3.1: "The Capability Length field of this capability
+            // is zero."
+            70 if len == 0 => Capability::EnhancedRouteRefresh,
+            1 | 2 | 5 | 6 | 9 | 64 | 65 | 69 | 70 => return Err(malformed()),
             // RFC 5492 §5: capabilities not understood MUST be ignored.
             _ => Capability::Unknown {
                 code,
@@ -555,6 +566,9 @@ mod tests {
         );
         round_trip(&Capability::RouteRefresh, &[2, 0]);
         round_trip(&Capability::ExtendedMessage, &[6, 0]);
+        // RFC 7313 §3.1: code 70, length zero.
+        round_trip(&Capability::EnhancedRouteRefresh, &[70, 0]);
+        assert_eq!(Capability::EnhancedRouteRefresh.code(), 70);
         round_trip(
             &Capability::FourOctetAs(Asn(65_000)),
             &[65, 4, 0, 0, 0xfd, 0xe8],
@@ -1004,6 +1018,9 @@ mod tests {
             &[1, 3, 0, 1, 0][..],             // MP with wrong length
             &[2, 1, 0][..],                   // route refresh with a value
             &[6, 4, 0, 0, 0, 0][..],          // extended message with a value
+            &[70, 1, 0][..],                  // enhanced route refresh with a value
+            &[70, 2, 0, 1][..],               // ... or two octets of one
+            &[70][..],                        // ... or no length at all
             &[5, 4, 0, 1, 0, 1][..],          // extended next hop: a partial triple
             &[5, 7, 0, 1, 0, 1, 0, 2, 0][..], // a triple and one octet more
             &[5, 6, 0, 1, 0, 1][..],          // extended next hop: truncated value

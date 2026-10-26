@@ -671,7 +671,7 @@ impl Peer {
             return false;
         }
         for family in &session.families {
-            let body = RouteRefreshMessage { family: *family }.encode();
+            let body = RouteRefreshMessage::request(*family).encode();
             self.write_message(MessageType::RouteRefresh, &body);
             bgpfc_log::info!("route refresh sent", peer = self.cfg.addr, family = family);
         }

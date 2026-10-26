@@ -3,7 +3,8 @@
 //!
 //! Implements: RFC 4271 §4.5 (error codes and subcodes), §6.1 and §6.2,
 //! RFC 5492 §5 (Unsupported Capability), RFC 6608 §3 (FSM subcodes),
-//! RFC 4486 §3 (Cease subcodes), RFC 9234 §4.2 and §7 (Role Mismatch).
+//! RFC 4486 §3 (Cease subcodes), RFC 9234 §4.2 and §7 (Role Mismatch),
+//! RFC 7313 §5 (ROUTE-REFRESH Message Error).
 
 use std::fmt;
 
@@ -126,6 +127,15 @@ pub enum UpdateSubcode {
     MalformedAsPath = 11,
 }
 
+/// ROUTE-REFRESH Message Error subcodes (RFC 7313 §5). Subcode 0 is
+/// reserved and never sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RouteRefreshSubcode {
+    /// Invalid Message Length.
+    InvalidMessageLength = 1,
+}
+
 /// Finite State Machine Error subcodes (RFC 6608 §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -167,8 +177,8 @@ pub enum CeaseSubcode {
 }
 
 /// Human-readable name of a `(code, subcode)` pair for logs, from the
-/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3, RFC 4486 §3 and RFC 8538 §8
-/// tables.
+/// RFC 4271 §4.5, RFC 5492 §5, RFC 6608 §3, RFC 4486 §3, RFC 8538 §8 and
+/// RFC 7313 §5 tables.
 /// `None` when the subcode is not defined for that code.
 #[must_use]
 pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
@@ -208,6 +218,7 @@ pub fn subcode_name(code: ErrorCode, subcode: u8) -> Option<&'static str> {
         (ErrorCode::Cease, 7) => "Connection Collision Resolution",
         (ErrorCode::Cease, 8) => "Out of Resources",
         (ErrorCode::Cease, 9) => "Hard Reset",
+        (ErrorCode::RouteRefresh, 1) => "Invalid Message Length",
         _ => return None,
     })
 }
@@ -253,6 +264,16 @@ impl DecodeError {
     pub fn update(subcode: UpdateSubcode, data: Vec<u8>) -> Self {
         DecodeError {
             code: ErrorCode::Update,
+            subcode: subcode as u8,
+            data,
+        }
+    }
+
+    /// A ROUTE-REFRESH Message Error (RFC 7313 §5).
+    #[must_use]
+    pub fn route_refresh(subcode: RouteRefreshSubcode, data: Vec<u8>) -> Self {
+        DecodeError {
+            code: ErrorCode::RouteRefresh,
             subcode: subcode as u8,
             data,
         }
@@ -358,6 +379,12 @@ mod tests {
         // RFC 9234 §4.2: Role Mismatch is OPEN Message Error subcode 11.
         let e = DecodeError::open(OpenSubcode::RoleMismatch, vec![]);
         assert_eq!((e.code, e.subcode), (ErrorCode::Open, 11));
+        // RFC 7313 §5: code 7, subcode 1.
+        let e = DecodeError::route_refresh(RouteRefreshSubcode::InvalidMessageLength, vec![9]);
+        assert_eq!(
+            (e.code, e.subcode, e.data),
+            (ErrorCode::RouteRefresh, 1, vec![9])
+        );
     }
 
     #[test]
@@ -387,5 +414,12 @@ mod tests {
         for s in 1..=8u8 {
             assert!(subcode_name(ErrorCode::Cease, s).is_some());
         }
+        // RFC 7313 §5 / §6: 0 is reserved, 1 is Invalid Message Length.
+        assert_eq!(
+            subcode_name(ErrorCode::RouteRefresh, 1),
+            Some("Invalid Message Length")
+        );
+        assert_eq!(subcode_name(ErrorCode::RouteRefresh, 0), None);
+        assert_eq!(subcode_name(ErrorCode::RouteRefresh, 2), None);
     }
 }
