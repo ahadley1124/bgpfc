@@ -298,6 +298,7 @@ fn decision(filter: Option<&str>, update: &DecodedUpdate) {
                         from: neighbors[i],
                         attrs: &attrs,
                         path_id: 0,
+                        demoted: false,
                     }));
                 }
                 10_000

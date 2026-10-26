@@ -65,7 +65,9 @@ rpki-item    = "mode" ( "disabled" | "external" ) ";"    (* required *)
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
              | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
-             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
+             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX; default 1 600 *)
+             | "invalid" ( "drop" | "prefer-valid" | "policy" ) ";" ;
+                                                      (* required with mode external; default policy *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
 
@@ -81,14 +83,17 @@ match        = "prefix" prefix-entry
              | "ext-community" ext-community
              | "large-community" large-community
              | "origin" ( "igp" | "egp" | "incomplete" )
-             | "neighbor" ip ;
+             | "neighbor" ip
+             | "rpki" rov-state ;
 set          = "local-pref" u32
              | "med" u32
              | "community" op community { community }
              | "ext-community" op ext-community { ext-community }
              | "large-community" op large-community { large-community }
              | "as-path" "prepend" asn { asn }
-             | "next-hop" "self" ;
+             | "next-hop" "self"
+             | "rpki" rov-state ;
+rov-state    = "valid" | "invalid" | "not-found" | "disabled" ;
 op           = "add" | "remove" | "replace" ;
 action       = "accept" | "reject" | "next" ;
 
@@ -151,7 +156,8 @@ Match clauses: `prefix` and `prefix-list` compare the route's NLRI;
 `as-path` is a regular expression over AS numbers (below); the three
 community clauses hold when the route carries the value; `origin` compares
 the ORIGIN attribute; `neighbor` compares the peer the route was received
-from (import) or is being sent to (export).
+from (import) or is being sent to (export); `rpki` compares the route's
+origin validation state (below).
 
 Set actions change the route's attributes before the decision process
 (import) or before sending (export). On export they run before the
@@ -161,6 +167,51 @@ address on the session, see `extended-next-hop` below for IPv4 routes on an
 IPv6 session). `next-hop self` is therefore only meaningful in export
 policies towards internal peers. A policy cannot advertise a route to the
 peer it came from, nor an internal route to another internal peer.
+
+**Origin validation state in policy.** `match rpki STATE` holds when the
+route's RFC 6811 origin validation state is `valid`, `invalid`,
+`not-found` or `disabled`, the spelling `show routes` uses (RFC 6811 §3:
+"match and set the validation state of routes as part of its route policy
+filtering function"). `disabled` is not an RFC state: it is the state of a
+route nobody validated (`rpki` without a block, with `mode disabled`, or
+before a cache has sent its VRPs), kept apart from `not-found`, which
+means that no VRP covers the route (`docs/control.md`, "Validation
+state"). A policy that treats the two alike matches both, in two terms.
+In an import policy the state is the one the lookup gave the route; in an
+export policy, the one the route holds in the Loc-RIB. A policy can filter
+by the state or set a preference from it (RFC 6811 §5):
+
+```
+policy FROM-TRANSIT {
+    term bad       { match rpki invalid;   action reject; }
+    term good      { match rpki valid;     set local-pref 200; action accept; }
+    term unknown   { match rpki not-found; set local-pref 100; action accept; }
+}
+```
+
+`set rpki STATE` gives the route that state from there on: the terms
+after it match it, and an import policy that accepts the route leaves it
+with that state, in the decision process, in export policy, and in `show
+routes`. It is for a state that did not come from a lookup (RFC 6811
+§5: where a property that is not passed on to internal peers decides which
+route is chosen, "it could be necessary for routing correctness to
+propagate the validation state to the IBGP peer", by a community on the
+sending side that "the receiving side" matches before "setting the
+validation state"):
+
+```
+policy FROM-IBGP {
+    term said-invalid { match community 65000:666; set rpki invalid; action next; }
+    term said-valid   { match community 65000:200; set rpki valid;   action next; }
+    term rest         { action accept; }
+}
+```
+
+When the VRPs change, a route whose lookup changed runs through its import
+policy again from the route as received, so a state a policy set is set
+again or no longer set according to the new lookup. The state is local to
+the speaker: it is never sent, so what an export policy sets only matters
+to its own later terms.
 
 **AS-path regular expressions.** The pattern is matched against the
 route's `AS_PATH` as a sequence of AS numbers; every operator acts on
@@ -352,8 +403,8 @@ disabled`, there are none and every route is `disabled`. The block must
 state its `mode`; nothing else implies one. `mode external` takes the VRPs
 over the RPKI-to-Router protocol (RTR) from the caches listed with `cache`,
 of which there must be at least one; `mode disabled` keeps the cache list
-but uses none of it. The state is not yet acted on: it does not decide
-whether a route is accepted or which one is chosen.
+but uses none of it. What the speaker does with the state is the `invalid`
+statement, below.
 
 > **Keep the cache on the router or on a trusted network.** RTR runs over
 > plain TCP to port 323: nothing authenticates the cache to bgpfcd or
@@ -379,6 +430,71 @@ back (RFC 8210 §4). The VRPs from the last cache stay in use until another
 cache has sent a full set, which replaces them, or until they expire (RFC
 8210 §10, §6). A cache listed twice, by the same address or the same name
 in any case, and the same port, is an error.
+
+**Invalid routes (`invalid`).** The block states what the RIB does by
+itself with a route whose state is `invalid`, before and apart from the
+policies you wrote. It is required with `mode external` and has no
+default: RFC 8481 §5 ("Set State, Don't Act") says that once routes are
+evaluated "the operator should be in complete control of any policy
+applied based on the evaluation state. Absent specific operator
+configuration, policy MUST NOT be applied", and RFC 6811 §2 that a route
+must not be excluded from consideration "as a side effect of its
+validation state, unless explicitly configured to do so", so a cache
+named in the file is not taken to say how to treat the routes it judges.
+Without the statement, an `external` block is an error that names the
+three choices. With `mode disabled` it is optional and defaults to
+`policy`, and one given there acts on the states import policy sets with
+`set rpki`, since no lookup gives any.
+
+| `invalid` | An Invalid route is | RFC |
+|---|---|---|
+| `drop` | no candidate for the decision process: not used, not installed, not passed on | 6811 §5: "rejecting all 'invalid' routes" |
+| `prefer-valid` | a candidate that loses to every route that is not Invalid, whatever the rest of the decision process says; used only where nothing else leads to the prefix | 6811 §5: "adjusting a route's degree of preference in the selection algorithm based on its validation state"; "a purely local policy matter and should be done with utmost care" |
+| `policy` | treated like any other route; only your policies act on the state | 8481 §5 |
+
+The action acts on the state a route holds after import policy (above), so
+a policy that gives a route another state with `set rpki` overrules the
+lookup either way: a route taken as `valid` is used under `drop`, and one
+taken as `invalid` is refused. An import policy still runs on an Invalid
+route, which is how `set rpki` reaches it:
+
+```
+policy FROM-CUSTOMER {
+    # Their ROA is wrong and they know: take their route as unvalidated.
+    term known-bad { match neighbor 192.0.2.77; match rpki invalid;
+                     set rpki not-found; action next; }
+    term rest      { action accept; }
+}
+```
+
+**What `drop` keeps.** A route `drop` refuses stays in the Adj-RIB-In as
+received, and counts towards `maximum-prefix`: whether a route is kept
+never depends on its state or on the action (RFC 6811 §2, §4). It is used
+at once, without an UPDATE from the neighbor or a ROUTE-REFRESH, when
+the VRPs change so that it is `valid` or `not-found` (RFC 6811 §4), when
+an import policy now gives it another state, or when a reload changes
+`invalid`; and it goes again, off the kernel's table and out of the
+neighbors' Adj-RIBs-Out, when the VRPs change the other way. `show routes
+PREFIX` lists the candidates, so it does not show a refused route; `show
+rpki validate PREFIX ASN` gives the state of any route.
+
+`prefer-valid` works within the decision process, ahead of the steps of
+RFC 4271 §9.1.2.2: the Invalid routes to a prefix are compared with one
+another by those steps, the MED step included, and the others likewise,
+and the best of the others wins; the best Invalid route wins only where
+there is no other. A `local-pref` an import policy sets cannot lift an
+Invalid route over another. With `add-path send N` the N best paths are
+taken in the same order, so an Invalid path is sent last. An Invalid route
+that is chosen is passed on like any other; keep it from a neighbor with
+`match rpki invalid; action reject;` in its export policy.
+
+No route is Invalid before a cache has sent its first full set, and with
+`mode disabled` (every route is `disabled`), nor once the VRPs have
+expired (RFC 8210 §6; every route is `not-found`). So `drop` and
+`prefer-valid` act on nothing in those times: the routes `drop` refused
+are used when validation is lost, and refused again when it returns. The
+router fails open, as a router without validation does, rather than
+refusing routes on the strength of data it no longer trusts.
 
 A cache that restarts usually starts a new session, with a new Session ID
 (RFC 8210 §5.1). bgpfcd resumes with a Serial Query from its last data
@@ -443,8 +559,8 @@ has `remote-as`, `import` and `export`; the HTTP listen address is a
 loopback address; timer constraints above; `extended-next-hop` only with
 `ipv4-unicast` in `families`; `maximum-prefix` and `add-path` only for a
 family in `families`; a `role` only on an external session, and
-`role-strict yes` only with a `role`; an `rpki` block has a `mode`, at least one `cache` with `mode
-external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
+`role-strict yes` only with a `role`; an `rpki` block has a `mode`, at least one `cache` and an `invalid`
+statement with `mode external`, no cache twice, `connect-timeout` ≤ `response-timeout` ≤
 `reply-timeout`, `max-vrps` at least 1, and a `backoff` MAX no lower than
 its MIN.
 
@@ -466,7 +582,12 @@ had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 `local-as` resets every session.
 
-A changed `rpki` block restarts the RTR client with the new settings. The
+A changed `invalid` applies at once to the running RIB, which judges
+again every route it holds that is Invalid and sends the difference (route
+changes to the kernel and UPDATEs to neighbors, paced as any are): no
+session resets, no ROUTE-REFRESH is needed, and the RTR client is left
+alone. A changed `rpki` block otherwise restarts the RTR client with the
+new settings. The
 VRPs the old client had stay in use until a cache of the new list has sent
 a full set, which then validates again only the routes it judges
 differently, or until they expire (RFC 8210 §10, §6). A change to `mode

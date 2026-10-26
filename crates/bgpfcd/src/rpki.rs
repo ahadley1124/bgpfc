@@ -325,7 +325,7 @@ mod tests {
         /// The block of a daemon that uses this cache alone.
         fn block(&self) -> String {
             format!(
-                "rpki {{ mode external; cache 127.0.0.1 port {}; }}",
+                "rpki {{ mode external; invalid policy; cache 127.0.0.1 port {}; }}",
                 self.port()
             )
         }
@@ -402,7 +402,7 @@ mod tests {
         let router_id = RouterId::new(0xC000_0201).unwrap();
         let cfg = config(
             "rpki {
-                mode external;
+                mode external; invalid policy;
                 cache rtr.example.net port 3323 preference 10;
                 cache 127.0.0.1;
                 version 0; connect-timeout 5; response-timeout 30; reply-timeout 600;
@@ -441,7 +441,7 @@ mod tests {
             }
         );
         // The block's defaults are the client's.
-        let cfg = config("rpki { mode external; cache 192.0.2.10; }");
+        let cfg = config("rpki { mode external; invalid policy; cache 192.0.2.10; }");
         let c = client_config(&cfg.rpki, router_id).unwrap();
         let defaults = client::Config::new(vec![Cache::new("192.0.2.10")]);
         assert_eq!(c.caches, defaults.caches);
@@ -459,11 +459,13 @@ mod tests {
 
     #[test]
     fn caches_that_cannot_be_found_are_named() {
-        let ok = config("rpki { mode external; cache 127.0.0.1; cache ::1; cache localhost; }");
+        let ok = config(
+            "rpki { mode external; invalid policy; cache 127.0.0.1; cache ::1; cache localhost; }",
+        );
         assert_eq!(resolve(&ok.rpki), Ok(()));
         // RFC 2606 §2: `.invalid` never resolves.
         let bad = config(
-            "rpki { mode external; cache 127.0.0.1; cache rtr.invalid;
+            "rpki { mode external; invalid policy; cache 127.0.0.1; cache rtr.invalid;
              cache other.invalid preference 1; }",
         );
         let e = resolve(&bad.rpki).unwrap_err();
@@ -553,7 +555,7 @@ mod tests {
         let cache = StubCache::new();
         let named = |host: &str| {
             config(&format!(
-                "rpki {{ mode external; cache {host} port {}; }}",
+                "rpki {{ mode external; invalid policy; cache {host} port {}; }}",
                 cache.port()
             ))
         };
@@ -732,7 +734,7 @@ mod tests {
     fn a_cache_that_never_answers_holds_up_neither_reload_nor_stop() {
         let (listener, _queued) = unanswered();
         let hanging = config(&format!(
-            "rpki {{ mode external; cache 127.0.0.1 port {};
+            "rpki {{ mode external; invalid policy; cache 127.0.0.1 port {};
              connect-timeout 30; response-timeout 60; }}",
             listener.local_addr().unwrap().port()
         ));

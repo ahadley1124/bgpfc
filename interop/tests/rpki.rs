@@ -1,8 +1,13 @@
 //! Route origin validation in `bgpfcd` (RFC 6811) with VRPs over RTR
 //! (RFC 8210) from `StayRTR`, an independent RTR cache, for routes from
-//! BIRD 2 (AGENTS.md §5, `interop/` row). Nothing acts on the states yet
-//! (AGENTS.md §9, step 13), so every route is accepted and relayed
-//! whatever its state.
+//! BIRD 2 (AGENTS.md §5, `interop/` row). Most scenarios are about the
+//! states, so their `rpki` block says `invalid policy`: nothing acts on
+//! them, every route is accepted and relayed whatever its state. Three
+//! are about acting on them (AGENTS.md §9, step 13): `invalid drop` keeps
+//! the Invalid out of the Loc-RIB and away from a neighbor, `invalid
+//! prefer-valid` lets them lose to the other routes to a prefix, and a
+//! change of VRPs, or a reload that changes the statement, moves a route
+//! between used and refused with no UPDATE from the neighbor.
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
@@ -101,6 +106,33 @@ const FAILED_OVER: [(&str, &str); 4] = [
     ("203.0.113.0/24", "valid"),
 ];
 
+/// The prefix both BIRDs originate when a scenario has a rival. B's route
+/// to it has the path `65001`; C's has `65002 65002`, a hop more, since the
+/// filter of [`RIVAL`] puts C's AS on the path and C's export puts it there
+/// again. By the length of the path alone, B's route is the better.
+const RIVAL_ROUTE: &str = "192.0.2.0/24";
+
+/// C's second source, which originates [`RIVAL_ROUTE`] from its own AS with
+/// a longer path than B's.
+const RIVAL: &str = "protocol static rival {\n\
+                     \x20   ipv4 { import filter { bgp_path.prepend(65002); accept; }; };\n\
+                     \x20   route 192.0.2.0/24 blackhole;\n}\n";
+
+/// The VRPs where B's route to [`RIVAL_ROUTE`] is Invalid and C's Valid;
+/// 198.51.100.0/24 is Invalid for the one route to it, B's.
+const REFUSED: [(&str, u8, u32); 2] = [
+    ("192.0.2.0/24", 24, RELAY_AS),
+    ("198.51.100.0/24", 24, 64_999),
+];
+
+/// The VRPs where B's route is Valid and C's Invalid; B's other routes
+/// have VRPs too.
+const SWAPPED: [(&str, u8, u32); 3] = [
+    ("192.0.2.0/24", 24, BIRD_AS),
+    ("198.51.100.0/24", 24, BIRD_AS),
+    ("203.0.113.0/24", 24, BIRD_AS),
+];
+
 /// The states without validation (issue #52).
 const DISABLED: [(&str, &str); 4] = [
     ("192.0.2.0/24", "disabled"),
@@ -130,8 +162,36 @@ struct Opts {
     unanswered: bool,
     /// The `mode` of the `rpki` block.
     mode: &'static str,
+    /// The `invalid` statement of the block: what bgpfcd does with the
+    /// routes that turn out Invalid.
+    invalid: &'static str,
     /// Whether a second BIRD, in C, takes the routes from bgpfcd.
     relay: bool,
+    /// Whether the BIRD in C also originates [`RIVAL_ROUTE`], with a path
+    /// of two hops against BIRD in B's one, so that bgpfcd has two routes
+    /// to choose from. Implies `relay`.
+    rival: bool,
+    /// Policies for bgpfcd's file, and the names of the import policy for
+    /// B and the export policy for C: `ANY` accepts everything.
+    policies: Policies,
+}
+
+/// The policies of a scenario, as configuration text with the names the
+/// neighbors use.
+#[derive(Clone, Copy)]
+struct Policies {
+    text: &'static str,
+    import_b: &'static str,
+    export_c: &'static str,
+}
+
+impl Policies {
+    /// No policy of its own: `ANY` both ways.
+    const NONE: Policies = Policies {
+        text: "",
+        import_b: "ANY",
+        export_c: "ANY",
+    };
 }
 
 impl Opts {
@@ -142,7 +202,12 @@ impl Opts {
             backup: None,
             unanswered: false,
             mode: "external",
+            // Nothing of its own: the scenarios that are about the
+            // states, not about acting on them, see every route.
+            invalid: "policy",
             relay: false,
+            rival: false,
+            policies: Policies::NONE,
         }
     }
 }
@@ -194,9 +259,9 @@ impl Setup {
                 &CACHES[..1],
             ),
         };
-        let relay = opts.relay.then(|| {
+        let relay = (opts.relay || opts.rival).then(|| {
             let ns_c = lab.add_c();
-            Bird::start(
+            Bird::start_with(
                 &lab,
                 &ns_c,
                 &BirdOpts {
@@ -212,6 +277,7 @@ impl Setup {
                     channel: String::new(),
                     protocol: String::new(),
                 },
+                if opts.rival { RIVAL } else { "" },
             )
         });
         let bird = Bird::start(
@@ -232,21 +298,24 @@ impl Setup {
             },
         );
         let socket = lab.dir.join("ctl.sock");
-        let mut bgpfcd_opts =
-            BgpfcdOpts::single(BGPFC_AS, lab.a_addr, NeighborOpts::new(lab.b_addr, BIRD_AS));
-        if opts.relay {
+        let mut from_bird = NeighborOpts::new(lab.b_addr, BIRD_AS);
+        opts.policies.import_b.clone_into(&mut from_bird.import);
+        let mut bgpfcd_opts = BgpfcdOpts::single(BGPFC_AS, lab.a_addr, from_bird);
+        if opts.relay || opts.rival {
             // RFC 4271 §9.2.1.1 pacing, shortened from the 30 s EBGP
             // default so that the routes reach the relay quickly.
             let mut to_relay = NeighborOpts::new(lab.c_addr, RELAY_AS);
             to_relay.advertisement_interval = Some(1);
+            opts.policies.export_c.clone_into(&mut to_relay.export);
             bgpfcd_opts.neighbors.push(to_relay);
             bgpfcd_opts.listen.push(lab.a2_addr.into());
         }
         let unanswered = opts.unanswered.then(|| lab.blackhole());
         bgpfcd_opts.extra = format!(
-            "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}",
+            "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}\n{}",
             socket.display(),
-            rpki_block(opts.mode, binds, unanswered)
+            rpki_block((opts.mode, opts.invalid), binds, unanswered),
+            opts.policies.text
         );
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &bgpfcd_opts);
         Setup {
@@ -387,7 +456,81 @@ impl Setup {
 
     /// How many UPDATEs bgpfcd has taken from BIRD.
     fn updates_from_bird(&self) -> usize {
-        self.count(&format!("msg=\"rib: update\" peer={} ", self.lab.b_addr))
+        self.updates_from(self.lab.b_addr)
+    }
+
+    /// How many UPDATEs bgpfcd has taken from the peer at `addr`.
+    fn updates_from(&self, addr: Ipv4Addr) -> usize {
+        self.count(&format!("msg=\"rib: update\" peer={addr} "))
+    }
+
+    /// What `show routes PREFIX` says of each route to `prefix`, in the
+    /// order it lists them: whether it is the chosen one, the neighbor it
+    /// came from, its state, and whether it is held, not used.
+    fn routes_to(&self, prefix: &str) -> Vec<(bool, String, String, bool)> {
+        let (out, _) = self.ctl(&["show", "routes", prefix]);
+        out.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let via = words.iter().position(|w| *w == "via")?;
+                Some((
+                    words.first()?.starts_with('*'),
+                    (*words.get(via + 1)?).to_owned(),
+                    (*words.get(5)?).to_owned(),
+                    words.last() == Some(&"held"),
+                ))
+            })
+            .collect()
+    }
+
+    /// Wait up to `timeout` for `show routes PREFIX` to list `want`, each
+    /// as `(chosen, neighbor, state, held)`.
+    fn wait_for_routes_to(&self, prefix: &str, want: &[(bool, Ipv4Addr, &str, bool)]) {
+        let want: Vec<(bool, String, String, bool)> = want
+            .iter()
+            .map(|(best, peer, rov, held)| (*best, peer.to_string(), (*rov).to_owned(), *held))
+            .collect();
+        assert!(
+            wait_for(CHANGE, || self.routes_to(prefix) == want),
+            "{prefix}: {:?}, not {want:?}\n{}",
+            self.routes_to(prefix),
+            self.report()
+        );
+    }
+
+    /// Wait up to `CHANGE` for the second BIRD to have exactly those of
+    /// [`ROUTES`] that are in `want`.
+    fn wait_for_relay(&self, want: &[&str]) {
+        let relay = self.relay.as_ref().expect("relay");
+        let has = || {
+            let routes = relay.birdc(&self.lab, &["show", "route"]);
+            ROUTES
+                .iter()
+                .all(|p| routes.contains(p) == want.contains(p))
+        };
+        assert!(
+            wait_for(CHANGE, has),
+            "wanted {want:?}:\n{}\n{}",
+            relay.birdc(&self.lab, &["show", "route"]),
+            self.report()
+        );
+    }
+
+    /// Rewrite the `invalid` statement of bgpfcd's file and reload, as an
+    /// operator would; the log line about the new action is waited for.
+    fn reload_invalid(&self, from: &str, to: &str) {
+        let path = self.config_path();
+        let text = fs::read_to_string(&path).unwrap();
+        let (old, new) = (format!("invalid {from};"), format!("invalid {to};"));
+        assert!(text.contains(&old), "{text}");
+        fs::write(&path, text.replace(&old, &new)).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok, "{out}\n{}", self.report());
+        self.wait_for_log(
+            CHANGE,
+            &format!("msg=\"rib: action for invalid routes\" action={to} "),
+        );
     }
 
     /// Wait up to `timeout` for `show rpki` to say that bgpfcd lost its
@@ -430,7 +573,11 @@ impl Setup {
 
 /// The `rpki` block for the caches at `binds`, in that order of
 /// preference, after the one at `unanswered` if there is one.
-fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
+fn rpki_block(
+    (mode, invalid): (&str, &str),
+    binds: &[&str],
+    unanswered: Option<Ipv4Addr>,
+) -> String {
     let mut entries = String::new();
     if let Some(addr) = unanswered {
         let _ = write!(
@@ -448,7 +595,7 @@ fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> Strin
     }
     // The shortest back-off, so that a cache that comes back is found
     // within a second or two.
-    format!("rpki {{ mode {mode};{entries} backoff 1 1; }}")
+    format!("rpki {{ mode {mode}; invalid {invalid};{entries} backoff 1 1; }}")
 }
 
 /// The `session-id ... serial ...` line of `show rpki`.
@@ -506,8 +653,8 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
         "{body}"
     );
 
-    // Nothing acts on the states yet: the invalid routes reach the relay
-    // too.
+    // This block says `invalid policy`, so nothing acts on the states: the
+    // invalid routes reach the relay too.
     let relay = s.relay.as_ref().expect("relay");
     let relayed = || {
         let routes = relay.birdc(&s.lab, &["show", "route"]);
@@ -703,7 +850,7 @@ fn with_mode_disabled_no_cache_is_asked() {
     s.wait_for_states(ESTABLISH, &DISABLED);
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
-        ok && out == "mode disabled\ncache 127.0.0.1:3323 preference 0\n",
+        ok && out == "mode disabled\ninvalid policy\ncache 127.0.0.1:3323 preference 0\n",
         "{out}"
     );
     let body = s.http("/v1/rpki");
@@ -926,4 +1073,269 @@ fn a_cache_that_never_answers_holds_up_neither_reload_nor_shutdown() {
         "{}",
         s.bird.daemon.log_text()
     );
+}
+
+/// `invalid drop` (RFC 6811 §5, "rejecting all 'invalid' routes"): BIRD's
+/// routes that the VRPs make Invalid, by length and by origin AS, are not
+/// in the Loc-RIB and never reach the second BIRD, but bgpfcd holds them
+/// (§2) and says so. A new VRP file moves every route between used and
+/// held without any UPDATE from BIRD (§4), and a reload that changes the
+/// statement does the same without a session reset or a ROUTE-REFRESH. A
+/// reload that leaves the statement out is refused (RFC 8481 §5).
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn invalid_routes_are_dropped_and_come_back_with_the_vrps() {
+    let opts = Opts {
+        relay: true,
+        invalid: "drop",
+        ..Opts::external(Caches::StayRtr(1))
+    };
+    let s = Setup::start("ia", 40, &opts, &FIRST);
+    let b = s.lab.b_addr;
+    // Valid and NotFound only; the two Invalid routes are held.
+    s.wait_for_states(
+        ESTABLISH,
+        &[("192.0.2.0/24", "valid"), ("203.0.113.0/24", "not-found")],
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.starts_with("mode external\ninvalid drop\n"),
+        "{out}"
+    );
+    assert!(s.http("/v1/rpki").contains("\"invalid\":\"drop\""));
+    s.wait_for_routes_to("192.0.2.128/25", &[(false, b, "invalid", true)]);
+    s.wait_for_routes_to("198.51.100.0/24", &[(false, b, "invalid", true)]);
+    s.wait_for_routes_to("192.0.2.0/24", &[(true, b, "valid", false)]);
+    // The HTTP API says the same of a held route.
+    let body = s.http("/v1/routes?prefix=198.51.100.0/24");
+    assert!(
+        body.contains("\"held\":true") && body.contains("\"rov\":\"invalid\""),
+        "{body}"
+    );
+    // The second BIRD has what is used, and nothing else.
+    s.wait_for_relay(&["192.0.2.0/24", "203.0.113.0/24"]);
+
+    // New VRPs: 192.0.2.0/24 Invalid and held, the /25 Valid, 198.51.100.0/24
+    // NotFound, 203.0.113.0/24 Valid. Each route changes places, and no
+    // UPDATE comes from BIRD.
+    let updates = s.updates_from_bird();
+    let sessions = s.count("session established");
+    s.caches[0].set_vrps(&SECOND);
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    s.wait_for_routes_to("192.0.2.0/24", &[(false, b, "invalid", true)]);
+    s.wait_for_relay(&["192.0.2.128/25", "198.51.100.0/24", "203.0.113.0/24"]);
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+
+    // Leaving it to policy brings the held route back: all four are used,
+    // with the states the VRPs give them. The sessions stay up and nothing
+    // is asked of BIRD.
+    s.reload_invalid("drop", "policy");
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.0/24", "invalid"),
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    s.wait_for_routes_to("192.0.2.0/24", &[(true, b, "invalid", false)]);
+    s.wait_for_relay(&ROUTES);
+    // And dropping again takes it away.
+    s.reload_invalid("policy", "drop");
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    s.wait_for_routes_to("192.0.2.0/24", &[(false, b, "invalid", true)]);
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+
+    // RFC 8481 §5: no statement, no policy. The reload is refused, and the
+    // running configuration goes on dropping.
+    let path = s.config_path();
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace(" invalid drop;", "")).unwrap();
+    let (out, ok) = s.ctl(&["reload"]);
+    assert!(
+        !ok && out.contains("`mode external` needs an `invalid` statement"),
+        "{out}"
+    );
+    s.wait_for_log(Duration::ZERO, "reload failed; running configuration kept");
+    s.wait_for_routes_to("192.0.2.0/24", &[(false, b, "invalid", true)]);
+}
+
+/// `invalid prefer-valid`, with a second source: B's route to
+/// 192.0.2.0/24 is the shorter, and when the VRPs make it Invalid and C's
+/// Valid, C's is chosen all the same (RFC 6811 §5), while B's stays a
+/// candidate behind it. An Invalid route with no rival is used. A new VRP
+/// file swaps the two with no UPDATE from either; a reload to `policy`
+/// puts the shorter path first again, and one to `drop` holds B's route.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn prefer_valid_puts_an_invalid_route_behind_the_others() {
+    let opts = Opts {
+        rival: true,
+        invalid: "prefer-valid",
+        ..Opts::external(Caches::StayRtr(1))
+    };
+    let s = Setup::start("ib", 41, &opts, &REFUSED);
+    let (b, c) = (s.lab.b_addr, s.lab.c_addr);
+    let prefix = RIVAL_ROUTE;
+    // Both routes are candidates; C's Valid one is chosen, though B's has
+    // the shorter path. B's other routes are used, Invalid or not.
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, c, "valid", false), (false, b, "invalid", false)],
+    );
+    s.wait_for_states(
+        ESTABLISH,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("192.0.2.128/25", "invalid"),
+            ("198.51.100.0/24", "invalid"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.starts_with("mode external\ninvalid prefer-valid\n"),
+        "{out}"
+    );
+
+    // The VRPs swap the two states: B's route is Valid now, and first;
+    // C's is Invalid, and a candidate behind it. No UPDATE came from
+    // either neighbor, and no session was reset.
+    let (from_b, from_c) = (s.updates_from(b), s.updates_from(c));
+    let sessions = s.count("session established");
+    s.caches[0].set_vrps(&SWAPPED);
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, b, "valid", false), (false, c, "invalid", false)],
+    );
+    assert_eq!(
+        (s.updates_from(b), s.updates_from(c)),
+        (from_b, from_c),
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+    s.caches[0].set_vrps(&REFUSED);
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, c, "valid", false), (false, b, "invalid", false)],
+    );
+
+    // Leaving it to policy: the shorter path wins again, Invalid or not.
+    s.reload_invalid("prefer-valid", "policy");
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, b, "invalid", false), (false, c, "valid", false)],
+    );
+    // Dropping: B's route is held, C's is all there is, and the prefixes
+    // only B's Invalid routes lead to are gone.
+    s.reload_invalid("policy", "drop");
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, c, "valid", false), (false, b, "invalid", true)],
+    );
+    s.wait_for_states(
+        CHANGE,
+        &[("192.0.2.0/24", "valid"), ("203.0.113.0/24", "not-found")],
+    );
+    // And back to preferring: the held routes are candidates again.
+    s.reload_invalid("drop", "prefer-valid");
+    s.wait_for_routes_to(
+        prefix,
+        &[(true, c, "valid", false), (false, b, "invalid", false)],
+    );
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("192.0.2.128/25", "invalid"),
+            ("198.51.100.0/24", "invalid"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    assert_eq!(
+        (s.updates_from(b), s.updates_from(c)),
+        (from_b, from_c),
+        "{}",
+        s.report()
+    );
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+}
+
+/// Policy matches and sets the state the VRPs give (RFC 6811 §3), with
+/// `invalid policy` so that nothing but the policy acts. Import: Invalid
+/// routes are rejected but for one prefix, which a `set rpki not-found`
+/// rescues; a rejected route is held (§2) and taken when a new VRP file
+/// makes it valid. Export to the second BIRD passes the Valid alone, by the
+/// state the route holds in the Loc-RIB, the rescued route's included.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn policy_matches_and_sets_the_state_the_vrps_give() {
+    const POLICIES: &str = "\
+        policy RPKI-IN {\n\
+        \x20   term rescue { match prefix 198.51.100.0/24; match rpki invalid;\n\
+        \x20                 set rpki not-found; action next; }\n\
+        \x20   term bad    { match rpki invalid; action reject; }\n\
+        \x20   term rest   { action accept; }\n\
+        }\n\
+        policy RPKI-OUT {\n\
+        \x20   term valid  { match rpki valid; action accept; }\n\
+        }\n";
+    let opts = Opts {
+        relay: true,
+        policies: Policies {
+            text: POLICIES,
+            import_b: "RPKI-IN",
+            export_c: "RPKI-OUT",
+        },
+        ..Opts::external(Caches::StayRtr(1))
+    };
+    let s = Setup::start("ic", 42, &opts, &FIRST);
+    let b = s.lab.b_addr;
+    // The /25 is Invalid and rejected; the other Invalid route is taken as
+    // not-found.
+    s.wait_for_states(
+        ESTABLISH,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    s.wait_for_routes_to("192.0.2.128/25", &[(false, b, "invalid", true)]);
+    // Only the Valid route goes to the second BIRD.
+    s.wait_for_relay(&["192.0.2.0/24"]);
+
+    // New VRPs: the /25 is Valid and taken, 192.0.2.0/24 is Invalid and
+    // rejected, the others are Valid or not-found. No UPDATE from BIRD.
+    let updates = s.updates_from_bird();
+    s.caches[0].set_vrps(&SECOND);
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    s.wait_for_routes_to("192.0.2.0/24", &[(false, b, "invalid", true)]);
+    s.wait_for_relay(&["192.0.2.128/25", "203.0.113.0/24"]);
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
 }

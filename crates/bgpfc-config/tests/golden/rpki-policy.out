@@ -1,0 +1,213 @@
+Config {
+    router_id: RouterId(
+        3221225985,
+    ),
+    local_as: Asn(
+        65000,
+    ),
+    log_level: Info,
+    listen: [
+        [::]:179,
+    ],
+    fib: Fib {
+        mode: DryRun,
+        table: 254,
+        protocol: 186,
+    },
+    control: Control {
+        socket: None,
+        http: None,
+    },
+    rpki: Rpki {
+        mode: Disabled,
+        caches: [],
+        version: 1,
+        connect_timeout: 10s,
+        response_timeout: 60s,
+        reply_timeout: 1800s,
+        max_expire: 172800s,
+        max_vrps: 4000000,
+        backoff_min: 1s,
+        backoff_max: 600s,
+        invalid: Policy,
+    },
+    prefix_lists: [],
+    policies: [
+        Policy {
+            pos: Pos {
+                line: 4,
+                col: 1,
+            },
+            name: "FROM-IBGP",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 7,
+                        col: 5,
+                    },
+                    name: "said-invalid",
+                    matches: [
+                        Community(
+                            65000:666,
+                        ),
+                    ],
+                    sets: [
+                        Rpki(
+                            Invalid,
+                        ),
+                    ],
+                    action: Next,
+                },
+                Term {
+                    pos: Pos {
+                        line: 8,
+                        col: 5,
+                    },
+                    name: "said-valid",
+                    matches: [
+                        Community(
+                            65000:200,
+                        ),
+                    ],
+                    sets: [
+                        Rpki(
+                            Valid,
+                        ),
+                    ],
+                    action: Next,
+                },
+                Term {
+                    pos: Pos {
+                        line: 9,
+                        col: 5,
+                    },
+                    name: "drop-invalid",
+                    matches: [
+                        Rpki(
+                            Invalid,
+                        ),
+                    ],
+                    sets: [],
+                    action: Reject,
+                },
+                Term {
+                    pos: Pos {
+                        line: 10,
+                        col: 5,
+                    },
+                    name: "rest",
+                    matches: [],
+                    sets: [],
+                    action: Accept,
+                },
+            ],
+        },
+        Policy {
+            pos: Pos {
+                line: 12,
+                col: 1,
+            },
+            name: "PREFER",
+            terms: [
+                Term {
+                    pos: Pos {
+                        line: 13,
+                        col: 5,
+                    },
+                    name: "valid",
+                    matches: [
+                        Rpki(
+                            Valid,
+                        ),
+                    ],
+                    sets: [
+                        LocalPref(
+                            200,
+                        ),
+                    ],
+                    action: Accept,
+                },
+                Term {
+                    pos: Pos {
+                        line: 14,
+                        col: 5,
+                    },
+                    name: "not-found",
+                    matches: [
+                        Rpki(
+                            NotFound,
+                        ),
+                    ],
+                    sets: [
+                        LocalPref(
+                            100,
+                        ),
+                    ],
+                    action: Accept,
+                },
+                Term {
+                    pos: Pos {
+                        line: 15,
+                        col: 5,
+                    },
+                    name: "unchecked",
+                    matches: [
+                        Rpki(
+                            Disabled,
+                        ),
+                    ],
+                    sets: [
+                        Rpki(
+                            NotFound,
+                        ),
+                    ],
+                    action: Accept,
+                },
+            ],
+        },
+    ],
+    neighbors: [
+        Neighbor {
+            pos: Pos {
+                line: 17,
+                col: 1,
+            },
+            addr: 192.0.2.2,
+            remote_as: Asn(
+                65000,
+            ),
+            description: None,
+            port: 179,
+            hold_time: HoldTime(
+                90,
+            ),
+            keepalive_time: None,
+            connect_retry_time: 120s,
+            send_hold_time: Default,
+            families: [
+                AddressFamily {
+                    afi: Ipv4,
+                    safi: Unicast,
+                },
+                AddressFamily {
+                    afi: Ipv6,
+                    safi: Unicast,
+                },
+            ],
+            import: "FROM-IBGP",
+            export: "PREFER",
+            passive: false,
+            allow_as_set: false,
+            collision_detect_established: false,
+            advertisement_interval: None,
+            extended_next_hop: [],
+            restart_limit: Some(
+                10,
+            ),
+            maximum_prefix: [],
+            add_path_receive: [],
+            add_path_send: [],
+            role: None,
+        },
+    ],
+}

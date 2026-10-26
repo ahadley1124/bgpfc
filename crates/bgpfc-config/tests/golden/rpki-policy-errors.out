@@ -1,0 +1,21 @@
+rpki-policy-errors.conf:5:20: `match rpki` takes one value, found 0
+      term a { match rpki; action accept; }
+                     ^
+rpki-policy-errors.conf:6:25: `unknown` is not `valid`, `invalid`, `not-found` or `disabled`
+      term b { match rpki unknown; action accept; }
+                          ^
+rpki-policy-errors.conf:7:20: `match rpki` takes one value, found 2
+      term c { match rpki valid invalid; action accept; }
+                     ^
+rpki-policy-errors.conf:8:25: `Valid` is not `valid`, `invalid`, `not-found` or `disabled`
+      term d { match rpki Valid; action accept; }
+                          ^
+rpki-policy-errors.conf:9:18: `set rpki` takes one value, found 0
+      term e { set rpki; action accept; }
+                   ^
+rpki-policy-errors.conf:10:23: `notfound` is not `valid`, `invalid`, `not-found` or `disabled`
+      term f { set rpki notfound; action accept; }
+                        ^
+rpki-policy-errors.conf:11:18: `set rpki` takes one value, found 2
+      term g { set rpki valid invalid; action accept; }
+                   ^

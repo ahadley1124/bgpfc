@@ -40,9 +40,14 @@ pub(crate) struct Route {
     pub(crate) received: Option<Arc<PathAttrs>>,
     /// The peer it came from.
     pub(crate) peer: PeerId,
-    /// Its RFC 6811 §2 validation state, judged on the route as received.
-    /// Phase 2 does not use it; policy does.
+    /// Its RFC 6811 §2 validation state: what the lookup said of the route
+    /// as received (`lookup`), unless import policy set another (RFC 6811
+    /// §3). What export policy and the control plane see.
     pub(crate) rov: RovState,
+    /// What the lookup of the route as received said, whatever policy made
+    /// of it. A new source is compared against this, not against `rov`,
+    /// to tell whether the route needs judging again.
+    pub(crate) lookup: RovState,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub(crate) aspa: AspaState,
     /// Import policy rejected the route for its validation state alone:
@@ -590,6 +595,7 @@ mod tests {
             received: None,
             peer: PeerId(peer),
             rov: RovState::Disabled,
+            lookup: RovState::Disabled,
             aspa: AspaState::Disabled,
             held: false,
         }

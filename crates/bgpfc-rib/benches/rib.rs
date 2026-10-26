@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bgpfc_rib::{Output, PathLimit, PeerInfo, Rib};
-use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
+use bgpfc_rpki::{
+    AffectedPrefixes, InvalidAction, ValidationChange, ValidationSource, Vrp, VrpSet,
+};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::mp::{MpReach, NextHop};
@@ -243,6 +245,7 @@ fn bench(c: &mut Criterion) {
     group.finish();
     roles(c, routes, &v4, &v6);
     revalidation(c, routes, &v4, &v6);
+    enforcement(c, routes, &v4, &v6);
     add_path_receive(c, routes);
     add_path_send(c, routes);
 }
@@ -356,6 +359,89 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
             black_box(outputs(|o| rib.validation_changed(change, now, o)))
         });
     });
+    group.finish();
+}
+
+/// What the RIB does with Invalid routes by itself (RFC 6811 §5), against a
+/// table that two peers send, so that every destination is decided between
+/// two routes, one in twenty of them Invalid: loading it under each
+/// [`InvalidAction`], and switching the action on a loaded RIB, which
+/// decides again every destination with an Invalid route.
+fn enforcement(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let prefixes: Vec<Prefix> = v4
+        .iter()
+        .chain(v6)
+        .flat_map(|u| {
+            let m = &u.message;
+            m.nlri
+                .iter()
+                .chain(m.mp_reach.iter().flat_map(|r| &r.nlri))
+                .copied()
+        })
+        .collect();
+    // The routes originate in AS 7; every twentieth prefix has a VRP for
+    // AS 8 instead, which makes its routes Invalid.
+    let vrps: VrpSet = prefixes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Vrp::new(*p, p.prefix_len(), Asn(if i % 20 == 0 { 8 } else { 7 })).unwrap())
+        .collect();
+    let source: Arc<dyn ValidationSource> = Arc::new(vrps);
+    let on = || ValidationChange {
+        source: Arc::clone(&source),
+        affected: AffectedPrefixes::All,
+    };
+    let v4_other = updates(routes * 4 / 5, false, 65_003, 7);
+    let v6_other = updates(routes / 5, true, 65_003, 7);
+    let load = |action: InvalidAction| {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut out = Vec::new();
+        rib.set_invalid_action(action, now, &mut out);
+        outputs(|o| rib.peer_up(peer(1), now, o));
+        outputs(|o| rib.peer_up(peer(2), now, o));
+        outputs(|o| rib.peer_up(peer(3), now, o));
+        outputs(|o| rib.validation_changed(on(), now, o));
+        feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+        feed(
+            &mut rib,
+            peer(3).addr,
+            v4_other.iter().chain(&v6_other),
+            now,
+            &mut out,
+        );
+        (rib, now)
+    };
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    for action in InvalidAction::ALL {
+        group.bench_function(
+            format!("insert_{routes}_from_two_peers_validated_{action}"),
+            |b| b.iter(|| load(action)),
+        );
+    }
+    // Preferring the Valid decides each destination with an Invalid route
+    // again; dropping also moves those routes between the candidates and
+    // the held routes.
+    for to in [InvalidAction::PreferValid, InvalidAction::Drop] {
+        let (mut rib, now) = load(InvalidAction::Policy);
+        let mut flip = false;
+        group.bench_function(
+            format!(
+                "switch_the_action_to_{to}_and_back_with_{}_invalid_of_{routes}",
+                prefixes.len() / 20
+            ),
+            |b| {
+                b.iter(|| {
+                    flip = !flip;
+                    let action = if flip { to } else { InvalidAction::Policy };
+                    black_box(outputs(|o| {
+                        black_box(rib.set_invalid_action(action, now, o));
+                    }))
+                });
+            },
+        );
+    }
     group.finish();
 }
 

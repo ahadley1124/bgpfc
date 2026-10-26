@@ -61,6 +61,11 @@ pub enum GlobalChange {
     /// out or a cache's host (see [`Rpki::same_as`](crate::ast::Rpki::same_as)),
     /// is no change.
     Rpki,
+    /// What the RIB does with Invalid routes by itself, the `invalid`
+    /// statement of the `rpki` block: applied to the running RIB, which
+    /// judges its Invalid routes again, with no session reset and the RTR
+    /// client left alone.
+    RpkiInvalid,
 }
 
 impl ConfigDiff {
@@ -76,6 +81,10 @@ impl ConfigDiff {
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
             (!old.rpki.same_as(&new.rpki), GlobalChange::Rpki),
+            (
+                old.rpki.invalid != new.rpki.invalid,
+                GlobalChange::RpkiInvalid,
+            ),
         ] {
             if changed {
                 d.global.push(what);
@@ -165,6 +174,7 @@ fn policy_fingerprint(cfg: &Config, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bgpfc_rpki::InvalidAction;
 
     const BASE: &str = "router-id 192.0.2.1; local-as 65000;
         listen { address ::; }
@@ -292,6 +302,18 @@ mod tests {
             ConfigDiff::between(a, &e).policy_changed,
             vec![addr("192.0.2.2"), addr("192.0.2.3")]
         );
+        // So does the validation state a term matches or sets (RFC 6811
+        // §3), each a different one from the last.
+        let valid = cfg(&BASE.replace("term r {", "term r { match rpki valid;"));
+        let invalid = cfg(&BASE.replace("term r {", "term r { match rpki invalid;"));
+        let set = cfg(&BASE.replace("term r {", "term r { set rpki valid;"));
+        for (x, y) in [(a, &valid), (&valid, &invalid), (a, &set), (&valid, &set)] {
+            assert_eq!(
+                ConfigDiff::between(x, y).policy_changed,
+                vec![addr("192.0.2.2"), addr("192.0.2.3")]
+            );
+        }
+        assert!(ConfigDiff::between(&valid, &valid).is_empty());
     }
 
     #[test]
@@ -437,10 +459,42 @@ mod tests {
     }
 
     #[test]
+    fn a_new_action_for_invalid_routes_is_its_own_change_and_leaves_the_client_alone() {
+        let base = cfg(BASE);
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let drop = with("rpki { mode external; invalid drop; cache 192.0.2.10; }");
+        let prefer = with("rpki { mode external; invalid prefer-valid; cache 192.0.2.10; }");
+        let d = ConfigDiff::between(&drop, &prefer);
+        assert_eq!(d.global, vec![GlobalChange::RpkiInvalid]);
+        // No neighbor is touched: the RIB judges its routes again.
+        assert!(d.reset.is_empty() && d.policy_changed.is_empty());
+        // Order of statements is no change.
+        let reordered = with("rpki { mode external; cache 192.0.2.10; invalid drop; }");
+        assert!(ConfigDiff::between(&drop, &reordered).is_empty());
+        // A block with a new cache and a new action changes both.
+        let both = with("rpki { mode external; invalid policy; cache 192.0.2.11; }");
+        assert_eq!(
+            ConfigDiff::between(&drop, &both).global,
+            vec![GlobalChange::Rpki, GlobalChange::RpkiInvalid]
+        );
+        // Without a block the action is `policy`, and a disabled block may
+        // state another, which is a change even though no client runs.
+        let plain = with("rpki { mode disabled; }");
+        assert!(ConfigDiff::between(&base, &plain).is_empty());
+        let acting = with("rpki { mode disabled; invalid drop; }");
+        assert_eq!(
+            ConfigDiff::between(&base, &acting).global,
+            vec![GlobalChange::RpkiInvalid]
+        );
+        assert_eq!(base.rpki.invalid, InvalidAction::Policy);
+        assert_eq!(acting.rpki.invalid, InvalidAction::Drop);
+    }
+
+    #[test]
     fn rpki_changes_are_one_global_change() {
         let a = cfg(BASE);
         let with = |block: &str| cfg(&format!("{BASE} {block}"));
-        let external = with("rpki { mode external; cache 192.0.2.10; }");
+        let external = with("rpki { mode external; invalid policy; cache 192.0.2.10; }");
         let d = ConfigDiff::between(&a, &external);
         assert_eq!(d.global, vec![GlobalChange::Rpki]);
         // No neighbor is touched.
@@ -450,9 +504,9 @@ mod tests {
         // Spelling out a default, or moving the block, is no change: the
         // running client is left alone.
         for same in [
-            "rpki { mode external; cache 192.0.2.10 port 323 preference 0; }",
-            "rpki { mode external; version 1; max-expire 172800; cache 192.0.2.10; }",
-            "rpki { mode external; backoff 1 600; connect-timeout 10; cache 192.0.2.10; }",
+            "rpki { mode external; invalid policy; cache 192.0.2.10 port 323 preference 0; }",
+            "rpki { mode external; invalid policy; version 1; max-expire 172800; cache 192.0.2.10; }",
+            "rpki { mode external; invalid policy; backoff 1 600; connect-timeout 10; cache 192.0.2.10; }",
         ] {
             assert!(
                 ConfigDiff::between(&external, &with(same)).is_empty(),
@@ -461,11 +515,13 @@ mod tests {
         }
         // Nor is respelling a cache as the parser reads it: the same
         // address, or the same name in another case or with its final dot.
-        let named = with("rpki { mode external; cache rtr.example.net; cache 2001:db8::1; }");
+        let named = with(
+            "rpki { mode external; invalid policy; cache rtr.example.net; cache 2001:db8::1; }",
+        );
         for same in [
-            "rpki { mode external; cache RTR.Example.NET; cache 2001:db8::1; }",
-            "rpki { mode external; cache rtr.example.net.; cache 2001:0db8:0::1; }",
-            "rpki { mode external; cache rtr.example.net port 323; cache 2001:db8::1; }",
+            "rpki { mode external; invalid policy; cache RTR.Example.NET; cache 2001:db8::1; }",
+            "rpki { mode external; invalid policy; cache rtr.example.net.; cache 2001:0db8:0::1; }",
+            "rpki { mode external; invalid policy; cache rtr.example.net port 323; cache 2001:db8::1; }",
         ] {
             assert!(
                 ConfigDiff::between(&named, &with(same)).is_empty(),
@@ -473,10 +529,10 @@ mod tests {
             );
         }
         for other in [
-            "rpki { mode external; cache rtr.example.org; cache 2001:db8::1; }",
-            "rpki { mode external; cache rtr.example.net; cache 2001:db8::2; }",
-            "rpki { mode external; cache rtr.example.net port 3323; cache 2001:db8::1; }",
-            "rpki { mode external; cache 2001:db8::1; cache rtr.example.net; }",
+            "rpki { mode external; invalid policy; cache rtr.example.org; cache 2001:db8::1; }",
+            "rpki { mode external; invalid policy; cache rtr.example.net; cache 2001:db8::2; }",
+            "rpki { mode external; invalid policy; cache rtr.example.net port 3323; cache 2001:db8::1; }",
+            "rpki { mode external; invalid policy; cache 2001:db8::1; cache rtr.example.net; }",
         ] {
             assert_eq!(
                 ConfigDiff::between(&named, &with(other)).global,
@@ -485,7 +541,7 @@ mod tests {
             );
         }
         let moved = cfg(&format!(
-            "rpki {{ mode external; cache 192.0.2.10; }}\n# moved\n{BASE}"
+            "rpki {{ mode external; invalid policy; cache 192.0.2.10; }}\n# moved\n{BASE}"
         ));
         assert!(ConfigDiff::between(&external, &moved).is_empty());
         // No block is `mode disabled`.
@@ -494,10 +550,10 @@ mod tests {
         // caches (it breaks ties of preference), a setting.
         for other in [
             "rpki { mode disabled; cache 192.0.2.10; }",
-            "rpki { mode external; cache 192.0.2.10 port 3323; }",
-            "rpki { mode external; cache 192.0.2.10 preference 1; }",
-            "rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }",
-            "rpki { mode external; cache 192.0.2.10; max-vrps 10; }",
+            "rpki { mode external; invalid policy; cache 192.0.2.10 port 3323; }",
+            "rpki { mode external; invalid policy; cache 192.0.2.10 preference 1; }",
+            "rpki { mode external; invalid policy; cache 192.0.2.10; cache 192.0.2.11; }",
+            "rpki { mode external; invalid policy; cache 192.0.2.10; max-vrps 10; }",
         ] {
             assert_eq!(
                 ConfigDiff::between(&external, &with(other)).global,
@@ -505,8 +561,10 @@ mod tests {
                 "{other}"
             );
         }
-        let two = with("rpki { mode external; cache 192.0.2.10; cache 192.0.2.11; }");
-        let swapped = with("rpki { mode external; cache 192.0.2.11; cache 192.0.2.10; }");
+        let two =
+            with("rpki { mode external; invalid policy; cache 192.0.2.10; cache 192.0.2.11; }");
+        let swapped =
+            with("rpki { mode external; invalid policy; cache 192.0.2.11; cache 192.0.2.10; }");
         assert_eq!(
             ConfigDiff::between(&two, &swapped).global,
             vec![GlobalChange::Rpki]

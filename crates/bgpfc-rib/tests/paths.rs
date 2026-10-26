@@ -197,6 +197,7 @@ fn run(steps: &[Step]) -> Vec<Prefixes> {
                     from: Neighbor::of(info),
                     attrs: c.attrs,
                     path_id: c.path_id.map_or(0, |p| p.0),
+                    demoted: false,
                 }
             });
             let in_rib = rib.loc_rib(V4).find(|(p, _)| *p == prefix(i));

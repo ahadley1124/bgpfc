@@ -192,6 +192,7 @@ impl Sessions {
             from: self.peer(route.peer).neighbor,
             attrs: &route.attrs,
             path_id: dest.id(i),
+            demoted: self.phase2().demotes(route),
         }
     }
 

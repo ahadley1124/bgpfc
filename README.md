@@ -11,7 +11,7 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 7911. RFC 4271 has five rows
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811 and 8481. RFC 4271 has five rows
 > open. Two need the host's interfaces and routes, which bgpfc does not track,
 > so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
 > and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
@@ -61,8 +61,14 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 - An RFC 6811 origin validation state on every route, from VRPs fetched over
   RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
   with failover in order of preference; `bgpfcctl show rpki` reports the
-  client, and interop tests run it against StayRTR. Nothing acts on the
-  state yet.
+  client, and interop tests run it against StayRTR. Policy matches and sets
+  the state (`match rpki invalid;`, `set rpki not-found;`), and the block's
+  `invalid` statement says what the RIB does with the Invalid routes
+  itself: `drop` them, `prefer-valid` (keep them, behind every other route),
+  or leave them to `policy`. The statement is required, since RFC 8481 §5
+  forbids acting on the state unless the operator says so. A route `drop`
+  refuses is held, shown by `show routes PREFIX`, and used again when a VRP
+  change admits it, with no UPDATE from the neighbor.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -117,11 +123,34 @@ cache answers, until they expire. Without the block, or with `mode
 disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
 8210 §9), so the cache belongs on loopback or a trusted network.
 
-Enforcement comes next. Nothing acts on the state yet; step 13 will drop
-Invalid routes by default, offer a non-enforcing prefer-valid mode, and let
-policy match on the validation state (RFC 6811 §3). Then bgpfcd will be
-able to start and supervise an optional Routinator as a child process.
-Routinator is a separate program; bgpfc neither bundles nor links it.
+The state is acted on (step 13), as the operator says. Import and export
+policy match it and set it (RFC 6811 §3: `match rpki invalid;`, `set rpki
+not-found;`), and the block's `invalid` statement chooses what the RIB does
+with an Invalid route on its own (RFC 6811 §5):
+
+```
+rpki {
+    mode external;
+    invalid drop;            # or prefer-valid, or policy
+    cache 127.0.0.1 port 3323;
+}
+```
+
+`drop` keeps Invalid routes out of the decision process, the kernel's table
+and the neighbors' Adj-RIBs-Out, but not out of the Adj-RIB-In: they are
+held, shown by `show routes PREFIX`, and used again as soon as a VRP change
+or a reload admits them, with no UPDATE from the neighbor and no
+ROUTE-REFRESH. `prefer-valid` is the non-enforcing choice: an Invalid route
+stays a candidate and loses to every route that is not Invalid, whatever
+the local preference, and is used only where nothing else leads to the
+prefix. `policy` does nothing of its own. There is no default: RFC 8481 §5
+says that absent specific operator configuration policy MUST NOT be
+applied, so an `external` block without `invalid` is a configuration
+error. Interop tests drive all three against StayRTR and BIRD.
+
+Next, bgpfcd will be able to start and supervise an optional Routinator as a
+child process (step 14). Routinator is a separate program; bgpfc neither
+bundles nor links it.
 
 ### BGP roles and Only to Customer
 

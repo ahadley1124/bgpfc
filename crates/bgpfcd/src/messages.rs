@@ -180,7 +180,8 @@ pub(crate) enum RibQuery {
     /// Per-peer route counts and session facts.
     Peers,
     /// Loc-RIB routes of a family, a page after `after`; or one prefix
-    /// with all its candidates.
+    /// with all its candidates, and the routes held for their validation
+    /// state.
     Routes {
         /// The family.
         family: AddressFamily,
@@ -211,6 +212,10 @@ pub(crate) struct RouteReport {
     pub(crate) path_id: Option<bgpfc_wire::types::PathId>,
     /// Whether it is the chosen route.
     pub(crate) best: bool,
+    /// Whether it is a route the Adj-RIB-In holds that is no candidate:
+    /// refused for its validation state (RFC 6811 §2), by `invalid drop`
+    /// or by import policy.
+    pub(crate) held: bool,
     /// Its RFC 6811 §2 origin validation state, judged on the route as
     /// received; `Disabled` while there is no validation source.
     pub(crate) rov: bgpfc_rib::RovState,
@@ -328,6 +333,10 @@ pub(crate) enum RibMsg {
     /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
     /// coordinator when a reload turns validation off.
     Validation(bgpfc_rpki::ValidationChange),
+    /// What the RIB does with Invalid routes by itself changed, with a
+    /// reload (RFC 6811 §5): the RIB judges the routes it holds that are
+    /// Invalid again, with no session reset and no ROUTE-REFRESH.
+    SetInvalidAction(bgpfc_rpki::InvalidAction),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.

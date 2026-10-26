@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
 use bgpfc_rib::{FibChange, Output, PathLimit, PeerInfo, Revalidation, Rib, Sink};
-use bgpfc_rpki::AffectedPrefixes;
+use bgpfc_rpki::{AffectedPrefixes, InvalidAction};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
 use bgpfc_wire::update::PeerKind;
@@ -122,44 +122,7 @@ fn handle(
             peer,
             local_addr,
             session,
-        } => {
-            let interval =
-                advertisement_interval(configured(&settings.intervals, peer), session.peer);
-            let limits = prefix_limits(settings, peer);
-            bgpfc_log::info!(
-                "rib: peer up",
-                peer = peer,
-                local = local_addr,
-                families = session
-                    .families
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                extended_next_hop_send = session
-                    .extended_next_hop_send
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                role = session
-                    .role
-                    .map_or_else(|| "none".to_owned(), |r| r.to_string()),
-                advertisement_interval = interval.as_secs()
-            );
-            let mut info = peer_info(peer, local_addr, &session, interval);
-            info.prefix_limits = limits;
-            info.add_path_send = add_path_send(settings, peer, &session.add_path_send);
-            if !info.add_path_receive.is_empty() || !info.add_path_send.is_empty() {
-                bgpfc_log::info!(
-                    "rib: add-path",
-                    peer = peer,
-                    receive = families(&info.add_path_receive),
-                    send = describe_path_limits(&info.add_path_send)
-                );
-            }
-            rib.peer_up(info, now, out);
-        }
+        } => peer_up(rib, settings, (peer, local_addr, &session), now, out),
         RibMsg::Update { peer, update, .. } => {
             log_update(peer, &update);
             rib.update(peer, &update, now, out);
@@ -215,10 +178,71 @@ fn handle(
             );
             rib.validation_changed(change, now, out);
         }
+        RibMsg::SetInvalidAction(action) => set_invalid_action(rib, action, now, out),
         // The changes of earlier messages went to the FIB first: the loop
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
     }
+}
+
+/// A session reached Established: tell the RIB, with the settings the
+/// configuration gives the neighbor.
+fn peer_up(
+    rib: &mut Rib,
+    settings: &RibSettings,
+    (peer, local_addr, session): (IpAddr, IpAddr, &Session),
+    now: Instant,
+    out: &mut impl Sink,
+) {
+    let interval = advertisement_interval(configured(&settings.intervals, peer), session.peer);
+    let limits = prefix_limits(settings, peer);
+    bgpfc_log::info!(
+        "rib: peer up",
+        peer = peer,
+        local = local_addr,
+        families = session
+            .families
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        extended_next_hop_send = session
+            .extended_next_hop_send
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        role = session
+            .role
+            .map_or_else(|| "none".to_owned(), |r| r.to_string()),
+        advertisement_interval = interval.as_secs()
+    );
+    let mut info = peer_info(peer, local_addr, session, interval);
+    info.prefix_limits = limits;
+    info.add_path_send = add_path_send(settings, peer, &session.add_path_send);
+    if !info.add_path_receive.is_empty() || !info.add_path_send.is_empty() {
+        bgpfc_log::info!(
+            "rib: add-path",
+            peer = peer,
+            receive = families(&info.add_path_receive),
+            send = describe_path_limits(&info.add_path_send)
+        );
+    }
+    rib.peer_up(info, now, out);
+}
+
+/// Switch what the RIB does with Invalid routes by itself (RFC 6811 §5)
+/// and log what that reached: counts, however many routes it moved.
+fn set_invalid_action(rib: &mut Rib, action: InvalidAction, now: Instant, out: &mut impl Sink) {
+    let r = rib.set_invalid_action(action, now, out);
+    bgpfc_log::info!(
+        "rib: action for invalid routes",
+        action = action,
+        invalid = r.invalid,
+        held = r.held,
+        taken = r.taken,
+        best_changed = r.best_changed
+    );
 }
 
 /// Routes in one `FibMsg::Reconcile`.
@@ -670,17 +694,23 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                     .loc_rib(*family)
                     .find(|(p, _)| p == prefix)
                     .map(|(_, b)| (b.peer, b.path_id));
+                // RFC 6811 §2: the routes held for their state follow the
+                // candidates, so that an operator can see what the RIB
+                // keeps but does not use.
+                let report = |c: &bgpfc_rib::RouteRef<'_>, held: bool| RouteReport {
+                    prefix: *prefix,
+                    peer: c.peer,
+                    attrs: std::sync::Arc::clone(c.attrs),
+                    path_id: c.path_id,
+                    best: !held && best == Some((c.peer, c.path_id)),
+                    held,
+                    rov: c.rov,
+                };
                 RibReply::Routes(
                     rib.candidates(*family, *prefix)
                         .iter()
-                        .map(|c| RouteReport {
-                            prefix: *prefix,
-                            peer: c.peer,
-                            attrs: std::sync::Arc::clone(c.attrs),
-                            path_id: c.path_id,
-                            best: best == Some((c.peer, c.path_id)),
-                            rov: c.rov,
-                        })
+                        .map(|c| report(c, false))
+                        .chain(rib.held(*family, *prefix).iter().map(|c| report(c, true)))
                         .collect(),
                 )
             }
@@ -693,6 +723,7 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
                         attrs: std::sync::Arc::clone(b.attrs),
                         path_id: b.path_id,
                         best: true,
+                        held: false,
                         rov: b.rov,
                     })
                     .collect(),
@@ -1581,8 +1612,9 @@ mod tests {
                 s("203.0.113.0/24", Disabled)
             ]
         );
-        // Both routes reached the FIB, the invalid one too: nothing acts
-        // on the state yet. Turning validation off changed no best route.
+        // Both routes reached the FIB, the invalid one too: the RIB acts
+        // on no state unless told to (`invalid`). Turning validation off
+        // changed no best route.
         let installed: Vec<_> = fib_rx
             .try_iter()
             .flat_map(|m| match m {
@@ -1591,6 +1623,143 @@ mod tests {
             })
             .collect();
         assert_eq!(installed, ["198.51.100.0/24", "203.0.113.0/24"]);
+    }
+
+    #[test]
+    fn the_rib_thread_applies_a_new_action_for_invalid_routes_in_order() {
+        // RFC 6811 §5 through the channel, as a reload sends it: dropping
+        // the Invalid takes the route out of the Loc-RIB and the FIB, and
+        // leaving it to policy gives it back, with no UPDATE from the
+        // neighbor.
+        use RovState::{Invalid, Valid};
+        let (tx, rx) = sync_channel(16);
+        let (fib_tx, fib_rx) = sync_channel(16);
+        spawn(
+            Rib::new(Asn(65_000)),
+            RibSettings::default(),
+            rx,
+            PeerTable::default(),
+            fib_tx,
+        );
+        let query = |tx: &SyncSender<RibMsg>| {
+            let (reply, answer) = sync_channel(1);
+            let q = RibQuery::Routes {
+                family: V4,
+                prefix: None,
+                after: None,
+            };
+            tx.send(RibMsg::Query(q, reply)).unwrap();
+            match answer.recv_timeout(Duration::from_secs(10)) {
+                Ok(RibReply::Routes(routes)) => routes
+                    .iter()
+                    .map(|r| (r.prefix.to_string(), r.rov))
+                    .collect::<Vec<_>>(),
+                other => panic!("expected routes, got {other:?}"),
+            }
+        };
+        let s = |p: &str, rov| (p.to_owned(), rov);
+        tx.send(up("192.0.2.1", 65_001, PeerKind::External))
+            .unwrap();
+        tx.send(RibMsg::Validation(all(&[
+            vrp("198.51.100.0/24", 24, 65_001),
+            vrp("203.0.113.0/24", 24, 64_496),
+        ])))
+        .unwrap();
+        tx.send(routes(
+            "192.0.2.1",
+            65_001,
+            &["198.51.100.0/24", "203.0.113.0/24"],
+        ))
+        .unwrap();
+        assert_eq!(
+            query(&tx),
+            [s("198.51.100.0/24", Valid), s("203.0.113.0/24", Invalid)]
+        );
+        tx.send(RibMsg::SetInvalidAction(InvalidAction::Drop))
+            .unwrap();
+        assert_eq!(query(&tx), [s("198.51.100.0/24", Valid)]);
+        tx.send(RibMsg::SetInvalidAction(InvalidAction::Policy))
+            .unwrap();
+        assert_eq!(
+            query(&tx),
+            [s("198.51.100.0/24", Valid), s("203.0.113.0/24", Invalid)]
+        );
+        // The FIB saw both routes installed, the Invalid one removed and
+        // installed again.
+        let changes: Vec<_> = fib_rx
+            .try_iter()
+            .flat_map(|m| match m {
+                FibMsg::Changes(c) => c
+                    .into_iter()
+                    .map(|c| (c.prefix.to_string(), c.next_hop.is_some()))
+                    .collect::<Vec<_>>(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                ("198.51.100.0/24".to_owned(), true),
+                ("203.0.113.0/24".to_owned(), true),
+                ("203.0.113.0/24".to_owned(), false),
+                ("203.0.113.0/24".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn routes_for_a_prefix_list_the_held_routes_after_the_candidates() {
+        // RFC 6811 §2: what `invalid drop` refuses is kept, and the
+        // control plane can show it.
+        use RovState::{Invalid, Valid};
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        for (addr, asn) in [("192.0.2.1", 65_001), ("192.0.2.2", 65_002)] {
+            handle(
+                &mut rib,
+                &mut settings,
+                up(addr, asn, PeerKind::External),
+                now,
+            );
+        }
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::Validation(all(&[vrp("198.51.100.0/24", 24, 65_001)])),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::SetInvalidAction(InvalidAction::Drop),
+            now,
+        );
+        for (addr, asn) in [("192.0.2.1", 65_001), ("192.0.2.2", 65_002)] {
+            let msg = routes(addr, asn, &["198.51.100.0/24"]);
+            handle(&mut rib, &mut settings, msg, now);
+        }
+        let q = RibQuery::Routes {
+            family: V4,
+            prefix: Some("198.51.100.0/24".parse().unwrap()),
+            after: None,
+        };
+        let RibReply::Routes(listed) = answer(&rib, &q) else {
+            panic!("expected routes");
+        };
+        let seen: Vec<_> = listed
+            .iter()
+            .map(|r| (r.peer.to_string(), r.rov, r.best, r.held))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("192.0.2.1".to_owned(), Valid, true, false),
+                ("192.0.2.2".to_owned(), Invalid, false, true),
+            ]
+        );
+        // The Loc-RIB listing has the candidate alone.
+        assert_eq!(states(&rib), [("198.51.100.0/24".to_owned(), Valid)]);
     }
 
     #[test]

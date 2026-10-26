@@ -31,7 +31,7 @@ failure, 2 on a usage error.
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, our BGP Role and the one the neighbor sent (RFC 9234), the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it, and the ADD-PATH families of RFC 7911 negotiated: those the neighbor sends several paths for, and those we send it several for, with how many paths of a prefix each gets), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; and a route with the Only to Customer attribute ends in `otc ASN` (see [Only to Customer](#only-to-customer)) |
+| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`, then the routes the Adj-RIB-In holds for it that are no candidate, each ending in `held` (see [Validation state](#validation-state)); each route with its origin validation state (`rov`); a route the neighbor sent under a Path Identifier (RFC 7911 §3) has `id N` after the neighbor, which tells apart the several paths one neighbor has to a prefix; and a route with the Only to Customer attribute ends in `otc ASN` (see [Only to Customer](#only-to-customer)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -105,12 +105,12 @@ Example objects:
                          "send":[{"family":"ipv4-unicast","paths":"all"}]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "otc":64511,"peer":"198.51.100.1","path_id":7,"best":true,"rov":"disabled",
+  "otc":64511,"peer":"198.51.100.1","path_id":7,"best":true,"held":false,"rov":"disabled",
   "as_path":[64511],"communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
-{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
+{"mode":"external","invalid":"drop","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
  "current":true}],"running":true,"state":"idle","connected":true,"version":1,"session_id":4242,
  "serial":17,"synced_seconds_ago":12,"expires_in_seconds":7188,
  "vrps":{"ipv4":512340,"ipv6":121877,"from":{"host":"127.0.0.1","port":3323}},
@@ -164,9 +164,27 @@ from one that no VRP covers (issue #52). Every route is `disabled` until
 VRPs of an RPKI cache; from then on the states follow the cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
-policy, and follows the validation source when it changes. It is shown
-for information only: it does not yet change whether a route is used or
-which one is chosen.
+policy, and follows the validation source when it changes. Import policy
+may match it and set another (`match rpki`, `set rpki`, RFC 6811 §3), and
+the state a route holds after that is the one `show routes` prints. What
+the RIB does with an `invalid` route by itself is the `invalid` statement
+of the `rpki` block (`docs/config.md`, "RPKI"), which `show rpki` reports:
+
+- `drop`: the route is not a candidate, so it is not in the Loc-RIB, the
+  kernel's table or any neighbor's Adj-RIB-Out. It is held: the
+  Adj-RIB-In keeps it as received, and it counts as received for the
+  neighbor's `maximum-prefix`. `show routes PREFIX` lists it after the
+  candidates, ending in `held` (`"held":true` in JSON), with its `rov`.
+  It becomes a candidate when a change of the VRPs, of the state policy
+  sets, or of `invalid` admits it, with no UPDATE from the neighbor.
+- `prefer-valid`: it is a candidate and is chosen only where no other
+  route leads to the prefix, so `show routes` shows it as the best route
+  of a prefix only when nothing else does.
+- `policy`: it is an ordinary route.
+
+A route held for a reason other than the action is listed the same way:
+import policy rejects it with the state it has but would accept it with
+another (`docs/config.md`, "Policy").
 
 `show rpki validate` answers the question for any route, held or not,
 from the same VRPs the RIB validates with.
@@ -216,6 +234,7 @@ replaces them, or until they expire (§10, §6).
 | Member | Line | Meaning |
 |---|---|---|
 | `mode` | `mode` | `disabled` or `external` |
+| `invalid` | `invalid` | what the RIB does with `invalid` routes by itself: `drop`, `prefer-valid` or `policy` (`docs/config.md`, "RPKI"). In `mode disabled` it is `policy` unless the block says otherwise |
 | `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
 | `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
 | `state` | `state` | the session with the current cache: `disconnected`, `connecting` (a connection attempt is under way), `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
@@ -228,8 +247,8 @@ replaces them, or until they expire (§10, §6).
 | `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
-Without a client, in `mode disabled`, every member but `mode` and
-`caches` is `null`, `false` or 0, and the text lists only those two.
+Without a client, in `mode disabled`, every member but `mode`, `invalid`
+and `caches` is `null`, `false` or 0, and the text lists only those three.
 
 ## Reload
 
@@ -248,6 +267,9 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again. `router-id` and `local-as` changes are refused, and `listen`,
+again; a changed `invalid` statement of that block is applied to the
+running RIB alone, which judges its Invalid routes again (logged as one
+`rib: action for invalid routes` line with the counts) and leaves the
+client and the sessions alone. `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.
