@@ -137,6 +137,30 @@ impl Lab {
         c
     }
 
+    /// Give both ends of each link an IPv6 address: `2001:db8:9::1` and
+    /// `2001:db8:9::2` on the link from A to B, `2001:db8:8::1` and
+    /// `2001:db8:8::2` on the one to C, if there is one, all /64. Whether
+    /// the kernel took them: a host that boots with `ipv6.disable=1` has no
+    /// IPv6 to give.
+    #[must_use]
+    pub fn add_ipv6(&self) -> bool {
+        let mut links = vec![
+            (&self.a, format!("v{}a", self.id), "2001:db8:9::1/64"),
+            (&self.b, format!("v{}b", self.id), "2001:db8:9::2/64"),
+        ];
+        if let Some(c) = &self.c {
+            links.push((&self.a, format!("v{}a2", self.id), "2001:db8:8::1/64"));
+            links.push((c, format!("v{}c", self.id), "2001:db8:8::2/64"));
+        }
+        links.iter().all(|(ns, dev, addr)| {
+            // No duplicate address detection: the address is usable at once.
+            Command::new("ip")
+                .args(["-n", ns, "addr", "add", addr, "dev", dev, "nodad"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    }
+
     /// An address on the link between A and B where what A sends goes
     /// nowhere: A has a permanent neighbour entry for it with a MAC address
     /// nobody has, and B drops frames for that address. A connection to
@@ -534,6 +558,30 @@ impl Bird {
     /// If the config cannot be written or `bird` cannot be spawned.
     #[must_use]
     pub fn start_named(lab: &Lab, ns: &str, name: &str, opts: &BirdOpts, extra: &str) -> Bird {
+        Bird::launch(lab, ns, name, opts, extra, false)
+    }
+
+    /// [`Bird::start_with`] for a BIRD that comes back from a graceful
+    /// restart (`birdc graceful restart`, then this): `bird -R` applies the
+    /// recovery, so that its BGP speaks as a Restarting Speaker (RFC 4724
+    /// §4.1): the Restart State and Forwarding State bits are set, and it
+    /// waits for End-of-RIB markers before it selects routes.
+    ///
+    /// # Panics
+    /// If the config cannot be written or `bird` cannot be spawned.
+    #[must_use]
+    pub fn start_recovering(lab: &Lab, ns: &str, opts: &BirdOpts, extra: &str) -> Bird {
+        Bird::launch(lab, ns, ns, opts, extra, true)
+    }
+
+    fn launch(
+        lab: &Lab,
+        ns: &str,
+        name: &str,
+        opts: &BirdOpts,
+        extra: &str,
+        recover: bool,
+    ) -> Bird {
         let cfg = lab.dir.join(format!("bird-{name}.conf"));
         let socket = lab.dir.join(format!("bird-{name}.ctl"));
         let mut statics = String::new();
@@ -582,6 +630,9 @@ impl Bird {
             "-s",
             socket.to_str().expect("path"),
         ]);
+        if recover {
+            cmd.arg("-R");
+        }
         let daemon = Daemon::start(cmd, lab.dir.join(format!("bird-{name}.log")));
         Bird {
             daemon,
