@@ -139,6 +139,11 @@ impl Setup {
         }
     }
 
+    /// bgpfcd's configuration file.
+    fn config_path(&self) -> PathBuf {
+        self.lab.dir.join(format!("bgpfcd-{}.conf", self.lab.a))
+    }
+
     fn ctl(&self, args: &[&str]) -> (String, bool) {
         interop::bgpfcctl(&self.socket, args)
     }
@@ -211,6 +216,20 @@ impl Setup {
         );
     }
 
+    /// The prefixes `show fib` lists, installed or pending (the FIB is in
+    /// dry-run here), sorted.
+    fn fib(&self) -> Vec<String> {
+        let (out, _) = self.ctl(&["show", "fib"]);
+        let mut fib: Vec<String> = out
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+        fib.sort();
+        fib
+    }
+
     /// The routes `show routes held` lists: prefix, validation state and
     /// what holds it, sorted.
     fn held(&self) -> Vec<(String, String, String)> {
@@ -243,6 +262,18 @@ impl Setup {
     /// How often bgpfcd has logged `text`.
     fn count(&self, text: &str) -> usize {
         self.bgpfcd.log_text().matches(text).count()
+    }
+
+    /// Wait up to five seconds for the fake to have been started `n`
+    /// times, and no more.
+    fn wait_for_starts(&self, n: usize) {
+        assert!(
+            wait_for(Duration::from_secs(5), || self.fake.invocations().len()
+                >= n),
+            "{}",
+            self.report()
+        );
+        assert_eq!(self.fake.invocations().len(), n, "{}", self.report());
     }
 
     /// Where bgpfcd first logged `text`, as an offset into its log.
@@ -315,6 +346,13 @@ fn pairs(states: &[(&str, &str)]) -> Vec<(String, String)> {
         .iter()
         .map(|(p, s)| ((*p).to_owned(), (*s).to_owned()))
         .collect();
+    p.sort();
+    p
+}
+
+/// The prefixes of `states`, sorted.
+fn prefixes(states: &[(&str, &str)]) -> Vec<String> {
+    let mut p: Vec<String> = states.iter().map(|(p, _)| (*p).to_owned()).collect();
     p.sort();
     p
 }
@@ -793,4 +831,333 @@ fn a_routinator_that_keeps_failing_backs_off_and_raises_the_alarm() {
     let body = s.http("/v1/status");
     assert!(body.contains("\"alarms\":[]"), "{body}");
     assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
+
+/// Issue #71: "cold start converges without hanging and without silently
+/// disabling enforcement". Routinator listens only after its first
+/// validation run, twenty seconds here. bgpfcd does not wait for it: the
+/// session comes up and BIRD's routes are used, best and in the FIB, as
+/// `disabled` (RFC 6811 §2: no route leaves route selection for its state
+/// unless configured to), and `show rpki` and `show status` say that
+/// validation waits, as the log does at warn. Once the fake listens, the
+/// client (`backoff 1 5`) finds it, every route is validated (RFC 6811 §4)
+/// and `drop-invalid` takes the Invalid ones out of route selection and
+/// the FIB.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_cold_sidecar_converges_without_hanging() {
+    let opts = Opts {
+        rpki: "backoff 1 5;",
+        ..Opts::default()
+    };
+    let s = Setup::start("sf", 31, &opts, |fake| fake.set_delay(20));
+    s.wait_for_states(ESTABLISH, &DISABLED);
+    // Before the fake listens: it has not written its pid yet.
+    assert_eq!(s.fake.pid(), None, "{}", s.report());
+    assert!(s.started.elapsed() < Duration::from_secs(20));
+    let (routes, _) = s.ctl(&["show", "routes"]);
+    assert_eq!(
+        routes
+            .lines()
+            .skip(1)
+            .filter(|l| l.starts_with('*'))
+            .count(),
+        4,
+        "{routes}"
+    );
+    assert_eq!(s.fib(), prefixes(&DISABLED), "{}", s.report());
+    s.wait_for_rpki(Duration::ZERO, &["validation waiting "]);
+    let (status, _) = s.ctl(&["show", "status"]);
+    assert!(
+        status.contains("rpki sidecar, validation waiting\n"),
+        "{status}"
+    );
+
+    // The fake listens after its delay; the client finds it within its
+    // back-off.
+    assert!(
+        wait_for(Duration::from_secs(30), || s.fake.pid().is_some()),
+        "{}",
+        s.report()
+    );
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(Duration::from_secs(15), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    assert!(
+        wait_for(Duration::from_secs(10), || s.fib() == prefixes(&used)),
+        "{:?}\n{}",
+        s.fib(),
+        s.report()
+    );
+    s.wait_for_rpki(Duration::ZERO, &["validation active\n"]);
+
+    let waiting = s
+        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\"")
+        .unwrap_or_else(|| panic!("no waiting line:\n{}", s.report()));
+    let arrived =
+        "INFO  msg=\"rpki: validation data arrived; routes are validated from now on\" waited=";
+    let at = s
+        .first(arrived)
+        .unwrap_or_else(|| panic!("no arrival line:\n{}", s.report()));
+    assert!(waiting < at, "{}", s.report());
+    let log = s.bgpfcd.log_text();
+    let waited: u64 = log[at + arrived.len()..]
+        .split(['s', '\n'])
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no waited= in:\n{log}"));
+    assert!((20..40).contains(&waited), "waited={waited}s\n{log}");
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
+
+/// m14 design §3.2: an operator who wants routes held until the first
+/// full set writes `match rpki disabled; action reject;` first in the
+/// import policy, and needs nothing else. While Routinator runs its first
+/// validation, every route is held by policy and none is used; with the
+/// first full set the policy is asked again, the Valid and `NotFound`
+/// routes are used and `drop-invalid` holds the Invalid ones.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn unvalidated_routes_can_be_held_until_the_first_full_set() {
+    let opts = Opts {
+        rpki: "backoff 1 5;",
+        import: Some(
+            "policy GUARD {
+                 term unvalidated { match rpki disabled; action reject; }
+                 term rest { action accept; }
+             }",
+        ),
+        ..Opts::default()
+    };
+    let s = Setup::start("sg", 32, &opts, |fake| fake.set_delay(20));
+    let all_held = held_by(&DISABLED, "policy");
+    assert!(
+        wait_for(ESTABLISH, || s.held() == all_held),
+        "{:?}\n{}",
+        s.held(),
+        s.report()
+    );
+    assert_eq!(s.fake.pid(), None, "{}", s.report());
+    assert_eq!(s.states(), Vec::<(String, String)>::new());
+    assert_eq!(s.fib(), Vec::<String>::new());
+    let (routes, _) = s.ctl(&["show", "routes", "held"]);
+    assert!(!routes.lines().any(|l| l.starts_with('*')), "{routes}");
+
+    assert!(
+        wait_for(Duration::from_secs(30), || s.fake.pid().is_some()),
+        "{}",
+        s.report()
+    );
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(Duration::from_secs(15), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    assert!(
+        wait_for(Duration::from_secs(10), || s.fib() == prefixes(&used)),
+        "{:?}\n{}",
+        s.fib(),
+        s.report()
+    );
+}
+
+/// The `rpki` block of a running [`Setup`] reloaded: the configuration
+/// file it started with, its `rpki` block replaced.
+struct Reloader<'a> {
+    s: &'a Setup,
+    config: String,
+    first: String,
+}
+
+impl Reloader<'_> {
+    /// Write the file with `block` as its `rpki` block, and reload.
+    fn reload(&self, block: &str) -> (String, bool) {
+        fs::write(
+            self.s.config_path(),
+            self.config.replace(&self.first, block),
+        )
+        .expect("config");
+        self.s.ctl(&["reload"])
+    }
+}
+
+/// m14 design §5.2: a reload restarts only what changed. `enforcement`
+/// alone touches neither the client nor Routinator; a client setting
+/// restarts the client alone; a sidecar setting restarts Routinator, and
+/// the data the client held covers its validation run (RFC 8210 §10);
+/// a Routinator of another release fails the reload before anything
+/// changes (issue #72); and the mode moves to `external`, back to
+/// `sidecar` and to `disabled`, starting and stopping Routinator, with
+/// the states kept across each move until the mode is `disabled`. The BGP
+/// session is never reset.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_reload_restarts_only_what_changed_and_switches_modes() {
+    let s = Setup::start("sh", 33, &Opts::default(), |_| {});
+    let (used, _) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    s.wait_for_rpki(
+        Duration::ZERO,
+        &["validation active\n", "state idle, connected"],
+    );
+    let config = fs::read_to_string(s.config_path()).expect("config");
+    let first = s.fake.block("", "");
+    assert!(config.contains(&first), "{config}");
+    let r = Reloader {
+        s: &s,
+        config,
+        first,
+    };
+    let restarted = reload_within_the_sidecar(&r);
+    reload_across_modes(&r, &restarted);
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
+
+/// Steps (a) to (d) of the reload walk, within `mode sidecar`; the block
+/// in use at the end, with `prefer-valid`, `backoff 1 3` and `refresh
+/// 300`.
+fn reload_within_the_sidecar(r: &Reloader) -> String {
+    let s = r.s;
+    let pid = s.fake.pid().expect("the fake's pid");
+    let clients = s.count("msg=\"rpki: starting the rtr client\"");
+
+    // (a) `enforcement` alone: the RIB judges the routes again, with
+    // nothing restarted. prefer-valid holds nothing.
+    let (out, ok) = r.reload(&s.fake.block("enforcement prefer-valid;", ""));
+    assert!(ok && out.contains("rpki enforcement prefer-valid"), "{out}");
+    assert!(!out.contains("rpki: "), "{out}");
+    s.wait_for_states(Duration::from_secs(10), &VALIDATED);
+    assert_eq!(s.fake.invocations().len(), 1, "{}", s.report());
+    assert_eq!(s.fake.serving(), [pid]);
+    assert_eq!(s.count("msg=\"rpki: starting the rtr client\""), clients);
+
+    // (b) A client setting: the client restarts, Routinator goes on.
+    let client = "enforcement prefer-valid; backoff 1 3;";
+    let (out, ok) = r.reload(&s.fake.block(client, ""));
+    assert!(ok && out.contains("rpki: rtr client restarted"), "{out}");
+    assert_eq!(
+        s.count("msg=\"rpki: starting the rtr client\""),
+        clients + 1
+    );
+    assert_eq!(s.fake.invocations().len(), 1, "{}", s.report());
+    assert_eq!(s.fake.serving(), [pid]);
+    s.wait_for_rpki(Duration::from_secs(10), &["state idle, connected"]);
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+
+    // (c) A sidecar setting: Routinator restarts with it, and takes five
+    // seconds to listen; the held data keeps every state meanwhile.
+    s.fake.set_delay(5);
+    let restarted = s.fake.block(client, "refresh 300;");
+    let (out, ok) = r.reload(&restarted);
+    assert!(ok && out.contains("rpki: sidecar restarted"), "{out}");
+    assert!(!alive(pid), "{pid} still runs");
+    // The supervisor thread starts the child a moment after the reload.
+    s.wait_for_starts(2);
+    let starts = s.fake.invocations();
+    assert!(
+        starts[1].contains(&"--refresh=300".to_owned()),
+        "{starts:?}"
+    );
+    let want = pairs(&VALIDATED);
+    let mut samples = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            samples.push(s.states());
+            s.fake.pid().is_some_and(|p| p != pid)
+        }),
+        "{}",
+        s.report()
+    );
+    assert!(samples.len() > 4, "{samples:?}");
+    assert!(samples.iter().all(|states| *states == want), "{samples:?}");
+    let pid = s.fake.pid().expect("the new pid");
+    let session = format!("session-id {} serial 1\n", pid % 65_535 + 1);
+    s.wait_for_rpki(
+        Duration::from_secs(15),
+        &["state idle, connected", &session, "validation active\n"],
+    );
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+
+    // (d) A Routinator of another release: the preflight's `--version`
+    // fails the reload, and the running one goes on. The script itself
+    // is unchanged, so the running supervisor checks nothing.
+    s.fake.set_version("Routinator 0.14.1");
+    let (out, ok) = r.reload(&s.fake.block(client, "refresh 301;"));
+    assert!(
+        !ok && out.contains("Routinator 0.14.1 is not supported"),
+        "{out}"
+    );
+    s.wait_for_log(Duration::ZERO, "reload failed; running configuration kept");
+    assert_eq!(s.fake.serving(), [pid]);
+    assert_eq!(s.fake.invocations().len(), 2, "{}", s.report());
+    s.fake.set_version("Routinator 0.15.2");
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+    restarted
+}
+
+/// Steps (e) to (g) of the reload walk: to `mode external`, back to
+/// `mode sidecar` with `sidecar`, the block (c) left, and to `mode
+/// disabled`.
+fn reload_across_modes(r: &Reloader, sidecar: &str) {
+    let s = r.s;
+    // (e) To `mode external`, with a cache that serves the same VRPs:
+    // Routinator stops, and the states stay as they were.
+    let ns_a = s.lab.a.clone();
+    let stub = RtrStub::start(&s.lab, &ns_a, "127.0.0.1:3323", 9, &FIRST);
+    let (out, ok) = r.reload(
+        "rpki { mode external; enforcement prefer-valid; backoff 1 3; cache 127.0.0.1 port 3323; }",
+    );
+    assert!(
+        ok && out.contains("rpki: rtr client restarted; sidecar stopped"),
+        "{out}"
+    );
+    assert_eq!(s.fake.serving(), Vec::<u32>::new());
+    s.wait_for_rpki(
+        Duration::from_secs(10),
+        &[
+            "cache 127.0.0.1:3323 preference 0, in use, current\n",
+            "session-id 9 serial 1\n",
+        ],
+    );
+    assert!(!s.rpki().contains("sidecar"), "{}", s.rpki());
+    s.wait_for_states(Duration::ZERO, &VALIDATED);
+
+    // (f) Back to `mode sidecar`: Routinator starts, and the external
+    // cache's data covers its validation run, so nothing waits.
+    let warned = s.count("msg=\"rpki: no validation data yet");
+    let (out, ok) = r.reload(sidecar);
+    assert!(ok && out.contains("rpki: sidecar started"), "{out}");
+    s.wait_for_starts(3);
+    let want = pairs(&VALIDATED);
+    let mut samples = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            let rpki = s.rpki();
+            samples.push((s.states(), rpki.contains("validation waiting")));
+            rpki.contains("(sidecar) preference 0, in use, current\n")
+                && rpki.contains("state idle, connected")
+        }),
+        "{}",
+        s.report()
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|(states, waiting)| *states == want && !waiting),
+        "{samples:?}"
+    );
+    assert_eq!(s.count("msg=\"rpki: no validation data yet"), warned);
+    drop(stub);
+
+    // (g) To `mode disabled`: Routinator stops, and every route is
+    // `disabled` again.
+    let pid = s.fake.pid().expect("the pid");
+    assert_eq!(s.fake.serving(), [pid]);
+    let (out, ok) = r.reload(&sidecar.replace("mode sidecar", "mode disabled"));
+    assert!(
+        ok && out.contains("rpki: validation disabled; sidecar stopped"),
+        "{out}"
+    );
+    assert_eq!(s.fake.serving(), Vec::<u32>::new());
+    s.wait_for_states(Duration::from_secs(10), &DISABLED);
+    s.wait_for_rpki(Duration::ZERO, &["mode disabled\n", "validation off\n"]);
+    assert_eq!(s.fake.invocations().len(), 3, "{}", s.report());
 }
