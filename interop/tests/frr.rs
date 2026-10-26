@@ -62,6 +62,7 @@ fn frr_session_prefixes_both_ways_withdraw_and_refresh() {
                 NeighborOpts::new(lab.c_addr, BIRD_AS),
             ],
             extra: String::new(),
+            args: Vec::new(),
         },
     );
     let ok = wait_for(ESTABLISH, || {

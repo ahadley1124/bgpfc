@@ -63,6 +63,7 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
             neighbors: vec![NeighborOpts::new(lab.b_addr, GOBGP_AS), to_bird],
             extra: format!("control {{ socket {}; }}", socket.display()),
+            args: Vec::new(),
         },
     );
     let ok = wait_for(ESTABLISH, || {
