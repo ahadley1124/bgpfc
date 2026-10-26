@@ -43,6 +43,29 @@ pub use error::{ConfigError, ConfigErrors, Pos};
 /// the pass before lowering; otherwise lowering and validation errors are
 /// reported together.
 pub fn parse_str(file: &str, text: &str) -> Result<Config, ConfigErrors> {
+    parse_str_with(file, text, &no_check)
+}
+
+/// [`parse_str`], plus `check`: the caller's own checks of the lowered
+/// configuration, for rules this crate cannot judge, such as those of a
+/// program the caller runs from it. Each error `check` returns carries a
+/// position in `text`, as validation's do (a position the configuration
+/// keeps, such as a [`Neighbor`](ast::Neighbor)'s), and is reported with
+/// them, in source order, as `file:line:col` with the line and a caret.
+///
+/// `check` runs only on a file that lowers: after a lexical, syntax or
+/// lowering error the pass stops, as in [`parse_str`], without it. It runs
+/// whether or not validation finds problems, so that one pass reports
+/// them all.
+///
+/// # Errors
+/// As [`parse_str`], with the errors of `check` among the validation
+/// errors.
+pub fn parse_str_with(
+    file: &str,
+    text: &str,
+    check: &dyn Fn(&Config) -> Vec<ConfigError>,
+) -> Result<Config, ConfigErrors> {
     let (tokens, mut errors) = lexer::lex(text);
     let (statements, parse_errors) = parser::parse(&tokens);
     errors.extend(parse_errors);
@@ -53,7 +76,8 @@ pub fn parse_str(file: &str, text: &str) -> Result<Config, ConfigErrors> {
         Ok(cfg) => cfg,
         Err(errors) => return Err(ConfigErrors::new(file, text, errors)),
     };
-    let errors = validate::validate(&cfg);
+    let mut errors = validate::validate(&cfg);
+    errors.extend(check(&cfg));
     if errors.is_empty() {
         Ok(cfg)
     } else {
@@ -66,9 +90,27 @@ pub fn parse_str(file: &str, text: &str) -> Result<Config, ConfigErrors> {
 /// # Errors
 /// [`LoadError::Io`] when the file cannot be read, else as [`parse_str`].
 pub fn parse_file(path: &Path) -> Result<Config, LoadError> {
+    parse_file_with(path, &no_check)
+}
+
+/// Read and parse a configuration file, with the caller's `check` as in
+/// [`parse_str_with`].
+///
+/// # Errors
+/// [`LoadError::Io`] when the file cannot be read, else as
+/// [`parse_str_with`].
+pub fn parse_file_with(
+    path: &Path,
+    check: &dyn Fn(&Config) -> Vec<ConfigError>,
+) -> Result<Config, LoadError> {
     let text =
         std::fs::read_to_string(path).map_err(|e| LoadError::Io(path.display().to_string(), e))?;
-    parse_str(&path.display().to_string(), &text).map_err(LoadError::Config)
+    parse_str_with(&path.display().to_string(), &text, check).map_err(LoadError::Config)
+}
+
+/// The check of [`parse_str`] and [`parse_file`]: none.
+fn no_check(_: &Config) -> Vec<ConfigError> {
+    Vec::new()
 }
 
 /// Why a file could not be loaded.
@@ -90,3 +132,104 @@ impl std::fmt::Display for LoadError {
 }
 
 impl std::error::Error for LoadError {}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    const TEXT: &str = "router-id 192.0.2.1;
+local-as 65000;
+policy ANY { term all { action accept; } }
+neighbor 192.0.2.2 { remote-as 65001; import NONE; export ANY; }
+neighbor 192.0.2.3 { remote-as 65002; import ANY; export ANY; }
+";
+
+    /// The caller's error at the second neighbor, rendered like the
+    /// validation error at the first, and after it.
+    #[test]
+    fn parse_str_with_reports_the_callers_errors_with_positions() {
+        let check = |cfg: &Config| {
+            vec![ConfigError::new(
+                cfg.neighbors[1].pos,
+                "the caller's rule is broken",
+            )]
+        };
+        let errors = parse_str_with("t.conf", TEXT, &check).unwrap_err();
+        assert_eq!(errors.len(), 2, "{errors}");
+        let text = errors.to_string();
+        let (validation, caller) = text.split_once("\nt.conf:5:").expect("two errors");
+        assert!(
+            validation.starts_with("t.conf:4:1: ") && validation.contains("`NONE`"),
+            "{validation}"
+        );
+        assert_eq!(
+            caller,
+            "1: the caller's rule is broken\n  \
+             neighbor 192.0.2.3 { remote-as 65002; import ANY; export ANY; }\n  ^"
+        );
+        // Without the caller's check, the file has the validation error
+        // alone.
+        assert_eq!(parse_str("t.conf", TEXT).unwrap_err().len(), 1);
+    }
+
+    /// A check that finds nothing leaves a good file alone.
+    #[test]
+    fn a_check_that_finds_nothing_accepts_the_file() {
+        let text = TEXT.replace("import NONE", "import ANY");
+        let checked = Cell::new(0);
+        let check = |_: &Config| {
+            checked.set(checked.get() + 1);
+            Vec::new()
+        };
+        let cfg = parse_str_with("t.conf", &text, &check).unwrap();
+        assert_eq!(checked.get(), 1);
+        assert_eq!(cfg, parse_str("t.conf", &text).unwrap());
+    }
+
+    /// The caller's check sees only a lowered configuration: a syntax
+    /// error or a lowering error stops the pass first.
+    #[test]
+    fn the_callers_check_runs_only_on_a_lowered_file() {
+        let checked = Cell::new(false);
+        let check = |_: &Config| {
+            checked.set(true);
+            vec![ConfigError::new(Pos { line: 1, col: 1 }, "never")]
+        };
+        let syntax = TEXT.replace("local-as 65000;", "local-as 65000");
+        let errors = parse_str_with("t.conf", &syntax, &check).unwrap_err();
+        assert!(!errors.to_string().contains("never"), "{errors}");
+        let lowering = TEXT.replace("local-as 65000;", "local-as 0;");
+        let errors = parse_str_with("t.conf", &lowering, &check).unwrap_err();
+        assert!(!errors.to_string().contains("never"), "{errors}");
+        assert!(!checked.get(), "the check ran on a file that did not lower");
+    }
+
+    /// A file that cannot be read is an I/O error; one that can is
+    /// checked by the caller as text is.
+    #[test]
+    fn parse_file_with_checks_what_it_reads() {
+        let missing = Path::new("/nonexistent/bgpfc.conf");
+        let err = parse_file_with(missing, &no_check).unwrap_err();
+        assert!(matches!(err, LoadError::Io(..)), "{err}");
+        let dir = std::env::temp_dir().join(format!("bgpfc-config-lib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.conf");
+        std::fs::write(&path, TEXT.replace("import NONE", "import ANY")).unwrap();
+        let check = |cfg: &Config| vec![ConfigError::new(cfg.neighbors[0].pos, "caller")];
+        let err = parse_file_with(&path, &check).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let LoadError::Config(errors) = err else {
+            panic!("expected config errors, got {err}");
+        };
+        assert_eq!(
+            errors.to_string(),
+            format!(
+                "{}:4:1: caller\n  \
+                 neighbor 192.0.2.2 {{ remote-as 65001; import ANY; export ANY; }}\n  ^",
+                path.display()
+            )
+        );
+    }
+}

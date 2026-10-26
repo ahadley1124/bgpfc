@@ -44,6 +44,7 @@ use std::io;
 use std::net::ToSocketAddrs as _;
 use std::sync::mpsc::SyncSender;
 
+use bgpfc_config::ConfigError;
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
@@ -52,6 +53,15 @@ use bgpfc_rtr::session;
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::RibMsg;
+
+/// The checks of the `rpki` block that need more than the configuration
+/// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
+/// errors are reported with the file's own, at their positions in it, by
+/// `bgpfcd --check`, at start and at a reload. They judge the file alone,
+/// like the configuration crate, and run nothing. There are none yet.
+pub(crate) fn check_config(_config: &bgpfc_config::Config) -> Vec<ConfigError> {
+    Vec::new()
+}
 
 /// Look up every cache of an external `rpki` block, so that a name that
 /// does not resolve stops the daemon at start with an error naming it,
@@ -476,6 +486,20 @@ mod tests {
         // Nothing is looked up for a mode without a client.
         let off = config("rpki { mode disabled; cache rtr.invalid; }");
         assert_eq!(resolve(&off.rpki), Ok(()));
+    }
+
+    /// The parse hook finds nothing in the modes bgpfcd runs, so such a
+    /// file loads as the configuration crate alone judges it.
+    #[test]
+    fn the_parse_hook_accepts_the_modes_bgpfcd_runs() {
+        for rpki in [
+            "",
+            "rpki { mode disabled; }",
+            "rpki { mode external; cache 192.0.2.10; }",
+        ] {
+            let errors = check_config(&config(rpki));
+            assert!(errors.is_empty(), "{rpki}: {errors:?}");
+        }
     }
 
     #[test]

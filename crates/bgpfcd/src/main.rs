@@ -94,9 +94,11 @@ fn main() {
 }
 
 /// Parse, validate and compile the configuration file, with the command
-/// line overrides applied; exits with the errors printed otherwise.
+/// line overrides applied; exits with the errors printed otherwise. The
+/// checks of [`rpki::check_config`] are among the validation errors, with
+/// their positions in the file.
 fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
-    let mut config = match bgpfc_config::parse_file(&opts.config) {
+    let mut config = match bgpfc_config::parse_file_with(&opts.config, &rpki::check_config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -493,7 +495,8 @@ impl Coordinator<'_> {
 /// [`load`] without exiting: for reload, where the running configuration
 /// must survive a bad file.
 fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy::Engine), String> {
-    let mut config = bgpfc_config::parse_file(&opts.config).map_err(|e| e.to_string())?;
+    let mut config = bgpfc_config::parse_file_with(&opts.config, &rpki::check_config)
+        .map_err(|e| e.to_string())?;
     let engine = bgpfc_policy::Engine::new(&config).map_err(|errors| {
         errors
             .iter()
