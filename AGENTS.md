@@ -98,7 +98,8 @@ crates/
 fuzz/                   cargo-fuzz crate, NOT a workspace member. Nightly allowed.
 interop/                dev-only crate: drives BIRD / FRR / GoBGP in network
                         namespaces or containers, with RTR caches (StayRTR and
-                        a stub of its own). Not a workspace default-member.
+                        a stub of its own) and a fake Routinator. Not a
+                        workspace default-member.
 benches/ (per crate)    criterion benches as dev-dependencies.
 bench/results.csv       bgp_bench history; machine-specific, git-ignored.
 scripts/                check.sh, check-deps.sh, miri.sh, ...
@@ -155,7 +156,11 @@ runtime and no hand-rolled epoll.
   directly.
 - **Signals**: std has no signal API, so `bgpfc-sys` installs a minimal
   `SIGTERM`/`SIGHUP`/`SIGINT` handler that only writes to a self-pipe or sets
-  an `AtomicBool`. Everything else happens on normal threads.
+  an `AtomicBool`. Everything else happens on normal threads. The self-pipe
+  is created close-on-exec (`pipe2(O_CLOEXEC)`), so no child inherits it.
+  Only the sidecar reaps its own child: nothing else in bgpfcd may ignore
+  `SIGCHLD`, call `waitpid(-1)` or run a reaper thread, or the sidecar loses
+  its child (`bgpfc-sidecar`, `Sidecar`, "Threads").
 - **Backpressure**: use bounded `mpsc::sync_channel` between peer threads and
   the RIB thread. A slow peer must not be able to grow memory without bound.
   Outbound queues per peer are bounded too. When a peer falls too far behind,
@@ -305,7 +310,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. Miri, since the RTR decoder fills its VRP set. No fuzz target: the crate decodes no bytes. |
 | `bgpfc-rtr` | Unit tests with PDU byte vectors laid out as in the figures of RFC 8210 §5 and RFC 6810 §5, and from a capture of a real version 0 session. `proptest` round-trips of the codec, and framer properties: the same PDUs, and the same error, however the stream is cut. Fuzz targets for the PDU decoder and framer and for the client session. Miri. Table-driven session tests with injected time: every PDU type and every transport and timer event in every state, then the RFC 8210 §8 sequences, the §7 version fallback, the §6 timers and stale data. A proptest of the session against a simulated cache that updates, restarts, goes away and runs out of data: every commit is a whole set the cache held, and the session ends in sync with it. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
-| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`. What acts on the state: Invalid routes held by the default `drop-invalid` and kept from the kernel and a relay, ROAs created, changed and deleted moving installed routes with the per-route log lines and `show rpki transitions`, `prefer-valid` against a higher LOCAL_PREF, a reload of the `enforcement` that leaves the RTR client alone, `enforcement off`, and import policy that matches and sets the state; a stub cache of the crate's own stands in where StayRTR cannot. Uses network namespaces and needs root, so it runs in CI and on demand. |
+| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`. What acts on the state: Invalid routes held by the default `drop-invalid` and kept from the kernel and a relay, ROAs created, changed and deleted moving installed routes with the per-route log lines and `show rpki transitions`, `prefer-valid` against a higher LOCAL_PREF, a reload of the `enforcement` that leaves the RTR client alone, `enforcement off`, and import policy that matches and sets the state; a stub cache of the crate's own stands in where StayRTR cannot. The Routinator sidecar, with `bgpfcd --user nobody` and a fake Routinator, a script that answers `--version`, records its arguments and `exec`s the stub cache (never a real Routinator): the arguments derived from the block, Routinator started after the privilege drop with no capabilities, RTR on loopback only, a version mismatch, a missing binary and root without `--user` stopping the start, the stop order at `SIGTERM` and no orphan after `SIGKILL`, a killed Routinator restarted with the data held, one that keeps failing backing off and raising the alarm, a cold start that converges without hanging, the import-policy hold until the first set, and a reload walk across settings and modes. Uses network namespaces and needs root, so it runs in CI and on demand. |
 | benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation; std-only micro-benchmarks in `bgpfc-bench`. Do not regress them without saying so in the PR. |
 | `bgpfc-prof`, `bgpfc-bench`, profiling | Histogram bucket and percentile math; allocator arithmetic on a private instance, under Miri; UPDATE packing against the size limit and round-tripped through the daemon's decoder; MRT parsing from hand-built records; the ignored loadgen-to-daemon test (`cargo test -p bgpfcd --features profiling -- --ignored`). `bgp_bench` keeps the time and memory history (`docs/PROFILING.md`); quote it when a change claims to be faster or smaller. |
 
@@ -420,11 +425,11 @@ Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
 Steps 0–9 are complete: they built v1. Their text stays as a record of what
-v1 covers. Steps 10 to 13 are complete as well, and their text stays as a
+v1 covers. Steps 10 to 14 are complete as well, and their text stays as a
 record of what they added; step 11 also did the part of step 13 that
 re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4), and step
-12 the part that adds the `rpki` config, external caches or disabled. Work
-continues at step 14.
+12 the part that adds the `rpki` config, external caches or disabled. There
+is no step after 14: ask the maintainer what comes next.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.
