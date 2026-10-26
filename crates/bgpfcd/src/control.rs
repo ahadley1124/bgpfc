@@ -13,7 +13,10 @@
 //! with the VRPs that Cover and Match it; the routes the Adj-RIBs-In hold
 //! for their state, listed and counted), §3 (the state import policy set
 //! beside the one looked up), §5 (the `enforcement` that acts on the
-//! state); issue #59 (the latest routes whose state changed, with when).
+//! state); issue #59 (the latest routes whose state changed, with when);
+//! issues #70 and #71 (Routinator's supervision with the alarm of one that
+//! keeps failing, and whether the routes still wait for the first full
+//! set).
 
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -26,19 +29,21 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bgpfc_config::ast::{RpkiCache, RpkiMode};
 use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
 use bgpfc_rib::{Held, RouteStatus};
 use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_sidecar::SidecarState;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
     FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
-    RpkiReport, TransitionsReport,
+    RpkiReport, SidecarReport, TransitionsReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -479,9 +484,9 @@ fn seconds_between(earlier: Instant, later: Instant) -> u64 {
     later.saturating_duration_since(earlier).as_secs()
 }
 
-/// `show rpki`: the block's mode, its enforcement (RFC 6811 §5), its
-/// cache list, and where the client stands with the cache it uses (RFC
-/// 8210 §10).
+/// `show rpki`: the block's mode, its enforcement (RFC 6811 §5), where
+/// validation stands, Routinator with `mode sidecar`, the cache list, and
+/// where the client stands with the cache it uses (RFC 8210 §10).
 fn render_rpki(r: &RpkiReport, now: Instant) -> Reply {
     let mut j = Json::new();
     write_rpki(&mut j, r, now);
@@ -493,10 +498,7 @@ fn render_rpki(r: &RpkiReport, now: Instant) -> Reply {
 
 /// Whether the RIB validates with VRPs from `cache`: RFC 8210 §10, the
 /// data of one cache of the list at a time, "marked as to source".
-fn in_use(
-    status: Option<&bgpfc_rtr::client::Status>,
-    cache: &bgpfc_config::ast::RpkiCache,
-) -> bool {
+fn in_use(status: Option<&bgpfc_rtr::client::Status>, cache: &RpkiCache) -> bool {
     status
         .and_then(|s| s.source.as_ref())
         .is_some_and(|source| cache.is_at(&source.host, source.port))
@@ -506,11 +508,111 @@ fn in_use(
 /// next. The `state` line is about that session. After a move it is
 /// another cache than the one [`in_use`] marks, until that cache has sent
 /// a full set (RFC 8210 §10).
-fn current(
-    status: Option<&bgpfc_rtr::client::Status>,
-    cache: &bgpfc_config::ast::RpkiCache,
-) -> bool {
+fn current(status: Option<&bgpfc_rtr::client::Status>, cache: &RpkiCache) -> bool {
     status.is_some_and(|s| s.running && cache.is_at(&s.cache.host, s.cache.port))
+}
+
+/// Where route origin validation stands (issue #71: the startup window is
+/// not silent; m14 design §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Validation {
+    /// No client runs, so every route is `disabled`: `mode disabled`, or
+    /// a reload that could not start the client or Routinator.
+    Off,
+    /// The client runs and has published no full set yet: every route has
+    /// been `disabled` since then, and used as received.
+    Waiting(Instant),
+    /// The RIB validates with VRPs a cache sent, or with those held from
+    /// one, which expire as RFC 8210 §6 has it.
+    Active,
+}
+
+impl Validation {
+    fn of(r: &RpkiReport) -> Validation {
+        match (&r.status, r.waiting_since) {
+            (None, _) => Validation::Off,
+            (Some(_), Some(since)) => Validation::Waiting(since),
+            (Some(_), None) => Validation::Active,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Validation::Off => "off",
+            Validation::Waiting(_) => "waiting",
+            Validation::Active => "active",
+        }
+    }
+}
+
+/// `n failures`, or `1 failure`.
+fn failures(n: u32) -> String {
+    if n == 1 {
+        "1 failure".to_owned()
+    } else {
+        format!("{n} failures")
+    }
+}
+
+/// The cache the client has with a sidecar: Routinator's address, at
+/// preference 0, written as the client writes it (`rpki::client_config`),
+/// so that [`in_use`] and [`current`] find it as they find a configured
+/// one.
+fn sidecar_cache(s: &SidecarReport) -> RpkiCache {
+    RpkiCache {
+        host: s.status.rtr.ip().to_string(),
+        port: s.status.rtr.port(),
+        preference: 0,
+    }
+}
+
+/// The caches `show rpki` lists: the block's, and the sidecar's, marked
+/// `true`. A block with `mode sidecar` has no `cache`, so the client's
+/// one cache is listed like any other.
+fn listed_caches(r: &RpkiReport) -> Vec<(RpkiCache, bool)> {
+    let mut caches: Vec<_> = r.config.caches.iter().map(|c| (c.clone(), false)).collect();
+    caches.extend(r.sidecar.as_ref().map(|s| (sidecar_cache(s), true)));
+    caches
+}
+
+/// The two lines on Routinator: where supervision stands, with the alarm
+/// in upper case, and its RTR address and history.
+fn sidecar_lines(s: &SidecarReport, now: Instant) -> [String; 2] {
+    let st = &s.status;
+    let state = match st.state {
+        SidecarState::Running { pid, since } => {
+            format!("running pid {pid} for {}s", seconds_between(since, now))
+        }
+        SidecarState::BackingOff { until, failures: n } => format!(
+            "backing-off after {}, next attempt in {}s",
+            failures(n),
+            seconds_between(now, until)
+        ),
+        SidecarState::Failed { until, failures: n } => format!(
+            "FAILED after {} in a row, next attempt in {}s",
+            failures(n),
+            seconds_between(now, until)
+        ),
+        SidecarState::ShuttingDown { pid: Some(pid) } => format!("shutting-down pid {pid}"),
+        other => other.name().to_owned(),
+    };
+    [
+        format!(
+            "sidecar {state}, routinator {} ({})",
+            s.version,
+            one_line(&s.binary.to_string_lossy())
+        ),
+        format!(
+            "sidecar rtr {}, restarts {}, failures {}{}",
+            st.rtr,
+            st.restarts,
+            st.consecutive_failures,
+            st.last_exit.as_ref().map_or(String::new(), |e| format!(
+                ", last exit: {}",
+                one_line(&e.to_string())
+            ))
+        ),
+    ]
 }
 
 fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
@@ -518,13 +620,28 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let mut lines = vec![
         format!("mode {}", r.config.mode),
         format!("enforcement {}", r.config.enforcement),
+        match Validation::of(r) {
+            Validation::Waiting(since) => format!(
+                "validation waiting {}s for the first full set: every route is disabled \
+                 and used unvalidated; enforcement acts once it arrives",
+                seconds_between(since, now)
+            ),
+            v => format!("validation {}", v.as_str()),
+        },
     ];
-    for c in &r.config.caches {
+    if let Some(s) = &r.sidecar {
+        lines.extend(sidecar_lines(s, now));
+    } else if r.config.mode == RpkiMode::Sidecar {
+        // A reload could not start it, and turned validation off.
+        lines.push("sidecar not running".to_owned());
+    }
+    for (c, sidecar) in listed_caches(r) {
         lines.push(format!(
-            "cache {c} preference {}{}{}",
+            "cache {c}{} preference {}{}{}",
+            if sidecar { " (sidecar)" } else { "" },
             c.preference,
-            if in_use(status, c) { ", in use" } else { "" },
-            if current(status, c) { ", current" } else { "" }
+            if in_use(status, &c) { ", in use" } else { "" },
+            if current(status, &c) { ", current" } else { "" }
         ));
     }
     let Some(s) = status else {
@@ -604,20 +721,59 @@ fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     out.into()
 }
 
+/// The `sidecar` member of `GET /v1/rpki`.
+fn write_sidecar(j: &mut Json, s: &SidecarReport, now: Instant) {
+    let st = &s.status;
+    let (running, retry) = match st.state {
+        SidecarState::Running { since, .. } => (Some(seconds_between(since, now)), None),
+        SidecarState::BackingOff { until, .. } | SidecarState::Failed { until, .. } => {
+            (None, Some(seconds_between(now, until)))
+        }
+        _ => (None, None),
+    };
+    j.begin_object()
+        .field_str("state", st.state.name())
+        .field_bool("alarm", matches!(st.state, SidecarState::Failed { .. }))
+        .field_opt_num("pid", st.pid)
+        .field_opt_num("running_seconds", running)
+        .field_opt_num("retry_in_seconds", retry)
+        .field_num("restarts", st.restarts)
+        .field_num("consecutive_failures", st.consecutive_failures)
+        .field_opt("last_exit", st.last_exit.as_ref())
+        .field_display("rtr", st.rtr)
+        .field_display("binary", s.binary.display())
+        .field_display("version", &s.version)
+        .end_object();
+}
+
 fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
     let status = r.status.as_ref();
+    let validation = Validation::of(r);
     j.begin_object()
         .field_display("mode", r.config.mode)
         .field_display("enforcement", r.config.enforcement)
-        .key("caches")
-        .begin_array();
-    for c in &r.config.caches {
+        .field_str("validation", validation.as_str())
+        .field_opt_num(
+            "waiting_seconds",
+            match validation {
+                Validation::Waiting(since) => Some(seconds_between(since, now)),
+                Validation::Off | Validation::Active => None,
+            },
+        )
+        .key("sidecar");
+    if let Some(s) = &r.sidecar {
+        write_sidecar(j, s, now);
+    } else {
+        j.null();
+    }
+    j.key("caches").begin_array();
+    for (c, _) in listed_caches(r) {
         j.begin_object()
             .field_str("host", &c.host)
             .field_num("port", c.port)
             .field_num("preference", c.preference)
-            .field_bool("in_use", in_use(status, c))
-            .field_bool("current", current(status, c))
+            .field_bool("in_use", in_use(status, &c))
+            .field_bool("current", current(status, &c))
             .end_object();
     }
     j.end_array();
@@ -2423,6 +2579,8 @@ mod tests {
                 last_error_at: now.checked_sub(Duration::from_secs(30)),
                 running: true,
             }),
+            waiting_since: None,
+            sidecar: None,
         }
     }
 
@@ -2437,6 +2595,7 @@ mod tests {
             [
                 "mode external",
                 "enforcement drop-invalid",
+                "validation active",
                 "cache 127.0.0.1:3323 preference 0",
                 "cache rtr.example.net:323 preference 10, in use, current",
                 "state idle, connected, version 1",
@@ -2450,7 +2609,8 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"external","enforcement":"drop-invalid","caches":["#,
+                r#"{"mode":"external","enforcement":"drop-invalid","validation":"active","#,
+                r#""waiting_seconds":null,"sidecar":null,"caches":["#,
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
                 r#"{"host":"rtr.example.net","port":323,"preference":10,"in_use":true,"#,
@@ -2477,9 +2637,15 @@ mod tests {
             (s.vrps, s.source, s.last_error, s.last_error_at) = (None, None, None, None);
             s.failures = 3;
         }
+        report.waiting_since = now.checked_sub(Duration::from_secs(3));
         let r = render_rpki(&report, now);
+        assert!(
+            r.lines[2].starts_with("validation waiting 3s "),
+            "{:?}",
+            r.lines
+        );
         assert_eq!(
-            r.lines[4..],
+            r.lines[5..],
             [
                 "state connecting, version 1",
                 "session-id - serial -",
@@ -2500,13 +2666,15 @@ mod tests {
             s.running = false;
         }
         assert_eq!(
-            render_rpki(&report, now).lines[4],
+            render_rpki(&report, now).lines[5],
             "state stopped, version 1"
         );
         // Disabled: the configured caches, nothing else, every member there.
         let report = RpkiReport {
             config: rpki_block("rpki { mode disabled; cache 192.0.2.10; }"),
             status: None,
+            waiting_since: None,
+            sidecar: None,
         };
         let r = render_rpki(&report, now);
         assert_eq!(
@@ -2514,13 +2682,15 @@ mod tests {
             [
                 "mode disabled",
                 "enforcement drop-invalid",
+                "validation off",
                 "cache 192.0.2.10:323 preference 0"
             ]
         );
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","enforcement":"drop-invalid","#,
+                r#"{"mode":"disabled","enforcement":"drop-invalid","validation":"off","#,
+                r#""waiting_seconds":null,"sidecar":null,"#,
                 r#""caches":[{"host":"192.0.2.10","port":323,"#,
                 r#""preference":0,"in_use":false,"current":false}],"#,
                 r#""running":false,"state":null,"#,
@@ -2532,10 +2702,16 @@ mod tests {
         let none = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            waiting_since: None,
+            sidecar: None,
         };
         assert_eq!(
             render_rpki(&none, now).lines,
-            ["mode disabled", "enforcement drop-invalid"]
+            [
+                "mode disabled",
+                "enforcement drop-invalid",
+                "validation off"
+            ]
         );
     }
 
@@ -2558,7 +2734,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[2..8],
+            r.lines[3..9],
             [
                 "cache 127.0.0.1:3323 preference 0, current",
                 "cache rtr.example.net:323 preference 10, in use",
@@ -2589,7 +2765,7 @@ mod tests {
             r.lines
         );
         assert_eq!(
-            r.lines[7],
+            r.lines[8],
             "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
         );
         assert!(
@@ -2605,7 +2781,7 @@ mod tests {
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(
-            render_rpki(&respelled, now).lines[3],
+            render_rpki(&respelled, now).lines[4],
             "cache RTR.Example.NET.:323 preference 10, in use, current"
         );
         // Held data that expired is no cache's: every route not-found.
@@ -2615,7 +2791,7 @@ mod tests {
             (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
         }
         let r = render_rpki(&report, now);
-        assert_eq!(r.lines[7], "vrps ipv4 0 ipv6 0");
+        assert_eq!(r.lines[8], "vrps ipv4 0 ipv6 0");
         assert!(
             r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
             "{}",
@@ -2645,16 +2821,421 @@ mod tests {
                 let report = RpkiReport {
                     config: rpki_block(&format!("rpki {{ {block} {statement} }}")),
                     status,
+                    waiting_since: None,
+                    sidecar: None,
                 };
                 let r = render_rpki(&report, now);
                 assert_eq!(r.lines[1], format!("enforcement {mode}"), "{block}");
                 assert!(
                     r.json
-                        .contains(&format!(r#""enforcement":"{mode}","caches":["#)),
+                        .contains(&format!(r#""enforcement":"{mode}","validation":"#)),
                     "{}",
                     r.json
                 );
             }
+        }
+    }
+
+    /// Routinator in `state`, serving RTR at 127.0.0.1:41234, restarted
+    /// once after a `SIGKILL`; the client in sync with it.
+    fn sidecar_report(now: Instant, state: SidecarState) -> RpkiReport {
+        use bgpfc_rtr::client::Cache;
+        let mut r = rpki_report(now, &[]);
+        r.config = rpki_block("rpki { mode sidecar; }");
+        let rtr = Cache {
+            port: 41_234,
+            ..Cache::new("127.0.0.1")
+        };
+        if let Some(s) = &mut r.status {
+            s.cache = rtr.clone();
+            s.source = Some(rtr);
+            (s.last_error, s.last_error_at) = (None, None);
+        }
+        let pid = match state {
+            SidecarState::Running { pid, .. } => Some(pid),
+            SidecarState::ShuttingDown { pid } => pid,
+            _ => None,
+        };
+        r.sidecar = Some(SidecarReport {
+            status: bgpfc_sidecar::SidecarStatus {
+                state,
+                pid,
+                restarts: 1,
+                consecutive_failures: 0,
+                last_exit: Some(bgpfc_sidecar::ExitReason::Signal {
+                    number: 9,
+                    core_dumped: false,
+                }),
+                rtr: "127.0.0.1:41234".parse().unwrap(),
+            },
+            version: bgpfc_sidecar::TESTED_VERSION,
+            binary: "/usr/bin/routinator".into(),
+        });
+        r
+    }
+
+    /// The names of the members of the JSON object `json`, of its
+    /// outermost level only, in order: enough of a reader for what the
+    /// writer writes, which has no white space.
+    fn members(json: &str) -> Vec<String> {
+        let b = json.as_bytes();
+        let (mut names, mut depth, mut i) = (Vec::new(), 0, 0);
+        while i < b.len() {
+            match b[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    if depth == 1 && b.get(i + 1) == Some(&b':') {
+                        names.push(json[start..i].to_owned());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        names
+    }
+
+    #[test]
+    fn rpki_status_shows_a_running_sidecar() {
+        // Issues #26, #70, #71 (m14 design §4.6): Routinator's state, pid,
+        // uptime, version and binary, its RTR address and history, and the
+        // client's one cache, at that address, listed like a configured one.
+        let now = Instant::now();
+        let since = now.checked_sub(Duration::from_secs(312)).unwrap();
+        let report = sidecar_report(now, SidecarState::Running { pid: 4242, since });
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines,
+            [
+                "mode sidecar",
+                "enforcement drop-invalid",
+                "validation active",
+                "sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)",
+                "sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, \
+                 last exit: killed by signal 9 (SIGKILL)",
+                "cache 127.0.0.1:41234 (sidecar) preference 0, in use, current",
+                "state idle, connected, version 1",
+                "session-id 4242 serial 17",
+                "last sync 12s ago",
+                "vrps ipv4 2 ipv6 1 from 127.0.0.1:41234, expire in 7188s",
+                "failures 0",
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"mode":"sidecar","enforcement":"drop-invalid","validation":"active","#,
+                r#""waiting_seconds":null,"#,
+                r#""sidecar":{"state":"running","alarm":false,"pid":4242,"#,
+                r#""running_seconds":312,"retry_in_seconds":null,"restarts":1,"#,
+                r#""consecutive_failures":0,"last_exit":"killed by signal 9 (SIGKILL)","#,
+                r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
+                r#""version":"0.15.2"},"#,
+                r#""caches":[{"host":"127.0.0.1","port":41234,"preference":0,"#,
+                r#""in_use":true,"current":true}],"#,
+                r#""running":true,"state":"idle","connected":true,"version":1,"#,
+                r#""session_id":4242,"serial":17,"synced_seconds_ago":12,"#,
+                r#""expires_in_seconds":7188,"#,
+                r#""vrps":{"ipv4":2,"ipv6":1,"from":{"host":"127.0.0.1","port":41234}},"#,
+                r#""failures":0,"last_error":null,"last_error_seconds_ago":null}"#
+            )
+        );
+        // Before its first exit there is none to show; an address on ::1
+        // is written as the client writes it.
+        let mut fresh = sidecar_report(now, SidecarState::Running { pid: 4242, since });
+        if let Some(s) = &mut fresh.sidecar {
+            s.status.last_exit = None;
+            s.status.restarts = 0;
+            s.status.rtr = "[::1]:3323".parse().unwrap();
+        }
+        let r = render_rpki(&fresh, now);
+        assert_eq!(
+            r.lines[4..6],
+            [
+                "sidecar rtr [::1]:3323, restarts 0, failures 0",
+                "cache [::1]:3323 (sidecar) preference 0",
+            ]
+        );
+        assert!(
+            r.json.contains(r#""last_exit":null,"rtr":"[::1]:3323""#)
+                && r.json.contains(r#""caches":[{"host":"::1","port":3323,"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn the_sidecar_line_names_each_state() {
+        // m14 design §4.6: one line per state, with when the next attempt
+        // starts while Routinator backs off or has failed.
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3);
+        let since = now.checked_sub(Duration::from_secs(5)).unwrap();
+        let cases = [
+            (SidecarState::Starting, "starting", "null", "null", "null"),
+            (
+                SidecarState::Running { pid: 7, since },
+                "running pid 7 for 5s",
+                "7",
+                "5",
+                "null",
+            ),
+            (
+                SidecarState::BackingOff {
+                    until: later,
+                    failures: 1,
+                },
+                "backing-off after 1 failure, next attempt in 3s",
+                "null",
+                "null",
+                "3",
+            ),
+            (
+                SidecarState::BackingOff {
+                    until: later,
+                    failures: 2,
+                },
+                "backing-off after 2 failures, next attempt in 3s",
+                "null",
+                "null",
+                "3",
+            ),
+            (
+                SidecarState::Failed {
+                    until: later,
+                    failures: 1,
+                },
+                "FAILED after 1 failure in a row, next attempt in 3s",
+                "null",
+                "null",
+                "3",
+            ),
+            (
+                SidecarState::ShuttingDown { pid: Some(7) },
+                "shutting-down pid 7",
+                "7",
+                "null",
+                "null",
+            ),
+            (
+                SidecarState::ShuttingDown { pid: None },
+                "shutting-down",
+                "null",
+                "null",
+                "null",
+            ),
+            (SidecarState::Stopped, "stopped", "null", "null", "null"),
+        ];
+        for (state, line, pid, running, retry) in cases {
+            let r = render_rpki(&sidecar_report(now, state), now);
+            assert_eq!(
+                r.lines[3],
+                format!("sidecar {line}, routinator 0.15.2 (/usr/bin/routinator)")
+            );
+            let alarm = matches!(state, SidecarState::Failed { .. });
+            let json = format!(
+                r#""sidecar":{{"state":"{}","alarm":{alarm},"pid":{pid},"running_seconds":{running},"retry_in_seconds":{retry},"#,
+                state.name()
+            );
+            assert!(r.json.contains(&json), "{json}\n{}", r.json);
+        }
+    }
+
+    #[test]
+    fn rpki_status_shows_a_failed_sidecar_as_an_alarm() {
+        // Issue #70: "Repeated restart failures must surface as an
+        // operational error, not just a log line." The state is in upper
+        // case, and the JSON says `alarm`.
+        let now = Instant::now();
+        let until = now + Duration::from_secs(280);
+        let mut report = sidecar_report(now, SidecarState::Failed { until, failures: 7 });
+        if let Some(s) = &mut report.sidecar {
+            s.status.restarts = 6;
+            s.status.consecutive_failures = 7;
+            s.status.last_exit = Some(bgpfc_sidecar::ExitReason::Code(1));
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[3..5],
+            [
+                "sidecar FAILED after 7 failures in a row, next attempt in 280s, \
+                 routinator 0.15.2 (/usr/bin/routinator)",
+                "sidecar rtr 127.0.0.1:41234, restarts 6, failures 7, \
+                 last exit: exited with status 1",
+            ]
+        );
+        assert!(
+            r.json.contains(concat!(
+                r#""sidecar":{"state":"failed","alarm":true,"pid":null,"#,
+                r#""running_seconds":null,"retry_in_seconds":280,"restarts":6,"#,
+                r#""consecutive_failures":7,"last_exit":"exited with status 1","#,
+                r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
+                r#""version":"0.15.2"},"#
+            )),
+            "{}",
+            r.json
+        );
+        // A replaced binary that is not of the series fails to start: the
+        // reason, from the version check, stays on its line, and so does a
+        // binary whose path has a newline.
+        if let Some(s) = &mut report.sidecar {
+            s.status.last_exit = Some(bgpfc_sidecar::ExitReason::SpawnFailed(
+                "Routinator 0.16.0 is not supported:\nneeds 0.15".to_owned(),
+            ));
+            s.binary = "/opt/rout\ninator".into();
+        }
+        let r = render_rpki(&report, now);
+        assert!(
+            r.lines[3].ends_with(r"(/opt/rout\ninator)"),
+            "{}",
+            r.lines[3]
+        );
+        assert!(
+            r.lines[4].ends_with(
+                r"last exit: could not be started: Routinator 0.16.0 is not supported:\nneeds 0.15"
+            ),
+            "{}",
+            r.lines[4]
+        );
+        assert!(r.lines.iter().all(|l| !l.chars().any(char::is_control)));
+        assert!(
+            r.json.contains(concat!(
+                r#""last_exit":"could not be started: Routinator 0.16.0 is not supported:\nneeds 0.15","#,
+                r#""rtr":"127.0.0.1:41234","binary":"/opt/rout\ninator""#
+            )),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn rpki_status_while_waiting_for_the_first_set() {
+        // Issue #71, m14 design §3.3: until the client's first full set,
+        // every route is `disabled` and used; `show rpki` says so, and for
+        // how long. Routinator listens only after its first validation run.
+        let now = Instant::now();
+        let mut report = sidecar_report(
+            now,
+            SidecarState::Running {
+                pid: 4242,
+                since: now.checked_sub(Duration::from_secs(95)).unwrap(),
+            },
+        );
+        report.waiting_since = now.checked_sub(Duration::from_secs(95));
+        if let Some(s) = &mut report.status {
+            s.state = bgpfc_rtr::session::State::Connecting;
+            s.connected = false;
+            (s.session_id, s.serial, s.synced_at, s.expires_at) = (None, None, None, None);
+            (s.vrps, s.source) = (None, None);
+            s.failures = 4;
+        }
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[2],
+            "validation waiting 95s for the first full set: every route is disabled \
+             and used unvalidated; enforcement acts once it arrives"
+        );
+        assert_eq!(
+            r.lines[5..],
+            [
+                "cache 127.0.0.1:41234 (sidecar) preference 0, current",
+                "state connecting, version 1",
+                "session-id - serial -",
+                "last sync never",
+                "vrps none yet: every route is disabled",
+                "failures 4",
+            ]
+        );
+        assert!(
+            r.json
+                .contains(r#""validation":"waiting","waiting_seconds":95,"sidecar":{"#),
+            "{}",
+            r.json
+        );
+        // An external cache's window is the same, if normally short.
+        let mut external = rpki_report(now, &[]);
+        external.waiting_since = Some(now);
+        let r = render_rpki(&external, now);
+        assert!(
+            r.lines[2].starts_with("validation waiting 0s for the first full set: "),
+            "{}",
+            r.lines[2]
+        );
+        assert!(
+            r.json
+                .contains(r#""validation":"waiting","waiting_seconds":0,"sidecar":null,"#),
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn the_json_has_the_same_members_without_a_sidecar() {
+        // One shape in every mode, so that a reader needs no second one:
+        // `sidecar` is null and `validation` off without a sidecar or a
+        // client.
+        let now = Instant::now();
+        let disabled = RpkiReport {
+            config: bgpfc_config::ast::Rpki::default(),
+            status: None,
+            waiting_since: None,
+            sidecar: None,
+        };
+        let r = render_rpki(&disabled, now);
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"mode":"disabled","enforcement":"drop-invalid","validation":"off","#,
+                r#""waiting_seconds":null,"sidecar":null,"caches":[],"#,
+                r#""running":false,"state":null,"#,
+                r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
+                r#""synced_seconds_ago":null,"expires_in_seconds":null,"vrps":null,"#,
+                r#""failures":0,"last_error":null,"last_error_seconds_ago":null}"#
+            )
+        );
+        // `mode sidecar` with none running: a reload could not start it,
+        // and validation is off.
+        let gone = RpkiReport {
+            config: rpki_block("rpki { mode sidecar; }"),
+            ..disabled.clone()
+        };
+        let not_running = render_rpki(&gone, now);
+        assert_eq!(
+            not_running.lines,
+            [
+                "mode sidecar",
+                "enforcement drop-invalid",
+                "validation off",
+                "sidecar not running",
+            ]
+        );
+        let mut waiting = sidecar_report(now, SidecarState::Starting);
+        waiting.waiting_since = Some(now);
+        let shapes = [
+            render_rpki(&rpki_report(now, &[]), now),
+            not_running,
+            render_rpki(
+                &sidecar_report(
+                    now,
+                    SidecarState::Failed {
+                        until: now,
+                        failures: 5,
+                    },
+                ),
+                now,
+            ),
+            render_rpki(&waiting, now),
+        ];
+        let expected = members(&r.json);
+        assert_eq!(expected.len(), 18, "{expected:?}");
+        for shape in shapes {
+            assert_eq!(members(&shape.json), expected, "{}", shape.json);
         }
     }
 
@@ -2868,6 +3449,8 @@ mod tests {
         let off = RpkiReport {
             config: bgpfc_config::ast::Rpki::default(),
             status: None,
+            waiting_since: None,
+            sidecar: None,
         };
         let r = render_validation(&off, p("192.0.2.0/24"), Asn(64_496));
         assert_eq!(

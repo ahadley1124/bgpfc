@@ -491,7 +491,10 @@ The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
 router MUST NOT retain the data past the time indicated by this
 parameter"), so the setting can only shorten it; it lies in 600–172800, the
 range §6 gives the Expire Interval, and the default leaves the cache's
-value. When the data expires, every route becomes `not-found`. `max-vrps`,
+value. When the data expires, every route becomes `not-found`; with `mode
+sidecar` that means Routinator has not answered for the Expire Interval
+(7200 seconds, unless `server-args` or `max-expire` say otherwise), as
+when it keeps failing (`docs/control.md`, "RPKI"). `max-vrps`,
 at least 1, is the most VRPs an answer may leave bgpfcd holding; an answer
 that would exceed it is refused with an Internal Error (RFC 8210 §12) and
 the data before it stays in use. The default, four million, is several
@@ -622,9 +625,11 @@ Routinator's first run, and at info with `mode external`, whose window is
 normally a moment. When the first set arrives it logs `rpki: validation
 data arrived; routes are validated from now on` with `waited=`, the
 seconds the routes waited; the RIB's `rib: validation states changed` line
-follows, with the routes held and released. A reload from `mode
-disabled` opens the window again. A reload that restarts the client
-does not, since the data in use stays in use until the new set arrives.
+follows, with the routes held and released. Meanwhile `show rpki` says
+`validation waiting Ns for the first full set` (`docs/control.md`,
+"RPKI"). A reload from `mode disabled` opens the window again. A reload
+that restarts the client does not, since the data in use stays in use
+until the new set arrives.
 
 To hold the routes until the first set instead, say so in each import
 policy, first:
@@ -700,8 +705,9 @@ The `sidecar` block takes these statements, each at most once:
 - `stop-timeout N`: how many seconds Routinator gets to stop after
   `SIGTERM` before bgpfcd kills it; 1–3600, 10 unless given.
 - `failure-threshold N`: after this many failures in a row the sidecar is
-  reported as failed, an alarm, while bgpfcd keeps trying at the
-  back-off's cap (issue #70); at least 1, 5 unless given.
+  reported as failed, an alarm (`sidecar FAILED` in `show rpki`,
+  `docs/control.md`, "RPKI"), while bgpfcd keeps trying at the back-off's
+  cap (issue #70); at least 1, 5 unless given.
 
 With `mode sidecar`, bgpfcd also checks the block as Routinator would take
 it, and reports a problem at the block's position like any other error:

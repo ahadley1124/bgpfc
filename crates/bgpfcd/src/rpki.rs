@@ -86,7 +86,7 @@ use bgpfc_rtr::session;
 use bgpfc_sidecar::{BackoffConfig, Sidecar, SidecarConfig, TalConfig};
 use bgpfc_wire::types::RouterId;
 
-use crate::messages::RibMsg;
+use crate::messages::{RibMsg, RpkiReport, SidecarReport};
 use crate::privileges;
 
 /// The checks of the `rpki` block that need more than the configuration
@@ -622,6 +622,27 @@ impl Rpki {
     /// The client's status, if one runs.
     pub(crate) fn status(&self) -> Option<Status> {
         self.client.as_ref().map(Client::status)
+    }
+
+    /// What the control plane shows of the running block `config`: the
+    /// client's status, since when the routes have waited for the first
+    /// full set, and Routinator's status and version, read now rather than
+    /// kept, since a restart after the binary was replaced may change the
+    /// version (issue #70: a validator that is not running must be
+    /// visible).
+    pub(crate) fn report(&self, config: &ast::Rpki) -> RpkiReport {
+        RpkiReport {
+            config: config.clone(),
+            status: self.status(),
+            waiting_since: *lock(&self.waiting),
+            // A sidecar runs only with `mode sidecar`, started from this
+            // block's `sidecar` settings: a change to them restarts it.
+            sidecar: self.sidecar.as_ref().map(|s| SidecarReport {
+                status: s.status(),
+                version: s.version(),
+                binary: config.sidecar.binary.clone(),
+            }),
+        }
     }
 }
 
@@ -1454,6 +1475,9 @@ mod tests {
         let (tx, rx) = sync_channel(4);
         let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
         let since = waiting(&rpki).expect("waiting from the start");
+        let report = rpki.report(&cfg.rpki);
+        assert_eq!(report.waiting_since, Some(since));
+        assert!(report.sidecar.is_none(), "an external cache has no sidecar");
         // Until the cache answers, nothing ends the wait.
         let (mut conn, query) = first.accept();
         assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
@@ -1571,10 +1595,24 @@ mod tests {
         assert_eq!(sidecar.version(), TESTED_VERSION);
         let pid = routinator_pid(&rpki);
         assert!(waiting(&rpki).is_some(), "routes wait for Routinator");
+        // What the control plane shows (m14 design §4.6), read from the
+        // sidecar at the request.
+        let report = rpki.report(&cfg.rpki);
+        assert_eq!(report.waiting_since, waiting(&rpki));
+        let shown = report.sidecar.expect("the sidecar is reported");
+        assert!(
+            matches!(shown.status.state, SidecarState::Running { pid: p, .. } if p == pid),
+            "{:?}",
+            shown.status
+        );
+        assert_eq!(shown.status.rtr, rtr);
+        assert_eq!(shown.version, TESTED_VERSION);
+        assert_eq!(shown.binary, binary);
 
         let mut conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
         let change = next_change(&rx);
         assert_eq!(waiting(&rpki), None);
+        assert_eq!(rpki.report(&cfg.rpki).waiting_since, None);
         assert_eq!(change.affected, AffectedPrefixes::All);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Valid);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_497), RovState::Invalid);
@@ -1590,6 +1628,8 @@ mod tests {
         assert!(!alive(pid), "routinator is gone");
         assert!(rpki.sidecar.is_none());
         assert!(rpki.status().is_none());
+        let report = rpki.report(&cfg.rpki);
+        assert!(report.sidecar.is_none() && report.status.is_none());
         assert!(rx.try_recv().is_err());
     }
 

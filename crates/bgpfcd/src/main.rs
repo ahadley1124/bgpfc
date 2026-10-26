@@ -468,12 +468,9 @@ impl Coordinator<'_> {
         Ok(summary)
     }
 
-    /// The running `rpki` block and its client's status.
+    /// The running `rpki` block, its client and its sidecar.
     fn rpki_report(&self) -> messages::RpkiReport {
-        messages::RpkiReport {
-            config: self.config.rpki.clone(),
-            status: self.rpki.status(),
-        }
+        self.rpki.report(&self.config.rpki)
     }
 
     /// Stop every session with a Cease (RFC 4486 §4 Administrative
