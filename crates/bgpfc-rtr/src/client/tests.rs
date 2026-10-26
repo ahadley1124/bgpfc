@@ -428,6 +428,7 @@ mod net {
                 response_timeout: SEC,
                 ..session::Config::default()
             },
+            check: None,
         }
     }
 
@@ -1292,5 +1293,65 @@ mod net {
                 .unwrap()
                 .contains("nowhere to go")
         );
+    }
+
+    /// A connection the caller's check refuses is closed before anything
+    /// is sent or read on it, and fails like an attempt that found no
+    /// cache: logged with the check's reason, counted for the back-off,
+    /// and tried again. Once the check lets one through, the client goes
+    /// on as ever. The check sees each connection to the cache.
+    #[test]
+    fn a_connection_the_check_refuses_is_never_used() {
+        let cache = TestCache::new();
+        let port = cache.entry(0).port;
+        let allow = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = {
+            let (allow, seen) = (Arc::clone(&allow), Arc::clone(&seen));
+            ConnectionCheck::new(move |stream: &TcpStream| {
+                lock(&seen).push(stream.peer_addr()?.port());
+                if allow.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("not the cache we started"))
+                }
+            })
+        };
+        assert_eq!(check, check.clone());
+        assert_eq!(format!("{check:?}"), "ConnectionCheck(..)");
+        let config = Config {
+            check: Some(check),
+            ..config(vec![cache.entry(0)])
+        };
+        let (mut client, rx) = start_with(config);
+        // Closed before the client wrote a query on it.
+        cache.accept().expect_close();
+        eventually("the refusal in the status", || {
+            client
+                .status()
+                .last_error
+                .is_some_and(|e| e.contains("not the cache we started"))
+        });
+        assert!(client.status().failures >= 1);
+        assert!(client.status().vrps.is_none());
+        assert!(rx.try_recv().is_err());
+
+        // Let through: the first connection that carries a query is used.
+        allow.store(true, Ordering::Release);
+        let mut router = loop {
+            let mut router = cache.accept();
+            let mut buf = [0; 64];
+            match router.stream.read(&mut buf) {
+                Ok(0) | Err(_) => {}
+                Ok(n) => {
+                    router.framer.feed(&buf[..n]);
+                    break router;
+                }
+            }
+        };
+        router.serve_reset(SID, 1, &[a(), b()]);
+        assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
+        assert!(lock(&seen).iter().all(|&p| p == port));
+        client.stop();
     }
 }
