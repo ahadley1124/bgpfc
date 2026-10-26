@@ -1015,6 +1015,13 @@ impl Peer {
         if !established {
             return;
         }
+        bgpfc_log::debug!(
+            "route refresh received",
+            peer = self.cfg.addr,
+            family = message.family,
+            subtype = message.subtype.to_u8(),
+            enhanced = enhanced
+        );
         let family = message.family;
         let subtype = if enhanced {
             message.subtype
