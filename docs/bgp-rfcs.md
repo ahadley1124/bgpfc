@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 24 are `done`, 7 `partial`,
-15 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 25 are `done`, 7 `partial`,
+14 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 6811, 7606, 7607, 7911, 8092, 8212, 8481, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 6811, 7313, 7606, 7607, 7911, 8092, 8212, 8481, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -65,7 +65,7 @@ Of the 154 RFCs below, 24 are `done`, 7 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8893, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 5065, 6514, 7432, 7705, 7947, 8097, 8893, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
 `bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
@@ -116,7 +116,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [2842](https://datatracker.ietf.org/doc/html/rfc2842) | Capabilities Advertisement with BGP-4 | PS; obsoleted by 3392 | `n/a` |  |
 | [8810](https://datatracker.ietf.org/doc/html/rfc8810) | Revision to Capability Codes Registration Procedures | PS | `n/a` | IANA procedure. |
 | [2918](https://datatracker.ietf.org/doc/html/rfc2918) | Route Refresh Capability for BGP-4 | PS; updated by 7313 | `done` |  |
-| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `later` | RESOURCES.md, "Later: features". |
+| [7313](https://datatracker.ietf.org/doc/html/rfc7313) | Enhanced Route Refresh Capability for BGP-4 | PS | `done` | AGENTS.md §9 step 17. The stale routes of a refresh wait for the EoRR for `refresh-stale-time`, 360 s (a MAY in §4). |
 | [4486](https://datatracker.ietf.org/doc/html/rfc4486) | Subcodes for BGP Cease Notification Message | PS; updated by 8203, 9003 | `done` |  |
 | [8203](https://datatracker.ietf.org/doc/html/rfc8203) | BGP Administrative Shutdown Communication | PS; obsoleted by 9003 | `n/a` |  |
 | [9003](https://datatracker.ietf.org/doc/html/rfc9003) | Extended BGP Administrative Shutdown Communication | PS | `done` |  |

@@ -11,7 +11,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811, 8481 and 8538.
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911, 6811, 8481, 8538 and
+> 7313.
 > RFC 4271 has six rows open. Two need the host's interfaces and routes, which
 > bgpfc does not track, so the kernel's verdict is logged instead: next-hop
 > resolvability (§9.1.2), and a next hop on a shared subnet for one-hop EBGP
@@ -64,6 +65,18 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 - BGP Roles and the Only to Customer attribute (RFC 9234, `role` per neighbor),
   with the Role Mismatch NOTIFICATION and an optional strict mode; interop
   tests against BIRD 2.14.
+- Enhanced Route Refresh (RFC 7313), advertised unless a neighbor has
+  `enhanced-refresh no;` and used on sessions where both sides advertised it:
+  a route refresh bgpfcd makes (the table a neighbor asked for, or `bgpfcctl
+  clear neighbor ADDR soft`) is a BoRR, the Adj-RIB-Out and an EoRR, and a
+  neighbor's marks all its routes of the family stale at the BoRR and removes
+  those it does not send again at the EoRR, or when `refresh-stale-time` has
+  run out. It reuses the stale marking of Graceful Restart and holds each
+  ADD-PATH path apart. A message of another subtype than 0, 1 or 2 is
+  ignored, and a BoRR or EoRR of the wrong length ends the session with the
+  ROUTE-REFRESH Message Error. Tested against BIRD 2.14 and FRR 8.4
+  (`interop/tests/route_refresh.rs`); sessions without the capability pay
+  nothing for it.
 - Graceful Restart (RFC 4724 with the Notification support of RFC 8538), per
   neighbor and off unless `graceful-restart yes;` is set
   ([`docs/config.md`](docs/config.md), "Graceful Restart"). As a Receiving
