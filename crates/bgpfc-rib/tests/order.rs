@@ -78,6 +78,7 @@ fn peers() -> Vec<PeerInfo> {
             add_path_send: Vec::new(),
             role: None,
             restart: None,
+            enhanced_refresh: None,
         })
         .collect()
 }

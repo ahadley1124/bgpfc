@@ -2027,6 +2027,7 @@ mod tests {
             ],
             role: None,
             restart: None,
+            enhanced_refresh: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 2), (v6, 0)],
@@ -2089,6 +2090,7 @@ mod tests {
             add_path_send: Vec::new(),
             role: None,
             restart: None,
+            enhanced_refresh: None,
         };
         let stats = bgpfc_rib::PeerStats {
             received: vec![(v4, 12), (v6, 3)],

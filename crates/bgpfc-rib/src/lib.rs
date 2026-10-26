@@ -43,7 +43,10 @@
 //! them again, its End-of-RIB comes or a timer runs out, see
 //! [`Rib::peer_retain`]; a Restarting Speaker defers route selection, see
 //! [`Rib::defer_selection`]; each initial update ends with the End-of-RIB
-//! marker, see [`export::end_of_rib`]).
+//! marker, see [`export::end_of_rib`]); RFC 7313 §4 (a route refresh we
+//! make is bracketed by `BoRR` and `EoRR`, see [`Rib::refresh`]; the routes
+//! a peer's route refresh does not send again are removed at its `EoRR`,
+//! see [`Rib::refresh_begin`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -63,6 +66,7 @@ pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod refresh;
 mod restart;
 mod store;
 #[cfg(test)]
@@ -79,6 +83,7 @@ use std::time::{Duration, Instant};
 use bgpfc_rpki::{InvalidAction, NullSource, ValidationSource};
 use bgpfc_wire::mp::NextHop;
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
+use bgpfc_wire::route_refresh::RouteRefreshMessage;
 use bgpfc_wire::types::{AddressFamily, Asn, PathId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
@@ -86,7 +91,8 @@ pub use attrs::{Interner, PathAttrs};
 pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
-pub use peer::{PathLimit, PeerInfo};
+pub use peer::{EnhancedRefresh, PathLimit, PeerInfo};
+pub use refresh::{RefreshIgnored, RefreshReport};
 pub use restart::{Deferral, PeerRestart, Restart, Retention, StaleEnd, StalePeer};
 pub use validation::{Enforcement, Revalidation};
 
@@ -284,6 +290,16 @@ pub enum Output {
         /// Why.
         why: StaleEnd,
     },
+    /// A message of a route refresh from the peer was ignored (RFC 7313
+    /// §4): the caller logs it, as the RFC asks.
+    RefreshIgnored {
+        /// The peer.
+        peer: IpAddr,
+        /// The family.
+        family: AddressFamily,
+        /// Why.
+        why: RefreshIgnored,
+    },
     /// Route selection for `family` is no longer deferred (RFC 4724
     /// §4.1): the Loc-RIB is complete for it. The RIB has kept the FIB
     /// and the peers out of it until now; the caller brings the FIB in
@@ -362,6 +378,14 @@ struct PeerState {
     /// The routes of the peer kept as stale, and the timers that end it
     /// (RFC 4724 §4.2); `None` for a peer none of whose routes are.
     stale: Option<restart::Stale>,
+    /// The route refreshes the peer has begun and not ended: the routes of
+    /// those families it has not sent again are stale (RFC 7313 §4). Empty
+    /// for a session without Enhanced Route Refresh.
+    refreshing: Vec<refresh::Refreshing>,
+    /// For a peer that advertised Graceful Restart on a session with
+    /// Enhanced Route Refresh: the families whose End-of-RIB has not come,
+    /// for which a `BoRR` is ignored (RFC 7313 §4). Empty otherwise.
+    awaiting_end_of_rib: Vec<AddressFamily>,
 }
 
 impl PeerState {
@@ -619,6 +643,18 @@ impl Rib {
     pub fn peer_up(&mut self, info: PeerInfo, now: Instant, out: &mut impl Sink) {
         let addr = info.addr;
         let families = info.families.clone();
+        // RFC 7313 §4: a peer that advertised Graceful Restart sends the
+        // End-of-RIB of every family it exchanges (RFC 4724 §2), and a
+        // `BoRR` for a family waits for it.
+        let awaiting_end_of_rib = if info
+            .enhanced_refresh
+            .as_ref()
+            .is_some_and(|e| e.peer_graceful_restart)
+        {
+            families.clone()
+        } else {
+            Vec::new()
+        };
         let mut state = PeerState {
             neighbor: Neighbor::of(&info),
             info,
@@ -629,6 +665,8 @@ impl Rib {
             sent: FamilyMap::default(),
             leaving: false,
             stale: None,
+            refreshing: Vec::new(),
+            awaiting_end_of_rib,
         };
         // The routes the peer sent before stay in the tables under its
         // slot, which the new session takes over with their count.
@@ -741,9 +779,16 @@ impl Rib {
         }
     }
 
-    /// The peer asked for `family` again (RFC 2918 §4): resend the
-    /// Adj-RIB-Out in full, held destinations as they are now. Also used
-    /// to build the initial one. Every destination's interval restarts.
+    /// A route refresh of `family` to `addr`, because the peer asked for it
+    /// (RFC 2918 §4) or the operator did: resend the Adj-RIB-Out in full,
+    /// held destinations as they are now. Every destination's interval
+    /// restarts. On a session with Enhanced Route Refresh the routes are
+    /// bracketed: a `BoRR` first, the whole Adj-RIB-Out, then an `EoRR`
+    /// (RFC 7313 §4), which the peer takes to purge the routes of ours it
+    /// has and we no longer send. A family that is not sent to the peer, or
+    /// whose route selection is deferred (RFC 4724 §4.1), gets neither,
+    /// which also keeps a `BoRR` from going before our End-of-RIB (RFC 7313
+    /// §4).
     pub fn refresh(
         &mut self,
         addr: IpAddr,
@@ -754,11 +799,42 @@ impl Rib {
         let Some(id) = self.s.up_id(addr) else {
             return;
         };
-        // RFC 4724 §4.1: nothing is advertised for a family while route
-        // selection is deferred; the end of the deferral sends it all.
-        if !self.s.peer(id).info.speaks(family) || self.s.deferred(family) {
+        if !self.can_advertise(id, family) {
             return;
         }
+        // RFC 7313 §4: "Before the speaker starts a route refresh that is
+        // either initiated locally, or in response to a "normal route
+        // refresh request" from the peer, the speaker MUST send a BoRR
+        // message. After the speaker completes the re-advertisement of the
+        // entire Adj-RIB-Out to the peer, it MUST send an EoRR message."
+        let enhanced = self.s.peer(id).info.enhanced_refresh.is_some();
+        if enhanced {
+            refresh::mark(addr, RouteRefreshMessage::begin(family), out);
+        }
+        self.advertise(id, family, now, out);
+        if enhanced {
+            refresh::mark(addr, RouteRefreshMessage::end(family), out);
+        }
+    }
+
+    /// Whether routes of `family` may be advertised to `id` now: it was
+    /// negotiated, and (RFC 4724 §4.1) route selection is not deferred for
+    /// it; the end of the deferral sends it all.
+    fn can_advertise(&self, id: PeerId, family: AddressFamily) -> bool {
+        self.s.peer(id).info.speaks(family) && !self.s.deferred(family)
+    }
+
+    /// Send peer `id` the Adj-RIB-Out of `family` in full, held
+    /// destinations as they are now: the initial update (RFC 4271 §9.2) or
+    /// a route refresh (RFC 2918 §4). Every destination's interval
+    /// restarts.
+    pub(crate) fn advertise(
+        &mut self,
+        id: PeerId,
+        family: AddressFamily,
+        now: Instant,
+        out: &mut impl Sink,
+    ) {
         let now = self.s.tick(now);
         let mut batch = Batch::default();
         if self.s.peer(id).info.path_limit(family).is_some() {
@@ -1256,6 +1332,20 @@ impl Rib {
         }
         // The count is zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
+        // RFC 7313 §4: a refresh of the family begun earlier has no stale
+        // routes left to remove, so the time allowed for its `EoRR` has
+        // nothing to wait for. The refresh itself stays begun: its `EoRR`
+        // is not one without a `BoRR`.
+        if let Some(r) = self
+            .s
+            .peer_mut(id)
+            .refreshing
+            .iter_mut()
+            .find(|r| r.family == family)
+        {
+            r.expires = None;
+            self.s.cancel_refresh_timers(id, Some(family));
+        }
     }
 
     /// Phase 3 for every destination whose best route an input changed,

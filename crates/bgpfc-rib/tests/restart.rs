@@ -53,6 +53,7 @@ fn info(last: u8, restart: Option<Restart>) -> PeerInfo {
         add_path_send: Vec::new(),
         role: None,
         restart,
+        enhanced_refresh: None,
     }
 }
 

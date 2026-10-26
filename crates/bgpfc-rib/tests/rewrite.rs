@@ -157,6 +157,7 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
         // the session says, not of whether the combination is sensible.
         role: role.map(Role::from_u8),
         restart: None,
+        enhanced_refresh: None,
     })
 }
 

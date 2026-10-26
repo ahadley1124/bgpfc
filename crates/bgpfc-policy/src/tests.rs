@@ -265,6 +265,7 @@ fn engine_applies_each_neighbors_policies() {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
@@ -339,6 +340,7 @@ fn engine_tells_next_hop_self_what_the_session_negotiated() {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();
@@ -389,6 +391,7 @@ fn engine_keeps_each_neighbors_policies_apart() {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     };
     let local_pref = |v: Verdict| match v {
         Verdict::Modified(m) => m.local_pref,
@@ -587,6 +590,7 @@ fn the_engine_tells_import_and_export_policy_the_state() {
         add_path_send: Vec::new(),
         role: None,
         restart: None,
+        enhanced_refresh: None,
     };
     let a = attrs(&[65_001]);
     let p: Prefix = "203.0.113.0/24".parse().unwrap();

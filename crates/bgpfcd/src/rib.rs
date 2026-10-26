@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{FibChange, Output, PathLimit, PeerInfo, Revalidation, Rib, Sink};
+use bgpfc_rib::{FibChange, Output, PathLimit, PeerInfo, RefreshIgnored, Revalidation, Rib, Sink};
 use bgpfc_rpki::{AffectedPrefixes, InvalidAction};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -552,6 +552,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         add_path_send: Vec::new(),
         role: s.role,
         restart: None,
+        enhanced_refresh: None,
     }
 }
 
@@ -703,6 +704,7 @@ impl Sink for Deliver<'_> {
                     why = why
                 );
             }
+            Output::RefreshIgnored { peer, family, why } => refresh_ignored(peer, family, why),
             Output::SelectionDone { family } => self.selected.push(family),
             Output::Revalidated(r) => {
                 // RFC 6811 §4: the routes a change of the validation source
@@ -718,6 +720,26 @@ impl Sink for Deliver<'_> {
                 bgpfc_log::log(bgpfc_log::Level::Info, REVALIDATED, &fields);
             }
         }
+    }
+}
+
+/// Log a message of a route refresh the RIB ignored. RFC 7313 §4: a `BoRR`
+/// taken before the End-of-RIB of a Graceful Restart neighbor "SHOULD" be
+/// logged as an error; an `EoRR` without a `BoRR` "MAY" be.
+fn refresh_ignored(peer: IpAddr, family: AddressFamily, why: RefreshIgnored) {
+    match why {
+        RefreshIgnored::BeforeEndOfRib => bgpfc_log::error!(
+            "rib: route refresh message ignored",
+            peer = peer,
+            family = family,
+            why = why
+        ),
+        RefreshIgnored::NoBegin => bgpfc_log::warn!(
+            "rib: route refresh message ignored",
+            peer = peer,
+            family = family,
+            why = why
+        ),
     }
 }
 

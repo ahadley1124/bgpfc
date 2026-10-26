@@ -97,8 +97,17 @@ pub enum StaleEnd {
     /// family, or lists neither it nor the capability (RFC 4724 §4.2).
     NoForwardingState,
     /// The session ended again before the End-of-RIB, and the Graceful
-    /// Notification bit was not exchanged (RFC 4724 §4.2, RFC 8538 §4.1).
+    /// Notification bit was not exchanged (RFC 4724 §4.2, RFC 8538 §4.1); or
+    /// before the `EoRR` of a route refresh, whose routes still stale are not
+    /// the up-to-date ones a restart should keep (RFC 7313 §4).
     Superseded,
+    /// The peer ended a route refresh with its `EoRR`: the routes it did not
+    /// send again in it go (RFC 7313 §4).
+    EndOfRefresh,
+    /// The time allowed for the `EoRR` of a route refresh ran out (RFC 7313
+    /// §4: "MAY remove any routes from the peer that are still marked as
+    /// stale for that `<AFI, SAFI>` without waiting for an `EoRR` message").
+    RefreshTimer,
 }
 
 impl std::fmt::Display for StaleEnd {
@@ -109,6 +118,8 @@ impl std::fmt::Display for StaleEnd {
             StaleEnd::StaleTimer => "stale timer",
             StaleEnd::NoForwardingState => "no forwarding state",
             StaleEnd::Superseded => "session ended again",
+            StaleEnd::EndOfRefresh => "end-of-refresh",
+            StaleEnd::RefreshTimer => "refresh timer",
         })
     }
 }
@@ -152,6 +163,14 @@ pub(crate) struct Stale {
     expires: Option<Instant>,
 }
 
+impl Stale {
+    /// Whether the End-of-RIB of `family` is still awaited for its stale
+    /// routes.
+    pub(crate) fn awaits(&self, family: AddressFamily) -> bool {
+        self.pending.contains(&family)
+    }
+}
+
 /// The peers a deferred family waits for (kept in `Sessions`).
 #[derive(Debug)]
 pub(crate) struct Waiting {
@@ -174,6 +193,9 @@ enum What {
     Stale(PeerId),
     /// Route selection for the family stops being deferred.
     Deferral(AddressFamily),
+    /// The stale routes a peer's route refresh of the family left go
+    /// (RFC 7313 §4).
+    Refresh(PeerId, AddressFamily),
 }
 
 impl crate::peer::PeerInfo {
@@ -214,7 +236,26 @@ impl crate::Sessions {
 
     /// Drop every wake-up for peer `id`, whose slot is free.
     pub(crate) fn cancel_peer_timers(&mut self, id: PeerId) {
-        self.cancel_timers(|w| matches!(w, What::Restart(i) | What::Stale(i) if i == id));
+        self.cancel_timers(
+            |w| matches!(w, What::Restart(i) | What::Stale(i) | What::Refresh(i, _) if i == id),
+        );
+    }
+
+    /// Wake up at `at` to remove the routes still stale from `id`'s route
+    /// refresh of `family` (RFC 7313 §4).
+    pub(crate) fn queue_refresh_timer(&mut self, at: Instant, id: PeerId, family: AddressFamily) {
+        self.restart_timers.push(Reverse(Timer {
+            at,
+            what: What::Refresh(id, family),
+        }));
+    }
+
+    /// Drop the wake-up for `id`'s route refresh of `family`, if there is
+    /// one, or all of its refreshes' for `None`.
+    pub(crate) fn cancel_refresh_timers(&mut self, id: PeerId, family: Option<AddressFamily>) {
+        self.cancel_timers(
+            |w| matches!(w, What::Refresh(i, f) if i == id && family.is_none_or(|g| g == f)),
+        );
     }
 
     /// The state of `addr`, a peer that is down with its routes kept, taken
@@ -258,6 +299,15 @@ impl Rib {
         self.s.tick(now);
         // Before anything is removed, so that nothing is sent to it.
         self.s.peer_mut(id).leaving = true;
+        // RFC 7313 §4: a route refresh under way ends with the session. The
+        // routes it left stale are among those kept below, where forwarding
+        // goes on over them until the peer sends them again or its
+        // End-of-RIB comes; none of them is a route "from an earlier
+        // session" that RFC 4724 §4.2 deletes.
+        if !self.s.peer(id).refreshing.is_empty() {
+            self.s.peer_mut(id).refreshing.clear();
+            self.s.cancel_refresh_timers(id, None);
+        }
         let earlier = self.s.peer_mut(id).stale.take();
         if let Some(stale) = &earlier
             && !retention.notification
@@ -330,6 +380,11 @@ impl Rib {
         let Some(id) = self.s.up_id(addr) else {
             return;
         };
+        // RFC 7313 §4: from now on a BoRR for the family is taken.
+        self.s
+            .peer_mut(id)
+            .awaiting_end_of_rib
+            .retain(|f| *f != family);
         let pending = self.s.peer_mut(id).stale.as_mut().is_some_and(|stale| {
             let before = stale.pending.len();
             stale.pending.retain(|f| *f != family);
@@ -528,10 +583,14 @@ impl Rib {
         now: Instant,
         out: &mut impl Sink,
     ) {
-        self.refresh(addr, family, now, out);
         let Some(id) = self.s.up_id(addr) else {
             return;
         };
+        // The initial update is no route refresh, and RFC 7313 §4 has no
+        // `BoRR` before it.
+        if self.can_advertise(id, family) {
+            self.advertise(id, family, now, out);
+        }
         let info = &self.s.peer(id).info;
         if info.restart.is_none() || !info.speaks(family) {
             return;
@@ -654,6 +713,7 @@ impl Rib {
                     self.restart_expired(id, timer.at, StaleEnd::RestartTimer, now, out);
                 }
                 What::Stale(id) => self.stale_expired(id, timer.at, now, out),
+                What::Refresh(id, family) => self.refresh_expired(id, family, timer.at, now, out),
                 What::Deferral(family) => {
                     if self
                         .s
@@ -723,9 +783,9 @@ impl Rib {
         }
     }
 
-    /// Remove the stale routes `id` has in `family` (§4.2), with the FIB
-    /// changes and UPDATEs that follow. How many.
-    fn drop_stale_family(
+    /// Remove the stale routes `id` has in `family` (RFC 4724 §4.2, RFC 7313
+    /// §4), with the FIB changes and UPDATEs that follow. How many.
+    pub(crate) fn drop_stale_family(
         &mut self,
         id: PeerId,
         family: AddressFamily,
