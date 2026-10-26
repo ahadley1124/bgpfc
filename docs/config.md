@@ -486,6 +486,19 @@ query, and between two PDUs of an answer; it must be at least
 its End of Data, and must be at least `response-timeout`. A cache that
 breaks one of them is dropped and the next one tried.
 
+Between queries a connection in sync is idle, an hour by default (the
+cache's Refresh Interval), so bgpfcd turns TCP keep-alive on for every
+connection to a cache, in both modes (RFC 8210 §9: routers "SHOULD enable
+keep-alives when available"): after 60 seconds without a segment the
+kernel probes the cache every 10 seconds, and drops the connection after
+6 unanswered probes. A cache that vanished without closing the connection,
+by a crash or a network that drops its packets, is then noticed within two
+minutes, and bgpfcd moves to the next cache or reconnects, rather than at
+the next query an hour on. The values are fixed: the first probe comes
+after the same minute as Routinator's on its end (`--rtr-tcp-keepalive`),
+and a minute of unanswered probes rides out a short loss on the trusted
+network RTR needs.
+
 `max-expire` is the longest bgpfcd keeps using VRPs it cannot refresh.
 The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
 router MUST NOT retain the data past the time indicated by this

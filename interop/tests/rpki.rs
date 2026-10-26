@@ -340,6 +340,26 @@ impl Setup {
         assert_eq!(self.http_states(), want, "{}", self.http("/v1/routes"));
     }
 
+    /// What `ss` says of bgpfcd's connections to the cache on port 3323,
+    /// a line each, with the kernel's timer on the socket:
+    /// `timer:(keepalive,...)` while TCP keep-alive is on and nothing is
+    /// in flight (RFC 8210 §9).
+    fn rtr_sockets(&self) -> String {
+        let mut cmd = self.lab.exec(&self.lab.a, "ss");
+        cmd.args([
+            "-tnoH",
+            "state",
+            "established",
+            "(",
+            "dport",
+            "=",
+            ":3323",
+            ")",
+        ]);
+        let out = cmd.output().expect("ss");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     /// Wait up to `timeout` for bgpfcd to log `line`.
     fn wait_for_log(&self, timeout: Duration, line: &str) {
         assert!(
@@ -786,7 +806,8 @@ fn session_line(show_rpki: &str) -> String {
 /// A new VRP file then changes the state of every route without any BGP
 /// UPDATE: `StayRTR` sends a Serial Notify, bgpfcd asks for the changes
 /// (RFC 8210 §8.2), and the routes they cover are validated again
-/// (RFC 6811 §4, issue #59).
+/// (RFC 6811 §4, issue #59). bgpfcd's connection to the cache has TCP
+/// keep-alive on (RFC 8210 §9), as `ss` shows.
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
@@ -807,6 +828,17 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
     ] {
         assert!(ok && out.contains(line), "{line}:\n{out}");
     }
+    // RFC 8210 §9: the connection bgpfcd made to the cache probes with
+    // TCP keep-alive while idle in sync.
+    let mut sockets = String::new();
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            sockets = s.rtr_sockets();
+            sockets.lines().count() == 1 && sockets.contains("timer:(keepalive,")
+        }),
+        "{sockets}\n{}",
+        s.report()
+    );
     let body = s.http("/v1/rpki");
     assert!(
         body.contains("\"mode\":\"external\"")

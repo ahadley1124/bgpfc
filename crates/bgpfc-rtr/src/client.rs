@@ -73,9 +73,12 @@
 //! configuration, never waits for a cache that does not answer.
 //!
 //! RFC 8210 §9 says routers SHOULD enable TCP keep-alives. std offers no
-//! way to set the socket option, so the client does without: the polls
-//! of the Refresh Interval and the response timeout find a dead
-//! connection instead.
+//! way to set the socket option, and this crate may not depend on
+//! `bgpfc-sys`, which sets it (AGENTS.md §2), so the client leaves it to
+//! the [`ConnectionCheck`] its caller gives it (see "Checking the other
+//! end"), which gets every connection first: bgpfcd turns keep-alive on
+//! there. A client without one does without, and the polls of the Refresh
+//! Interval and the response timeout find a dead connection, only later.
 //!
 //! # Checking the other end
 //!
@@ -86,7 +89,10 @@
 //! sets [`Config::check`]: a [`ConnectionCheck`] runs on every connection
 //! as it is made, on the attempt's thread and before anything is sent or
 //! read, and a connection it refuses is closed and fails like an attempt
-//! that found no cache.
+//! that found no cache. Since it gets every connection before the
+//! session does, it is also where the caller prepares one, such as by
+//! setting socket options the client cannot set itself (TCP keep-alive,
+//! RFC 8210 §9).
 //!
 //! Implements: RFC 8210 §4 (the most preferred cache that accepts a
 //! connection, also one that comes back), §8.3 and §8.4 (other caches
@@ -257,8 +263,8 @@ pub struct Config {
     /// override ([`max_expire`](session::Config::max_expire)), for the
     /// session with each cache.
     pub session: session::Config,
-    /// What each new connection must pass before the client uses it, if
-    /// anything (see [`ConnectionCheck`]).
+    /// What each new connection must pass before the client uses it, and
+    /// what prepares it, if anything (see [`ConnectionCheck`]).
     pub check: Option<ConnectionCheck>,
 }
 
@@ -272,6 +278,10 @@ pub struct Config {
 /// It runs on the thread of the connection attempt, which the client does
 /// not wait for once it is stopped, so a check that takes a while holds up
 /// no stop.
+///
+/// It may also change the connection before the client uses it, such as
+/// by setting socket options: it is the first to get each one, before the
+/// session sends its first PDU.
 #[derive(Clone)]
 pub struct ConnectionCheck(Arc<CheckFn>);
 

@@ -64,9 +64,9 @@
 //!
 //! Implements: RFC 8210 §6 (the Expire Interval cap and the reconnect
 //! back-off configured), §7 (the version offered first), §9 and §13
-//! (unprotected TCP to the configured port, 323 by default; the sidecar's
-//! RTR on loopback only, and used only from a server of bgpfcd's own
-//! user), §10 (the cache list with preferences; the data kept
+//! (unprotected TCP to the configured port, 323 by default, with TCP
+//! keep-alive on every connection; the sidecar's RTR on loopback only,
+//! and used only from a server of bgpfcd's own user), §10 (the cache list with preferences; the data kept
 //! across a new cache list, and across a restart of Routinator); RFC 6811
 //! §4 (each change of the VRPs reaches the RIB, which validates the
 //! affected routes again).
@@ -74,13 +74,13 @@
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_config::{ConfigError, Pos};
@@ -89,6 +89,7 @@ use bgpfc_rtr::Version;
 use bgpfc_rtr::client::{self, Backoff, Cache, Client, ConnectionCheck, Held, Status};
 use bgpfc_rtr::session;
 use bgpfc_sidecar::{BackoffConfig, Sidecar, SidecarConfig, TalConfig};
+use bgpfc_sys::TcpKeepalive;
 use bgpfc_wire::types::RouterId;
 
 use crate::messages::{RibMsg, RpkiReport, SidecarReport};
@@ -264,11 +265,13 @@ pub(crate) fn resolve(rpki: &ast::Rpki) -> Result<(), String> {
 /// wired without operator configuration); `mode external` lists its
 /// caches itself.
 ///
-/// With `mode sidecar` the client uses a connection only if its other end
-/// belongs to bgpfcd's own user, as Routinator, its child, does
-/// ([`owner::same_user`]): until Routinator binds its port, after its
-/// first validation run, any local process could bind it and serve VRPs
-/// of its own (RFC 8210 §9, §13).
+/// The client turns TCP keep-alive on for every connection it makes
+/// ([`RTR_KEEPALIVE`], RFC 8210 §9). With `mode sidecar` it also uses a
+/// connection only if its other end belongs to bgpfcd's own user, as
+/// Routinator, its child, does ([`owner::same_user`]): until Routinator
+/// binds its port, after its first validation run, any local process
+/// could bind it and serve VRPs of its own (RFC 8210 §9, §13). Both go
+/// through [`prepare`].
 pub(crate) fn client_config(
     rpki: &ast::Rpki,
     router_id: RouterId,
@@ -301,9 +304,7 @@ pub(crate) fn client_config(
         }
     };
     let mut config = client::Config::new(caches);
-    if rpki.mode == RpkiMode::Sidecar {
-        config.check = Some(ConnectionCheck::new(owner::same_user));
-    }
+    config.check = Some(prepare(rpki.mode == RpkiMode::Sidecar));
     config.connect_timeout = rpki.connect_timeout;
     // With `mode sidecar` the block's default is `1 30` rather than
     // `1 600` (`ast::Rpki::default_backoff`), so that the client finds
@@ -330,6 +331,78 @@ pub(crate) fn client_config(
         max_vrps: usize::try_from(rpki.max_vrps).unwrap_or(usize::MAX),
     };
     Some(config)
+}
+
+/// TCP keep-alive on every connection to a cache. RFC 8210 §9: "To
+/// reduce exposure to dropped but non-terminated sessions, both caches and
+/// routers SHOULD enable keep-alives when available in the chosen
+/// transport protocol."
+///
+/// In sync, an RTR connection is idle between polls, which come every
+/// Refresh Interval, an hour by default (§6). Without probes, a cache
+/// that vanished without closing the connection (a crash, a power loss, a
+/// network that drops its packets) is noticed only when the next poll
+/// goes unanswered for the response timeout, more than an hour on; until
+/// then the client neither moves to another cache (§10) nor hears the
+/// cache's Serial Notifies again. The host's default would probe only
+/// after two hours of silence (RFC 1122 §4.2.3.6). With these values a
+/// dead cache is noticed within two minutes of its last segment:
+///
+/// - `idle` 60 s: what Routinator sets on its own end of each RTR
+///   connection by default (`--rtr-tcp-keepalive 60`), so both ends start
+///   probing after the same minute of silence; one small exchange a
+///   minute per connection costs nothing on the controlled network §9
+///   asks for.
+/// - `interval` 10 s and `probes` 6: the cache is declared gone after a
+///   minute of unanswered probes, so a loss of a few seconds on that
+///   network does not reset a session that would have lived on, and a
+///   reconnect, which costs the cache a Serial Query at least (§8.1),
+///   comes only for a cache that is really gone.
+///
+/// Keep-alive acts only on a connection with nothing in flight. While a
+/// query is unanswered, the session's response timeout finds a dead
+/// cache instead (§6, `response-timeout`). Not configurable: no value
+/// changes an outcome, only how soon a dead cache is noticed.
+pub(crate) const RTR_KEEPALIVE: TcpKeepalive = TcpKeepalive {
+    idle: Duration::from_secs(60),
+    interval: Duration::from_secs(10),
+    probes: 6,
+};
+
+/// What the client does with each connection it makes, before it sends
+/// or reads anything on it: with `owner_check` (`mode sidecar`), refuse
+/// one whose other end does not belong to bgpfcd's own user
+/// ([`owner::same_user`]); then, in every mode, turn on TCP keep-alive
+/// ([`RTR_KEEPALIVE`], RFC 8210 §9).
+///
+/// The keep-alive goes through the client's [`ConnectionCheck`] because
+/// that hook already runs on every connection the client makes, to every
+/// cache, after each reconnect, on the attempt's thread and before the
+/// first PDU, which is where a socket option belongs; and `bgpfc-rtr`
+/// may not reach `bgpfc-sys`, which sets it (AGENTS.md §2), while bgpfcd
+/// may. A second hook for the client would run at the same point.
+///
+/// A connection on which the kernel refuses the option is still used: §9
+/// asks for keep-alives "when available", and without them the polls
+/// and timeouts of §6 still find a dead cache, only later. The refusal is
+/// a warning, once per connection.
+fn prepare(owner_check: bool) -> ConnectionCheck {
+    ConnectionCheck::new(move |stream: &TcpStream| {
+        if owner_check {
+            owner::same_user(stream)?;
+        }
+        if let Err(e) = bgpfc_sys::set_tcp_keepalive(stream, RTR_KEEPALIVE) {
+            let cache = stream
+                .peer_addr()
+                .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
+            bgpfc_log::warn!(
+                "rtr cannot turn on tcp keep-alive; a cache that vanishes is noticed at the next poll",
+                cache = cache,
+                error = e
+            );
+        }
+        Ok(())
+    })
 }
 
 /// Create Routinator's repository directory, with the parents it lacks,
@@ -1636,7 +1709,8 @@ mod tests {
                 max_vrps: 1_000,
             }
         );
-        // RFC 8210 §9, §13: only a server of bgpfcd's own user is used.
+        // RFC 8210 §9, §13: only a server of bgpfcd's own user is used,
+        // and with keep-alive (see `every_rtr_connection_has_tcp_keep_alive`).
         assert!(c.check.is_some());
         let v6 = client_config(&cfg.rpki, router_id, Some("[::1]:3323".parse().unwrap())).unwrap();
         assert_eq!(v6.caches[0].host, "::1");
@@ -1650,9 +1724,53 @@ mod tests {
         let external = config("rpki { mode external; cache 192.0.2.10; }");
         let c = client_config(&external.rpki, router_id, Some(addr)).unwrap();
         assert_eq!(c.caches, [Cache::new("192.0.2.10")]);
-        assert!(c.check.is_none(), "an external cache is another host's");
+        // An external cache is another host's, so no owner check; but its
+        // connections get keep-alive too.
+        assert!(c.check.is_some());
         let disabled = config("rpki { mode disabled; }");
         assert!(client_config(&disabled.rpki, router_id, Some(addr)).is_none());
+    }
+
+    /// RFC 8210 §9: every connection the client makes to a cache has TCP
+    /// keep-alive on, as [`RTR_KEEPALIVE`] sets it, before the client
+    /// sends its first query, with `mode external` and with `mode
+    /// sidecar`, whose owner check passes for a cache of this process.
+    #[test]
+    fn every_rtr_connection_has_tcp_keep_alive() {
+        let router_id = RouterId::new(0xC000_0201).unwrap();
+        let cache = StubCache::new();
+        let addr = SocketAddr::from(([127, 0, 0, 1], cache.port()));
+        for (block, sidecar) in [
+            (cache.block(), None),
+            ("rpki { mode sidecar; }".to_owned(), Some(addr)),
+        ] {
+            let mut c = client_config(&config(&block).rpki, router_id, sidecar).unwrap();
+            // What the kernel has on the client's end once bgpfcd's check
+            // has run on it.
+            let prepare = c.check.take().expect("a check of every connection");
+            let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+            c.check = Some(ConnectionCheck::new(move |stream: &TcpStream| {
+                let verdict = prepare.run(stream);
+                let kernel = bgpfc_sys::tcp_keepalive(stream).map_err(|e| e.to_string());
+                let _ = seen_tx.send((verdict.is_ok(), kernel));
+                verdict
+            }));
+            let (tx, _changes) = sync_channel::<ValidationChange>(4);
+            let mut client = Client::start(c, tx).unwrap();
+            let (_stream, query) = cache.accept();
+            assert!(
+                matches!(query, Pdu::ResetQuery { .. }),
+                "{block}: {query:?}"
+            );
+            assert_eq!(
+                seen_rx.recv_timeout(WAIT).unwrap(),
+                (true, Ok(Some(RTR_KEEPALIVE))),
+                "{block}"
+            );
+            client.stop();
+        }
+        // Two minutes from the last segment to a dead cache noticed.
+        assert_eq!(RTR_KEEPALIVE.detection_time(), Duration::from_secs(120));
     }
 
     /// Issues #26 and #71: `mode sidecar` starts Routinator and wires the
