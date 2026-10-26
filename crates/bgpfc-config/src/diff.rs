@@ -50,11 +50,14 @@ pub enum GlobalChange {
     Log,
     /// The `control` block.
     Control,
-    /// The `rpki` block's RTR client settings, an absent block counting
-    /// as `mode disabled` with the defaults: the RTR client starts, stops
-    /// or restarts. A block that only spells something differently, such
-    /// as a default written out or a cache's host, is no change, and nor
-    /// is its `enforcement`, which the client does not use (see
+    /// The `rpki` block's mode, or the RTR client's or the sidecar's
+    /// settings, an absent block counting as
+    /// [`Rpki::implicit`](crate::ast::Rpki::implicit): the RTR client
+    /// starts, stops or restarts, and with `mode sidecar` the sidecar too
+    /// when its own settings changed. A block that only spells something
+    /// differently, such as a default written out, a cache's host or a
+    /// moved `sidecar` block, is no change, and nor is its `enforcement`,
+    /// which neither uses (see
     /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); that is
     /// [`GlobalChange::RpkiEnforcement`].
     Rpki,
@@ -163,6 +166,8 @@ fn policy_fingerprint(cfg: &Config, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const BASE: &str = "router-id 192.0.2.1; local-as 65000;
@@ -470,6 +475,108 @@ mod tests {
         );
         let c = with("rpki { mode external; enforcement off; cache 192.0.2.11; }");
         assert_eq!(ConfigDiff::between(&a, &c).global, vec![GlobalChange::Rpki]);
+    }
+
+    #[test]
+    fn sidecar_settings_are_an_rpki_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let sidecar = with("rpki { mode sidecar; }");
+        for other in [
+            "rpki { mode sidecar; sidecar { refresh 300; } }",
+            "rpki { mode sidecar; sidecar { binary /opt/routinator/bin/routinator; } }",
+            "rpki { mode sidecar; sidecar { rtr-listen 127.0.0.1 port 3323; } }",
+            "rpki { mode sidecar; sidecar { global-args --strict; } }",
+            "rpki { mode sidecar; sidecar { server-args --rtr-tcp-keepalive=30; } }",
+            "rpki { mode sidecar; sidecar { restart-backoff 1 60; } }",
+            "rpki { mode sidecar; sidecar { failure-threshold 3; } }",
+            // A client setting: the client restarts, the sidecar does not
+            // (the reload tells them apart by `RpkiSidecar::same_as`).
+            "rpki { mode sidecar; max-vrps 10; }",
+            // The modes on either side.
+            "rpki { mode external; cache 127.0.0.1; }",
+            "rpki { mode disabled; }",
+        ] {
+            let d = ConfigDiff::between(&sidecar, &with(other));
+            assert_eq!(d.global, vec![GlobalChange::Rpki], "{other}");
+            // No neighbor is touched.
+            assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+        }
+        // The enforcement alone neither restarts the sidecar nor the
+        // client.
+        let off = with("rpki { mode sidecar; enforcement off; }");
+        assert!(sidecar.rpki.same_as(&off.rpki));
+        assert_eq!(
+            ConfigDiff::between(&sidecar, &off).global,
+            vec![GlobalChange::RpkiEnforcement]
+        );
+        // Two words in another order are other arguments.
+        assert_eq!(
+            ConfigDiff::between(
+                &with("rpki { mode sidecar; sidecar { global-args --strict -v; } }"),
+                &with("rpki { mode sidecar; sidecar { global-args -v --strict; } }"),
+            )
+            .global,
+            vec![GlobalChange::Rpki]
+        );
+    }
+
+    #[test]
+    fn a_respelled_or_moved_sidecar_block_is_no_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let sidecar = with("rpki { mode sidecar; }");
+        for same in [
+            "rpki { mode sidecar; sidecar { } }",
+            "rpki { mode sidecar; sidecar { rtr-listen 127.0.0.1 port 0; } }",
+            "rpki { mode sidecar; sidecar { rtr-listen 127.0.0.1; } }",
+            "rpki { mode sidecar; backoff 1 30; }",
+            "rpki {
+                mode sidecar;
+                sidecar {
+                    binary /usr/bin/routinator;
+                    repository-dir /var/lib/bgpfc/rpki;
+                    rir-tals yes;
+                    accept-arin-rpa no;
+                    refresh 600;
+                    restart-backoff 1 300;
+                    stable-after 300;
+                    stop-timeout 10;
+                    failure-threshold 5;
+                }
+            }",
+        ] {
+            let other = with(same);
+            assert!(sidecar.rpki.same_as(&other.rpki), "{same}");
+            assert!(ConfigDiff::between(&sidecar, &other).is_empty(), "{same}");
+        }
+        // The block before or after the mode, or the whole `rpki` block
+        // elsewhere in the file: only the positions differ.
+        let a = with("rpki { mode sidecar; sidecar { refresh 300; } }");
+        let b = with("rpki { sidecar { refresh 300; } mode sidecar; }");
+        let moved = cfg(&format!(
+            "rpki {{\n  mode sidecar;\n  sidecar {{ refresh 300; }}\n}}\n{BASE}"
+        ));
+        for other in [&b, &moved] {
+            assert_ne!(a.rpki.sidecar.pos, other.rpki.sidecar.pos);
+            assert!(ConfigDiff::between(&a, other).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_sidecar_backoff_default_follows_the_mode() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        let external = with("rpki { mode external; cache 127.0.0.1; }");
+        let sidecar = with("rpki { mode sidecar; }");
+        assert_eq!(external.rpki.backoff_max, Duration::from_secs(600));
+        assert_eq!(sidecar.rpki.backoff_max, Duration::from_secs(30));
+        assert_eq!(external.rpki.backoff_min, sidecar.rpki.backoff_min);
+        assert_eq!(
+            ConfigDiff::between(&external, &sidecar).global,
+            vec![GlobalChange::Rpki]
+        );
+        // A `backoff` written out applies in every mode.
+        let written = with("rpki { mode sidecar; backoff 1 600; }");
+        assert_eq!(written.rpki.backoff_max, Duration::from_secs(600));
+        assert!(!sidecar.rpki.same_as(&written.rpki));
     }
 
     #[test]

@@ -1,0 +1,96 @@
+rpki-sidecar-errors.conf:8:5: `cache` is not used with `mode sidecar`: the RTR client uses the sidecar's own listener; list caches with `mode external`
+      cache 127.0.0.1;                    # caches are for mode external
+      ^
+rpki-sidecar-errors.conf:10:16: `binary` needs an absolute path, found `routinator`: bgpfcd never searches PATH (issue #70)
+          binary routinator;              # not absolute: PATH is never searched
+                 ^
+rpki-sidecar-errors.conf:11:24: `repository-dir` needs an absolute path, found `var/lib/rpki`
+          repository-dir var/lib/rpki;    # relative
+                         ^
+rpki-sidecar-errors.conf:12:21: `config-file` needs an absolute path, found `routinator.conf`
+          config-file routinator.conf;    # relative
+                      ^
+rpki-sidecar-errors.conf:13:24: `extra-tals-dir` needs an absolute path, found `tals`
+          extra-tals-dir tals;            # relative
+                         ^
+rpki-sidecar-errors.conf:14:20: rtr-listen address 192.0.2.1 is not a loopback address: the sidecar serves RTR on loopback only (issue #71)
+          rtr-listen 192.0.2.1;           # not loopback
+                     ^
+rpki-sidecar-errors.conf:15:17: refresh must be between 1 and 7199 seconds (RFC 8210 §6: below Routinator's Expire Interval, 7200 seconds)
+          refresh 0;
+                  ^
+rpki-sidecar-errors.conf:16:25: a restart-backoff must be between 1 and 3600 seconds
+          restart-backoff 0 5;
+                          ^
+rpki-sidecar-errors.conf:17:22: stable-after must be between 1 and 86400 seconds
+          stable-after 0;
+                       ^
+rpki-sidecar-errors.conf:18:22: stop-timeout must be between 1 and 3600 seconds
+          stop-timeout 0;
+                       ^
+rpki-sidecar-errors.conf:19:27: failure-threshold must be at least 1
+          failure-threshold 0;
+                            ^
+rpki-sidecar-errors.conf:20:9: `tals` needs at least one TAL name
+          tals;                           # no TAL named
+          ^
+rpki-sidecar-errors.conf:21:9: `global-args` needs at least one argument
+          global-args;                    # no argument
+          ^
+rpki-sidecar-errors.conf:22:9: unknown statement `frobnicate` in `sidecar`
+          frobnicate yes;
+          ^
+rpki-sidecar-errors.conf:25:1: `rpki` is given more than once
+  rpki {
+  ^
+rpki-sidecar-errors.conf:29:9: `binary` is given more than once
+          binary /usr/local/bin/routinator;   # given twice
+          ^
+rpki-sidecar-errors.conf:30:20: rtr-listen address ::ffff:127.0.0.1 is not a loopback address: the sidecar serves RTR on loopback only (issue #71); write it as 127.0.0.1
+          rtr-listen ::ffff:127.0.0.1;    # IPv4-mapped: not loopback as read
+                     ^
+rpki-sidecar-errors.conf:31:17: refresh must be between 1 and 7199 seconds (RFC 8210 §6: below Routinator's Expire Interval, 7200 seconds)
+          refresh 7200;                   # not below Routinator's Expire Interval
+                  ^
+rpki-sidecar-errors.conf:32:27: a restart-backoff must be between 1 and 3600 seconds
+          restart-backoff 1 3601;
+                            ^
+rpki-sidecar-errors.conf:33:22: stable-after must be between 1 and 86400 seconds
+          stable-after 86401;
+                       ^
+rpki-sidecar-errors.conf:34:22: stop-timeout must be between 1 and 3600 seconds
+          stop-timeout 3601;
+                       ^
+rpki-sidecar-errors.conf:37:1: `rpki` is given more than once
+  rpki {
+  ^
+rpki-sidecar-errors.conf:40:35: rtr-listen port 323 is below 1024: Routinator runs without capabilities and cannot bind it; use 0, picked at start, or 1024-65535
+          rtr-listen 127.0.0.1 port 323;  # privileged: Routinator has no capabilities
+                                    ^
+rpki-sidecar-errors.conf:41:9: restart-backoff cap 5s is below its initial delay 10s
+          restart-backoff 10 5;           # cap below the initial delay
+          ^
+rpki-sidecar-errors.conf:44:1: `rpki` is given more than once
+  rpki {
+  ^
+rpki-sidecar-errors.conf:46:5: `sidecar` needs a `{ ... }` block
+      sidecar;                            # no block
+      ^
+rpki-sidecar-errors.conf:48:1: `rpki` is given more than once
+  rpki {
+  ^
+rpki-sidecar-errors.conf:50:36: expected `port`, found `prt`
+      sidecar { rtr-listen 127.0.0.1 prt 3323; }
+                                     ^
+rpki-sidecar-errors.conf:52:1: `rpki` is given more than once
+  rpki {
+  ^
+rpki-sidecar-errors.conf:55:5: `sidecar` is used with `mode sidecar` only
+      sidecar { }                         # never run with mode external
+      ^
+rpki-sidecar-errors.conf:57:1: `rpki` is given more than once
+  rpki { mode bogus; }
+  ^
+rpki-sidecar-errors.conf:57:13: `bogus` is not `disabled`, `external` or `sidecar`
+  rpki { mode bogus; }
+              ^

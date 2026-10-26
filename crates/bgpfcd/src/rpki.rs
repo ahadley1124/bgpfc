@@ -44,8 +44,8 @@ use std::io;
 use std::net::ToSocketAddrs as _;
 use std::sync::mpsc::SyncSender;
 
-use bgpfc_config::ConfigError;
 use bgpfc_config::ast::{self, RpkiMode};
+use bgpfc_config::{ConfigError, Pos};
 use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
 use bgpfc_rtr::client::{self, Backoff, Cache, Client, Held, Status};
@@ -58,9 +58,25 @@ use crate::messages::RibMsg;
 /// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
 /// errors are reported with the file's own, at their positions in it, by
 /// `bgpfcd --check`, at start and at a reload. They judge the file alone,
-/// like the configuration crate, and run nothing. There are none yet.
-pub(crate) fn check_config(_config: &bgpfc_config::Config) -> Vec<ConfigError> {
-    Vec::new()
+/// like the configuration crate, and run nothing.
+///
+/// This bgpfcd does not run the Routinator sidecar yet, so `mode sidecar`
+/// is an error at the `sidecar` block, or at the `mode` statement without
+/// one: a file that asks for validation must not load as if it had none
+/// (issue #60: fail loudly and early).
+pub(crate) fn check_config(config: &bgpfc_config::Config) -> Vec<ConfigError> {
+    match config.rpki.mode {
+        RpkiMode::Disabled | RpkiMode::External => Vec::new(),
+        RpkiMode::Sidecar => {
+            // The configuration crate places every `mode sidecar` block;
+            // the start of the file stands in for a hand-built one.
+            let pos = config.rpki.sidecar.pos.unwrap_or(Pos { line: 1, col: 1 });
+            vec![ConfigError::new(
+                pos,
+                "`mode sidecar` is not supported by this bgpfcd yet",
+            )]
+        }
+    }
 }
 
 /// Look up every cache of an external `rpki` block, so that a name that
@@ -500,6 +516,34 @@ mod tests {
             let errors = check_config(&config(rpki));
             assert!(errors.is_empty(), "{rpki}: {errors:?}");
         }
+    }
+
+    /// Until bgpfcd runs the sidecar, `mode sidecar` stops the load at
+    /// its block, or at the mode without one, with the file's other
+    /// errors; the configuration crate alone accepts the file.
+    #[test]
+    fn mode_sidecar_is_refused_until_bgpfcd_runs_it() {
+        let head = "router-id 192.0.2.1;\nlocal-as 65000;\n";
+        let bare = format!("{head}rpki {{ mode sidecar; }}\n");
+        let errors = bgpfc_config::parse_str_with("t", &bare, &check_config).unwrap_err();
+        assert_eq!(
+            errors.to_string(),
+            "t:3:8: `mode sidecar` is not supported by this bgpfcd yet\n  \
+             rpki { mode sidecar; }\n         ^"
+        );
+        let block = format!("{head}rpki {{\n  mode sidecar;\n  sidecar {{ refresh 300; }}\n}}\n");
+        let errors = bgpfc_config::parse_str_with("t", &block, &check_config).unwrap_err();
+        assert_eq!(
+            errors.to_string(),
+            "t:5:3: `mode sidecar` is not supported by this bgpfcd yet\n    \
+             sidecar { refresh 300; }\n    ^"
+        );
+        for text in [&bare, &block] {
+            assert!(bgpfc_config::parse_str("t", text).is_ok(), "{text}");
+        }
+        // The other modes may keep a sidecar block (issue #60).
+        let disabled = config("rpki { mode disabled; sidecar { refresh 300; } }");
+        assert_eq!(check_config(&disabled), []);
     }
 
     #[test]

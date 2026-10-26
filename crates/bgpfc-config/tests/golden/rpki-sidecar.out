@@ -1,0 +1,74 @@
+Config {
+    router_id: RouterId(
+        3221225985,
+    ),
+    local_as: Asn(
+        65000,
+    ),
+    log_level: Info,
+    listen: [
+        [::]:179,
+    ],
+    fib: Fib {
+        mode: DryRun,
+        table: 254,
+        protocol: 186,
+    },
+    control: Control {
+        socket: None,
+        http: None,
+    },
+    rpki: Rpki {
+        mode: Sidecar,
+        enforcement: PreferValid,
+        caches: [],
+        sidecar: RpkiSidecar {
+            pos: Some(
+                Pos {
+                    line: 10,
+                    col: 5,
+                },
+            ),
+            binary: "/opt/routinator/bin/routinator",
+            repository_dir: "/var/lib/bgpfc/rpki cache",
+            rtr_listen: [::1]:3323,
+            rir_tals: false,
+            tals: [
+                "ripe",
+                "ripe-pilot",
+            ],
+            extra_tals_dir: Some(
+                "/etc/bgpfc/tals",
+            ),
+            accept_arin_rpa: true,
+            refresh: 300s,
+            config_file: Some(
+                "/etc/bgpfc/routinator.conf",
+            ),
+            global_args: [
+                "--strict",
+                "--exceptions=/etc/bgpfc/slurm;local.json",
+            ],
+            server_args: [
+                "--rtr-tcp-keepalive=30",
+                "--http=127.0.0.1:8323",
+            ],
+            restart_initial: 2s,
+            restart_cap: 600s,
+            stable_after: 900s,
+            stop_timeout: 20s,
+            failure_threshold: 3,
+        },
+        version: 1,
+        connect_timeout: 5s,
+        response_timeout: 60s,
+        reply_timeout: 1800s,
+        max_expire: 172800s,
+        max_vrps: 4000000,
+        backoff_min: 2s,
+        backoff_max: 60s,
+    },
+    prefix_lists: [],
+    policies: [],
+    neighbors: [],
+}

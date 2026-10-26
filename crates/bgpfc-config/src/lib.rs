@@ -9,9 +9,11 @@
 //! (`restart-limit`); RFC 4271 §6.7 (`maximum-prefix`); RFC 8210 §6, §7,
 //! §9 and §10 (the `rpki` block: the Expire Interval cap and the
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
-//! the cache list with preferences); RFC 6811 §2 and §5 (the `rpki`
-//! block's `enforcement`: acting on the validation state only as
-//! configured).
+//! the cache list with preferences, the sidecar's RTR on loopback only);
+//! RFC 6811 §2 and §5 (the `rpki` block's `enforcement`: acting on the
+//! validation state only as configured). Issues #26 and #70-#72: the
+//! `sidecar` block, Routinator's settings within the bounds of
+//! `bgpfc-sidecar`.
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;
