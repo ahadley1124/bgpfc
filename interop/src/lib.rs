@@ -982,11 +982,18 @@ pub const NOBODY: u32 = 65_534;
 /// as a restarted Routinator does. `fail` makes every start exit 1 at once;
 /// `delay` holds the start that many seconds before it listens, as
 /// Routinator's first validation run does. Every `--version` adds a line
-/// to `version-checks`. `@DIR@` is the directory of these files.
+/// to `version-checks`; from the one whose number `version-from` holds on,
+/// it prints `version-later` instead of `version`. `@DIR@` is the
+/// directory of these files.
 const FAKE_ROUTINATOR: &str = r#"#!/bin/sh
 # A stand-in for Routinator 0.15 in bgpfc's interop tests; never shipped.
 dir=@DIR@
-case "$1" in --version|-V) echo "$*" >> "$dir/version-checks"; cat "$dir/version"; exit 0 ;; esac
+case "$1" in --version|-V)
+  echo "$*" >> "$dir/version-checks"
+  if [ -e "$dir/version-from" ] && [ "$(wc -l < "$dir/version-checks")" -ge "$(cat "$dir/version-from")" ]
+  then cat "$dir/version-later"; else cat "$dir/version"; fi
+  exit 0 ;;
+esac
 { printf 'start'; for a in "$@"; do printf ' %s' "$a"; done; echo; } >> "$dir/invocations"
 rtr=; server=
 for a in "$@"; do
@@ -1058,12 +1065,28 @@ impl FakeRoutinator {
         fake
     }
 
-    /// What `--version` prints from now on.
+    /// What `--version` prints from now on; it ends a switch that
+    /// [`FakeRoutinator::switch_version`] set.
     ///
     /// # Panics
     /// If the file cannot be written.
     pub fn set_version(&self, line: &str) {
+        let _ = fs::remove_file(self.dir.join("version-from"));
         fs::write(self.dir.join("version"), format!("{line}\n")).expect("fake routinator version");
+    }
+
+    /// What `--version` prints from the `check`-th question on, counting
+    /// every one since [`FakeRoutinator::install`]: a binary replaced
+    /// between two of bgpfcd's checks, such as a reload's preflight and
+    /// the start that follows it.
+    ///
+    /// # Panics
+    /// If a file cannot be written.
+    pub fn switch_version(&self, check: usize, line: &str) {
+        fs::write(self.dir.join("version-later"), format!("{line}\n"))
+            .expect("fake routinator later version");
+        fs::write(self.dir.join("version-from"), check.to_string())
+            .expect("fake routinator version switch");
     }
 
     /// Whether every start from now on fails at once, with exit status 1.
@@ -1195,6 +1218,24 @@ mod tests {
         );
         assert_eq!(fake.version_checks(), 2);
         assert_eq!(fake.invocations(), Vec::<Vec<String>>::new());
+        // A switch from the fourth question on, which `set_version` ends.
+        fake.switch_version(4, "Routinator 0.13.0");
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["--version"]).stdout),
+            "Routinator 0.14.1\n"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                String::from_utf8_lossy(&run(&["--version"]).stdout),
+                "Routinator 0.13.0\n"
+            );
+        }
+        fake.set_version("Routinator 0.14.1");
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["--version"]).stdout),
+            "Routinator 0.14.1\n"
+        );
+        assert_eq!(fake.version_checks(), 6);
 
         let out = run(&["--strict", "server"]);
         assert_eq!(out.status.code(), Some(2), "{out:?}");
@@ -1247,6 +1288,6 @@ mod tests {
             .output()
             .expect("bgpfcd --check");
         assert!(out.status.success(), "{out:?}");
-        assert_eq!(fake.version_checks(), 2);
+        assert_eq!(fake.version_checks(), 6);
     }
 }

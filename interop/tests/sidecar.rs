@@ -1161,3 +1161,102 @@ fn reload_across_modes(r: &Reloader, sidecar: &str) {
     s.wait_for_rpki(Duration::ZERO, &["mode disabled\n", "validation off\n"]);
     assert_eq!(s.fake.invocations().len(), 3, "{}", s.report());
 }
+
+/// Issue #71 and `docs/config.md`, "Reload": a Routinator replaced, by one
+/// of another release, between a reload's preflight and its start cannot
+/// start. Validation is then off while `mode sidecar` is configured: `show
+/// status` raises `rpki-sidecar-not-running` rather than list no alarm, and
+/// `show rpki` says `sidecar not running`. A reload of the same file checks
+/// the block again: it fails while the binary is still of the other
+/// release, and starts Routinator once it is fixed, which clears the alarm.
+/// The BGP session is never reset.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn a_sidecar_a_reload_could_not_start_raises_an_alarm_until_one_does() {
+    let s = Setup::start("si", 34, &Opts::default(), |_| {});
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    s.wait_for_rpki(
+        Duration::ZERO,
+        &["validation active\n", "state idle, connected"],
+    );
+    let config = fs::read_to_string(s.config_path()).expect("config");
+    let first = s.fake.block("", "");
+    let r = Reloader {
+        s: &s,
+        config,
+        first,
+    };
+
+    // The preflight asks the next `--version`; the start, right after it,
+    // finds another release.
+    s.fake
+        .switch_version(s.fake.version_checks() + 2, "Routinator 0.14.1");
+    let changed = s.fake.block("", "refresh 300;");
+    let (out, ok) = r.reload(&changed);
+    assert!(
+        ok && out.contains(
+            "rpki: cannot start the sidecar (rpki sidecar: Routinator 0.14.1 is not supported"
+        ) && out.contains("); validation disabled"),
+        "{out}"
+    );
+    assert_eq!(s.fake.serving(), Vec::<u32>::new());
+    s.wait_for_states(Duration::from_secs(10), &DISABLED);
+    s.wait_for_rpki(
+        Duration::ZERO,
+        &[
+            "mode sidecar\n",
+            "validation off\n",
+            "sidecar not running\n",
+        ],
+    );
+    let status = s.ctl(&["show", "status"]).0;
+    assert!(
+        status.contains(
+            "rpki sidecar, validation off\nalarm rpki sidecar not running: validation is off\n"
+        ),
+        "{status}"
+    );
+    let body = s.http("/v1/status");
+    assert!(
+        body.contains("\"alarms\":[\"rpki-sidecar-not-running\"]"),
+        "{body}"
+    );
+
+    // The same file again: the block is checked again, and the reload
+    // fails while the binary is of the other release.
+    let (out, ok) = r.reload(&changed);
+    assert!(
+        !ok && out.contains("Routinator 0.14.1 is not supported"),
+        "{out}"
+    );
+    assert_eq!(s.fake.serving(), Vec::<u32>::new());
+    assert_eq!(s.fake.invocations().len(), 1, "{}", s.report());
+
+    // Fixed: the same file starts it, and the alarm goes.
+    s.fake.set_version("Routinator 0.15.2");
+    let (out, ok) = r.reload(&changed);
+    assert!(ok && out.contains("rpki: sidecar started"), "{out}");
+    s.wait_for_rpki(
+        Duration::from_secs(20),
+        &[
+            "validation active\n",
+            "sidecar running pid ",
+            "state idle, connected",
+        ],
+    );
+    s.wait_for_states(Duration::from_secs(10), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    let status = s.ctl(&["show", "status"]).0;
+    assert!(
+        status.contains("rpki sidecar, validation active\n") && !status.contains("alarm"),
+        "{status}"
+    );
+    let starts = s.fake.invocations();
+    assert_eq!(starts.len(), 2, "{}", s.report());
+    assert!(
+        starts[1].contains(&"--refresh=300".to_owned()),
+        "{starts:?}"
+    );
+    assert_eq!(s.count("session established"), 1, "{}", s.report());
+}
