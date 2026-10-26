@@ -11,8 +11,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 7911. RFC 4271 has five rows
-> open. Two need the host's interfaces and routes, which bgpfc does not track,
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911 and 8538. RFC 4271 has
+> five rows open. Two need the host's interfaces and routes, which bgpfc does not track,
 > so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
 > and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
 > a received next hop is checked against our own address on that session, not
@@ -23,8 +23,10 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
 > link-local next hop, which §3 asks for where it shares a subnet with the next
 > hop and the peer. RFC 9234 has one partial row too: a route learned over a
-> session with no BGP Role carries no Only to Customer mark (§3.1). Nothing
-> else is claimed.
+> session with no BGP Role carries no Only to Customer mark (§3.1). So has RFC
+> 4724: the Restart State bit is set after a restart that kept forwarding
+> state, and a restart that kept none is not told from a first start (§4.1).
+> Nothing else is claimed.
 
 ### What works
 
@@ -58,6 +60,26 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 - BGP Roles and the Only to Customer attribute (RFC 9234, `role` per neighbor),
   with the Role Mismatch NOTIFICATION and an optional strict mode; interop
   tests against BIRD 2.14.
+- Graceful Restart (RFC 4724 with the Notification support of RFC 8538), per
+  neighbor and off unless `graceful-restart yes;` is set
+  ([`docs/config.md`](docs/config.md), "Graceful Restart"). As a Receiving
+  Speaker bgpfcd keeps the routes of a neighbor whose session ended by a TCP
+  failure, a hold timer expiry or, where both sides sent the N bit, any
+  NOTIFICATION but a Hard Reset, as stale routes in the RIB, the kernel and
+  what other neighbors were told; they are replaced as the neighbor sends
+  them again and the rest go at its End-of-RIB, at the end of its Restart
+  Time or of `stale-time`, or at once if it comes back without the
+  Forwarding State bit. After bgpfcd itself restarts in install mode with its
+  routes still in the kernel, it sets the Restart State and Forwarding State
+  bits, defers route selection until the neighbors' End-of-RIB or the longest
+  `restart-time`, and then removes from the kernel only the routes it did not
+  learn again. `bgpfcctl clear neighbor ADDR hard-reset` sends a Hard Reset.
+  A Hard Reset also goes out when bgpfcd shuts down or removes a neighbor, and
+  when a neighbor exceeds its prefix limit. A `SIGTERM` is an administrative
+  shutdown that takes its routes out of the kernel; crashes and kills are what
+  the kept routes are for. Tested against BIRD 2.14 and FRR 8.4 in both
+  directions; the IPv6 variant that installs routes runs where the kernel has
+  IPv6.
 - An RFC 6811 origin validation state on every route, from VRPs fetched over
   RTR (RFC 8210, falling back to RFC 6810) from the caches of an `rpki` block,
   with failover in order of preference; `bgpfcctl show rpki` reports the
@@ -143,8 +165,8 @@ operator's policy that keeps it from a provider (the `partial` row of
 ### Later
 
 ASPA (planned for v1.1.0), origin validation on export (RFC 8893),
-RFC 8212 default policy, graceful restart (RFC 4724),
-route reflection (RFC 4456), multipath, and TCP-MD5/TCP-AO.
+RFC 8212 default policy, route reflection (RFC 4456), multipath, and
+TCP-MD5/TCP-AO.
 
 The full reference list is in [`RESOURCES.md`](RESOURCES.md).
 

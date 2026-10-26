@@ -25,10 +25,10 @@ PS is Proposed Standard and DS is Draft Standard.
 
 ## Where bgpfc stands
 
-Of the 154 RFCs below, 21 are `done`, 7 `partial`,
-18 `later`, 47 `no` and 61 `n/a`.
+Of the 154 RFCs below, 22 are `done`, 8 `partial`,
+16 `later`, 47 `no` and 61 `n/a`.
 
-**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 7911, 8092, 8212, 8654, 8950, 9003, 9072, 9687, 9774.
+**Done:** 1997, 2918, 4360, 4486, 4760, 5396, 5492, 5668, 6608, 6793, 7606, 7607, 7911, 8092, 8212, 8538, 8654, 8950, 9003, 9072, 9687, 9774.
 
 **Partial, with what is left:**
 
@@ -38,6 +38,13 @@ Of the 154 RFCs below, 21 are `done`, 7 `partial`,
   §9.2.1.1); its row below says how.
 - RFC 2545: bgpfc never sends a link-local next hop (§3, MUST), as it
   cannot tell when it shares a subnet with the next hop and the peer.
+- RFC 4724: Graceful Restart, as a Receiving Speaker and as a Restarting
+  Speaker with forwarding state kept in the kernel (AGENTS.md §9 step 16).
+  The one MUST row not `done` is §4.1's Restart State bit: it is set after
+  a restart that kept forwarding state, and a restart that kept none is not
+  told from a first start. Open SHOULD rows: the Restart Time default is
+  120 s, not at most the Hold Time (§4), and the End-of-RIB marker goes only
+  to neighbors with `graceful-restart yes` (§2).
 - RFC 6811: every route carries its validation state, from VRPs fetched
   over RTR (§2, §4). Missing: a policy match on the state (§3, MUST) and
   acting on it, AGENTS.md §9 step 13.
@@ -61,7 +68,7 @@ Of the 154 RFCs below, 21 are `done`, 7 `partial`,
 - RFC 8212 is met by design (see its row) but is still listed as later
   work and has no rows in COMPLIANCE.md.
 
-**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 4724, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8481, 8538, 8893, 9494, 10005.
+**Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8481, 8893, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
 `bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
@@ -179,15 +186,15 @@ RFC 4360 is being replaced by rfc4360-bis, which is in the RFC Editor queue.
 | [5065](https://datatracker.ietf.org/doc/html/rfc5065) | Autonomous System Confederations for BGP | DS; updated by 9774 | `later` | AGENTS.md §9. The codec already knows the confederation segment types and counts them as §5.3 says. |
 | [5291](https://datatracker.ietf.org/doc/html/rfc5291) | Outbound Route Filtering Capability for BGP-4 | PS | `no` |  |
 | [5292](https://datatracker.ietf.org/doc/html/rfc5292) | Address-Prefix-Based Outbound Route Filter for BGP-4 | PS | `no` |  |
-| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `done` | Send and receive, per neighbor and family, for IPv4 and IPv6 unicast (AGENTS.md §9 step 15); every path received takes part in the decision process and the FIB still gets the one best path. Open in [COMPLIANCE.md](../COMPLIANCE.md): §5, keeping a receiver's forwarding plane steady across a graceful restart (SHOULD, todo until graceful restart, step 16). |
+| [7911](https://datatracker.ietf.org/doc/html/rfc7911) | Advertisement of Multiple Paths in BGP | PS | `done` | Send and receive, per neighbor and family, for IPv4 and IPv6 unicast (AGENTS.md §9 step 15); every path received takes part in the decision process and the FIB still gets the one best path. Path Identifiers need not be stable across a restart: stale paths are replaced by prefix and identifier and the rest go at the End-of-RIB (§5, with graceful restart). |
 | [5004](https://datatracker.ietf.org/doc/html/rfc5004) | Avoid BGP Best Path Transitions from One External to Another | PS | `no` | Would make the Loc-RIB depend on arrival order, against the RIB invariant in AGENTS.md §5. |
 | [7947](https://datatracker.ietf.org/doc/html/rfc7947) | Internet Exchange BGP Route Server | PS | `later` | RESOURCES.md, "Later: features". |
 | [1863](https://datatracker.ietf.org/doc/html/rfc1863) | A BGP/IDRP Route Server alternative to a full mesh routing | Historic; obsoleted by 4223 | `n/a` |  |
 | [4223](https://datatracker.ietf.org/doc/html/rfc4223) | Reclassification of RFC 1863 to Historic | Informational | `n/a` |  |
 | [2439](https://datatracker.ietf.org/doc/html/rfc2439) | BGP Route Flap Damping | PS | `no` |  |
 | [7196](https://datatracker.ietf.org/doc/html/rfc7196) | Making Route Flap Damping Usable | PS | `no` |  |
-| [4724](https://datatracker.ietf.org/doc/html/rfc4724) | Graceful Restart Mechanism for BGP | PS; updated by 8538 | `later` | AGENTS.md §9. Only the profiling build and `bgpfc-bench` recognise End-of-RIB. |
-| [8538](https://datatracker.ietf.org/doc/html/rfc8538) | Notification Message Support for BGP Graceful Restart | PS | `later` | Comes with graceful restart. |
+| [4724](https://datatracker.ietf.org/doc/html/rfc4724) | Graceful Restart Mechanism for BGP | PS; updated by 8538 | `partial` | Per neighbor with `graceful-restart yes` (AGENTS.md §9 step 16): the Receiving Speaker procedures (§4.2) and, in install mode with routes of our protocol number left in the kernel, the Restarting Speaker's (§4.1). Open in [COMPLIANCE.md](../COMPLIANCE.md): the Restart State bit after a restart that kept no forwarding state (§4.1, MUST, partial); the default Restart Time (§4) and the End-of-RIB marker for neighbors without the option (§2) deviate (SHOULD). |
+| [8538](https://datatracker.ietf.org/doc/html/rfc8538) | Notification Message Support for BGP Graceful Restart | PS | `done` | The N bit, graceful NOTIFICATIONs, the Hard Reset (Cease subcode 9) sent by `bgpfcctl clear neighbor ADDR hard-reset` and as RFC 8538 §5.1 suggests, and the stale timer (`stale-time`). Open SHOULD: the Forwarding State bit is clear in dry-run mode, where nothing is installed (§4). |
 | [9494](https://datatracker.ietf.org/doc/html/rfc9494) | Long-Lived Graceful Restart for BGP | PS | `later` | RESOURCES.md, "Later: features". |
 | [3345](https://datatracker.ietf.org/doc/html/rfc3345) | Border Gateway Protocol (BGP) Persistent Route Oscillation Condition | Informational | `n/a` |  |
 | [7964](https://datatracker.ietf.org/doc/html/rfc7964) | Solutions for BGP Persistent Route Oscillation | PS | `no` | The fixes rely on ADD-PATH or route reflection. |
