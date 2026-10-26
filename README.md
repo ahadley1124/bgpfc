@@ -12,14 +12,17 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
 > 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774, 7911 and 8538. RFC 4271 has
-> five rows open. Two need the host's interfaces and routes, which bgpfc does not track,
-> so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
+> six rows open. Two need the host's interfaces and routes, which bgpfc does not
+> track, so the kernel's verdict is logged instead: next-hop resolvability (§9.1.2),
 > and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is partial:
 > a received next hop is checked against our own address on that session, not
-> against every address of the host (§6.3 a). Two are deliberate deviations: a
+> against every address of the host (§6.3 a). Three are deliberate deviations: a
 > NOTIFICATION received in OpenSent closes the connection without an FSM error
-> in reply, as BIRD and FRR do (§8.2.2), and the MinRouteAdvertisementInterval
-> timer paces announcements but never holds back a withdrawal (§9.2.1.1). RFC
+> in reply, as BIRD and FRR do (§8.2.2), the MinRouteAdvertisementInterval
+> timer paces announcements but never holds back a withdrawal (§9.2.1.1), and
+> the TCP connection of a neighbor with `graceful-restart yes` stays open for
+> up to 3 s after our NOTIFICATION, until the neighbor has closed it, so that
+> the neighbor reads a Hard Reset as one (§4.5). RFC
 > 2545 has one partial row for the same lack of interfaces: bgpfc never sends a
 > link-local next hop, which §3 asks for where it shares a subnet with the next
 > hop and the peer. RFC 9234 has one partial row too: a route learned over a

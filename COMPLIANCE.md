@@ -59,6 +59,7 @@ is `done`.
 | 4.4 | KEEPALIVEs at most one per second; none when Hold Time is zero | MUST | done (KeepaliveTime ≥ Hold Time/3 ≥ 1 s; none at zero) | fsm/machine.rs `accept_open`, `start_session_timers` | fsm tests `hold_time_zero_disables_timers` |
 | 4.4 | May adjust the KEEPALIVE rate to the Hold Time | MAY | done (one third of the negotiated value) | fsm/machine.rs `accept_open` | fsm tests `open_negotiation` |
 | 4.5 | NOTIFICATION: code, subcode, data; connection closed after sending | MUST | done (codec; close is the FSM's) | wire/notification.rs | notification.rs `plain_notifications_round_trip` |
+| 4.5, 6 | The BGP connection is closed immediately after the NOTIFICATION is sent (§6: the TCP connection closed, the Adj-RIB-In cleared, the resources deallocated) | MUST | deviates (for a neighbor with `graceful-restart yes`, the TCP connection of an Established session stays open after our NOTIFICATION until the neighbor closes it, at most 3 s, and the next connection waits for that; the FSM, the Adj-RIB-In and the routes are dealt with at once, and §1 has the error notification assume a graceful TCP close that delivers all data first. A close right behind the NOTIFICATION is taken by FRR 8.4 under load for a failure of the transport, which keeps the routes of a Hard Reset (RFC 4724 §4.2, RFC 8538 §3.2). Any other neighbor: closed at once. NOTE(interop)) | bgpfcd/peer.rs `Linger`, `Peer::drop_conn`, `end_linger` | bgpfcd gr `a_hard_reset_waits_for_the_neighbor_to_close_before_the_connection_is_closed`, `a_neighbor_that_does_not_close_after_the_notification_is_closed_by_the_daemon`, `a_neighbor_without_graceful_restart_sees_the_connection_close_at_once`, interop gr `a_graceful_reset_keeps_the_routes_of_both_sides_and_a_hard_reset_deletes_them` |
 | 4.5 | Subcode 0 when the code defines none | MUST | done | wire/notification.rs `hold_timer_expired` | notification.rs `display_names` |
 | 4.5 | Minimum NOTIFICATION length is 21 octets | MUST | done | wire/header.rs `MessageType::min_len` | header.rs `length_bounds_carry_the_length_field_as_data` |
 | 6.4 | Errors in a received NOTIFICATION are logged, never answered | SHOULD | done (decoder never rejects; `is_recognised` for the log) | wire/notification.rs `decode`, `is_recognised` | notification.rs `unknown_codes_are_kept_and_flagged` |
@@ -405,7 +406,10 @@ NOTE(interop): BIRD 2.14 does not send the N bit, FRR 8.4 does; BIRD with
 `bird -R` (after `birdc graceful restart`) and FRR with `bgp graceful-restart
 preserve-fw-state` set the Restart State and Forwarding State bits; FRR
 without zebra sets the Restart State bit for as long as its own startup
-lasts, so bgpfcd does not wait for its End-of-RIB (§4.1). The defaults of
+lasts, so bgpfcd does not wait for its End-of-RIB (§4.1). FRR 8.4 under load
+reads a NOTIFICATION and the FIN behind it in one pass of its I/O thread and
+treats the pair as a TCP failure, which keeps the routes of a Hard Reset
+(RFC 4724 §4.2); bgpfcd closes only after FRR has (RFC 4271 §4.5 row). The defaults of
 `restart-time` (120 s, as BIRD and FRR) and `stale-time` (360 s, as FRR), and
 the Receiving Speaker procedures after a Hold Timer expiry without the N bit,
 are marked NOTE(interop) in the rows of RFC 4724 §4, RFC 8538 §4 and RFC 8538
