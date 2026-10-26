@@ -663,7 +663,7 @@ impl Peer {
             );
             return false;
         };
-        if !session.route_refresh {
+        if !session.route_refresh.peer_advertised() {
             bgpfc_log::warn!(
                 "route refresh: peer did not advertise the capability",
                 peer = self.cfg.addr

@@ -930,7 +930,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: false,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_receive: Vec::new(),

@@ -914,7 +914,7 @@ fn write_neighbor(
                 .field_num("keepalive_time", s.keepalive_time.as_secs())
                 .field_bool("four_octet_as", s.four_octet_as)
                 .field_bool("extended_messages", s.extended_messages)
-                .field_bool("route_refresh", s.route_refresh);
+                .field_bool("route_refresh", s.route_refresh.peer_advertised());
             write_role(j, s);
             j.key("families").begin_array();
             for f in &s.families {
@@ -1186,7 +1186,9 @@ fn render_neighbor(
         ));
         lines.push(format!(
             "  capabilities four-octet-as={} extended-messages={} route-refresh={}",
-            s.four_octet_as, s.extended_messages, s.route_refresh
+            s.four_octet_as,
+            s.extended_messages,
+            s.route_refresh.peer_advertised()
         ));
         if let Some(local) = s.role {
             lines.push(format!(
@@ -1861,7 +1863,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: true,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
             extended_next_hop_receive: vec![AddressFamily::IPV4_UNICAST],
@@ -1982,7 +1984,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: true,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![v4, v6],
             receive_families: vec![v4, v6],
             extended_next_hop_receive: Vec::new(),
@@ -2105,7 +2107,7 @@ mod tests {
                 keepalive_time: Duration::from_secs(30),
                 four_octet_as: true,
                 extended_messages: false,
-                route_refresh: true,
+                route_refresh: bgpfc_fsm::RouteRefresh::Supported,
                 families: vec![v4, v6],
                 receive_families: vec![v4, v6],
                 extended_next_hop_receive: Vec::new(),
@@ -2298,7 +2300,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: false,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![AddressFamily::IPV4_UNICAST],
             receive_families: vec![AddressFamily::IPV4_UNICAST],
             extended_next_hop_receive: Vec::new(),
@@ -2378,7 +2380,7 @@ mod tests {
             keepalive_time: Duration::from_secs(30),
             four_octet_as: true,
             extended_messages: false,
-            route_refresh: true,
+            route_refresh: bgpfc_fsm::RouteRefresh::Supported,
             families: vec![v4, v6],
             receive_families: vec![v4, v6],
             extended_next_hop_receive: Vec::new(),
