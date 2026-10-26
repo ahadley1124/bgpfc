@@ -183,10 +183,12 @@ pub(crate) fn sidecar_config(s: &ast::RpkiSidecar) -> SidecarConfig {
 ///   the `sidecar` block changes: bgpfcd is not root, since root now means
 ///   that no `--user` dropped it ([`privileges::sidecar_as_root`]); the
 ///   repository directory can be created; and [`Sidecar::check`] passes,
-///   the settings and the binary's `--version` (issue #72). Without this,
-///   a reload onto a Routinator that cannot start would stop the running
-///   one first, and only then fail. A change to the client's settings
-///   alone starts no Routinator and checks none of this.
+///   the settings, the binary's `--version` (issue #72) and the
+///   `rtr-listen` address, bound with port 0 as the start binds it.
+///   Without this, a reload onto a Routinator that cannot start would
+///   stop the running one first, and only then fail. A change to the
+///   client's settings alone starts no Routinator and checks none of
+///   this.
 ///
 /// # Errors
 /// What fails, for the reload's error.
@@ -2001,6 +2003,66 @@ mod tests {
         assert!(ran.exists() && fresh.is_dir());
         assert!(r.rx.try_recv().is_err());
         r.rpki.stop();
+    }
+
+    /// A reload onto an `rtr-listen` address this host cannot bind, such as
+    /// `::1` without IPv6, fails the preflight as it would fail the start,
+    /// so the running Routinator and its client go on; where the host can
+    /// bind it, both pass. Before the preflight bound the address, such a
+    /// reload stopped the working Routinator, failed to start the new one,
+    /// and left validation off.
+    #[test]
+    fn an_rtr_address_that_cannot_be_bound_fails_the_preflight() {
+        let mut r = Running::new("unbindable");
+        let v6 = |port: u16| {
+            config(&format!(
+                "rpki {{ mode sidecar; sidecar {{ binary \"{}\"; repository-dir \"{}\"; \
+                 rtr-listen ::1 port {port}; }} }}",
+                r.binary.display(),
+                r.dir.join("repo").display()
+            ))
+        };
+        let bindable = TcpListener::bind("[::1]:0").is_ok();
+        for (port, action) in [
+            (0, "picking a free RTR port"),
+            (3323, "trying the RTR address"),
+        ] {
+            let new = v6(port);
+            let checked = preflight_as(&r.cfg.rpki, &new.rpki, false);
+            if bindable {
+                assert_eq!(checked, Ok(()), "{port}");
+            } else {
+                let err = checked.unwrap_err();
+                assert!(
+                    err.starts_with(&format!("rpki sidecar: {action}: ")),
+                    "{port}: {err}"
+                );
+            }
+        }
+        assert_eq!(routinator_pid(&r.rpki), r.pid, "the running one goes on");
+        assert!(r.rpki.status().is_some_and(|s| s.connected));
+        r.conn
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0; 16];
+        assert!(r.conn.read(&mut buf).is_err(), "the client is untouched");
+        assert!(r.rx.try_recv().is_err());
+        // What the reload then does: the start agrees with the preflight.
+        let new = v6(0);
+        if bindable {
+            assert_eq!(
+                r.rpki.reconfigure(&r.cfg.rpki, &new.rpki),
+                Ok("rpki: sidecar restarted")
+            );
+        } else {
+            let err = r.rpki.reconfigure(&r.cfg.rpki, &new.rpki).unwrap_err();
+            assert!(
+                err.starts_with("rpki: cannot start the sidecar (rpki sidecar: picking a free"),
+                "{err}"
+            );
+        }
+        r.rpki.stop();
+        assert!(!alive(r.pid));
     }
 
     /// The preflight checks only what the reload will start: new external
