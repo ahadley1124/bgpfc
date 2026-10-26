@@ -586,12 +586,15 @@ parents it lacks, mode 0750, before it starts Routinator.
 
 At start, after the privilege drop and before any neighbor starts,
 bgpfcd creates the repository directory, runs `routinator --version`,
-which must name a 0.15 release within ten seconds, picks the RTR port if
+which must name a 0.15 release within ten seconds, binds the `rtr-listen`
+address with port 0 and closes it again, which picks the RTR port if
 `rtr-listen` leaves it at 0, and starts Routinator; then its RTR client
 connects to Routinator's address. If one of these steps fails (a binary
-that is missing, does not run or is another release, or a repository
-directory that cannot be created), bgpfcd logs `cannot start rpki` with
-the reason and exits with status 1 (issue #60: fail loudly and early).
+that is missing, does not run or is another release, an `rtr-listen`
+address this host cannot bind, such as `::1` without IPv6, or a
+repository directory that cannot be created), bgpfcd logs `cannot start
+rpki` with the reason and exits with status 1 (issue #60: fail loudly and
+early).
 Routinator's standard output is logged at info and its standard error,
 where it writes its warnings, at warn, each line with
 `sidecar=routinator`. When bgpfcd stops, it stops its RTR client, then
@@ -885,10 +888,12 @@ start of Routinator costs a validation run before it listens again:
 
 Before anything changes, a reload that would start Routinator checks what
 the start checks: bgpfcd must not be root (it is not, after `--user`),
-the repository directory is created, and `routinator --version` must name
-a 0.15 release (issue #72). If one fails, the reload fails, the running
-configuration is kept, and the running Routinator goes on serving: a
-reload onto a binary that would not start never stops the one that works.
+the repository directory is created, `routinator --version` must name a
+0.15 release (issue #72), and the `rtr-listen` address must bind with
+port 0, so that the port the running Routinator holds is no obstacle. If
+one fails, the reload fails, the running configuration is kept, and the
+running Routinator goes on serving: a reload onto a binary that would not
+start never stops the one that works.
 Should Routinator still fail to start after that, as when the binary
 changes in between, the reload goes ahead with validation off, every
 route `disabled`, and its summary and an error line say so; a later
