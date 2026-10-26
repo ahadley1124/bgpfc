@@ -509,7 +509,8 @@ no `enforcement` holds a `disabled` route, and withdrawn once the VRPs
 make it Invalid; an import policy that rejects on `match rpki not-found`
 holds it instead until they give it a state it accepts. A
 cache on the router or near it answers well before a BGP session comes up,
-so this window is normally empty; BIRD and FRR behave the same way. The
+so this window is normally empty (see **Startup window** below); BIRD
+and FRR behave the same way. The
 client logs with the rest of the daemon, at the `log` level: losing a cache
 is a warning, its return an info line, and VRPs that expire before a cache
 could refresh them an error.
@@ -527,8 +528,16 @@ so that a validator that restarts is picked up within seconds (issue #57),
 and reaches 600 seconds by the eleventh failure in a row. `backoff 600
 600` keeps to the RFC's default. With `mode sidecar` the default is
 `backoff 1 30`: the cache is bgpfcd's own child on loopback, which starts
-to listen only once its first validation run has ended, and the client
-should not then wait minutes more to try it.
+to listen only once its first validation run has ended, minutes after it
+starts from a cold repository, and the client should not then wait
+minutes more to try it. With `1 600`, a client that starts with a cold
+Routinator would have backed off to about 511 seconds by the time
+Routinator listens, and could find it up to about 15 minutes later; with
+`1 30` it finds it within about 45 seconds. Each attempt costs a SYN and a
+RST on loopback and one warning line, about 25 lines over a ten-minute
+cold start. This departs further from the Retry Interval of RFC 8210 §6,
+for a cache that is the router's own child; write `backoff` to choose
+otherwise.
 
 **The Routinator sidecar.** With `mode sidecar`, bgpfcd runs Routinator,
 the RPKI relying-party software of NLnet Labs, as a child process: it
@@ -593,6 +602,52 @@ Routinator: `SIGTERM`, and `SIGKILL` after `stop-timeout`. If bgpfcd dies
 without stopping it, the kernel kills Routinator too (`PR_SET_PDEATHSIG`).
 Nothing else in bgpfcd reaps child processes, which is what lets the
 sidecar keep track of its own.
+
+**Startup window.** Until the RTR client's first full set arrives there
+are no VRPs, and every route is `disabled`: shown so, not as `not-found`,
+and used as received, since no `enforcement` acts on `disabled`. With an
+external cache on the router or near it, the window is normally too short
+to matter. With the sidecar it is long: Routinator opens its RTR listener
+only once its first validation run has ended, minutes after it starts
+from a cold repository directory, less from a warm one. bgpfcd does not
+wait for it: the neighbors come up at once and their routes are used,
+unvalidated. When the first set arrives, every route is validated (RFC
+6811 §4) and `enforcement` acts on the result, so that under
+`drop-invalid` the Invalid routes are then held and withdrawn from the
+neighbors and the kernel. Holding every route until then without being
+told to is what RFC 6811 §2 forbids ("MUST NOT exclude a route from the
+Adj-RIB-In or from consideration in the decision process as a side effect
+of its validation state, unless explicitly configured to do so"), and on a
+transit router it would black-hole the whole table for the minutes of a
+cold start after every reboot; BIRD and FRR converge the same way. The
+window is not silent (issue #71). When a client starts with no data to
+hold, bgpfcd logs `rpki: no validation data yet; routes are used
+unvalidated until the first full set` with the mode and the
+`enforcement`: at warn with `mode sidecar`, with a hint about
+Routinator's first run, and at info with `mode external`, whose window is
+normally a moment. When the first set arrives it logs `rpki: validation
+data arrived; routes are validated from now on` with `waited=`, the
+seconds the routes waited; the RIB's `rib: validation states changed` line
+follows, with the routes held and released. A reload from `mode
+disabled` opens the window again. A reload that restarts the client
+does not, since the data in use stays in use until the new set arrives.
+
+To hold the routes until the first set instead, say so in each import
+policy, first:
+
+```
+policy UPSTREAM-IN {
+    term unvalidated { match rpki disabled; action reject; }   # held until the first full set
+    ...
+}
+```
+
+During the window every route is then held by policy (`show routes
+held`), and none is used. When the first set arrives they are judged
+again: under `drop-invalid`, the Valid and `not-found` routes are used and
+the Invalid ones stay held. VRPs that expire give `not-found`, not
+`disabled`, so this holds routes before the first set only, not after the
+data expires; with `mode disabled` it holds every route for good.
 
 The `sidecar` block takes these statements, each at most once:
 

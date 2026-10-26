@@ -68,6 +68,8 @@ use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_config::{ConfigError, Pos};
@@ -325,12 +327,30 @@ fn start_sidecar(s: &ast::RpkiSidecar) -> Result<Sidecar, String> {
 
 /// Where the client publishes: the RIB thread's bounded channel. A send
 /// waits while the channel is full, and fails once the RIB thread is
-/// gone, which stops the client.
-fn sink(rib: SyncSender<RibMsg>) -> impl ValidationSink {
+/// gone, which stops the client. The first change ends the wait for
+/// validation data, if routes were waiting, and says so (issue #71: the
+/// startup window is not silent; m14 design §3.3).
+fn sink(rib: SyncSender<RibMsg>, waiting: Arc<Mutex<Option<Instant>>>) -> impl ValidationSink {
     move |change: ValidationChange| {
+        let since = lock(&waiting).take();
+        if let Some(since) = since {
+            // The RIB's `rib: validation states changed` line follows,
+            // and the client's `rtr validation data committed`, with the
+            // number of VRPs, came just before.
+            bgpfc_log::info!(
+                "rpki: validation data arrived; routes are validated from now on",
+                waited = format!("{}s", since.elapsed().as_secs())
+            );
+        }
         rib.send(RibMsg::Validation(change))
             .map_err(|_| RpkiError::SinkClosed)
     }
+}
+
+/// The lock, also after a panic elsewhere: nothing that holds it can
+/// panic halfway through an update.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The running `rpki` block: the RTR client, if its mode has one, and
@@ -342,6 +362,11 @@ pub(crate) struct Rpki {
     client: Option<Client>,
     /// Routinator, supervised; the client's one cache.
     sidecar: Option<Sidecar>,
+    /// Since when every route has waited for the first full set, unused
+    /// for validation: set when a client starts with no data to hold,
+    /// cleared by the first change it publishes, or when validation is
+    /// disabled (m14 design §3.3).
+    waiting: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Rpki {
@@ -367,6 +392,7 @@ impl Rpki {
             router_id,
             client: None,
             sidecar: None,
+            waiting: Arc::default(),
         };
         if config.mode == RpkiMode::Sidecar {
             rpki.sidecar = Some(start_sidecar(&config.sidecar)?);
@@ -380,7 +406,8 @@ impl Rpki {
     }
 
     /// A client for `config`, holding `held`, if its mode runs one; with
-    /// `mode sidecar`, at the running sidecar's address.
+    /// `mode sidecar`, at the running sidecar's address. A client with no
+    /// data to hold leaves the routes waiting for its first full set.
     fn spawn_client(&self, config: &ast::Rpki, held: Option<Held>) -> io::Result<Option<Client>> {
         let sidecar = self.sidecar.as_ref().map(Sidecar::rtr_addr);
         let Some(client_config) = client_config(config, self.router_id, sidecar) else {
@@ -397,8 +424,41 @@ impl Rpki {
             version = config.version,
             held_vrps = held.as_ref().map_or(0, |h| h.vrps.len())
         );
-        let client = Client::start_holding(client_config, sink(self.rib.clone()), held)?;
+        if held.is_none() {
+            self.wait_for_data(config);
+        }
+        let sink = sink(self.rib.clone(), Arc::clone(&self.waiting));
+        let client = Client::start_holding(client_config, sink, held)?;
         Ok(Some(client))
+    }
+
+    /// Note that the routes wait for the first full set, from now unless
+    /// they waited already, and say so (issue #71). Until it arrives every
+    /// route is `disabled`, used as received: RFC 6811 §2 lets no route
+    /// leave route selection for its state without configuration, and the
+    /// import-policy term `match rpki disabled; action reject;` is that
+    /// configuration for those who want routes held instead (m14 design
+    /// §3.2). With the sidecar the wait is Routinator's first validation
+    /// run, minutes from a cold repository, so it is a warning; an
+    /// external cache answers within a moment, which is no news.
+    fn wait_for_data(&self, config: &ast::Rpki) {
+        const WAITING: &str =
+            "rpki: no validation data yet; routes are used unvalidated until the first full set";
+        lock(&self.waiting).get_or_insert_with(Instant::now);
+        if config.mode == RpkiMode::Sidecar {
+            bgpfc_log::warn!(
+                WAITING,
+                mode = config.mode,
+                enforcement = config.enforcement,
+                hint = "Routinator serves RTR once its first validation run ends: minutes from a cold cache"
+            );
+        } else {
+            bgpfc_log::info!(
+                WAITING,
+                mode = config.mode,
+                enforcement = config.enforcement
+            );
+        }
     }
 
     /// Apply `new`, the block of a reloaded configuration, in place of
@@ -460,8 +520,10 @@ impl Rpki {
         }
     }
 
-    /// Turn validation off in the RIB: every route `disabled`.
+    /// Turn validation off in the RIB: every route `disabled`, and no
+    /// longer waiting for data.
     fn disable(&self) {
+        *lock(&self.waiting) = None;
         bgpfc_log::info!("rpki: validation disabled; every route is disabled again");
         // A RIB thread that is gone has no routes to tell.
         let _ = self
@@ -1314,6 +1376,65 @@ mod tests {
         Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    /// Since when the routes have waited for the first full set.
+    fn waiting(rpki: &Rpki) -> Option<Instant> {
+        *lock(&rpki.waiting)
+    }
+
+    /// Issue #71, m14 design §3.3: a client that starts with no data
+    /// leaves the routes waiting until its first full set; one that takes
+    /// data over does not; disabling validation ends the wait.
+    #[test]
+    fn validation_waits_for_the_first_full_set() {
+        let first = StubCache::new();
+        let cfg = config(&first.block());
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&cfg.rpki, cfg.router_id, tx).unwrap();
+        let since = waiting(&rpki).expect("waiting from the start");
+        // Until the cache answers, nothing ends the wait.
+        let (mut conn, query) = first.accept();
+        assert!(matches!(query, Pdu::ResetQuery { .. }), "{query:?}");
+        assert_eq!(waiting(&rpki), Some(since));
+        drop(conn);
+        let _conn = first.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        next_change(&rx);
+        assert_eq!(waiting(&rpki), None);
+
+        // A new cache list: the new client holds the old data, which stays
+        // in use until the new cache answers, so nothing waits.
+        let second = StubCache::new();
+        let moved = config(&second.block());
+        assert_eq!(
+            rpki.reconfigure(&cfg.rpki, &moved.rpki),
+            Ok("rpki: rtr client restarted")
+        );
+        let (mut taken_over, _) = second.accept();
+        assert_eq!(waiting(&rpki), None);
+
+        // Back from `mode disabled` there is nothing to hold: the routes
+        // wait again, and disabling ends that.
+        let off = config("rpki { mode disabled; }");
+        assert_eq!(
+            rpki.reconfigure(&moved.rpki, &off.rpki),
+            Ok("rpki: validation disabled")
+        );
+        assert!(closed(&mut taken_over));
+        next_change(&rx);
+        assert_eq!(
+            rpki.reconfigure(&off.rpki, &moved.rpki),
+            Ok("rpki: rtr client started")
+        );
+        assert!(waiting(&rpki).is_some());
+        conn = second.accept().0;
+        assert_eq!(
+            rpki.reconfigure(&moved.rpki, &off.rpki),
+            Ok("rpki: validation disabled")
+        );
+        assert!(closed(&mut conn));
+        assert_eq!(waiting(&rpki), None);
+        rpki.stop();
+    }
+
     /// Issue #71: with `mode sidecar` the client's one cache is the
     /// sidecar's loopback address, with the block's client settings and
     /// the sidecar's own back-off default.
@@ -1386,9 +1507,11 @@ mod tests {
         assert_eq!(sidecar.status().rtr, rtr);
         assert_eq!(sidecar.version(), TESTED_VERSION);
         let pid = routinator_pid(&rpki);
+        assert!(waiting(&rpki).is_some(), "routes wait for Routinator");
 
         let mut conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
         let change = next_change(&rx);
+        assert_eq!(waiting(&rpki), None);
         assert_eq!(change.affected, AffectedPrefixes::All);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Valid);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_497), RovState::Invalid);
