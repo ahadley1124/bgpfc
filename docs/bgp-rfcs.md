@@ -68,7 +68,8 @@ Of the 154 RFCs below, 24 are `done`, 7 `partial`,
 **Later** (needs the maintainer's go-ahead): 2385, 4364, 4456, 4659, 4684, 5065, 6514, 7313, 7432, 7705, 7947, 8097, 8893, 9494, 10005.
 
 Not in the list but used by bgpfc: RFC 8210 and RFC 6810 (RTR, which
-`bgpfc-rtr` speaks to fetch VRPs), RFC 6483 and RFC 9319 (tracked in
+`bgpfc-rtr` speaks to fetch VRPs, also from the Routinator sidecar on the
+loopback), RFC 6483 and RFC 9319 (tracked in
 COMPLIANCE.md beside RFC 6811), RFC 6396 (MRT, read by `bgpfc-bench`),
 and for the control plane RFC 8259 (JSON), RFC 9112 (HTTP/1.1) and
 RFC 6750 (bearer tokens).
@@ -250,9 +251,9 @@ These come from GROW, SIDR/SIDROPS, L3VPN/BESS, IDR-adjacent work and BCPs. This
 | [9736](https://datatracker.ietf.org/doc/html/rfc9736) | The BGP Monitoring Protocol (BMP) Peer Up Message Namespace | PS | `no` |  |
 | [9972](https://datatracker.ietf.org/doc/html/rfc9972) | Advanced BGP Monitoring Protocol (BMP) Statistics Types | PS | `no` |  |
 | [6397](https://datatracker.ietf.org/doc/html/rfc6397) | Multi-Threaded Routing Toolkit (MRT) Border Gateway Protocol (BGP) Routing Information Export Format with Geo-Location Extensions | PS | `no` | `bgpfc-bench` reads RFC 6396 `TABLE_DUMP_V2` dumps for benchmarks; the daemon has no MRT export. |
-| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `done` | Every route is validated on arrival and again when the VRPs change (§2, §4), against VRPs fetched over RTR (RFC 8210). Policy matches and sets the state (§3), and the `invalid` statement of the `rpki` block drops Invalid routes or lets them lose in the decision process (§5). The SHOULD that an unvalidated route start as NotFound deviates: it is `disabled`. |
+| [6811](https://datatracker.ietf.org/doc/html/rfc6811) | BGP Prefix Origin Validation | PS; updated by 8481, 8893 | `done` | Every route is validated on arrival and again when the VRPs change (§2, §4), against VRPs fetched over RTR (RFC 8210) from external caches or from a Routinator that bgpfcd runs and supervises (`mode sidecar`). Policy matches and sets the state (§3), and the `invalid` statement of the `rpki` block drops Invalid routes or lets them lose in the decision process (§5). The SHOULD that an unvalidated route start as NotFound deviates: it is `disabled`. |
 | [8097](https://datatracker.ietf.org/doc/html/rfc8097) | BGP Prefix Origin Validation State Extended Community | PS | `later` | RPKI. Matchable today as a hex extended community. |
-| [8481](https://datatracker.ietf.org/doc/html/rfc8481) | Clarifications to BGP Origin Validation Based on Resource Public Key Infrastructure (RPKI) | PS; updated by 9324 | `done` | Every route is evaluated whatever its source (§4); the RIB acts on the state only as the operator's `invalid` statement says, which an `external` `rpki` block must give (§5, "Set State, Don't Act"). |
+| [8481](https://datatracker.ietf.org/doc/html/rfc8481) | Clarifications to BGP Origin Validation Based on Resource Public Key Infrastructure (RPKI) | PS; updated by 9324 | `done` | Every route is evaluated whatever its source (§4); the RIB acts on the state only as the operator's `invalid` statement says, which an `external` or `sidecar` `rpki` block must give (§5, "Set State, Don't Act"). |
 | [8893](https://datatracker.ietf.org/doc/html/rfc8893) | Resource Public Key Infrastructure (RPKI) Origin Validation for BGP Export | PS | `later` | RPKI, AGENTS.md §9. |
 | [8205](https://datatracker.ietf.org/doc/html/rfc8205) | BGPsec Protocol Specification | PS; updated by 8206 | `no` |  |
 | [8206](https://datatracker.ietf.org/doc/html/rfc8206) | BGPsec Considerations for Autonomous System (AS) Migration | PS | `no` |  |
