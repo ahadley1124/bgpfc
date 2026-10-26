@@ -6,10 +6,10 @@
 use super::*;
 use crate::{Deferral, PeerRestart, Restart, Retention, StaleEnd};
 
-const RESTART: Duration = Duration::from_secs(120);
+pub(super) const RESTART: Duration = Duration::from_secs(120);
 const STALE: Duration = Duration::from_secs(360);
 
-fn secs(n: u64) -> Duration {
+pub(super) fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
@@ -28,11 +28,11 @@ fn gr(mut info: PeerInfo, families: &[(AddressFamily, bool)]) -> PeerInfo {
 
 /// A Graceful Restart peer that preserved forwarding state for both
 /// families.
-fn gr_peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
+pub(super) fn gr_peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
     gr(peer(addr, remote_as, router_id), &[(V4, true), (V6, true)])
 }
 
-fn retention(notification: bool) -> Retention {
+pub(super) fn retention(notification: bool) -> Retention {
     Retention {
         families: vec![V4, V6],
         restart_time: RESTART,
@@ -52,7 +52,7 @@ fn stale_flags(rib: &Rib, prefix: &str) -> Vec<(IpAddr, bool)> {
         .collect()
 }
 
-fn removed(out: &[Output]) -> Vec<(IpAddr, Option<AddressFamily>, usize, StaleEnd)> {
+pub(super) fn removed(out: &[Output]) -> Vec<(IpAddr, Option<AddressFamily>, usize, StaleEnd)> {
     out.iter()
         .filter_map(|o| match o {
             Output::StaleRemoved {

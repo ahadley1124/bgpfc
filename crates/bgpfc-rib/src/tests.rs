@@ -28,6 +28,7 @@ mod restart;
 mod roles;
 mod roles_add_path;
 mod rov_add_path_roles;
+mod rov_restart;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
