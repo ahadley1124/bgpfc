@@ -2673,6 +2673,25 @@ mod tests {
             r.json
                 .contains(r#""best":true,"held":false,"stale":false,"rov":"valid""#)
         );
+        // RFC 4724 §4.2 and RFC 6811 §5 together: a stale route of a
+        // neighbor whose session ended can be held for its state too, and
+        // says both, in the order docs/control.md gives.
+        let mut both = route("192.0.2.0/24", "198.51.100.2", &[64_497], None, None);
+        both.rov = RovState::Invalid;
+        both.held = true;
+        both.stale = true;
+        let r = render_routes(&[both]);
+        assert!(
+            r.lines[1].ends_with("64497 via 198.51.100.2 held stale"),
+            "{}",
+            r.lines[1]
+        );
+        assert!(
+            r.json
+                .contains(r#""best":false,"held":true,"stale":true,"rov":"invalid""#),
+            "{}",
+            r.json
+        );
     }
 
     #[test]

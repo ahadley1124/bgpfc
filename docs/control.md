@@ -188,6 +188,13 @@ from the first session that is back until all End-of-RIB markers are in
 `neighbor` is `null` while the session is down or the neighbor sent no
 capability, and `stale` is `null` when no route of the neighbor is stale.
 
+A stale route is still in the Adj-RIB-In, so it is judged again like any
+other when the VRPs or the `invalid` statement change (see [Validation
+state](#validation-state)): under `invalid drop` one that turns `invalid`
+is held, out of the Loc-RIB, the kernel's table and what other neighbors
+were told, and `show routes PREFIX` ends its line in `held stale`. The
+End-of-RIB marker and the timers end it as they end the other stale routes.
+
 After a restart of bgpfcd itself with forwarding state kept (`docs/config.md`,
 "Graceful Restart"), route selection waits for the End-of-RIB markers of the
 neighbors that can send the routes again (RFC 4724 §4.1), and `show status`
