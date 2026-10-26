@@ -24,7 +24,7 @@ fn route(prefix: &str, remote_as: u32, otc: Option<u32>) -> DecodedUpdate {
 
 /// The Only to Customer attribute of the UPDATEs sent to `to`, one entry
 /// per announcement.
-fn sent_otc(out: &[Output], to: &PeerInfo) -> Vec<Option<Asn>> {
+pub(super) fn sent_otc(out: &[Output], to: &PeerInfo) -> Vec<Option<Asn>> {
     sends(out, to.addr)
         .into_iter()
         .flat_map(|m| decode_sent(m, to))
@@ -44,7 +44,7 @@ fn withdrawn_to(out: &[Output], to: &PeerInfo) -> Vec<Prefix> {
         .collect()
 }
 
-fn leaks(out: &[Output]) -> Vec<(IpAddr, Asn, usize, Prefix)> {
+pub(super) fn leaks(out: &[Output]) -> Vec<(IpAddr, Asn, usize, Prefix)> {
     out.iter()
         .filter_map(|o| match o {
             Output::RouteLeak {

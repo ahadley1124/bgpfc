@@ -26,6 +26,7 @@ mod adj_rib_in;
 mod invalid_drop;
 mod roles;
 mod roles_add_path;
+mod rov_add_path_roles;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
