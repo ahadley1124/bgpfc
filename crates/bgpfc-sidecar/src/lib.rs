@@ -7,7 +7,9 @@
 //! - [`Sidecar`]: the I/O shell. It checks the binary, picks the RTR
 //!   port, and spawns, restarts, signals and reaps Routinator on one
 //!   long-lived supervisor thread, logging what it prints and publishing
-//!   a [`SidecarStatus`].
+//!   a [`SidecarStatus`]. [`Sidecar::check`] runs the checks alone,
+//!   starting nothing, so that a reload can refuse settings or a binary
+//!   before it stops the running Routinator.
 //! - [`SidecarConfig`]: what to run and how to supervise it, checked by
 //!   [`SidecarConfig::validate`]: an absolute binary path that is never
 //!   looked up on `PATH` (issue #70), RTR on loopback only (issue #71).
