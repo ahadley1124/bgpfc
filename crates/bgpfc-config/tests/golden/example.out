@@ -42,7 +42,7 @@ Config {
     prefix_lists: [
         PrefixList {
             pos: Pos {
-                line: 32,
+                line: 37,
                 col: 1,
             },
             name: "BOGONS",
@@ -67,14 +67,14 @@ Config {
     policies: [
         Policy {
             pos: Pos {
-                line: 37,
+                line: 42,
                 col: 1,
             },
             name: "UPSTREAM-IN",
             terms: [
                 Term {
                     pos: Pos {
-                        line: 38,
+                        line: 43,
                         col: 5,
                     },
                     name: "no-bogons",
@@ -88,7 +88,7 @@ Config {
                 },
                 Term {
                     pos: Pos {
-                        line: 39,
+                        line: 44,
                         col: 5,
                     },
                     name: "rest",
@@ -104,14 +104,14 @@ Config {
         },
         Policy {
             pos: Pos {
-                line: 42,
+                line: 47,
                 col: 1,
             },
             name: "UPSTREAM-OUT",
             terms: [
                 Term {
                     pos: Pos {
-                        line: 43,
+                        line: 48,
                         col: 5,
                     },
                     name: "own",
@@ -129,7 +129,7 @@ Config {
                 },
                 Term {
                     pos: Pos {
-                        line: 44,
+                        line: 49,
                         col: 5,
                     },
                     name: "rest",
@@ -143,7 +143,7 @@ Config {
     neighbors: [
         Neighbor {
             pos: Pos {
-                line: 47,
+                line: 52,
                 col: 1,
             },
             addr: 198.51.100.1,
