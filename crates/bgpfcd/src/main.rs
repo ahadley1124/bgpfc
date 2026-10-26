@@ -5,7 +5,11 @@
 //! FIB thread, the control threads, and a main thread (the coordinator)
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
-//! client of the `rpki` block, which feeds the RIB thread.
+//! client of the `rpki` block, which feeds the RIB thread. Since step 16 a
+//! daemon that restarts in install mode keeps the kernel routes of its
+//! protocol number for the families of the neighbors with
+//! `graceful-restart yes` until their End-of-RIB (RFC 4724 §4.1, see
+//! [`restart`] and `start_fib`).
 #![forbid(unsafe_code)]
 
 mod args;

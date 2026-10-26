@@ -33,7 +33,13 @@
 //! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
 //! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
 //! attribute is added and checked on the way out, see [`otc`] and
-//! [`export`]).
+//! [`export`]);
+//! RFC 4724 §2, §4, §4.1, §4.2 and RFC 8538 §4.1, §9 (the routes of a
+//! session that ended gracefully stay as stale ones until the peer sends
+//! them again, its End-of-RIB comes or a timer runs out, see
+//! [`Rib::peer_retain`]; a Restarting Speaker defers route selection, see
+//! [`Rib::defer_selection`]; each initial update ends with the End-of-RIB
+//! marker, see [`export::end_of_rib`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
