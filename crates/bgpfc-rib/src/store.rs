@@ -12,6 +12,7 @@ use bgpfc_rpki::{AspaState, RovState};
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::AddressFamily;
 
+use crate::Held;
 use crate::attrs::PathAttrs;
 
 /// A peer's slot in the RIB's peer table. A route names its peer by slot;
@@ -41,14 +42,17 @@ pub(crate) struct Route {
     /// The peer it came from.
     pub(crate) peer: PeerId,
     /// Its RFC 6811 §2 validation state, judged on the route as received.
-    /// Phase 2 does not use it; policy does.
     pub(crate) rov: RovState,
+    /// The validation state import policy set, if it set one (RFC 6811
+    /// §3): the one the route is used with, in place of `rov`.
+    pub(crate) rov_set: Option<RovState>,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub(crate) aspa: AspaState,
-    /// Import policy rejected the route for its validation state alone:
-    /// the Adj-RIB-In holds it (RFC 6811 §2), but it is no candidate. A
-    /// destination keeps these after its candidates.
-    pub(crate) held: bool,
+    /// Why the Adj-RIB-In holds the route but it is no candidate (RFC
+    /// 6811 §2), if it is not one: import policy rejected it for its
+    /// validation state alone, or enforcement rules out the state it is
+    /// used with. A destination keeps these after its candidates.
+    pub(crate) held: Option<Held>,
 }
 
 impl Route {
@@ -57,10 +61,16 @@ impl Route {
         self.peer == other.peer && Arc::ptr_eq(&self.attrs, &other.attrs)
     }
 
-    /// Whether `other` has the same validation verdicts, which export
-    /// policy may look at.
+    /// Whether `other` has the same validation verdicts, and is used with
+    /// the same state, which export policy may look at.
     pub(crate) fn same_state(&self, other: &Route) -> bool {
-        self.rov == other.rov && self.aspa == other.aspa
+        self.rov == other.rov && self.rov_set == other.rov_set && self.aspa == other.aspa
+    }
+
+    /// The validation state the route is used with: the one import policy
+    /// set, else the one the lookup gave it.
+    pub(crate) fn effective_rov(&self) -> RovState {
+        self.rov_set.unwrap_or(self.rov)
     }
 
     /// The attributes as the peer sent them.
@@ -71,9 +81,9 @@ impl Route {
 
 /// Every route to one destination: the candidates first, the best of them
 /// first of all (Phase 2 moves it there), then the routes held for their
-/// validation state alone. One route is held inline; more go in a boxed
-/// slice sized exactly, which keeps a destination at 24 octets beside a
-/// 24-octet route.
+/// validation state (see [`Held`]). One route is held inline; more go in a
+/// boxed slice sized exactly, which keeps a destination at 24 octets
+/// beside a 24-octet route.
 #[derive(Debug)]
 pub(crate) enum Destination {
     /// One route, the common case.
@@ -100,12 +110,12 @@ impl Destination {
     /// The best route, if any: the first, unless that is held, which only
     /// happens when every route is.
     pub(crate) fn best(&self) -> Option<&Route> {
-        self.routes().first().filter(|r| !r.held)
+        self.routes().first().filter(|r| r.held.is_none())
     }
 
     /// How many of the routes are candidates; they come first.
     pub(crate) fn candidates(&self) -> usize {
-        self.routes().partition_point(|r| !r.held)
+        self.routes().partition_point(|r| r.held.is_none())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -120,7 +130,7 @@ impl Destination {
     /// Add a route from a peer that has none here yet: a candidate after
     /// the other candidates, a held route at the end.
     pub(crate) fn push(&mut self, route: Route) {
-        let at = if route.held {
+        let at = if route.held.is_some() {
             self.routes().len()
         } else {
             self.candidates()
@@ -167,7 +177,7 @@ impl Destination {
     /// between the candidates and the held routes when it changes kind.
     /// The route it replaces.
     pub(crate) fn replace(&mut self, i: usize, route: Route) -> Route {
-        if self.routes()[i].held == route.held {
+        if self.routes()[i].held.is_some() == route.held.is_some() {
             return mem::replace(&mut self.routes_mut()[i], route);
         }
         let old = self.remove(i);
@@ -388,14 +398,15 @@ mod tests {
             received: None,
             peer: PeerId(peer),
             rov: RovState::Disabled,
+            rov_set: None,
             aspa: AspaState::Disabled,
-            held: false,
+            held: None,
         }
     }
 
     fn held(peer: u32) -> Route {
         Route {
-            held: true,
+            held: Some(Held::Policy),
             ..route(peer)
         }
     }
@@ -407,9 +418,9 @@ mod tests {
     #[test]
     fn layout_stays_small() {
         // A full table holds one of these per destination and per route:
-        // a route's validation state and the attributes it was received
-        // with fit beside the inline one, as the slice of several routes
-        // leaves room for the variant.
+        // a route's validation states (looked up and set by policy) and
+        // the attributes it was received with fit beside the inline one,
+        // as the slice of several routes leaves room for the variant.
         assert_eq!(size_of::<Route>(), 24);
         assert_eq!(size_of::<Destination>(), 24);
     }
@@ -459,6 +470,14 @@ mod tests {
             ..a.clone()
         };
         assert!(a.same(&valid) && !a.same_state(&valid));
+        // So is one policy set another state for.
+        let set = Route {
+            rov_set: Some(RovState::Valid),
+            ..a.clone()
+        };
+        assert!(a.same(&set) && !a.same_state(&set));
+        assert_eq!(set.effective_rov(), RovState::Valid);
+        assert_eq!(a.effective_rov(), RovState::Disabled);
         assert!(Arc::ptr_eq(a.received(), &a.attrs));
     }
 
@@ -478,7 +497,7 @@ mod tests {
         // A candidate that becomes held moves behind the candidates, and
         // back.
         let old = d.replace(0, held(2));
-        assert!(!old.held);
+        assert!(old.held.is_none());
         assert_eq!(peers(&d), vec![4, 1, 3, 2]);
         d.replace(3, route(2));
         assert_eq!(peers(&d), vec![4, 2, 1, 3]);

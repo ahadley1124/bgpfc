@@ -1,8 +1,15 @@
 //! Route origin validation in `bgpfcd` (RFC 6811) with VRPs over RTR
 //! (RFC 8210) from `StayRTR`, an independent RTR cache, for routes from
-//! BIRD 2 (AGENTS.md §5, `interop/` row). Nothing acts on the states yet
-//! (AGENTS.md §9, step 13), so every route is accepted and relayed
-//! whatever its state.
+//! BIRD 2 (AGENTS.md §5, `interop/` row). Most scenarios test the RTR
+//! transport and the states it gives the routes, so their `rpki` blocks
+//! say `enforcement off;` (RFC 8481 §5, "Set State, Don't Act"): every
+//! route is accepted and relayed whatever its state, and the state moves
+//! nothing but itself. The others test what acts on the state (RFC 6811
+//! §5): the default, `drop-invalid`, which holds the Invalid routes back
+//! from the decision process, the relay and the kernel (issues #61, #59),
+//! and `prefer-valid`, which ranks the routes by state, and a reload from
+//! one to another (#47); and import policy that matches and sets the state
+//! (RFC 6811 §3).
 //!
 //! One scenario serves the VRPs from this crate's `rtr-stub` instead: a
 //! cache that restarts and brings `bgpfcd` back in sync, which `StayRTR`
@@ -18,7 +25,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use interop::{
@@ -130,19 +137,49 @@ struct Opts {
     unanswered: bool,
     /// The `mode` of the `rpki` block.
     mode: &'static str,
-    /// Whether a second BIRD, in C, takes the routes from bgpfcd.
-    relay: bool,
+    /// The `enforcement` of the `rpki` block; `None` writes none, which
+    /// means `drop-invalid`.
+    enforcement: Option<&'static str>,
+    /// The import policy for BIRD in B, `policy NAME { ... }`; `None`
+    /// accepts everything.
+    import: Option<&'static str>,
+    /// Whether bgpfcd installs its routes in the kernel (`fib { mode
+    /// install; }`).
+    fib_install: bool,
+    /// Whether a second BIRD, in C, takes the routes from bgpfcd, and the
+    /// prefixes it originates itself.
+    relay: Option<&'static [&'static str]>,
+    /// Whether BIRD in B sends its routes only once bgpfcd has the first
+    /// cache's VRPs, which closes the startup window of `docs/config.md`
+    /// ("RPKI"), in which a route that arrives before them is used as
+    /// `disabled`.
+    routes_after_vrps: bool,
 }
 
 impl Opts {
-    /// `caches` with `mode external`, nothing else.
+    /// `caches` with `mode external` and `enforcement off`, nothing else:
+    /// the RTR transport scenarios, in which nothing acts on the states.
     fn external(caches: Caches) -> Opts {
         Opts {
             caches,
             backup: None,
             unanswered: false,
             mode: "external",
-            relay: false,
+            enforcement: Some("off"),
+            import: None,
+            fib_install: false,
+            relay: None,
+            routes_after_vrps: false,
+        }
+    }
+
+    /// One `StayRTR` cache with `mode external`, `enforcement` as given,
+    /// and a relay that originates nothing: the enforcement scenarios.
+    fn enforcing(enforcement: Option<&'static str>) -> Opts {
+        Opts {
+            enforcement,
+            relay: Some(&[]),
+            ..Opts::external(Caches::StayRtr(1))
         }
     }
 }
@@ -194,62 +231,13 @@ impl Setup {
                 &CACHES[..1],
             ),
         };
-        let relay = opts.relay.then(|| {
-            let ns_c = lab.add_c();
-            Bird::start(
-                &lab,
-                &ns_c,
-                &BirdOpts {
-                    local_as: RELAY_AS,
-                    local: lab.c_addr,
-                    local_port: 179,
-                    neighbor: lab.a2_addr,
-                    neighbor_port: 179,
-                    remote_as: BGPFC_AS,
-                    hold_time: 30,
-                    passive: true,
-                    statics: Vec::new(),
-                    channel: String::new(),
-                    protocol: String::new(),
-                },
-            )
-        });
-        let bird = Bird::start(
-            &lab,
-            &lab.b.clone(),
-            &BirdOpts {
-                local_as: BIRD_AS,
-                local: lab.b_addr,
-                local_port: 179,
-                neighbor: lab.a_addr,
-                neighbor_port: 179,
-                remote_as: BGPFC_AS,
-                hold_time: 30,
-                passive: true,
-                statics: ROUTES.map(str::to_owned).to_vec(),
-                channel: String::new(),
-                protocol: String::new(),
-            },
-        );
+        let relay = opts.relay.map(|statics| start_relay(&mut lab, statics));
+        let bird = start_bird(&lab, opts.routes_after_vrps);
         let socket = lab.dir.join("ctl.sock");
-        let mut bgpfcd_opts =
-            BgpfcdOpts::single(BGPFC_AS, lab.a_addr, NeighborOpts::new(lab.b_addr, BIRD_AS));
-        if opts.relay {
-            // RFC 4271 §9.2.1.1 pacing, shortened from the 30 s EBGP
-            // default so that the routes reach the relay quickly.
-            let mut to_relay = NeighborOpts::new(lab.c_addr, RELAY_AS);
-            to_relay.advertisement_interval = Some(1);
-            bgpfcd_opts.neighbors.push(to_relay);
-            bgpfcd_opts.listen.push(lab.a2_addr.into());
-        }
         let unanswered = opts.unanswered.then(|| lab.blackhole());
-        bgpfcd_opts.extra = format!(
-            "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}",
-            socket.display(),
-            rpki_block(opts.mode, binds, unanswered)
-        );
+        let bgpfcd_opts = bgpfcd_opts(&lab, opts, &socket, binds, unanswered);
         let bgpfcd = start_bgpfcd(&lab, &ns_a, &bgpfcd_opts);
-        Setup {
+        let s = Setup {
             caches,
             stub,
             bgpfcd,
@@ -258,7 +246,27 @@ impl Setup {
             socket,
             unanswered,
             lab,
+        };
+        if opts.routes_after_vrps {
+            s.enable_bird_after_vrps();
         }
+        s
+    }
+
+    /// Wait for bgpfcd to have the VRPs of a cache, then let BIRD in B
+    /// start its session.
+    fn enable_bird_after_vrps(&self) {
+        let mut out = String::new();
+        assert!(
+            wait_for(ESTABLISH, || {
+                out = self.ctl(&["show", "rpki"]).0;
+                out.contains("vrps ipv4 ")
+            }),
+            "{out}\n{}",
+            self.report()
+        );
+        let enabled = self.bird.birdc(&self.lab, &["enable", "peer"]);
+        assert!(enabled.contains("peer: enabled"), "{enabled}");
     }
 
     /// bgpfcd's configuration file.
@@ -297,7 +305,8 @@ impl Setup {
         states
     }
 
-    /// What `GET /v1/routes` says about each route, as [`Setup::states`].
+    /// What `GET /v1/routes` says about each route, as [`Setup::states`]:
+    /// `rov`, and after `>` the `rov_set` import policy gave it, if any.
     fn http_states(&self) -> Vec<(String, String)> {
         let body = self.http("/v1/routes");
         let mut states: Vec<(String, String)> = body
@@ -305,8 +314,11 @@ impl Setup {
             .skip(1)
             .filter_map(|route| {
                 let prefix = route.split('"').next()?;
-                let (_, rov) = route.split_once("\"rov\":\"")?;
-                Some((prefix.to_owned(), rov.split('"').next()?.to_owned()))
+                let rov = match json_value(route, "rov_set").as_str() {
+                    "null" | "" => json_value(route, "rov"),
+                    set => format!("{}>{set}", json_value(route, "rov")),
+                };
+                Some((prefix.to_owned(), rov))
             })
             .collect();
         states.sort();
@@ -414,12 +426,173 @@ impl Setup {
         out
     }
 
+    /// The routes `show routes held` lists, every one marked `!`: prefix,
+    /// validation state and why it is held (`enforcement` or `policy`),
+    /// sorted.
+    fn held(&self) -> Vec<(String, String, String)> {
+        let (out, _) = self.ctl(&["show", "routes", "held"]);
+        let mut held: Vec<(String, String, String)> = out
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    words.first()?.strip_prefix('!')?.to_owned(),
+                    (*words.get(5)?).to_owned(),
+                    line.split_once(" held by ")?.1.to_owned(),
+                ))
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// The route lines of `show routes PREFIX`: every route the
+    /// Adj-RIBs-In hold for it.
+    fn routes_at(&self, prefix: &str) -> Vec<String> {
+        let (out, _) = self.ctl(&["show", "routes", prefix]);
+        out.lines().skip(1).map(str::to_owned).collect()
+    }
+
+    /// The prefixes the relay BIRD in C has a route to, sorted.
+    fn relay_routes(&self) -> Vec<String> {
+        let relay = self.relay.as_ref().expect("a relay");
+        let mut routes: Vec<String> = relay
+            .birdc(&self.lab, &["show", "route"])
+            .lines()
+            // A route's first line starts with its network; the lines of
+            // its next hops and alternatives are indented.
+            .filter(|l| !l.starts_with(char::is_whitespace))
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.contains('/'))
+            .map(str::to_owned)
+            .collect();
+        routes.sort();
+        routes.dedup();
+        routes
+    }
+
+    /// How many route updates and withdrawals the relay BIRD in C has
+    /// received from bgpfcd, by its `Import updates` and `Import
+    /// withdraws` counters.
+    fn relay_imports(&self) -> (usize, usize) {
+        let relay = self.relay.as_ref().expect("a relay");
+        let status = relay.peer_status(&self.lab);
+        let received = |row: &str| {
+            status
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(row))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(usize::MAX)
+        };
+        (received("Import updates:"), received("Import withdraws:"))
+    }
+
+    /// The prefixes bgpfcd has installed in its namespace's kernel table
+    /// with its protocol number (`ip route show proto 186`), sorted.
+    fn kernel_routes(&self) -> Vec<String> {
+        let out =
+            interop::Daemon::ip_in(&self.lab, &self.lab.a, &["route", "show", "proto", "186"]);
+        let mut routes: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+        routes.sort();
+        routes
+    }
+
+    /// The changes of state `show rpki transitions` keeps, oldest first and
+    /// without their time (`PREFIX peer PEER origin ASN FROM->TO ROUTE`),
+    /// and its closing line.
+    fn transitions(&self) -> (Vec<String>, String) {
+        let (out, _) = self.ctl(&["show", "rpki", "transitions"]);
+        let mut lines: Vec<&str> = out.lines().collect();
+        let last = lines.pop().unwrap_or_default().to_owned();
+        let entries = lines
+            .iter()
+            .map(|l| l.split_once(' ').map_or("", |(_, rest)| rest).to_owned())
+            .collect();
+        (entries, last)
+    }
+
+    /// The changes of state `GET /v1/rpki/transitions` keeps, written as
+    /// [`Setup::transitions`] writes them, and its `unrecorded`.
+    fn http_transitions(&self) -> (Vec<String>, String) {
+        let body = self.http("/v1/rpki/transitions");
+        let entries = body
+            .split("{\"time\":\"")
+            .skip(1)
+            .map(|t| {
+                let origin = match json_value(t, "origin").as_str() {
+                    "null" => "none".to_owned(),
+                    asn => format!("AS{asn}"),
+                };
+                let by = match json_value(t, "held_by").as_str() {
+                    "null" => String::new(),
+                    by => format!(" by {by}"),
+                };
+                format!(
+                    "{} peer {} origin {origin} {}->{} {}{by}",
+                    json_value(t, "prefix"),
+                    json_value(t, "peer"),
+                    json_value(t, "from"),
+                    json_value(t, "to"),
+                    json_value(t, "route"),
+                )
+            })
+            .collect();
+        (entries, json_value(&body, "unrecorded"))
+    }
+
+    /// The "rib: route validation state changed" lines bgpfcd has logged,
+    /// written as [`Setup::transitions`] writes the changes it keeps.
+    fn route_lines(&self) -> Vec<String> {
+        self.bgpfcd
+            .log_text()
+            .lines()
+            .filter(|l| l.contains("msg=\"rib: route validation state changed\""))
+            .map(|l| {
+                let by = log_value(l, "by").map_or(String::new(), |by| format!(" by {by}"));
+                let field = |key| log_value(l, key).unwrap_or_default();
+                format!(
+                    "{} peer {} origin {} {}->{} {}{by}",
+                    field("prefix"),
+                    field("peer"),
+                    field("origin"),
+                    field("from"),
+                    field("to"),
+                    field("route"),
+                )
+            })
+            .collect()
+    }
+
+    /// The last line bgpfcd has logged with the message `msg`.
+    fn last_line(&self, msg: &str) -> String {
+        let needle = format!("msg=\"{msg}\"");
+        self.bgpfcd
+            .log_text()
+            .lines()
+            .rfind(|l| l.contains(&needle))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     /// Everything a failed assertion needs.
     fn report(&self) -> String {
         let mut caches: Vec<String> = self.caches.iter().map(|c| c.daemon.log_text()).collect();
         caches.extend(self.stub.iter().map(|s| s.daemon.log_text()));
+        let relay = self.relay.as_ref().map_or(String::new(), |r| {
+            format!(
+                "\n--- relay ---\n{}{}",
+                r.birdc(&self.lab, &["show", "route"]),
+                r.daemon.log_text()
+            )
+        });
         format!(
-            "{:?}\n--- bgpfcd ---\n{}\n--- cache ---\n{}\n--- bird ---\n{}",
+            "{:?}\n--- bgpfcd ---\n{}\n--- cache ---\n{}\n--- bird ---\n{}{relay}",
             self.states(),
             self.bgpfcd.log_text(),
             caches.join("\n--- cache ---\n"),
@@ -428,9 +601,38 @@ impl Setup {
     }
 }
 
+/// The value of `key` in the first JSON member of that name in `text`: a
+/// string without its quotes, or a bare number or `null`.
+fn json_value(text: &str, key: &str) -> String {
+    let Some((_, rest)) = text.split_once(&format!("\"{key}\":")) else {
+        return String::new();
+    };
+    match rest.strip_prefix('"') {
+        Some(s) => s.split('"').next().unwrap_or_default().to_owned(),
+        None => rest
+            .split([',', '}', ']'])
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+/// The value of the field `key` of a bgpfcd log line, which none of the
+/// fields read here quotes (AGENTS.md §3, "Logging").
+fn log_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+}
+
 /// The `rpki` block for the caches at `binds`, in that order of
-/// preference, after the one at `unanswered` if there is one.
-fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
+/// preference, after the one at `unanswered` if there is one, with the
+/// `enforcement` given, or none.
+fn rpki_block(
+    mode: &str,
+    enforcement: Option<&str>,
+    binds: &[&str],
+    unanswered: Option<Ipv4Addr>,
+) -> String {
     let mut entries = String::new();
     if let Some(addr) = unanswered {
         let _ = write!(
@@ -446,9 +648,127 @@ fn rpki_block(mode: &str, binds: &[&str], unanswered: Option<Ipv4Addr>) -> Strin
             " cache 127.0.0.1 port {port} preference {preference};"
         );
     }
+    let enforcement = enforcement.map_or(String::new(), |e| format!(" enforcement {e};"));
     // The shortest back-off, so that a cache that comes back is found
     // within a second or two.
-    format!("rpki {{ mode {mode};{entries} backoff 1 1; }}")
+    format!("rpki {{ mode {mode};{enforcement}{entries} backoff 1 1; }}")
+}
+
+/// The relay BIRD, in a new namespace C: it takes the routes bgpfcd
+/// passes on and originates `statics` itself.
+fn start_relay(lab: &mut Lab, statics: &[&str]) -> Bird {
+    let ns_c = lab.add_c();
+    Bird::start(
+        lab,
+        &ns_c,
+        &BirdOpts {
+            local_as: RELAY_AS,
+            local: lab.c_addr,
+            local_port: 179,
+            neighbor: lab.a2_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: statics.iter().map(|&p| p.to_owned()).collect(),
+            channel: String::new(),
+            protocol: String::new(),
+        },
+    )
+}
+
+/// BIRD in B, which originates [`ROUTES`]; with `held_back`, its session
+/// stays down until [`Setup::enable_bird_after_vrps`].
+fn start_bird(lab: &Lab, held_back: bool) -> Bird {
+    Bird::start(
+        lab,
+        &lab.b,
+        &BirdOpts {
+            local_as: BIRD_AS,
+            local: lab.b_addr,
+            local_port: 179,
+            neighbor: lab.a_addr,
+            neighbor_port: 179,
+            remote_as: BGPFC_AS,
+            hold_time: 30,
+            passive: true,
+            statics: ROUTES.map(str::to_owned).to_vec(),
+            channel: String::new(),
+            protocol: if held_back {
+                "disabled;".to_owned()
+            } else {
+                String::new()
+            },
+        },
+    )
+}
+
+/// bgpfcd's configuration for `opts`, with the caches at `binds`.
+fn bgpfcd_opts(
+    lab: &Lab,
+    opts: &Opts,
+    socket: &Path,
+    binds: &[&str],
+    unanswered: Option<Ipv4Addr>,
+) -> BgpfcdOpts {
+    let from_bird = NeighborOpts {
+        import: opts
+            .import
+            .map_or_else(|| "ANY".to_owned(), |p| policy_name(p).to_owned()),
+        // BIRD refuses the session until it is enabled: try again every
+        // second rather than every 120.
+        extra: if opts.routes_after_vrps {
+            "connect-retry-time 1;".to_owned()
+        } else {
+            String::new()
+        },
+        ..NeighborOpts::new(lab.b_addr, BIRD_AS)
+    };
+    let mut bgpfcd_opts = BgpfcdOpts::single(BGPFC_AS, lab.a_addr, from_bird);
+    if opts.relay.is_some() {
+        // RFC 4271 §9.2.1.1 pacing, shortened from the 30 s EBGP default
+        // so that the routes reach the relay quickly.
+        let to_relay = NeighborOpts {
+            advertisement_interval: Some(1),
+            ..NeighborOpts::new(lab.c_addr, RELAY_AS)
+        };
+        bgpfcd_opts.neighbors.push(to_relay);
+        bgpfcd_opts.listen.push(lab.a2_addr.into());
+    }
+    bgpfcd_opts.extra = format!(
+        "control {{ socket {}; http {{ listen {HTTP}; }} }}\n{}{}\n{}",
+        socket.display(),
+        if opts.fib_install {
+            "fib { mode install; }\n"
+        } else {
+            ""
+        },
+        rpki_block(opts.mode, opts.enforcement, binds, unanswered),
+        opts.import.unwrap_or_default(),
+    );
+    bgpfcd_opts
+}
+
+/// The name of the policy `text` defines: `policy NAME { ... }`.
+fn policy_name(text: &str) -> &str {
+    text.split_whitespace().nth(1).unwrap_or_default()
+}
+
+/// Routes and their validation states: (prefix, state).
+type States<'a> = Vec<(&'a str, &'a str)>;
+
+/// `states` split into those of the routes `enforcement drop-invalid`
+/// uses, which `show routes` lists, and those of the routes it holds: the
+/// Invalid ones (RFC 6811 §5, "rejecting all "invalid" routes").
+fn split_invalid<'a>(states: &[(&'a str, &'a str)]) -> (States<'a>, States<'a>) {
+    states.iter().partition(|(_, rov)| *rov != "invalid")
+}
+
+/// The prefixes of `states`, sorted.
+fn prefixes(states: &[(&str, &str)]) -> Vec<String> {
+    let mut p: Vec<String> = states.iter().map(|(p, _)| (*p).to_owned()).collect();
+    p.sort();
+    p
 }
 
 /// The `session-id ... serial ...` line of `show rpki`.
@@ -461,7 +781,8 @@ fn session_line(show_rpki: &str) -> String {
 }
 
 /// BIRD's routes come out valid, invalid (by length and by origin) and
-/// not-found, by the CLI and the HTTP API, and all of them are relayed.
+/// not-found, by the CLI and the HTTP API, and with `enforcement off` all
+/// of them are used and relayed (RFC 8481 §5, "Set State, Don't Act").
 /// A new VRP file then changes the state of every route without any BGP
 /// UPDATE: `StayRTR` sends a Serial Notify, bgpfcd asks for the changes
 /// (RFC 8210 §8.2), and the routes they cover are validated again
@@ -470,7 +791,7 @@ fn session_line(show_rpki: &str) -> String {
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
     let opts = Opts {
-        relay: true,
+        relay: Some(&[]),
         ..Opts::external(Caches::StayRtr(1))
     };
     let s = Setup::start("v", 15, &opts, &FIRST);
@@ -506,8 +827,9 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
         "{body}"
     );
 
-    // Nothing acts on the states yet: the invalid routes reach the relay
-    // too.
+    // `enforcement off`: nothing acts on the states, so no route is held
+    // and the invalid routes reach the relay too.
+    assert!(s.held().is_empty(), "{}", s.report());
     let relay = s.relay.as_ref().expect("relay");
     let relayed = || {
         let routes = relay.birdc(&s.lab, &["show", "route"]);
@@ -547,9 +869,10 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
         s.report()
     );
     // No UPDATE came from BIRD, no session was reset, and every route is
-    // still relayed.
+    // still used and relayed.
     assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
     assert_eq!(s.count("session established"), sessions, "{}", s.report());
+    assert!(s.held().is_empty(), "{}", s.report());
     assert!(relayed(), "{}", relay.birdc(&s.lab, &["show", "route"]));
 }
 
@@ -703,7 +1026,7 @@ fn with_mode_disabled_no_cache_is_asked() {
     s.wait_for_states(ESTABLISH, &DISABLED);
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
-        ok && out == "mode disabled\ncache 127.0.0.1:3323 preference 0\n",
+        ok && out == "mode disabled\nenforcement off\ncache 127.0.0.1:3323 preference 0\n",
         "{out}"
     );
     let body = s.http("/v1/rpki");
@@ -926,4 +1249,545 @@ fn a_cache_that_never_answers_holds_up_neither_reload_nor_shutdown() {
         "{}",
         s.bird.daemon.log_text()
     );
+}
+
+/// What `show routes held` gives for routes in `states`, all held by `by`.
+fn held_by(states: &[(&str, &str)], by: &str) -> Vec<(String, String, String)> {
+    let mut held: Vec<(String, String, String)> = states
+        .iter()
+        .map(|(p, rov)| ((*p).to_owned(), (*rov).to_owned(), by.to_owned()))
+        .collect();
+    held.sort();
+    held
+}
+
+impl Setup {
+    /// The changes of state of BIRD's routes, `(prefix, "FROM->TO ROUTE")`,
+    /// as [`Setup::transitions`] writes them.
+    fn moved(&self, changes: &[(&str, &str)]) -> Vec<String> {
+        changes
+            .iter()
+            .map(|(prefix, change)| {
+                format!(
+                    "{prefix} peer {} origin AS{BIRD_AS} {change}",
+                    self.lab.b_addr
+                )
+            })
+            .collect()
+    }
+
+    /// Wait up to `timeout` for the relay BIRD and the kernel to have
+    /// routes to exactly the prefixes of `used`.
+    fn wait_for_used(&self, timeout: Duration, used: &[(&str, &str)]) {
+        let want = prefixes(used);
+        assert!(
+            wait_for(timeout, || self.relay_routes() == want
+                && self.kernel_routes() == want),
+            "relay {:?} kernel {:?}, not {want:?}\n{}",
+            self.relay_routes(),
+            self.kernel_routes(),
+            self.report()
+        );
+    }
+}
+
+/// Issue #61: "Invalid routes are dropped by default". With `mode
+/// external` and no `enforcement` statement, bgpfcd holds BIRD's two
+/// Invalid routes in the Adj-RIB-In, out of the decision process (RFC 6811
+/// §2: "unless explicitly configured to do so"; §5: "rejecting all
+/// "invalid" routes"), and uses the Valid and the `NotFound` one. Only those
+/// two are installed and relayed: the relay never hears of the others,
+/// since BIRD sends its routes once bgpfcd has the VRPs. `show routes`,
+/// `show neighbor`, `show rpki` and the start line tell it.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn invalid_routes_are_held_and_not_used_by_default() {
+    let opts = Opts {
+        fib_install: true,
+        routes_after_vrps: true,
+        ..Opts::enforcing(None)
+    };
+    let s = Setup::start("i", 21, &opts, &FIRST);
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    s.wait_for_used(Duration::from_secs(20), &used);
+    // RFC 6811 §2: held in the Adj-RIB-In, but no candidate.
+    let at = s.routes_at("192.0.2.128/25");
+    assert!(
+        at.len() == 1
+            && at[0].starts_with("!192.0.2.128/25 ")
+            && at[0].ends_with(&format!(
+                " invalid   {BIRD_AS} via {} held by enforcement",
+                s.lab.b_addr
+            )),
+        "{at:?}"
+    );
+    let body = s.http("/v1/routes?family=ipv4&held=1");
+    assert!(
+        body.matches("\"held\":\"enforcement\"").count() == 2
+            && body.contains("\"prefix\":\"198.51.100.0/24\"")
+            && !body.contains("\"held\":null"),
+        "{body}"
+    );
+    // Counted as received, and as held.
+    let b = s.lab.b_addr.to_string();
+    let (out, ok) = s.ctl(&["show", "neighbor", &b]);
+    assert!(
+        ok && out.contains("ipv4-unicast received 4 held 2 "),
+        "{out}"
+    );
+    let body = s.http(&format!("/v1/neighbors/{b}"));
+    assert!(body.contains("\"received\":4,\"held\":2,"), "{body}");
+    // The relay has had two routes and no withdrawal: the Invalid ones
+    // never reached it.
+    assert_eq!(s.relay_imports(), (2, 0), "{}", s.report());
+    // Where the operator turns validation on, the enforcement shows.
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.starts_with("mode external\nenforcement drop-invalid\n"),
+        "{out}"
+    );
+    let start = s.last_line("bgpfcd starting");
+    assert!(
+        start.ends_with(" rpki=external enforcement=drop-invalid"),
+        "{start}"
+    );
+}
+
+/// Issue #59's acceptance, and #52's: "Creating, modifying and deleting a
+/// ROA in the lab each flip the state of an already-installed route and
+/// produce the correct advertisement or withdrawal, with no BGP UPDATE
+/// received." The cache's new VRPs create a ROA (203.0.113.0/24 goes from
+/// `not-found` to `valid`), change one (192.0.2.0/24, now for another AS,
+/// from `valid` to `invalid`), delete one (198.51.100.0/24, from `invalid`
+/// to `not-found`) and authorise the /25 (from `invalid` to `valid`).
+/// bgpfcd validates those routes again (RFC 6811 §4) and, with the
+/// default `drop-invalid`, withdraws 192.0.2.0/24 from the relay and the
+/// kernel, and advertises and installs the two it had held. Each route
+/// that changed state is logged with its states and what became of it,
+/// and kept for `show rpki transitions` (issue #59: "An operator needs to
+/// see that a prefix went Valid → Invalid at a specific time"). With the
+/// old VRPs back, everything moves back.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn a_roa_created_changed_and_deleted_moves_installed_routes_without_an_update() {
+    let opts = Opts {
+        fib_install: true,
+        ..Opts::enforcing(None)
+    };
+    let s = Setup::start("o", 22, &opts, &FIRST);
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(ESTABLISH, &used);
+    s.wait_for_used(Duration::from_secs(20), &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    let updates = s.updates_from_bird();
+    let sessions = s.count("session established");
+    assert!(s.route_lines().is_empty(), "{}", s.report());
+
+    s.caches[0].set_vrps(&SECOND);
+    let (used, held) = split_invalid(&FLIPPED);
+    s.wait_for_states(CHANGE, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    s.wait_for_used(Duration::from_secs(20), &used);
+    // No UPDATE came from BIRD, and no session was reset.
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+    // One line per route that changed state, in prefix order, after the
+    // summary line, which counts them.
+    let moved = s.moved(&[
+        ("192.0.2.0/24", "valid->invalid held by enforcement"),
+        ("192.0.2.128/25", "invalid->valid best"),
+        ("198.51.100.0/24", "invalid->not-found best"),
+        ("203.0.113.0/24", "not-found->valid best"),
+    ]);
+    assert_eq!(s.route_lines(), moved, "{}", s.report());
+    let summary = s.last_line("rib: validation states changed");
+    assert!(
+        summary.contains(" changed=4 ")
+            && summary.ends_with(" held=1 released=2 logged=4 unlogged=0"),
+        "{summary}"
+    );
+    assert_eq!(
+        s.transitions(),
+        (
+            moved.clone(),
+            "4 kept (most recent 1024); 0 not recorded".to_owned()
+        ),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.http_transitions(),
+        (moved.clone(), "0".to_owned()),
+        "{}",
+        s.http("/v1/rpki/transitions")
+    );
+
+    // The VRPs as they were: 192.0.2.0/24 is Valid again, and advertised
+    // and installed again; the others move back too.
+    s.caches[0].set_vrps(&FIRST);
+    let (used, held) = split_invalid(&VALIDATED);
+    s.wait_for_states(CHANGE, &used);
+    assert_eq!(s.held(), held_by(&held, "enforcement"), "{}", s.report());
+    s.wait_for_used(Duration::from_secs(20), &used);
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    assert_eq!(s.count("session established"), sessions, "{}", s.report());
+    let back = s.moved(&[
+        ("192.0.2.0/24", "invalid->valid best"),
+        ("192.0.2.128/25", "valid->invalid held by enforcement"),
+        ("198.51.100.0/24", "not-found->invalid held by enforcement"),
+        ("203.0.113.0/24", "valid->not-found best"),
+    ]);
+    let all: Vec<String> = moved.into_iter().chain(back).collect();
+    assert_eq!(s.route_lines(), all, "{}", s.report());
+    let summary = s.last_line("rib: validation states changed");
+    assert!(
+        summary.ends_with(" held=2 released=1 logged=4 unlogged=0"),
+        "{summary}"
+    );
+    assert_eq!(
+        s.transitions(),
+        (all, "8 kept (most recent 1024); 0 not recorded".to_owned()),
+        "{}",
+        s.report()
+    );
+}
+
+/// The VRP of the preference scenario: 192.0.2.0/24 belongs to the
+/// relay's AS, so BIRD's route to it is Invalid and the relay's Valid.
+const RELAY_OWNS: [(&str, u8, u32); 1] = [("192.0.2.0/24", 24, RELAY_AS)];
+
+/// An import policy for BIRD in B that prefers its routes to any other:
+/// `LOCAL_PREF` 200 against the default 100 (RFC 4271 §9.1.1).
+const PREFER_B: &str = "policy PREFER-B { term all { set local-pref 200; action accept; } }";
+
+/// A route as `show routes PREFIX` lists it: the mark (`*` best, `!`
+/// held, ` ` neither), the local preference, the validation state and the
+/// peer.
+type Row = (char, String, String, String);
+
+/// A [`Row`] from its parts.
+fn row(mark: char, local_pref: &str, rov: &str, peer: &str) -> Row {
+    (mark, local_pref.to_owned(), rov.to_owned(), peer.to_owned())
+}
+
+impl Setup {
+    /// The routes `show routes PREFIX` lists, in its order: the best first,
+    /// then the other candidates, then the held routes.
+    fn rows_at(&self, prefix: &str) -> Vec<Row> {
+        self.routes_at(prefix)
+            .iter()
+            .map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let peer = line
+                    .split_once(" via ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or_default();
+                row(
+                    line.chars().next().unwrap_or(' '),
+                    words.get(3).copied().unwrap_or_default(),
+                    words.get(5).copied().unwrap_or_default(),
+                    peer,
+                )
+            })
+            .collect()
+    }
+
+    /// Wait up to `timeout` for `show routes PREFIX` to list `rows`.
+    fn wait_for_rows(&self, timeout: Duration, prefix: &str, rows: &[Row]) {
+        assert!(
+            wait_for(timeout, || self.rows_at(prefix) == rows),
+            "{:?}, not {rows:?}\n{}",
+            self.routes_at(prefix),
+            self.report()
+        );
+    }
+
+    /// Rewrite bgpfcd's `enforcement` from `from` to `to` and reload; the
+    /// reload's summary.
+    fn reload_enforcement(&self, from: &str, to: &str) -> String {
+        let path = self.config_path();
+        let text = fs::read_to_string(&path).unwrap();
+        let old = format!(" enforcement {from};");
+        assert!(text.contains(&old), "{text}");
+        fs::write(&path, text.replace(&old, &format!(" enforcement {to};"))).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok, "{out}");
+        out
+    }
+
+    /// How often the RTR client connected to a cache and asked it for all
+    /// its data: bgpfcd's `rtr cache connected` lines and the cache's Reset
+    /// Queries.
+    fn rtr_starts(&self) -> (usize, usize) {
+        (
+            self.count("msg=\"rtr cache connected\""),
+            self.caches[0]
+                .daemon
+                .log_text()
+                .matches("Reset Query")
+                .count(),
+        )
+    }
+}
+
+/// Issue #47 and #61's non-enforcing mode: "the non-enforcing mode
+/// de-preferences rather than drops". BIRD in B and the relay BIRD in C
+/// both originate 192.0.2.0/24; a VRP makes B's route Invalid and C's
+/// Valid, and B's import policy gives B's routes `LOCAL_PREF` 200. Under
+/// `enforcement prefer-valid` C's Valid route is chosen all the same: the
+/// validation state comes before the degree of preference (RFC 6811 §5,
+/// "adjusting a route's degree of preference in the selection algorithm
+/// based on its validation state"; docs/config.md, "Route selection"),
+/// and B's Invalid route stays a candidate, as does B's Invalid /25, the
+/// only route to its prefix. A reload to `enforcement off` puts B's route
+/// first by its `LOCAL_PREF`, one to `drop-invalid` holds both of B's
+/// Invalid routes, and one back to `off` uses them again, with no UPDATE.
+/// None restarts the RTR client, which the `enforcement` does not
+/// concern.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn prefer_valid_takes_the_valid_path_over_a_higher_local_pref() {
+    let opts = Opts {
+        import: Some(PREFER_B),
+        relay: Some(&["192.0.2.0/24"]),
+        ..Opts::enforcing(Some("prefer-valid"))
+    };
+    let s = Setup::start("q", 23, &opts, &RELAY_OWNS);
+    let (b, c) = (s.lab.b_addr.to_string(), s.lab.c_addr.to_string());
+    // C's Valid route over B's Invalid one with the higher LOCAL_PREF.
+    s.wait_for_rows(
+        ESTABLISH,
+        "192.0.2.0/24",
+        &[row('*', "-", "valid", &c), row(' ', "200", "invalid", &b)],
+    );
+    s.wait_for_states(
+        Duration::ZERO,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("192.0.2.128/25", "invalid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    assert!(s.held().is_empty(), "{}", s.report());
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(ok && out.contains("\nenforcement prefer-valid\n"), "{out}");
+    let starts = s.rtr_starts();
+    assert_eq!(starts.0, 1, "{}", s.report());
+    assert!(starts.1 >= 1, "{}", s.report());
+
+    // `enforcement off`: the state no longer ranks, LOCAL_PREF decides.
+    let out = s.reload_enforcement("prefer-valid", "off");
+    assert!(
+        out.contains("; rpki enforcement off") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "200", "invalid", &b), row(' ', "-", "valid", &c)],
+    );
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=prefer-valid to=off ")
+            && changed.ends_with(" held=0 released=0 best_changed=1"),
+        "{changed}"
+    );
+
+    // `drop-invalid`: B's Invalid routes are held, C's route is used. A
+    // held route is kept as its neighbor sent it, without the LOCAL_PREF
+    // import policy gave it.
+    let out = s.reload_enforcement("off", "drop-invalid");
+    assert!(
+        out.contains("; rpki enforcement drop-invalid") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "-", "valid", &c), row('!', "-", "invalid", &b)],
+    );
+    let at = s.routes_at("192.0.2.0/24");
+    assert!(
+        at.len() == 2 && at[1].ends_with(&format!(" via {b} held by enforcement")),
+        "{at:?}"
+    );
+    assert_eq!(
+        s.held(),
+        held_by(
+            &[("192.0.2.0/24", "invalid"), ("192.0.2.128/25", "invalid")],
+            "enforcement"
+        ),
+        "{}",
+        s.report()
+    );
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=off to=drop-invalid ") && changed.contains(" held=2 released=0 "),
+        "{changed}"
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains("\nenforcement drop-invalid\n") && out.contains("state idle, connected"),
+        "{out}"
+    );
+
+    // Back to `off`: both routes are used again, B's with the LOCAL_PREF
+    // its import policy gives it again, with no UPDATE from BIRD.
+    let updates = s.updates_from_bird();
+    let out = s.reload_enforcement("drop-invalid", "off");
+    assert!(
+        out.contains("; rpki enforcement off") && !out.contains("rtr client"),
+        "{out}"
+    );
+    s.wait_for_rows(
+        Duration::from_secs(10),
+        "192.0.2.0/24",
+        &[row('*', "200", "invalid", &b), row(' ', "-", "valid", &c)],
+    );
+    assert!(s.held().is_empty(), "{}", s.report());
+    let changed = s.last_line("rib: rpki enforcement changed");
+    assert!(
+        changed.contains(" from=drop-invalid to=off ") && changed.contains(" held=0 released=2 "),
+        "{changed}"
+    );
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+    // None of the reloads touched the RTR client or a BGP session.
+    assert_eq!(s.rtr_starts(), starts, "{}", s.report());
+    assert_eq!(s.count("session established"), 2, "{}", s.report());
+}
+
+/// An import policy on the validation state (RFC 6811 §3): a customer
+/// prefix whose ROA is known to be wrong is used as Valid, Valid routes
+/// get `LOCAL_PREF` 200 and `NotFound` ones 120, and the rest is accepted
+/// as it is.
+const ROV_IN: &str = "policy ROV-IN {
+    term allow { match prefix 198.51.100.0/24; match rpki invalid; set rpki valid; action accept; }
+    term valid { match rpki valid; set local-pref 200; action accept; }
+    term nf { match rpki not-found; set local-pref 120; action accept; }
+    term rest { action accept; }
+}";
+
+impl Setup {
+    /// What `show routes` says about each route's `LOCAL_PREF`: its prefix
+    /// and the value, `-` for none, in the order of the prefixes as text.
+    fn local_prefs(&self) -> Vec<(String, String)> {
+        let (out, _) = self.ctl(&["show", "routes"]);
+        let mut prefs: Vec<(String, String)> = out
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                Some((
+                    words.first()?.trim_start_matches('*').to_owned(),
+                    (*words.get(3)?).to_owned(),
+                ))
+            })
+            .collect();
+        prefs.sort();
+        prefs
+    }
+}
+
+/// Owned pairs, as [`Setup::states`] and [`Setup::local_prefs`] give them.
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect()
+}
+
+/// RFC 6811 §3: "An implementation MUST provide the ability to match and
+/// set the validation state of routes as part of its route policy
+/// filtering function." BIRD's routes go through [`ROV_IN`] under the
+/// default `drop-invalid`. `match rpki` sets their `LOCAL_PREF` by state,
+/// and `set rpki valid` lets the Invalid 198.51.100.0/24 be used and
+/// relayed, shown as `invalid>valid`, while the other Invalid route is
+/// held. New VRPs move every route, with no UPDATE from BIRD: the import
+/// policy runs again on each (m11's path, RFC 6811 §4), so the
+/// `LOCAL_PREF`s follow the new states, the override no longer applies to
+/// the now `not-found` 198.51.100.0/24, and the newly Invalid
+/// 192.0.2.0/24 is held.
+#[test]
+#[ignore = "needs root, bird, curl, stayrtr and iproute2"]
+fn policy_matches_the_state_and_overrides_it() {
+    let opts = Opts {
+        import: Some(ROV_IN),
+        ..Opts::enforcing(None)
+    };
+    let s = Setup::start("y", 24, &opts, &FIRST);
+    s.wait_for_states(
+        ESTABLISH,
+        &[
+            ("192.0.2.0/24", "valid"),
+            ("198.51.100.0/24", "invalid>valid"),
+            ("203.0.113.0/24", "not-found"),
+        ],
+    );
+    assert_eq!(
+        s.local_prefs(),
+        pairs(&[
+            ("192.0.2.0/24", "200"),
+            ("198.51.100.0/24", "-"),
+            ("203.0.113.0/24", "120"),
+        ]),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.held(),
+        held_by(&[("192.0.2.128/25", "invalid")], "enforcement"),
+        "{}",
+        s.report()
+    );
+    let body = s.http("/v1/routes?family=ipv4&prefix=198.51.100.0/24");
+    assert!(
+        body.contains("\"rov\":\"invalid\",\"rov_set\":\"valid\",\"held\":null"),
+        "{body}"
+    );
+    // The overridden route is used like a Valid one: relayed.
+    let used = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"];
+    assert!(
+        wait_for(Duration::from_secs(20), || s.relay_routes() == used),
+        "{:?}\n{}",
+        s.relay_routes(),
+        s.report()
+    );
+
+    let updates = s.updates_from_bird();
+    s.caches[0].set_vrps(&SECOND);
+    s.wait_for_states(
+        CHANGE,
+        &[
+            ("192.0.2.128/25", "valid"),
+            ("198.51.100.0/24", "not-found"),
+            ("203.0.113.0/24", "valid"),
+        ],
+    );
+    assert_eq!(
+        s.local_prefs(),
+        pairs(&[
+            ("192.0.2.128/25", "200"),
+            ("198.51.100.0/24", "120"),
+            ("203.0.113.0/24", "200"),
+        ]),
+        "{}",
+        s.report()
+    );
+    assert_eq!(
+        s.held(),
+        held_by(&[("192.0.2.0/24", "invalid")], "enforcement"),
+        "{}",
+        s.report()
+    );
+    let used = ["192.0.2.128/25", "198.51.100.0/24", "203.0.113.0/24"];
+    assert!(
+        wait_for(Duration::from_secs(20), || s.relay_routes() == used),
+        "{:?}\n{}",
+        s.relay_routes(),
+        s.report()
+    );
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
 }

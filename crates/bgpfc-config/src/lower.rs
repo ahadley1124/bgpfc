@@ -11,13 +11,16 @@
 //! (`maximum-prefix`); RFC 8210 §6 (`max-expire` within the Expire
 //! Interval's range; `backoff` within the Retry Interval's), §7
 //! (`version`), §9 (port 323), §10 (`cache` and its `preference`);
-//! RFC 1123 §2.1 (cache host names).
+//! RFC 1123 §2.1 (cache host names); RFC 6811 §2 and §5 (`enforcement`:
+//! what the validation state does, configured), §3 (`match rpki`, `set
+//! rpki`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use bgpfc_rpki::{Enforcement, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
@@ -789,6 +792,12 @@ impl Lowerer {
                 let a = one(self)?;
                 self.parse(a, "an IP address").map(Match::Neighbor)
             }
+            "rpki" => {
+                // RFC 6811 §3: policy matches the validation state.
+                let a = one(self)?;
+                self.parse(a, "`valid`, `invalid`, `not-found` or `disabled`")
+                    .map(Match::Rpki)
+            }
             _ => {
                 self.err(kind.pos, format!("unknown match clause `{}`", kind.value));
                 None
@@ -895,6 +904,30 @@ impl Lowerer {
                     None
                 }
             }
+            "rpki" => {
+                // RFC 6811 §3: policy sets the validation state. `disabled`
+                // says that no lookup was made, which is not policy's to
+                // say.
+                let a = one(self)?;
+                match a.value.parse::<RovState>() {
+                    Ok(RovState::Disabled) => {
+                        self.err(
+                            a.pos,
+                            "`set rpki` takes `valid`, `invalid` or `not-found`: `disabled` means \
+                             validation is off, which policy cannot set",
+                        );
+                        None
+                    }
+                    Ok(state) => Some(SetAction::Rpki(state)),
+                    Err(_) => {
+                        self.err(
+                            a.pos,
+                            format!("`{}` is not `valid`, `invalid` or `not-found`", a.value),
+                        );
+                        None
+                    }
+                }
+            }
             _ => {
                 self.err(kind.pos, format!("unknown set action `{}`", kind.value));
                 None
@@ -985,6 +1018,7 @@ fn same_cache(a: &RpkiCache, b: &RpkiCache) -> bool {
 /// The statements of the `rpki` block, each at most once but `cache`.
 struct RpkiBuilder {
     mode: Once<RpkiMode>,
+    enforcement: Once<Enforcement>,
     caches: Vec<RpkiCache>,
     cache_seen: bool,
     version: Once<u8>,
@@ -1000,6 +1034,7 @@ impl RpkiBuilder {
     fn new() -> Self {
         RpkiBuilder {
             mode: Once::new("mode"),
+            enforcement: Once::new("enforcement"),
             caches: Vec::new(),
             cache_seen: false,
             version: Once::new("version"),
@@ -1027,6 +1062,24 @@ impl RpkiBuilder {
                     }
                 });
                 self.mode.set(l, t.pos, v);
+            }
+            "enforcement" => {
+                // RFC 6811 §5: filter on the state, or adjust the degree of
+                // preference by it; or neither (RFC 8481 §5).
+                let v = l.arg(t).and_then(|a| {
+                    let e = a.value.parse::<Enforcement>().ok();
+                    if e.is_none() {
+                        l.err(
+                            a.pos,
+                            format!(
+                                "`{}` is not `drop-invalid`, `prefer-valid` or `off`",
+                                a.value
+                            ),
+                        );
+                    }
+                    e
+                });
+                self.enforcement.set(l, t.pos, v);
             }
             "cache" => {
                 self.cache_seen = true;
@@ -1100,6 +1153,7 @@ impl RpkiBuilder {
             self.backoff.value.unwrap_or((d.backoff_min, d.backoff_max));
         let rpki = Rpki {
             mode: self.mode.value?,
+            enforcement: self.enforcement.value.unwrap_or(d.enforcement),
             caches: self.caches,
             version: self.version.value.unwrap_or(d.version),
             connect_timeout: self.connect_timeout.value.unwrap_or(d.connect_timeout),

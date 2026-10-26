@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
+use bgpfc_rib::{Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::prefix::Prefix;
@@ -84,12 +84,12 @@ impl Policies for RejectSome {
         p: Prefix,
         _: &PathAttrs,
         rov: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         let named = |by: fn(u8) -> bool| (0..12).any(|i| by(i) && prefix(i) == p);
         if named(rejected) || (named(unvalidated) && rov == RovState::Disabled) {
-            Verdict::Reject
+            Verdict::Reject.into()
         } else {
-            Verdict::Accept
+            Verdict::Accept.into()
         }
     }
 
@@ -208,4 +208,84 @@ proptest! {
             prop_assert_eq!(loc, expected);
         }
     }
+}
+
+#[test]
+fn the_prefix_limit_counts_held_routes_and_never_moves_with_enforcement() {
+    use std::sync::Arc;
+
+    use bgpfc_rib::Enforcement;
+    use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
+
+    // RFC 4271 §6.7 counts what the Adj-RIB-In holds, and a route held for
+    // its validation state is held (RFC 6811 §2): counted the same under
+    // every enforcement mode and in every state, so that neither a VRP
+    // change nor a reload of the mode can end the session or let it hold
+    // more.
+    let peer = info(3);
+    let now = Instant::now();
+    let mut rib = Rib::new(LOCAL_AS);
+    outputs(|o| rib.set_enforcement(Enforcement::DropInvalid, now, o));
+    outputs(|o| rib.peer_up(peer.clone(), now, o));
+    let change = |vrps: Vec<Vrp>| ValidationChange {
+        source: Arc::new(vrps.into_iter().collect::<VrpSet>()),
+        affected: AffectedPrefixes::All,
+    };
+    // Prefixes 0 and 1 may come from AS 64511 only: Invalid.
+    let other = || {
+        (0..2)
+            .map(|i| Vrp::new(prefix(i), 24, Asn(64_511)).unwrap())
+            .collect::<Vec<_>>()
+    };
+    outputs(|o| rib.validation_changed(change(other()), now, o));
+    let announce = |prefixes: Vec<u8>| Op::Announce {
+        prefixes,
+        looped: false,
+    };
+    let out = outputs(|o| rib.update(peer.addr, &update(&announce(vec![0, 1, 2])), now, o));
+    assert!(
+        out.iter()
+            .all(|o| !matches!(o, Output::PrefixLimitExceeded { .. }))
+    );
+    let counts = |rib: &Rib| {
+        let s = rib.peer_stats(peer.addr).unwrap();
+        (s.received[0].1, s.held[0].1)
+    };
+    assert_eq!(counts(&rib), (3, 2));
+    assert_eq!(rib.loc_rib(V4).count(), 1);
+    for (mode, held) in [
+        (Enforcement::Off, 0),
+        (Enforcement::PreferValid, 0),
+        (Enforcement::DropInvalid, 2),
+    ] {
+        let out = outputs(|o| rib.set_enforcement(mode, now, o));
+        assert!(
+            out.iter()
+                .all(|o| !matches!(o, Output::PrefixLimitExceeded { .. }))
+        );
+        assert_eq!(counts(&rib), (3, held), "{mode}");
+    }
+    // Valid now: used, and still three.
+    let theirs = (0..2)
+        .map(|i| Vrp::new(prefix(i), 24, PEER_AS).unwrap())
+        .collect();
+    outputs(|o| rib.validation_changed(change(theirs), now, o));
+    assert_eq!(counts(&rib), (3, 0));
+    assert_eq!(rib.loc_rib(V4).count(), 3);
+    // Every one Invalid and held: still three. A fourth, held as well, is
+    // one too many.
+    let all_other = (0..4)
+        .map(|i| Vrp::new(prefix(i), 24, Asn(64_511)).unwrap())
+        .collect();
+    outputs(|o| rib.validation_changed(change(all_other), now, o));
+    assert_eq!(counts(&rib), (3, 3));
+    let out = outputs(|o| rib.update(peer.addr, &update(&announce(vec![3])), now, o));
+    assert_eq!(
+        out.first(),
+        Some(&Output::PrefixLimitExceeded {
+            peer: peer.addr,
+            family: V4,
+            limit: 3
+        })
+    );
 }

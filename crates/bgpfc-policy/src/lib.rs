@@ -5,8 +5,10 @@
 //! Implements: RFC 4271 §9.1.1 (local policy sets the degree of
 //! preference), §9.1.3 (export policy); RFC 1997, 4360, 8092 (community
 //! matching and setting); RFC 8950 §5 (`next-hop self` on an IPv6 session
-//! gives IPv4 routes our IPv6 address once negotiated); `docs/config.md`,
-//! "Policies".
+//! gives IPv4 routes our IPv6 address once negotiated); RFC 6811 §3
+//! (`match rpki`, `set rpki`: "the ability to match and set the
+//! validation state of routes as part of its route policy filtering
+//! function"); `docs/config.md`, "Policies".
 #![forbid(unsafe_code)]
 
 pub mod prefix_list;
@@ -19,7 +21,7 @@ use std::net::IpAddr;
 
 use bgpfc_config::ast::{Action, CommunityOp, Config, Match, SetAction};
 use bgpfc_config::error::Pos;
-use bgpfc_rib::{PathAttrs, PeerInfo, Policies, RovState, Verdict};
+use bgpfc_rib::{Imported, PathAttrs, PeerInfo, Policies, RovState, Verdict};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::mp::NextHop;
@@ -57,18 +59,26 @@ enum Clause {
     LargeCommunity(LargeCommunity),
     Origin(Origin),
     Neighbor(IpAddr),
+    Rpki(RovState),
 }
 
 #[derive(Clone, Debug)]
 struct Term {
     clauses: Vec<Clause>,
+    /// The `set` actions on the attributes, in order.
     sets: Vec<SetAction>,
+    /// The state the term's last `set rpki` sets, which needs no copy of
+    /// the attributes.
+    rov: Option<RovState>,
     action: Action,
 }
 
 #[derive(Clone, Debug)]
 struct Policy {
     terms: Vec<Term>,
+    /// Whether a term matches the validation state: without one, the
+    /// verdict and the state set are the same whatever the route's state.
+    reads_rov: bool,
 }
 
 /// Every policy and prefix list of a configuration, compiled.
@@ -99,6 +109,11 @@ pub struct Route<'a> {
     /// and so did we (RFC 8950 §4): an IPv4 route may take an IPv6
     /// `local_addr` as its next hop.
     pub extended_next_hop: bool,
+    /// The route's origin validation state, which `match rpki` compares
+    /// (RFC 6811 §3): on import the one the lookup gave it (RFC 6811 §2),
+    /// on export the one it is used with. A `set rpki` replaces it for
+    /// the terms after it.
+    pub rov: RovState,
 }
 
 impl PolicySet {
@@ -157,17 +172,34 @@ impl PolicySet {
                         Match::LargeCommunity(c) => Clause::LargeCommunity(*c),
                         Match::Origin(o) => Clause::Origin(*o),
                         Match::Neighbor(a) => Clause::Neighbor(*a),
+                        Match::Rpki(state) => Clause::Rpki(*state),
                     };
                     clauses.push(clause);
                 }
+                // The term's clauses are tested before any of its actions,
+                // so where `set rpki` stands among them does not matter, and
+                // a later one replaces an earlier one.
+                let rov = t.sets.iter().rev().find_map(|s| match s {
+                    SetAction::Rpki(state) => Some(*state),
+                    _ => None,
+                });
                 terms.push(Term {
                     clauses,
-                    sets: t.sets.clone(),
+                    sets: t
+                        .sets
+                        .iter()
+                        .filter(|s| !matches!(s, SetAction::Rpki(_)))
+                        .cloned()
+                        .collect(),
+                    rov,
                     action: t.action,
                 });
             }
+            let reads_rov = terms
+                .iter()
+                .any(|t| t.clauses.iter().any(|c| matches!(c, Clause::Rpki(_))));
             names.insert(p.name.clone(), policies.len());
-            policies.push(Policy { terms });
+            policies.push(Policy { terms, reads_rov });
         }
         if errors.is_empty() {
             Ok(PolicySet {
@@ -186,23 +218,55 @@ impl PolicySet {
         self.names.contains_key(name)
     }
 
-    /// Run policy `name` on `route`. An unknown policy rejects, as does a
-    /// policy no term of which decides (`docs/config.md`, "Policies").
+    /// Whether what policy `name` makes of a route can depend on the
+    /// route's validation state: whether one of its terms has a `match
+    /// rpki` clause. A `set rpki` alone sets the same state whatever the
+    /// route's. An unknown policy rejects everything, so it does not.
+    #[must_use]
+    pub fn reads_rov(&self, name: &str) -> bool {
+        self.reads_rov_at(self.names.get(name).copied())
+    }
+
+    fn reads_rov_at(&self, index: Option<usize>) -> bool {
+        index
+            .and_then(|i| self.policies.get(i))
+            .is_some_and(|p| p.reads_rov)
+    }
+
+    /// Run policy `name` on `route`: whether and with which attributes the
+    /// route is accepted, and the validation state a `set rpki` gave it
+    /// (RFC 6811 §3), if the route is accepted and one did. An unknown
+    /// policy rejects, as does a policy no term of which decides
+    /// (`docs/config.md`, "Policies").
+    #[must_use]
+    pub fn run(&self, name: &str, route: &Route<'_>) -> Imported {
+        self.run_at(self.names.get(name).copied(), route)
+    }
+
+    /// [`PolicySet::run`]'s verdict alone, as export policy needs it.
     #[must_use]
     pub fn evaluate(&self, name: &str, route: &Route<'_>) -> Verdict {
-        self.evaluate_at(self.names.get(name).copied(), route)
+        self.run(name, route).verdict
     }
 
     /// Run the policy at `index` (from `names`); `None` rejects, as an
     /// unknown policy does.
-    fn evaluate_at(&self, index: Option<usize>, route: &Route<'_>) -> Verdict {
+    fn run_at(&self, index: Option<usize>, route: &Route<'_>) -> Imported {
         let Some(policy) = index.and_then(|i| self.policies.get(i)) else {
-            return Verdict::Reject;
+            return Verdict::Reject.into();
         };
         let mut modified: Option<PathAttrs> = None;
+        let mut rov_set: Option<RovState> = None;
         for term in &policy.terms {
             let attrs = modified.as_ref().unwrap_or(route.attrs);
-            if !term.clauses.iter().all(|c| self.holds(c, route, attrs)) {
+            // A later term sees the state an earlier one set, as it sees
+            // the attributes an earlier one set.
+            let rov = rov_set.unwrap_or(route.rov);
+            if !term
+                .clauses
+                .iter()
+                .all(|c| self.holds(c, route, attrs, rov))
+            {
                 continue;
             }
             if !term.sets.is_empty() {
@@ -213,18 +277,25 @@ impl PolicySet {
                 a.normalise();
                 modified = Some(a);
             }
+            if term.rov.is_some() {
+                rov_set = term.rov;
+            }
             match term.action {
                 Action::Accept => {
-                    return modified.map_or(Verdict::Accept, Verdict::Modified);
+                    return Imported {
+                        verdict: modified.map_or(Verdict::Accept, Verdict::Modified),
+                        rov: rov_set,
+                    };
                 }
-                Action::Reject => return Verdict::Reject,
+                // A rejected route is used with no state.
+                Action::Reject => return Verdict::Reject.into(),
                 Action::Next => {}
             }
         }
-        Verdict::Reject
+        Verdict::Reject.into()
     }
 
-    fn holds(&self, clause: &Clause, route: &Route<'_>, attrs: &PathAttrs) -> bool {
+    fn holds(&self, clause: &Clause, route: &Route<'_>, attrs: &PathAttrs, rov: RovState) -> bool {
         match clause {
             Clause::Prefix(r) => r.matches(route.prefix),
             Clause::PrefixList(i) => self.prefix_lists[*i].matches(route.prefix),
@@ -234,12 +305,18 @@ impl PolicySet {
             Clause::LargeCommunity(c) => attrs.large_communities.binary_search(c).is_ok(),
             Clause::Origin(o) => attrs.origin == *o,
             Clause::Neighbor(a) => route.neighbor == *a,
+            // RFC 6811 §3; `not-found` holds for `disabled` too (RFC 6811
+            // §2: a route not validated SHOULD read as NotFound).
+            Clause::Rpki(wanted) => rov.satisfies(*wanted),
         }
     }
 }
 
 fn apply(set: &SetAction, a: &mut PathAttrs, route: &Route<'_>) {
     match set {
+        // invariant: `PolicySet::compile` keeps it out of a term's `sets`
+        // and in its `rov`: it sets no attribute.
+        SetAction::Rpki(_) => {}
         SetAction::LocalPref(v) => a.local_pref = Some(*v),
         SetAction::Med(v) => a.med = Some(*v),
         SetAction::Community(op, vals) => edit(&mut a.communities, *op, vals),
@@ -332,13 +409,9 @@ impl Engine {
         &self.set
     }
 
-    fn run(
-        &self,
-        which: fn(NeighborPolicies) -> Option<usize>,
-        peer: &PeerInfo,
-        route: &Route<'_>,
-    ) -> Verdict {
-        let policies = match self.last.get() {
+    /// The policies of `peer`, `None` for a peer with none configured.
+    fn policies_of(&self, peer: &PeerInfo) -> Option<NeighborPolicies> {
+        match self.last.get() {
             Some((addr, p)) if addr == peer.addr => Some(p),
             _ => {
                 let p = self.neighbors.get(&peer.addr).copied();
@@ -347,18 +420,32 @@ impl Engine {
                 }
                 p
             }
-        };
-        match policies {
-            Some(p) => self.set.evaluate_at(which(p), route),
+        }
+    }
+
+    fn run(
+        &self,
+        which: fn(NeighborPolicies) -> Option<usize>,
+        peer: &PeerInfo,
+        route: &Route<'_>,
+    ) -> Imported {
+        match self.policies_of(peer) {
+            Some(p) => self.set.run_at(which(p), route),
             // A peer without configured policies gets nothing and gives
             // nothing (docs/config.md: every neighbor names both).
-            None => Verdict::Reject,
+            None => Verdict::Reject.into(),
         }
     }
 }
 
-/// No clause matches on the validation state yet, so `rov` is accepted
-/// and not read: the RFC 6811 §3 row in COMPLIANCE.md says what is left.
+/// `match rpki` compares the `rov` the RIB passes: on import the state the
+/// lookup gave the route, on export the one it is used with. Import
+/// returns the state a `set rpki` set, which the RIB then uses the route
+/// with (RFC 6811 §3). Validation keeps `set rpki` out of every policy a
+/// neighbor exports with, so export sets none. An import policy without
+/// `match rpki` tells the RIB that it does not read the state, which
+/// spares the RIB asking it about a rejected route again with every other
+/// state.
 impl Policies for Engine {
     fn import(
         &self,
@@ -366,8 +453,8 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
-        _rov: RovState,
-    ) -> Verdict {
+        rov: RovState,
+    ) -> Imported {
         let route = Route {
             prefix,
             family,
@@ -375,6 +462,7 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
             extended_next_hop: peer.extended_next_hop.contains(&family),
+            rov,
         };
         self.run(|n| n.0, peer, &route)
     }
@@ -385,7 +473,7 @@ impl Policies for Engine {
         family: AddressFamily,
         prefix: Prefix,
         attrs: &PathAttrs,
-        _rov: RovState,
+        rov: RovState,
     ) -> Verdict {
         let route = Route {
             prefix,
@@ -394,8 +482,17 @@ impl Policies for Engine {
             neighbor: peer.addr,
             local_addr: peer.local_addr,
             extended_next_hop: peer.extended_next_hop.contains(&family),
+            rov,
         };
-        self.run(|n| n.1, peer, &route)
+        self.run(|n| n.1, peer, &route).verdict
+    }
+
+    /// Whether the neighbor's import policy has a `match rpki` clause. A
+    /// peer with no policy configured is rejected whatever its routes'
+    /// state.
+    fn import_reads_rov(&self, peer: &PeerInfo) -> bool {
+        self.policies_of(peer)
+            .is_some_and(|p| self.set.reads_rov_at(p.0))
     }
 }
 

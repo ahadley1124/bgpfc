@@ -6,7 +6,7 @@ use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
 
 use bgpfc_policy::{PolicySet, Route};
-use bgpfc_rib::PathAttrs;
+use bgpfc_rib::{PathAttrs, RovState};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::Community;
@@ -54,6 +54,7 @@ fn bench(c: &mut Criterion) {
         neighbor: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         local_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)),
         extended_next_hop: false,
+        rov: RovState::NotFound,
     };
     c.bench_function("policy_evaluate_six_terms", |b| {
         b.iter(|| set.evaluate("IN", black_box(&route)));

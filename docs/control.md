@@ -30,10 +30,11 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX]` | the Loc-RIB of a family; with a prefix, every candidate route to it, the chosen one marked `*`; each route with its origin validation state (`rov`, see [Validation state](#validation-state)) |
+| `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
-| `show rpki` | the `rpki` mode, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
+| `show rpki` | the `rpki` mode and enforcement, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
+| `show rpki transitions` | the latest routes whose origin validation state changed, oldest first, each with its time (see [Changes of state](#changes-of-state)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
 | `clear neighbor ADDR [soft]` | hard: Cease / Administrative Reset (RFC 4486 §4), then reconnect; this is the manual start that brings back a neighbor the `restart-limit` left Idle; soft: ROUTE-REFRESH for every family (RFC 2918 §4) and a full resend of our Adj-RIB-Out. A soft reset is refused if the peer did not advertise the capability. |
 | `clear neighbor ADDR MESSAGE` | a hard reset carrying a Shutdown Communication (RFC 9003); at most 128 octets (RFC 9003 §3) |
@@ -52,8 +53,9 @@ A body line that starts with `.` is sent as `..`. One request per
 connection; the daemon closes after the response. Requests over 4096
 bytes are refused.
 
-`show routes` of a whole family and `show fib` can list millions of
-routes. The daemon takes them from the RIB and the FIB 4096 at a time and
+`show routes` of a whole family, held routes or not, and `show fib` can
+list millions of routes. The daemon takes them from the RIB and the FIB
+about 4096 at a time (all the held routes of a destination in one go) and
 writes each part as it comes, so the listing is not one snapshot: a
 route that changes meanwhile may show either way. If the daemon cannot
 finish a listing, the response ends without its `.` line, which the client
@@ -78,9 +80,10 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/status` | `show status` |
 | `GET /v1/neighbors` | `show neighbors` |
 | `GET /v1/neighbors/{addr}` | `show neighbor ADDR` (`404` if unknown) |
-| `GET /v1/routes?family=ipv4\|ipv6[&prefix=P]` | `show routes` |
+| `GET /v1/routes?family=ipv4\|ipv6[&prefix=P][&held=1]` | `show routes` |
 | `GET /v1/fib` | `show fib` |
 | `GET /v1/rpki` | `show rpki` |
+| `GET /v1/rpki/transitions` | `show rpki transitions` |
 | `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
 | `POST /v1/reload` | `reload` |
 | `POST /v1/neighbors/{addr}/clear[?soft=1][&message=TEXT]` | `clear neighbor` |
@@ -93,28 +96,35 @@ Example objects:
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
-  "received":2,"advertised":1,
-  "prefixes":[{"family":"ipv4-unicast","received":2,"advertised":1,"limit":1000},
-              {"family":"ipv6-unicast","received":0,"advertised":0,"limit":null}],
+  "received":2,"held":1,"advertised":1,
+  "prefixes":[{"family":"ipv4-unicast","received":2,"held":1,"advertised":1,"limit":1000},
+              {"family":"ipv6-unicast","received":0,"held":0,"advertised":0,"limit":null}],
   "session":{"router_id":"198.51.100.1","hold_time":90,"keepalive_time":30,
              "four_octet_as":true,"extended_messages":false,"route_refresh":true,
              "families":["ipv4-unicast","ipv6-unicast"],
              "extended_next_hop":{"receive":["ipv4-unicast"],"send":[]}}}]
 
 [{"prefix":"192.0.2.0/24","next_hop":"198.51.100.1","origin":"igp","local_pref":100,"med":null,
-  "peer":"198.51.100.1","best":true,"rov":"disabled","as_path":[64511],"communities":[],
-  "large_communities":[]}]
+  "peer":"198.51.100.1","best":true,"rov":"valid","rov_set":null,"held":null,"as_path":[64511],
+  "communities":[],"large_communities":[]},
+ {"prefix":"192.0.2.0/24","next_hop":"198.51.100.2","origin":"igp","local_pref":null,"med":null,
+  "peer":"198.51.100.2","best":false,"rov":"invalid","rov_set":null,"held":"enforcement",
+  "as_path":[64497],"communities":[],"large_communities":[]}]
 
 {"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
 
-{"mode":"external","caches":[{"host":"127.0.0.1","port":3323,"preference":0,"in_use":true,
- "current":true}],"running":true,"state":"idle","connected":true,"version":1,"session_id":4242,
+{"mode":"external","enforcement":"drop-invalid","caches":[{"host":"127.0.0.1","port":3323,
+ "preference":0,"in_use":true,"current":true}],"running":true,"state":"idle","connected":true,"version":1,"session_id":4242,
  "serial":17,"synced_seconds_ago":12,"expires_in_seconds":7188,
  "vrps":{"ipv4":512340,"ipv6":121877,"from":{"host":"127.0.0.1","port":3323}},
  "failures":0,"last_error":null,"last_error_seconds_ago":null}
 
 {"prefix":"192.0.2.0/24","origin":64496,"rov":"valid",
  "vrps":[{"prefix":"192.0.2.0/24","max_length":24,"asn":64496,"matches":true}]}
+
+{"capacity":1024,"unrecorded":0,"transitions":[{"time":"2026-10-22T12:34:56.789Z",
+ "seconds_ago":12,"family":"ipv4-unicast","prefix":"192.0.2.0/24","peer":"198.51.100.1",
+ "origin":65001,"from":"valid","to":"invalid","route":"held","held_by":"enforcement"}]}
 ```
 
 ## Validation state
@@ -137,15 +147,118 @@ from one that no VRP covers (issue #52). Every route is `disabled` until
 VRPs of an RPKI cache; from then on the states follow the cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
-policy, and follows the validation source when it changes. It is shown
-for information only: it does not yet change whether a route is used or
-which one is chosen.
+policy, and follows the validation source when it changes (RFC 6811 §4).
+What acts on it is the `rpki` block's `enforcement`, which `show rpki`
+prints, and the import policy (`docs/config.md`, "RPKI"): under
+`drop-invalid`, the default, an Invalid route is held; under
+`prefer-valid` route selection ranks Valid routes first; under `off`
+nothing acts on the state but policy.
+
+When import policy sets the state a route is used with (`set rpki`, RFC
+6811 §3), `show routes` prints it after the looked-up one, as in
+`invalid>valid`, and the JSON has it as `rov_set` (`null` otherwise);
+enforcement, route selection and export policy use the state set.
+
+A route the Adj-RIB-In holds for its state stays there, counted as
+received, but is no candidate for route selection, so it is neither
+installed nor advertised (RFC 6811 §2: kept in the Adj-RIB-In, and out
+of the decision process only as configured). It is used again, with no
+UPDATE from its neighbor, once its state allows. `show routes PREFIX`
+lists it after the candidates, marked `!`, followed by `held by
+enforcement` (the `enforcement` rules out the state it is used with) or
+`held by policy` (the import policy rejects it in its state and would
+accept it in another); the JSON has `held` (`enforcement`, `policy` or
+`null`). A held route keeps the attributes its neighbor sent, and is shown
+with them: the import policy runs on them again when the route is used
+again, so what the policy sets, such as a `set local-pref`, shows only
+then. `show routes held` lists every held route of a family, and `show
+neighbor` counts them per family.
+
+```
+prefix                                       next-hop                                 origin   lpref     med rov       path
+*192.0.2.0/24                                198.51.100.2                             igp          -       - valid     64496 via 198.51.100.2
+!192.0.2.0/24                                198.51.100.1                             igp          -       - invalid   65001 via 198.51.100.1 held by enforcement
+```
 
 `show rpki validate` answers the question for any route, held or not,
 from the same VRPs the RIB validates with.
 
 Routes also carry an ASPA verdict. Until ASPA verification exists, its
 only value is `disabled`, so it is not shown.
+
+### Changes of state
+
+Issue #59: "An operator needs to see that a prefix went Valid → Invalid
+at a specific time." Each change of the validation source (an RTR End of
+Data that changes the VRPs, a move to another cache, VRPs that expire,
+validation switched on or off) is logged at info as one line that counts
+what it did:
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: validation states changed" routes=3 changed=2 changes=valid->invalid:1,invalid->valid:1 destinations=2 prefixes=192.0.2.0/24,203.0.113.0/24 best_changed=2 held=1 released=1 logged=2 unlogged=0
+```
+
+`routes` were validated again, `changed` of them changed state, as
+`changes` details per pair of states; `destinations` is the number of
+prefixes they are for, the first eight of which `prefixes` names, and
+`best_changed` those whose best route changed. `held` routes the change
+took out of use, and `released` it put back into use. Of the routes it
+moved among `valid`, `invalid` and `not-found`, `logged` have a line of
+their own at info, which follows, and `unlogged` do not:
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: route validation state changed" prefix=192.0.2.0/24 peer=198.51.100.1 origin=AS65001 from=valid to=invalid route=held by=enforcement
+2026-10-22T12:34:56.789Z INFO  msg="rib: route validation state changed" prefix=203.0.113.0/24 peer=198.51.100.1 origin=AS65001 from=invalid to=valid route=best
+```
+
+`origin` is the route's origin AS (`none` when it has none, RFC 6811 §2);
+`route` is what the route is after route selection: `best`, `candidate`,
+or `held` with `by` the reason. Moves to and from `disabled`, which mean
+validation being switched on or off, are counted on the first line and
+never listed. A change of `enforcement` on reload is logged as one line
+too:
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: rpki enforcement changed" from=off to=drop-invalid routes=1250000 held=5000 released=0 best_changed=4800
+```
+
+`show rpki transitions` and `GET /v1/rpki/transitions` give the latest
+routes that moved among `valid`, `invalid` and `not-found`, oldest first,
+each with the time of its log line, then how many are kept and how many
+were never kept:
+
+```
+2026-10-22T12:34:56.789Z 192.0.2.0/24 peer 198.51.100.1 origin AS65001 valid->invalid held by enforcement
+2026-10-22T12:34:56.789Z 203.0.113.0/24 peer 198.51.100.1 origin AS65001 invalid->valid best
+2 kept (most recent 1024); 0 not recorded
+```
+
+In the JSON (see the example above), `seconds_ago` is how long ago the
+change was, `origin` is `null` for none, and `held_by` is `null` unless
+`route` is `held`. The memory is the RIB thread's and starts empty with
+the daemon. Three bounds keep a change that moves a whole table, such as
+VRPs that expire or validation switched on with a full table, from
+holding the RIB thread or flooding the log with the RIB's lines, and none
+is configurable:
+
+| Bound | Value | Why |
+|---|---|---|
+| per-route lines at info per change | 100 | Ordinary RTR deltas move few routes, since most VRP churn re-issues ROAs that are already Valid, so a hundred logs a typical change whole. A change that moves many routes (expiry, a move to a cache with other data, a bulk ROA operation) then costs about 15 KB of log rather than a line per route of a table of a million. |
+| routes listed per change | 1024 | The RIB names at most this many routes per change (`Revalidation::LISTED`): those after the first hundred go out at `debug`, and routes beyond the 1024 are only counted (`unlogged`, `not recorded`). It bounds the report (about 55 KB) and the debug output, which would otherwise be a line per route of the table. |
+| changes kept for `show rpki transitions` | 1024 | The latest, about 90 KB: as many as one change lists, so that the last large one shows whole. |
+
+Nothing is uncounted: the first line counts every move per pair of
+states, and `show routes` gives every route's current state. A knob
+would change no outcome, only how much is written.
+
+The bounds are on the RIB's lines only. The FIB thread logs each route it
+installs or removes at info (`fib: dry-run` or `fib: applied`), whatever
+made the change, as it does for an UPDATE. So a change of state or of
+`enforcement` adds up to one such line for each destination it counts in
+`best_changed`: under `drop-invalid`, one for each destination whose only
+route it holds or releases. The example above, `best_changed=4800`, comes
+with about 4800 of them. At `log { level warn; }` the FIB thread writes
+only its failures.
 
 ## RPKI
 
@@ -161,6 +274,7 @@ replaces them, or until they expire (§10, §6).
 | Member | Line | Meaning |
 |---|---|---|
 | `mode` | `mode` | `disabled` or `external` |
+| `enforcement` | `enforcement` | what acts on the validation state: `drop-invalid`, `prefer-valid` or `off` (see [Validation state](#validation-state)); written or the default, and shown in every mode |
 | `caches` | `cache` | the configured caches: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
 | `running` | `state stopped` | whether the client runs; it stops only when the RIB is gone |
 | `state` | `state` | the session with the current cache: `disconnected`, `connecting` (a connection attempt is under way), `querying` (a query is out), `receiving` (an answer is coming in) or `idle` (in sync, waiting to poll) |
@@ -173,8 +287,9 @@ replaces them, or until they expire (§10, §6).
 | `failures` | `failures` | failed attempts, connections lost before the cache was in sync, and No Data Available answers in a row; 0 again once a cache brings bgpfcd in sync |
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
-Without a client, in `mode disabled`, every member but `mode` and
-`caches` is `null`, `false` or 0, and the text lists only those two.
+Without a client, in `mode disabled`, every member but `mode`,
+`enforcement` and `caches` is `null`, `false` or 0, and the text lists
+only those three.
 
 ## Reload
 
@@ -192,6 +307,9 @@ Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
 RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
-again. `router-id` and `local-as` changes are refused, and `listen`,
+again; a changed `enforcement` alone leaves the client alone and judges
+every route again under the new mode at once (the summary says `rpki
+enforcement MODE`, the log `rib: rpki enforcement changed`).
+`router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.

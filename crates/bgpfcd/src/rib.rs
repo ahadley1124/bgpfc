@@ -7,7 +7,17 @@
 //! §6.7 prefix limit is told to end its session. Routes the RIB ignored
 //! for a semantically incorrect next hop are logged (RFC 4271 §6.3), and
 //! so is what a change of the validation source did to the routes' RFC
-//! 6811 states, in one line per change.
+//! 6811 states, in one line per change, and what a change of the `rpki`
+//! block's `enforcement` did to their use (RFC 6811 §5), in one line too.
+//!
+//! Issue #59: "An operator needs to see that a prefix went Valid → Invalid
+//! at a specific time." After the line of a change of the validation
+//! source come the routes it moved among valid, invalid and not-found, a
+//! line each: the first [`LOGGED`] at info, the rest the RIB lists at
+//! debug. The thread also keeps the latest [`KEPT`] of them, with their
+//! time, for `show rpki transitions` ([`RibQuery::Transitions`]). Moves
+//! to and from `disabled`, validation being switched on or off, are only
+//! counted, as is what the RIB does not list.
 //!
 //! Changes of the validation source arrive on the same channel, as
 //! [`RibMsg::Validation`], and go the way an UPDATE goes (RFC 6811 §4):
@@ -15,13 +25,17 @@
 //! delivered like any other output. The RIB starts with no source (every
 //! route `disabled`) and keeps it until a change says otherwise.
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
-use bgpfc_rib::{FibChange, Output, PeerInfo, Revalidation, Rib, Sink};
+use bgpfc_log::Level;
+use bgpfc_rib::{
+    FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, RouteStatus, Sink, Transition,
+};
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::AddressFamily;
@@ -29,7 +43,8 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, RibMsg, RibQuery, RibReply, RibSettings, RouteReport,
+    FibMsg, Intervals, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply, RibSettings,
+    RouteReport, TransitionsReport,
 };
 use crate::peer::SendError;
 
@@ -60,6 +75,7 @@ fn run(
         fib,
         changes: Vec::new(),
     };
+    let mut transitions = Transitions::default();
     #[cfg(feature = "profiling")]
     let mut loads = crate::profiling::Loads::from_env();
     loop {
@@ -75,7 +91,15 @@ fn run(
         #[cfg(feature = "profiling")]
         let seen = msg.as_ref().map(|m| loads.before(m));
         if let Some(msg) = msg {
-            handle(&mut rib, &mut settings, msg, now, fib, &mut out);
+            handle(
+                &mut rib,
+                &mut settings,
+                &mut transitions,
+                msg,
+                now,
+                fib,
+                &mut out,
+            );
         }
         // RFC 4271 §9.2.1.1: release what is due. After a message too, so
         // that a busy channel cannot starve the deadlines.
@@ -108,10 +132,12 @@ pub(crate) fn next(
     }
 }
 
-/// Apply one message to the RIB, its outputs going to `out`.
+/// Apply one message to the RIB, its outputs going to `out`; the routes
+/// a change of the validation source moved are kept in `transitions`.
 fn handle(
     rib: &mut Rib,
     settings: &mut RibSettings,
+    transitions: &mut Transitions,
     msg: RibMsg,
     now: Instant,
     fib: &SyncSender<FibMsg>,
@@ -166,7 +192,7 @@ fn handle(
             rib.peer_down(peer, now, out);
         }
         RibMsg::Query(q, reply) => {
-            let _ = reply.send(answer(rib, &q));
+            let _ = reply.send(answer(rib, transitions, &q));
         }
         RibMsg::SetPolicies { policies, reexport } => {
             for peer in &reexport {
@@ -197,7 +223,16 @@ fn handle(
                 "rib: validation change",
                 affected = describe_affected(&change.affected)
             );
-            rib.validation_changed(change, now, out);
+            let mut out = Recording {
+                transitions,
+                out,
+                when: now,
+            };
+            rib.validation_changed(change, now, &mut out);
+        }
+        RibMsg::SetEnforcement(mode) => {
+            bgpfc_log::debug!("rib: rpki enforcement", mode = mode);
+            rib.set_enforcement(mode, now, out);
         }
         // The changes of earlier messages went to the FIB first: the loop
         // hands them on after each.
@@ -440,19 +475,33 @@ impl Sink for Deliver<'_> {
             }
             Output::Revalidated(r) => {
                 // RFC 6811 §4: the routes a change of the validation source
-                // moved, counted. One line per change, however many routes
-                // it moved: turning validation on or off moves every route
-                // of the table, and a line per route would hold the RIB
-                // thread and flood the log.
-                let values = revalidated(&r);
-                let fields: Vec<bgpfc_log::Field<'_>> = values
-                    .iter()
-                    .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
-                    .collect();
-                bgpfc_log::log(bgpfc_log::Level::Info, REVALIDATED, &fields);
+                // moved, counted in one line however many routes it moved:
+                // turning validation on or off, or the expiry of the VRPs,
+                // moves every route of the table, and a line per route
+                // would hold the RIB thread and flood the log. Then a line
+                // per route it moved among valid, invalid and not-found
+                // (issue #59), as many as `LOGGED` at info.
+                let debug = bgpfc_log::enabled(Level::Debug);
+                for line in revalidation_lines(&r, debug) {
+                    log_line(line.level, line.msg, &line.fields);
+                }
+            }
+            Output::Enforcement(r) => {
+                // RFC 6811 §5: every route judged again under the
+                // operator's new enforcement mode, counted in one line.
+                log_line(Level::Info, ENFORCEMENT_CHANGED, &rejudged(&r));
             }
         }
     }
+}
+
+/// Log a line whose field values are already text.
+fn log_line(level: Level, msg: &str, values: &[(&'static str, String)]) {
+    let fields: Vec<bgpfc_log::Field<'_>> = values
+        .iter()
+        .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
+        .collect();
+    bgpfc_log::log(level, msg, &fields);
 }
 
 /// The message of the line logged for what a change of the validation
@@ -461,21 +510,200 @@ const REVALIDATED: &str = "rib: validation states changed";
 
 /// The fields of that line: the routes validated again, how many of them
 /// changed state, those per change of state (`disabled->valid:1000,...`),
-/// the destinations they are for with the first few of them, and the
-/// destinations whose best route changed.
-fn revalidated(r: &Revalidation) -> [(&'static str, String); 6] {
+/// the destinations they are for with the first few of them, the
+/// destinations whose best route changed, the routes the change took out
+/// of use (`held`) and put back into use (`released`) under the
+/// `enforcement` and import policy (RFC 6811 §2, §5), and of the routes
+/// it moved among valid, invalid and not-found, those with a line of
+/// their own at info (`logged`) and those without (`unlogged`). The first
+/// six are m11's, in m11's order, which scripts may read.
+fn revalidated(r: &Revalidation) -> [(&'static str, String); 10] {
     let changes = r
         .changes
         .iter()
         .map(|(from, to, n)| format!("{from}->{to}:{n}"))
         .collect::<Vec<_>>()
         .join(",");
+    let logged = r.transitions.len().min(LOGGED);
+    let unlogged = r.transitions.len() - logged + r.unlisted;
     [
         ("routes", r.routes.to_string()),
         ("changed", r.changed().to_string()),
         ("changes", changes),
         ("destinations", r.destinations.to_string()),
         ("prefixes", listed(&r.sample, r.destinations)),
+        ("best_changed", r.best_changed.to_string()),
+        ("held", r.held.to_string()),
+        ("released", r.released.to_string()),
+        ("logged", logged.to_string()),
+        ("unlogged", unlogged.to_string()),
+    ]
+}
+
+/// Routes a change of the validation source moved among valid, invalid
+/// and not-found that get a line of their own at info: the first this
+/// many the RIB lists, in prefix order. Ordinary RTR deltas move few
+/// routes, as most VRP churn re-issues ROAs that are already Valid, so a
+/// hundred logs a typical delta whole, line by line. The changes that move
+/// many routes (VRPs that expire, failover to a cache with other data, a
+/// bulk ROA operation) then cost about 15 KB of log, not a line per route
+/// of a table of a million or more. The rest the RIB lists, at most
+/// [`Revalidation::LISTED`] in all, go out at debug; every move is
+/// counted on the summary line. Not configurable: no value of it is more
+/// correct than another, and `show routes` gives every route's state.
+pub(crate) const LOGGED: usize = 100;
+
+/// The message of the line per route a change of the validation source
+/// moved (issue #59).
+const TRANSITION: &str = "rib: route validation state changed";
+
+/// One line to log, its field values already text.
+#[derive(Debug, PartialEq, Eq)]
+struct Line {
+    level: Level,
+    msg: &'static str,
+    fields: Vec<(&'static str, String)>,
+}
+
+/// What a change of the validation source is logged with: the summary
+/// line first, then a line per route it moved among valid, invalid and
+/// not-found that the RIB lists: the first [`LOGGED`] at info, and with
+/// `debug` the others at debug, which are not built otherwise.
+fn revalidation_lines(r: &Revalidation, debug: bool) -> Vec<Line> {
+    let shown = if debug {
+        r.transitions.len()
+    } else {
+        r.transitions.len().min(LOGGED)
+    };
+    let mut lines = Vec::with_capacity(1 + shown);
+    lines.push(Line {
+        level: Level::Info,
+        msg: REVALIDATED,
+        fields: revalidated(r).into(),
+    });
+    for (i, t) in r.transitions[..shown].iter().enumerate() {
+        lines.push(Line {
+            level: if i < LOGGED {
+                Level::Info
+            } else {
+                Level::Debug
+            },
+            msg: TRANSITION,
+            fields: transition(t),
+        });
+    }
+    lines
+}
+
+/// The fields of the line for one route a change moved: its destination,
+/// the peer it came from, its Route Origin ASN (RFC 6811 §2), the states
+/// the lookup gave it before and after, and what it is now: `best`,
+/// `candidate`, or `held` with `by` the reason (`enforcement` or
+/// `policy`).
+fn transition(t: &Transition) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("prefix", t.prefix.to_string()),
+        ("peer", t.peer.to_string()),
+        ("origin", t.origin.to_string()),
+        ("from", t.from.to_string()),
+        ("to", t.to.to_string()),
+        ("route", status_name(t.route).to_owned()),
+    ];
+    if let RouteStatus::Held(by) = t.route {
+        fields.push(("by", by.to_string()));
+    }
+    fields
+}
+
+/// What a route is after the decision process, as logs and the control
+/// plane name it: `best`, `candidate` or `held`.
+pub(crate) const fn status_name(s: RouteStatus) -> &'static str {
+    match s {
+        RouteStatus::Best => "best",
+        RouteStatus::Candidate => "candidate",
+        RouteStatus::Held(_) => "held",
+    }
+}
+
+/// Changes of state kept for `show rpki transitions`: the most recent of
+/// those the RIB lists, as many as one change of the validation source
+/// lists at most ([`Revalidation::LISTED`]), so that the last large one
+/// shows whole. About 90 KB: 88 bytes an entry on a 64-bit target, the
+/// [`Transition`] and its two times. Not configurable, as [`LOGGED`] is
+/// not.
+pub(crate) const KEPT: usize = 1024;
+
+/// The RIB thread's memory of the routes changes of the validation source
+/// moved among valid, invalid and not-found: the latest [`KEPT`], each
+/// with when it happened, and a count of those it was never given.
+#[derive(Debug, Default)]
+pub(crate) struct Transitions {
+    kept: VecDeque<Recorded>,
+    unrecorded: u64,
+}
+
+impl Transitions {
+    /// Keep what `r` lists, which happened at `at` (`when` on the
+    /// monotonic clock), dropping the oldest beyond [`KEPT`], and count
+    /// what it does not list.
+    fn record(&mut self, r: &Revalidation, at: SystemTime, when: Instant) {
+        let listed = &r.transitions[r.transitions.len().saturating_sub(KEPT)..];
+        let room = KEPT - listed.len();
+        if self.kept.len() > room {
+            self.kept.drain(..self.kept.len() - room);
+        }
+        self.kept.extend(listed.iter().map(|t| Recorded {
+            at,
+            when,
+            transition: t.clone(),
+        }));
+        self.unrecorded = self
+            .unrecorded
+            .saturating_add(u64::try_from(r.unlisted).unwrap_or(u64::MAX));
+    }
+
+    /// What is kept, oldest first, for the control plane.
+    fn report(&self) -> TransitionsReport {
+        TransitionsReport {
+            capacity: KEPT,
+            unrecorded: self.unrecorded,
+            entries: self.kept.iter().cloned().collect(),
+        }
+    }
+}
+
+/// Passes outputs on to `out`, keeping in `transitions` first what the
+/// report of a change of the validation source lists.
+struct Recording<'a, S> {
+    transitions: &'a mut Transitions,
+    out: &'a mut S,
+    /// When the change was taken from the channel.
+    when: Instant,
+}
+
+impl<S: Sink> Sink for Recording<'_, S> {
+    fn put(&mut self, output: Output) {
+        if let Output::Revalidated(r) = &output {
+            self.transitions.record(r, SystemTime::now(), self.when);
+        }
+        self.out.put(output);
+    }
+}
+
+/// The message of the line logged when the `enforcement` changes.
+const ENFORCEMENT_CHANGED: &str = "rib: rpki enforcement changed";
+
+/// The fields of that line: the mode before and after, the routes judged
+/// again (every route the Adj-RIBs-In hold), those the new mode took out
+/// of use and put back into use, and the destinations whose best route
+/// changed.
+fn rejudged(r: &Rejudged) -> [(&'static str, String); 6] {
+    [
+        ("from", r.from.to_string()),
+        ("to", r.to.to_string()),
+        ("routes", r.routes.to_string()),
+        ("held", r.held.to_string()),
+        ("released", r.released.to_string()),
         ("best_changed", r.best_changed.to_string()),
     ]
 }
@@ -533,8 +761,22 @@ fn log_update(peer: IpAddr, update: &bgpfc_wire::update::DecodedUpdate) {
     }
 }
 
-fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
+/// `r`, a route to `prefix`, for the control plane.
+fn route_report(prefix: Prefix, r: &bgpfc_rib::RouteRef<'_>, best: bool) -> RouteReport {
+    RouteReport {
+        prefix,
+        peer: r.peer,
+        attrs: std::sync::Arc::clone(r.attrs),
+        best,
+        rov: r.rov,
+        rov_set: r.rov_set,
+        held: r.held,
+    }
+}
+
+fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
     match q {
+        RibQuery::Transitions => RibReply::Transitions(transitions.report()),
         RibQuery::Peers => RibReply::Peers(
             rib.peers()
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
@@ -542,40 +784,48 @@ fn answer(rib: &Rib, q: &RibQuery) -> RibReply {
         ),
         RibQuery::Routes {
             family,
-            prefix,
+            prefix: Some(prefix),
+            held,
+            ..
+        } => RibReply::Routes(
+            // RFC 6811 §2: the Adj-RIBs-In keep a route held for its
+            // state; it comes after the candidates, of which the first is
+            // the best.
+            rib.routes(*family, *prefix)
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !held || r.held.is_some())
+                .map(|(i, r)| route_report(*prefix, r, i == 0 && r.held.is_none()))
+                .collect(),
+        ),
+        RibQuery::Routes {
+            family,
+            prefix: None,
             after,
-        } => match prefix {
-            Some(prefix) => {
-                let best = rib
-                    .loc_rib(*family)
-                    .find(|(p, _)| p == prefix)
-                    .map(|(_, b)| b.peer);
-                RibReply::Routes(
-                    rib.candidates(*family, *prefix)
-                        .iter()
-                        .map(|c| RouteReport {
-                            prefix: *prefix,
-                            peer: c.peer,
-                            attrs: std::sync::Arc::clone(c.attrs),
-                            best: best == Some(c.peer),
-                            rov: c.rov,
-                        })
-                        .collect(),
-                )
+            held: false,
+        } => RibReply::Routes(
+            rib.loc_rib_after(*family, *after)
+                .take(PAGE)
+                .map(|(prefix, b)| route_report(prefix, &b, true))
+                .collect(),
+        ),
+        RibQuery::Routes {
+            family,
+            prefix: None,
+            after,
+            held: true,
+        } => {
+            let mut page: Vec<RouteReport> = Vec::new();
+            for (prefix, r) in rib.held_after(*family, *after) {
+                // A page ends between two destinations, so that the next,
+                // after the last prefix, misses none of their routes.
+                if page.len() >= PAGE && page.last().is_some_and(|l| l.prefix != prefix) {
+                    break;
+                }
+                page.push(route_report(prefix, &r, false));
             }
-            None => RibReply::Routes(
-                rib.loc_rib_after(*family, *after)
-                    .take(PAGE)
-                    .map(|(prefix, b)| RouteReport {
-                        prefix,
-                        peer: b.peer,
-                        attrs: std::sync::Arc::clone(b.attrs),
-                        best: true,
-                        rov: b.rov,
-                    })
-                    .collect(),
-            ),
-        },
+            RibReply::Routes(page)
+        }
         RibQuery::FibRoutes { after } => {
             RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
         }
@@ -596,9 +846,20 @@ mod tests {
 
     /// [`super::handle`], with what it put out.
     fn handle(rib: &mut Rib, settings: &mut RibSettings, msg: RibMsg, now: Instant) -> Vec<Output> {
+        handle_with(rib, settings, &mut Transitions::default(), msg, now)
+    }
+
+    /// [`handle`], keeping the transitions in `transitions`.
+    fn handle_with(
+        rib: &mut Rib,
+        settings: &mut RibSettings,
+        transitions: &mut Transitions,
+        msg: RibMsg,
+        now: Instant,
+    ) -> Vec<Output> {
         let (fib, _) = sync_channel(1);
         let mut out = Vec::new();
-        super::handle(rib, settings, msg, now, &fib, &mut out);
+        super::handle(rib, settings, transitions, msg, now, &fib, &mut out);
         out
     }
 
@@ -1118,8 +1379,9 @@ mod tests {
             family: V4,
             prefix: None,
             after: None,
+            held: false,
         };
-        match answer(rib, &q) {
+        match answer(rib, &Transitions::default(), &q) {
             RibReply::Routes(routes) => routes
                 .iter()
                 .map(|r| (r.prefix.to_string(), r.rov))
@@ -1241,6 +1503,7 @@ mod tests {
                 family: V4,
                 prefix: None,
                 after: None,
+                held: false,
             };
             tx.send(RibMsg::Query(q, reply)).unwrap();
             match answer.recv_timeout(Duration::from_secs(10)) {
@@ -1280,8 +1543,10 @@ mod tests {
                 s("203.0.113.0/24", Disabled)
             ]
         );
-        // Both routes reached the FIB, the invalid one too: nothing acts
-        // on the state yet. Turning validation off changed no best route.
+        // Both routes reached the FIB, the invalid one too: a RIB acts on
+        // no state until it is given an enforcement mode, which `wiring`
+        // does from the `rpki` block. Turning validation off changed no
+        // best route.
         let installed: Vec<_> = fib_rx
             .try_iter()
             .flat_map(|m| match m {
@@ -1292,21 +1557,19 @@ mod tests {
         assert_eq!(installed, ["198.51.100.0/24", "203.0.113.0/24"]);
     }
 
+    /// The line [`log_line`] writes, at the epoch.
+    fn formatted(level: bgpfc_log::Level, msg: &str, values: &[(&'static str, String)]) -> String {
+        let fields: Vec<bgpfc_log::Field<'_>> = values
+            .iter()
+            .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
+            .collect();
+        bgpfc_log::format_line(std::time::UNIX_EPOCH, level, msg, &fields)
+    }
+
     #[test]
     fn a_validation_change_is_one_info_line_however_many_routes_it_moved() {
-        let line = |r: &Revalidation| {
-            let values = revalidated(r);
-            let fields: Vec<bgpfc_log::Field<'_>> = values
-                .iter()
-                .map(|(k, v)| (*k, v as &dyn std::fmt::Display))
-                .collect();
-            bgpfc_log::format_line(
-                std::time::UNIX_EPOCH,
-                bgpfc_log::Level::Info,
-                REVALIDATED,
-                &fields,
-            )
-        };
+        let line =
+            |r: &Revalidation| formatted(bgpfc_log::Level::Info, REVALIDATED, &revalidated(r));
         let p = |s: &str| -> Prefix { s.parse().unwrap() };
         // A full table turned on: counts, and the first destinations.
         let sample: Vec<Prefix> = (0..8).map(|i| p(&format!("1.0.{i}.0/24"))).collect();
@@ -1320,6 +1583,7 @@ mod tests {
             destinations: 1_000_000,
             sample,
             best_changed: 2,
+            ..Default::default()
         };
         assert_eq!(
             line(&on),
@@ -1328,7 +1592,8 @@ mod tests {
              changes=disabled->valid:600000,disabled->invalid:50000,disabled->not-found:600000 \
              destinations=1000000 \
              prefixes=1.0.0.0/24,1.0.1.0/24,1.0.2.0/24,1.0.3.0/24,1.0.4.0/24,1.0.5.0/24,\
-             1.0.6.0/24,1.0.7.0/24,... best_changed=2\n"
+             1.0.6.0/24,1.0.7.0/24,... best_changed=2 held=0 released=0 \
+             logged=0 unlogged=0\n"
         );
         // A small delta: every destination named.
         let delta = Revalidation {
@@ -1337,13 +1602,612 @@ mod tests {
             destinations: 1,
             sample: vec![p("2001:db8::/32")],
             best_changed: 0,
+            ..Default::default()
         };
         assert_eq!(
             line(&delta),
             "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
              routes=3 changed=2 changes=not-found->invalid:2 destinations=1 \
-             prefixes=2001:db8::/32 best_changed=0\n"
+             prefixes=2001:db8::/32 best_changed=0 held=0 released=0 logged=0 unlogged=0\n"
+        );
+        // Under drop-invalid the two invalid routes were taken out of use
+        // and a third put back (RFC 6811 §5): the same line, counted.
+        let enforced = Revalidation {
+            changes: vec![
+                (RovState::NotFound, RovState::Invalid, 2),
+                (RovState::Invalid, RovState::Valid, 1),
+            ],
+            held: 2,
+            released: 1,
+            best_changed: 1,
+            ..delta
+        };
+        assert_eq!(
+            line(&enforced),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
+             routes=3 changed=3 changes=not-found->invalid:2,invalid->valid:1 destinations=1 \
+             prefixes=2001:db8::/32 best_changed=1 held=2 released=1 logged=0 unlogged=0\n"
         );
         assert_eq!(listed(&[], 0), "");
+    }
+
+    #[test]
+    fn set_enforcement_message_rejudges_and_logs_one_line() {
+        // A reload's new mode through the channel (RFC 6811 §5): every
+        // route judged again, one report first, then what changed.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let on = all(&[vrp("203.0.113.0/24", 24, 64_496)]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        let (tx, rx) = sync_channel(4);
+        let mut send = |rib: &mut Rib, mode| {
+            tx.send(RibMsg::SetEnforcement(mode)).unwrap();
+            handle(rib, &mut settings, rx.try_recv().unwrap(), now)
+        };
+        let out = send(&mut rib, Enforcement::DropInvalid);
+        let reports: Vec<&bgpfc_rib::Rejudged> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::Enforcement(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "{out:?}");
+        assert!(matches!(out[0], Output::Enforcement(_)), "{out:?}");
+        assert_eq!(
+            formatted(
+                bgpfc_log::Level::Info,
+                ENFORCEMENT_CHANGED,
+                &rejudged(reports[0])
+            ),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: rpki enforcement changed\" \
+             from=off to=drop-invalid routes=2 held=1 released=0 best_changed=1\n"
+        );
+        assert!(
+            matches!(&out[1..], [Output::Fib(c)] if c.prefix.to_string() == "203.0.113.0/24"),
+            "{out:?}"
+        );
+        assert_eq!(rib.enforcement(), Enforcement::DropInvalid);
+        // The same mode again: nothing to do, nothing logged.
+        assert_eq!(send(&mut rib, Enforcement::DropInvalid), vec![]);
+        // prefer-valid uses the invalid route again, last in rank.
+        let out = send(&mut rib, Enforcement::PreferValid);
+        assert!(
+            matches!(&out[..], [Output::Enforcement(r), Output::Fib(_)] if r.released == 1),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_enforcement_change_is_one_info_line() {
+        // RFC 6811 §5: the operator's mode applied to routes the RIB
+        // holds. Validation on, then the mode: the invalid route of two is
+        // held under drop-invalid, the destination losing its only route.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let on = all(&[
+            vrp("198.51.100.0/24", 24, 65_001),
+            vrp("203.0.113.0/24", 24, 64_496),
+        ]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        let mut out = Vec::new();
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut out);
+        let Some(Output::Enforcement(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            formatted(bgpfc_log::Level::Info, ENFORCEMENT_CHANGED, &rejudged(r)),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: rpki enforcement changed\" \
+             from=off to=drop-invalid routes=2 held=1 released=0 best_changed=1\n"
+        );
+        // The withdrawn destination reaches the FIB after the line.
+        let (fib_tx, fib_rx) = sync_channel(4);
+        deliver(out, &PeerTable::default(), &fib_tx);
+        match fib_rx.try_recv() {
+            Ok(FibMsg::Changes(c)) => {
+                assert_eq!(c.len(), 1);
+                assert_eq!(c[0].prefix.to_string(), "203.0.113.0/24");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            states(&rib),
+            [("198.51.100.0/24".to_owned(), RovState::Valid)]
+        );
+        // And back: released, the route used again with no UPDATE.
+        let mut out = Vec::new();
+        rib.set_enforcement(Enforcement::Off, now, &mut out);
+        let Some(Output::Enforcement(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            rejudged(r).map(|(_, v)| v),
+            ["drop-invalid", "off", "2", "0", "1", "1"].map(str::to_owned)
+        );
+        assert_eq!(states(&rib).len(), 2);
+    }
+
+    /// The lines of `lines` as the log writes them, at the epoch.
+    fn written(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| formatted(l.level, l.msg, &l.fields))
+            .collect()
+    }
+
+    #[test]
+    fn a_small_change_logs_a_line_per_route_after_the_summary() {
+        // Issue #59: each route a VRP change moved among valid, invalid
+        // and not-found, with its time, after the summary of the change.
+        // Under drop-invalid one route becomes Invalid and is held, the
+        // other leaves Invalid and is used again.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        let mut kept = Transitions::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let mut apply = |rib: &mut Rib, change| {
+            handle_with(
+                rib,
+                &mut settings,
+                &mut kept,
+                RibMsg::Validation(change),
+                now,
+            )
+        };
+        // Validation switched on: disabled->X, counted and not listed.
+        let theirs = vrp("203.0.113.0/24", 24, 64_496);
+        let ours = vrp("198.51.100.0/24", 24, 65_001);
+        let out = apply(&mut rib, all(&[ours, theirs]));
+        let Some(Output::Revalidated(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(written(&revalidation_lines(r, true)).len(), 1);
+        // The VRPs trade places.
+        let change = ValidationChange {
+            source: std::sync::Arc::new(
+                [
+                    vrp("198.51.100.0/24", 24, 64_496),
+                    vrp("203.0.113.0/24", 24, 65_001),
+                ]
+                .into_iter()
+                .collect::<bgpfc_rpki::VrpSet>(),
+            ),
+            affected: AffectedPrefixes::from_vrps([ours, theirs]),
+        };
+        let out = apply(&mut rib, change);
+        let Some(Output::Revalidated(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            written(&revalidation_lines(r, false)),
+            [
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: validation states changed\" \
+                 routes=2 changed=2 changes=valid->invalid:1,invalid->valid:1 \
+                 destinations=2 prefixes=198.51.100.0/24,203.0.113.0/24 best_changed=2 \
+                 held=1 released=1 logged=2 unlogged=0\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: route validation state changed\" \
+                 prefix=198.51.100.0/24 peer=192.0.2.1 origin=AS65001 from=valid to=invalid \
+                 route=held by=enforcement\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: route validation state changed\" \
+                 prefix=203.0.113.0/24 peer=192.0.2.1 origin=AS65001 from=invalid to=valid \
+                 route=best\n",
+            ]
+        );
+        // Nothing more at debug: every listed move has its info line.
+        assert_eq!(revalidation_lines(r, true), revalidation_lines(r, false));
+        // Both kept, with the moment the change was applied.
+        let report = kept.report();
+        assert_eq!((report.capacity, report.unrecorded), (KEPT, 0));
+        let moved: Vec<_> = report
+            .entries
+            .iter()
+            .map(|e| {
+                assert_eq!(e.when, now);
+                (
+                    e.transition.prefix.to_string(),
+                    e.transition.from,
+                    e.transition.to,
+                    e.transition.route,
+                )
+            })
+            .collect();
+        assert_eq!(
+            moved,
+            [
+                (
+                    "198.51.100.0/24".to_owned(),
+                    RovState::Valid,
+                    RovState::Invalid,
+                    RouteStatus::Held(bgpfc_rib::Held::Enforcement)
+                ),
+                (
+                    "203.0.113.0/24".to_owned(),
+                    RovState::Invalid,
+                    RovState::Valid,
+                    RouteStatus::Best
+                ),
+            ]
+        );
+    }
+
+    /// `n` routes of AS 65001 from 192.0.2.1 moved from valid to invalid,
+    /// the i-th to 10.x.y.0/24 for i = 256 x + y, starting at `first`.
+    fn moved(first: usize, n: usize) -> Vec<Transition> {
+        (first..first + n)
+            .map(|i| {
+                let [_, _, x, y] = u32::try_from(i).unwrap().to_be_bytes();
+                Transition {
+                    family: V4,
+                    prefix: format!("10.{x}.{y}.0/24").parse().unwrap(),
+                    peer: ip("192.0.2.1"),
+                    origin: bgpfc_rpki::RouteOrigin::As(Asn(65_001)),
+                    from: RovState::Valid,
+                    to: RovState::Invalid,
+                    route: RouteStatus::Candidate,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_large_change_logs_a_hundred_lines_and_counts_the_rest() {
+        // A change that moves more routes than the RIB lists: the first
+        // LOGGED at info, the rest listed at debug, the others counted.
+        let r = Revalidation {
+            routes: 2000,
+            changes: vec![(RovState::Valid, RovState::Invalid, 2000)],
+            destinations: 2000,
+            transitions: moved(0, Revalidation::LISTED),
+            unlisted: 2000 - Revalidation::LISTED,
+            ..Default::default()
+        };
+        let info = revalidation_lines(&r, false);
+        assert_eq!(info.len(), 1 + LOGGED);
+        assert!(info.iter().all(|l| l.level == Level::Info));
+        let summary = &written(&info)[0];
+        assert!(
+            summary.ends_with(" logged=100 unlogged=1900\n"),
+            "{summary}"
+        );
+        assert!(
+            written(&info)[LOGGED].contains(" prefix=10.0.99.0/24 "),
+            "{:?}",
+            info[LOGGED]
+        );
+        // At debug, the rest of those listed, after them.
+        let all = revalidation_lines(&r, true);
+        assert_eq!(all.len(), 1 + Revalidation::LISTED);
+        assert_eq!(all[..=LOGGED], info[..]);
+        assert!(all[LOGGED + 1..].iter().all(|l| l.level == Level::Debug));
+        assert_eq!(
+            written(&all).last().map(String::as_str),
+            Some(
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: route validation state changed\" \
+                 prefix=10.3.255.0/24 peer=192.0.2.1 origin=AS65001 from=valid to=invalid \
+                 route=candidate\n"
+            )
+        );
+        // A route dropped by the change, which import policy rejects in
+        // every state, is not listed but counted.
+        let dropped = Revalidation {
+            transitions: moved(0, 3),
+            unlisted: 1,
+            ..Default::default()
+        };
+        assert!(
+            written(&revalidation_lines(&dropped, true))[0].ends_with(" logged=3 unlogged=1\n")
+        );
+        // A route without an origin, as RFC 6811 §2 has NONE.
+        let mut none = moved(0, 1);
+        none[0].origin = bgpfc_rpki::RouteOrigin::None;
+        none[0].route = RouteStatus::Held(bgpfc_rib::Held::Policy);
+        let fields = transition(&none[0]);
+        assert_eq!(fields[2], ("origin", "none".to_owned()));
+        assert_eq!(
+            fields[5..],
+            [("route", "held".to_owned()), ("by", "policy".to_owned())]
+        );
+    }
+
+    /// A route as `answer` lists it: prefix, peer, best, the looked-up
+    /// state, the one set, and why it is held.
+    type Listed = (
+        String,
+        String,
+        bool,
+        RovState,
+        Option<RovState>,
+        Option<bgpfc_rib::Held>,
+    );
+
+    /// What `answer` says to a routes query.
+    fn listed_routes(rib: &Rib, q: &RibQuery) -> Vec<Listed> {
+        match answer(rib, &Transitions::default(), q) {
+            RibReply::Routes(routes) => routes
+                .iter()
+                .map(|r| {
+                    (
+                        r.prefix.to_string(),
+                        r.peer.to_string(),
+                        r.best,
+                        r.rov,
+                        r.rov_set,
+                        r.held,
+                    )
+                })
+                .collect(),
+            other => panic!("asked for routes, got {other:?}"),
+        }
+    }
+
+    /// A RIB under drop-invalid with VRPs for AS 64496 alone, and routes:
+    /// 192.0.2.1 (AS 65001) to two prefixes, both Invalid and held;
+    /// 192.0.2.2 (AS 64496) to 203.0.113.0/24, Valid; 192.0.2.3 (AS
+    /// 65003) to 198.51.100.0/24, Invalid, which import policy sets valid
+    /// (RFC 6811 §3).
+    fn held_routes() -> Rib {
+        use bgpfc_rib::Enforcement;
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.254; local-as 65000;
+             policy IN {
+                 term pin { match neighbor 192.0.2.3; set rpki valid; action accept; }
+                 term all { action accept; }
+             }
+             policy OUT { term all { action accept; } }
+             neighbor 192.0.2.1 { remote-as 65001; import IN; export OUT; }
+             neighbor 192.0.2.2 { remote-as 64496; import IN; export OUT; }
+             neighbor 192.0.2.3 { remote-as 65003; import IN; export OUT; }",
+        )
+        .unwrap();
+        let engine = bgpfc_policy::Engine::new(&cfg).unwrap();
+        let now = Instant::now();
+        let mut rib = Rib::with_policies(Asn(65_000), Box::new(engine));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        let on = all(&[
+            vrp("203.0.113.0/24", 24, 64_496),
+            vrp("198.51.100.0/24", 24, 64_496),
+        ]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        let both: &[&str] = &["198.51.100.0/24", "203.0.113.0/24"];
+        for (peer, peer_as, prefixes) in [
+            ("192.0.2.1", 65_001, both),
+            ("192.0.2.2", 64_496, &both[1..]),
+            ("192.0.2.3", 65_003, &both[..1]),
+        ] {
+            let msg = up(peer, peer_as, PeerKind::External);
+            handle(&mut rib, &mut settings, msg, now);
+            handle(
+                &mut rib,
+                &mut settings,
+                routes(peer, peer_as, prefixes),
+                now,
+            );
+        }
+        rib
+    }
+
+    #[test]
+    fn routes_query_lists_held_routes() {
+        // RFC 6811 §2: under drop-invalid the Adj-RIB-In keeps the Invalid
+        // route, which `show routes PREFIX` lists after the candidates and
+        // `show routes held` alone; an import policy that sets the state
+        // (RFC 6811 §3) shows it beside the one looked up.
+        use RovState::{Invalid, Valid};
+        let rib = held_routes();
+        let query = |prefix: Option<&str>, held| RibQuery::Routes {
+            family: V4,
+            prefix: prefix.map(|p| p.parse().unwrap()),
+            after: None,
+            held,
+        };
+        let r = |p: &str, peer: &str, best, rov, set, held| {
+            (p.to_owned(), peer.to_owned(), best, rov, set, held)
+        };
+        let by = Some(bgpfc_rib::Held::Enforcement);
+        // Every route to a destination: the best, then the held one.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("203.0.113.0/24"), false)),
+            [
+                r("203.0.113.0/24", "192.0.2.2", true, Valid, None, None),
+                r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by),
+            ]
+        );
+        // Import policy set valid on the route from 192.0.2.3, which is
+        // used, and best; 192.0.2.1's own is held.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("198.51.100.0/24"), false)),
+            [
+                r(
+                    "198.51.100.0/24",
+                    "192.0.2.3",
+                    true,
+                    Invalid,
+                    Some(Valid),
+                    None
+                ),
+                r("198.51.100.0/24", "192.0.2.1", false, Invalid, None, by),
+            ]
+        );
+        // Only the held: of the destination, and of the family.
+        assert_eq!(
+            listed_routes(&rib, &query(Some("203.0.113.0/24"), true)),
+            [r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by)]
+        );
+        let held = [
+            r("198.51.100.0/24", "192.0.2.1", false, Invalid, None, by),
+            r("203.0.113.0/24", "192.0.2.1", false, Invalid, None, by),
+        ];
+        assert_eq!(listed_routes(&rib, &query(None, true)), held);
+        // The next page starts after a destination.
+        let after = RibQuery::Routes {
+            family: V4,
+            prefix: None,
+            after: Some("198.51.100.0/24".parse().unwrap()),
+            held: true,
+        };
+        assert_eq!(listed_routes(&rib, &after), held[1..]);
+        // The Loc-RIB has the best routes only.
+        assert_eq!(
+            listed_routes(&rib, &query(None, false)),
+            [
+                r(
+                    "198.51.100.0/24",
+                    "192.0.2.3",
+                    true,
+                    Invalid,
+                    Some(Valid),
+                    None
+                ),
+                r("203.0.113.0/24", "192.0.2.2", true, Valid, None, None),
+            ]
+        );
+        assert_eq!(listed_routes(&rib, &query(Some("192.0.2.0/24"), false)), []);
+    }
+
+    #[test]
+    fn a_page_of_held_routes_ends_between_destinations() {
+        // `show routes held` takes the routes a page at a time, each page
+        // after the last prefix of the one before: one that ended inside
+        // a destination would lose the rest of its routes.
+        use bgpfc_rib::Enforcement;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        rib.set_enforcement(Enforcement::DropInvalid, now, &mut Vec::new());
+        let mut settings = RibSettings::default();
+        let on = all(&[vrp("10.0.0.0/8", 24, 64_496)]);
+        handle(&mut rib, &mut settings, RibMsg::Validation(on), now);
+        // One route to the first destination, two to each of the others:
+        // the page reaches PAGE inside a destination.
+        let prefixes: Vec<String> = (0..=PAGE / 2 + 1)
+            .map(|i| {
+                let [_, _, x, y] = u32::try_from(i).unwrap().to_be_bytes();
+                format!("10.{x}.{y}.0/24")
+            })
+            .collect();
+        let all_of: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        for (peer, peer_as, sent) in [
+            ("192.0.2.1", 65_001, &all_of[..]),
+            ("192.0.2.2", 65_002, &all_of[1..]),
+        ] {
+            handle(
+                &mut rib,
+                &mut settings,
+                up(peer, peer_as, PeerKind::External),
+                now,
+            );
+            handle(&mut rib, &mut settings, routes(peer, peer_as, sent), now);
+        }
+        let page = |after: Option<&str>| {
+            let q = RibQuery::Routes {
+                family: V4,
+                prefix: None,
+                after: after.map(|p| p.parse().unwrap()),
+                held: true,
+            };
+            listed_routes(&rib, &q)
+        };
+        let first = page(None);
+        // 1 + 2 * 2047 routes, then both of the next destination's.
+        assert_eq!(first.len(), PAGE + 1);
+        let last = &prefixes[PAGE / 2];
+        assert_eq!(first[PAGE - 1].0, *last);
+        assert_eq!(first[PAGE].0, *last);
+        let second = page(Some(last));
+        assert_eq!(
+            second
+                .iter()
+                .map(|r| (r.0.as_str(), r.1.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (prefixes[PAGE / 2 + 1].as_str(), "192.0.2.1"),
+                (prefixes[PAGE / 2 + 1].as_str(), "192.0.2.2")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_transition_ring_keeps_the_latest_1024() {
+        let now = Instant::now();
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_791_030_896);
+        let mut kept = Transitions::default();
+        let report = |transitions, unlisted| Revalidation {
+            transitions,
+            unlisted,
+            ..Default::default()
+        };
+        kept.record(&report(moved(0, 600), 0), at, now);
+        assert_eq!(kept.report().entries.len(), 600);
+        // Past the capacity, the oldest go first.
+        kept.record(&report(moved(600, 600), 5), at, now);
+        let r = kept.report();
+        assert_eq!((r.capacity, r.unrecorded), (1024, 5));
+        assert_eq!(r.entries.len(), KEPT);
+        assert_eq!(r.entries[0].transition, moved(176, 1)[0]);
+        assert_eq!(r.entries[KEPT - 1].transition, moved(1199, 1)[0]);
+        // A change that lists the most the RIB lists replaces them all.
+        kept.record(&report(moved(2000, Revalidation::LISTED), 7), at, now);
+        let r = kept.report();
+        assert_eq!(r.unrecorded, 12);
+        assert_eq!(r.entries[0].transition, moved(2000, 1)[0]);
+        assert!(r.entries.iter().all(|e| e.at == at && e.when == now));
+        // The same through the channel's query.
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let (tx, rx) = sync_channel(1);
+        handle_with(
+            &mut rib,
+            &mut settings,
+            &mut kept,
+            RibMsg::Query(RibQuery::Transitions, tx),
+            now,
+        );
+        match rx.try_recv() {
+            Ok(RibReply::Transitions(answer)) => assert_eq!(answer, r),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_transition_ring_holds_about_90_kb() {
+        // docs/control.md and `KEPT`: the ring is "about 90 KB", and a
+        // `show rpki transitions` clones as much into its reply. Entries
+        // have a fixed size, so the bound is the capacity times it.
+        let entry = std::mem::size_of::<Recorded>();
+        assert_eq!(entry, 88);
+        let bytes = KEPT * entry;
+        assert!((85_000..=95_000).contains(&bytes), "{bytes}");
     }
 }

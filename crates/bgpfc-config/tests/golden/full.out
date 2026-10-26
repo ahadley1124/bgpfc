@@ -31,6 +31,7 @@ Config {
     },
     rpki: Rpki {
         mode: External,
+        enforcement: PreferValid,
         caches: [
             RpkiCache {
                 host: "127.0.0.1",
@@ -129,6 +130,9 @@ Config {
                         Neighbor(
                             10.0.0.2,
                         ),
+                        Rpki(
+                            NotFound,
+                        ),
                     ],
                     sets: [
                         LocalPref(
@@ -167,12 +171,15 @@ Config {
                             ],
                         ),
                         NextHopSelf,
+                        Rpki(
+                            Valid,
+                        ),
                     ],
                     action: Next,
                 },
                 Term {
                     pos: Pos {
-                        line: 35,
+                        line: 37,
                         col: 5,
                     },
                     name: "b",
@@ -184,14 +191,14 @@ Config {
         },
         Policy {
             pos: Pos {
-                line: 37,
+                line: 39,
                 col: 1,
             },
             name: "OUT",
             terms: [
                 Term {
                     pos: Pos {
-                        line: 37,
+                        line: 39,
                         col: 14,
                     },
                     name: "all",
@@ -205,7 +212,7 @@ Config {
     neighbors: [
         Neighbor {
             pos: Pos {
-                line: 38,
+                line: 40,
                 col: 1,
             },
             addr: 10.0.0.2,
@@ -256,7 +263,7 @@ Config {
         },
         Neighbor {
             pos: Pos {
-                line: 56,
+                line: 58,
                 col: 1,
             },
             addr: 2001:db8::2,

@@ -203,13 +203,27 @@ fn push_quoted(out: &mut String, value: &str) {
     out.push('"');
 }
 
-/// Append `now` as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+/// Append `t` as a log line writes its timestamp: UTC, in the form
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+///
+/// For times shown elsewhere that the log also has, such as when a
+/// route's validation state changed, so that each can be found in the
+/// log by its time.
 ///
 /// std has no calendar support, so the civil date is computed by hand. Times
 /// before the Unix epoch cannot occur on a correctly configured host and are
 /// clamped to the epoch rather than handled.
-fn push_timestamp(out: &mut String, now: SystemTime) {
-    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+///
+/// ```
+/// use std::time::{Duration, UNIX_EPOCH};
+///
+/// let mut text = String::from("at ");
+/// let t = UNIX_EPOCH + Duration::from_millis(1_791_030_896_789);
+/// bgpfc_log::push_timestamp(&mut text, t);
+/// assert_eq!(text, "at 2026-10-03T12:34:56.789Z");
+/// ```
+pub fn push_timestamp(out: &mut String, t: SystemTime) {
+    let since_epoch = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let secs = since_epoch.as_secs();
     let millis = since_epoch.subsec_millis();
     let (year, month, day) = civil_from_days(secs / 86_400);

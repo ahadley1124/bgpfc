@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bgpfc_rpki::{Enforcement, RovState};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -120,15 +121,23 @@ pub struct Http {
     pub token_file: Option<PathBuf>,
 }
 
-/// How routes get their RFC 6811 origin validation state: the `rpki`
-/// block.
+/// How routes get their RFC 6811 origin validation state, and what that
+/// state does: the `rpki` block.
 ///
 /// The durations are whole seconds. Every field has its default when the
-/// block leaves it out, and the defaults are those of the RTR client.
+/// block leaves it out, and the defaults of the RTR client's settings are
+/// those of the RTR client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rpki {
     /// `mode`: required in the block.
     pub mode: RpkiMode,
+    /// `enforcement`: what a route's validation state does to its use
+    /// beyond what policy does with it; [`Rpki::DEFAULT_ENFORCEMENT`]
+    /// unless given. RFC 6811 §2 lets a route leave the decision process
+    /// for its state only when "explicitly configured to do so": the
+    /// documented meaning of `mode external` includes the default, and
+    /// with `mode disabled` only a state import policy sets is acted on.
+    pub enforcement: Enforcement,
     /// `cache` statements in file order: the router's cache list
     /// (RFC 8210 §10). At least one in [`RpkiMode::External`].
     pub caches: Vec<RpkiCache>,
@@ -159,6 +168,12 @@ pub struct Rpki {
 }
 
 impl Rpki {
+    /// The `enforcement` of a file that writes none: Invalid routes are
+    /// held and not used (issue #61: "Default policy: drop Invalid"; RFC
+    /// 6811 §5: "rejecting all "invalid" routes"). RFC 8481 §5 would
+    /// apply none ("Absent specific operator configuration, policy MUST
+    /// NOT be applied"); `enforcement off` gives that.
+    pub const DEFAULT_ENFORCEMENT: Enforcement = Enforcement::DropInvalid;
     /// The rpki-rtr port (RFC 8210 §9, RFC 6810 §7).
     pub const DEFAULT_PORT: u16 = 323;
     /// The default `connect-timeout`.
@@ -188,15 +203,22 @@ impl Rpki {
 }
 
 impl Rpki {
-    /// Whether `other` asks for what `self` does: every setting the same,
-    /// and the same caches in the same order with the same preferences,
-    /// each host however it is spelled (see [`RpkiCache::is_at`]). A
-    /// reload leaves the RTR client alone unless this is false.
+    /// Whether `other` asks the RTR client for what `self` does: every
+    /// setting of the client the same, and the same caches in the same
+    /// order with the same preferences, each host however it is spelled
+    /// (see [`RpkiCache::is_at`]). A reload leaves the RTR client alone
+    /// unless this is false. The `enforcement` is not compared.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
         let Rpki {
             mode,
+            // Not the client's: what the state does is the RIB's business,
+            // and the VRPs, the sessions with the caches and the states
+            // they give the routes are the same whatever it is. A change
+            // to it alone re-judges the routes; restarting the client for
+            // it would reload every cache for nothing.
+            enforcement: _,
             caches,
             version,
             connect_timeout,
@@ -229,6 +251,7 @@ impl Default for Rpki {
     fn default() -> Rpki {
         Rpki {
             mode: RpkiMode::Disabled,
+            enforcement: Rpki::DEFAULT_ENFORCEMENT,
             caches: Vec::new(),
             version: 1,
             connect_timeout: Rpki::DEFAULT_CONNECT_TIMEOUT,
@@ -379,6 +402,12 @@ pub enum Match {
     Origin(Origin),
     /// `match neighbor ADDR`.
     Neighbor(IpAddr),
+    /// `match rpki valid|invalid|not-found|disabled`: the route's origin
+    /// validation state (RFC 6811 §3: "the ability to match and set the
+    /// validation state of routes"), as
+    /// [`RovState::satisfies`](bgpfc_rpki::RovState::satisfies) reads it:
+    /// `not-found` holds for a route not validated (`disabled`) too.
+    Rpki(RovState),
 }
 
 /// How a `set ... community` action changes the set.
@@ -409,6 +438,12 @@ pub enum SetAction {
     AsPathPrepend(Vec<Asn>),
     /// `set next-hop self`.
     NextHopSelf,
+    /// `set rpki valid|invalid|not-found`: the validation state the route
+    /// is used with from then on in place of the one the lookup gave it
+    /// (RFC 6811 §3). Never `disabled`, and only in import policies:
+    /// validation rejects a policy that sets it and is some neighbor's
+    /// export policy.
+    Rpki(RovState),
 }
 
 /// How a term ends.

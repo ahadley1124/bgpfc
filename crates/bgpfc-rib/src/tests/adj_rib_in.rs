@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::{AcceptAll, Policies, Verdict};
+use crate::{AcceptAll, Held, Imported, Policies, Verdict};
 
 /// Import policy that rejects one prefix and gives every other route a
 /// `LOCAL_PREF` of 200.
@@ -21,13 +21,13 @@ impl Policies for RejectOneRaiseRest {
         p: Prefix,
         a: &PathAttrs,
         _: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         if p == self.0 {
-            return Verdict::Reject;
+            return Verdict::Reject.into();
         }
         let mut a = a.clone();
         a.local_pref = Some(200);
-        Verdict::Modified(a)
+        Verdict::Modified(a).into()
     }
     fn export(
         &self,
@@ -61,12 +61,12 @@ impl Policies for RejectUnvalidated {
         p: Prefix,
         _: &PathAttrs,
         rov: RovState,
-    ) -> Verdict {
+    ) -> Imported {
         self.1.lock().unwrap().push((p, rov));
         if self.0.contains(&p) && rov == RovState::Disabled {
-            Verdict::Reject
+            Verdict::Reject.into()
         } else {
-            Verdict::Accept
+            Verdict::Accept.into()
         }
     }
     fn export(
@@ -78,6 +78,46 @@ impl Policies for RejectUnvalidated {
         _: RovState,
     ) -> Verdict {
         Verdict::Accept
+    }
+}
+
+/// Import policy that rejects some prefixes whatever their state and takes
+/// every other route, saying whether it reads the state; what it is asked
+/// is recorded.
+struct RejectSome {
+    rejected: Vec<Prefix>,
+    reads_rov: bool,
+    asked: Arc<Mutex<Vec<(Prefix, RovState)>>>,
+}
+
+impl Policies for RejectSome {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        p: Prefix,
+        _: &PathAttrs,
+        rov: RovState,
+    ) -> Imported {
+        self.asked.lock().unwrap().push((p, rov));
+        if self.rejected.contains(&p) {
+            Verdict::Reject.into()
+        } else {
+            Verdict::Accept.into()
+        }
+    }
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
+    }
+    fn import_reads_rov(&self, _: &PeerInfo) -> bool {
+        self.reads_rov
     }
 }
 
@@ -253,6 +293,49 @@ fn a_route_rejected_for_its_validation_state_alone_is_held() {
 }
 
 #[test]
+fn import_policy_that_reads_no_state_is_asked_once() {
+    // A policy whose answer cannot depend on the state rejects with every
+    // state what it rejects with one: asking again would only cost time.
+    use RovState::{Disabled, Invalid, NotFound, Valid};
+    let rejected = p("198.51.100.0/24");
+    for reads_rov in [false, true] {
+        let asked = Arc::default();
+        let policy = RejectSome {
+            rejected: vec![rejected],
+            reads_rov,
+            asked: Arc::clone(&asked),
+        };
+        let mut rib = Rib::with_policies(LOCAL_AS, Box::new(policy));
+        let e1 = peer("10.0.0.1", 65_001, 1);
+        outputs(|o| rib.peer_up(e1.clone(), now(), o));
+        let a = attrs(&[65_001], "10.0.0.1");
+        let out = outputs(|o| {
+            rib.update(
+                e1.addr,
+                &announce(&["192.0.2.0/24", "198.51.100.0/24"], &a),
+                now(),
+                o,
+            );
+        });
+        // The same outcome either way: the accepted route is used, the
+        // rejected one is neither held nor counted.
+        assert_eq!(fib(&out).len(), 1, "{reads_rov}");
+        assert!(routes(&rib, V4, rejected).is_empty(), "{reads_rov}");
+        assert_eq!(destinations(&rib, V4), vec![p("192.0.2.0/24")]);
+        assert_eq!(
+            rib.peer_stats(e1.addr).unwrap().received,
+            vec![(V4, 1), (V6, 0)]
+        );
+        let mut expected = vec![(p("192.0.2.0/24"), Disabled), (rejected, Disabled)];
+        if reads_rov {
+            // m11's questions: every other state, none of which admits it.
+            expected.extend([(rejected, Valid), (rejected, Invalid), (rejected, NotFound)]);
+        }
+        assert_eq!(*asked.lock().unwrap(), expected, "{reads_rov}");
+    }
+}
+
+#[test]
 fn withdrawals_peer_down_and_family_disable_drop_held_routes_too() {
     let held = p("198.51.100.0/24");
     let held6 = p("2001:db8:9::/48");
@@ -353,7 +436,7 @@ fn each_route_is_held_once_with_what_policy_made_of_it() {
         assert_eq!(routes(&rib, V4, p("192.0.2.0/24")).len(), n + 1);
     }
     for (_, r) in routes(&rib, V4, p("192.0.2.0/24")) {
-        assert!(!r.held);
+        assert_eq!(r.held, None);
         assert_eq!(r.received().local_pref, None);
         assert_eq!(r.attrs.local_pref, Some(200));
         assert_eq!(r.attrs.as_path, r.received().as_path);
@@ -390,15 +473,16 @@ fn held_routes_follow_the_candidates() {
         &mut Vec::new(),
     );
     send(&mut rib, 2, "198.51.100.0/24");
-    let order = |rib: &Rib| -> Vec<(IpAddr, bool)> {
+    let order = |rib: &Rib| -> Vec<(IpAddr, Option<Held>)> {
         routes(rib, V4, prefix)
             .into_iter()
             .map(|(peer, r)| (peer, r.held))
             .collect()
     };
+    let policy = Some(Held::Policy);
     assert_eq!(
         order(&rib),
-        vec![(e[1].addr, false), (e[0].addr, true), (e[2].addr, true)]
+        vec![(e[1].addr, None), (e[0].addr, policy), (e[2].addr, policy)]
     );
     let c = rib.candidates(V4, prefix);
     assert_eq!(c.len(), 1);
@@ -416,7 +500,7 @@ fn held_routes_follow_the_candidates() {
             previous: Some(e[1].addr),
         }]
     );
-    assert!(order(&rib).iter().all(|r| r.1));
+    assert!(order(&rib).iter().all(|r| r.1 == policy));
     assert!(rib.candidates(V4, prefix).is_empty());
     assert_eq!(rib.peer_stats(e[1].addr).unwrap().received[0], (V4, 1));
 }

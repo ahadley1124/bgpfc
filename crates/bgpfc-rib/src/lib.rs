@@ -22,10 +22,14 @@
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
-//! alone is kept), §3 (policy sees
-//! the validation state, see [`Policies`]), §4 (the affected routes are
+//! alone is kept, and one the operator's enforcement rules out is kept
+//! and is no candidate, see [`Held`]), §3 (policy sees
+//! the validation state and may set the one a route is used with, see
+//! [`Policies`] and [`Imported`]), §4 (the affected routes are
 //! validated again when the validation source changes, see
-//! [`Rib::validation_changed`]).
+//! [`Rib::validation_changed`]), §5 (enforcement: Invalid routes left out
+//! of the decision process, or Valid ones preferred before anything else,
+//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -62,13 +66,13 @@ use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
-pub use bgpfc_rpki::{AspaState, RouteOrigin, RovState};
+pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-pub use validation::Revalidation;
+pub use validation::{Rejudged, Revalidation, RouteStatus, Transition};
 
-use pacing::{Clock, Held, Jitter, Now, Offer, Pace, Pacing, Tick};
+use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
 
 /// What a policy decided about a route.
@@ -82,13 +86,71 @@ pub enum Verdict {
     Reject,
 }
 
+/// What import policy made of a route (RFC 4271 §9.1.1, RFC 6811 §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Imported {
+    /// Whether the route is a candidate, and with which attributes.
+    pub verdict: Verdict,
+    /// The validation state policy set, if it set one (RFC 6811 §3: "the
+    /// ability to match and set the validation state of routes"): the
+    /// route is then used with it in place of the one the lookup gave it,
+    /// which it keeps as its own (RFC 6811 §2: "The validation state of
+    /// the Route MUST be set to reflect the result of the lookup").
+    pub rov: Option<RovState>,
+}
+
+/// Why the Adj-RIB-In holds a route that is no candidate for the decision
+/// process. RFC 6811 §2: "An implementation MUST NOT exclude a route from
+/// the Adj-RIB-In or from consideration in the decision process as a side
+/// effect of its validation state, unless explicitly configured to do
+/// so": the route stays in the Adj-RIB-In, counted as received, and is
+/// used again, with no UPDATE, once its state allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// Import policy rejected it with its validation state and accepts it
+    /// with another.
+    Policy,
+    /// Import policy accepted it, but the operator's [`Enforcement`] rules
+    /// out the state it is used with (Invalid under `drop-invalid`, RFC
+    /// 6811 §5: "rejecting all "invalid" routes").
+    Enforcement,
+}
+
+impl Held {
+    /// The name used in logs and control output: `policy` or
+    /// `enforcement`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Held::Policy => "policy",
+            Held::Enforcement => "enforcement",
+        }
+    }
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<Verdict> for Imported {
+    /// A verdict that sets no validation state.
+    fn from(verdict: Verdict) -> Imported {
+        Imported { verdict, rov: None }
+    }
+}
+
 /// Import and export policy as the RIB sees it (RFC 4271 §9.1.1 local
 /// policy, §9.1.3 export policy). `peer` is the peer the route came from
 /// on import and the peer it is going to on export. `rov` is the route's
-/// validation state, which policy must be able to match (RFC 6811 §3).
+/// validation state, which policy must be able to match and set (RFC 6811
+/// §3).
 pub trait Policies: Send {
     /// Decide whether and how a route held in the Adj-RIB-In becomes a
-    /// candidate for the decision process.
+    /// candidate for the decision process, and with which validation
+    /// state it is used. `rov` is the state the lookup gave the route
+    /// (RFC 6811 §2).
     fn import(
         &self,
         peer: &PeerInfo,
@@ -96,10 +158,12 @@ pub trait Policies: Send {
         prefix: Prefix,
         attrs: &PathAttrs,
         rov: RovState,
-    ) -> Verdict;
+    ) -> Imported;
 
     /// Decide whether and how a Loc-RIB route is advertised to `peer`,
-    /// before the RFC 4271 §5.1 rewriting for the session.
+    /// before the RFC 4271 §5.1 rewriting for the session. `rov` is the
+    /// state the route is used with: the one import policy set, else the
+    /// one the lookup gave it.
     fn export(
         &self,
         peer: &PeerInfo,
@@ -108,6 +172,16 @@ pub trait Policies: Send {
         attrs: &PathAttrs,
         rov: RovState,
     ) -> Verdict;
+
+    /// Whether what [`Policies::import`] makes of a route from `peer` can
+    /// depend on its `rov` argument. When it cannot, policy gives the same
+    /// verdict and sets the same state whatever the route's state, so a
+    /// route it rejects is rejected with every state and the RIB does not
+    /// ask again with each of the others. `true`, the default, is always
+    /// correct; `false` only saves those questions.
+    fn import_reads_rov(&self, _peer: &PeerInfo) -> bool {
+        true
+    }
 }
 
 /// The policy that accepts every route unchanged.
@@ -122,8 +196,8 @@ impl Policies for AcceptAll {
         _: Prefix,
         _: &PathAttrs,
         _: RovState,
-    ) -> Verdict {
-        Verdict::Accept
+    ) -> Imported {
+        Verdict::Accept.into()
     }
 
     fn export(
@@ -198,10 +272,16 @@ pub enum Output {
     },
     /// Routes in the Adj-RIBs-In changed RFC 6811 validation state with
     /// the validation source (see [`Rib::validation_changed`]): one report
-    /// per change of the source, counted rather than listed, however many
+    /// per change of the source, counted, with the routes that moved among
+    /// valid, invalid and not-found listed up to a bound, however many
     /// routes it moved. The caller logs it. The state a route gets on
     /// arrival is its first, not a change, and is not reported.
     Revalidated(Revalidation),
+    /// The operator's enforcement mode changed (see
+    /// [`Rib::set_enforcement`]), and every route was judged again under
+    /// it: one report, counted, followed by the FIB changes and UPDATEs
+    /// that follow. The caller logs it.
+    Enforcement(Rejudged),
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -227,10 +307,25 @@ pub struct RouteRef<'a> {
     pub peer: IpAddr,
     /// Its attributes.
     pub attrs: &'a Arc<PathAttrs>,
-    /// Its RFC 6811 §2 validation state.
+    /// Its RFC 6811 §2 validation state: what the lookup gave it.
     pub rov: RovState,
+    /// The validation state import policy set, if it set one (RFC 6811
+    /// §3), which the route is used with in place of `rov`.
+    pub rov_set: Option<RovState>,
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
+    /// Why the Adj-RIB-In holds it while it is no candidate, if it is not
+    /// one.
+    pub held: Option<Held>,
+}
+
+impl RouteRef<'_> {
+    /// The validation state the route is used with: the one import policy
+    /// set, else the one the lookup gave it. Export policy sees this one.
+    #[must_use]
+    pub fn effective_rov(&self) -> RovState {
+        self.rov_set.unwrap_or(self.rov)
+    }
 }
 
 struct PeerState {
@@ -252,6 +347,10 @@ struct PeerState {
     /// Routes of each family in the Adj-RIB-In: what
     /// [`PeerStats::received`] reports and the RFC 4271 §6.7 limit counts.
     adj_in_count: FamilyMap<usize>,
+    /// How many of those are held and no candidate ([`Held`]): what
+    /// [`PeerStats::held`] reports. Kept as routes come, go and change
+    /// places, so that the control plane never walks the table for it.
+    adj_in_held: FamilyMap<usize>,
     /// The RFC 4271 §9.2.1.1 pacing state per family.
     pacing: FamilyMap<Pacing>,
     /// The session is going down: its routes are being removed, and it is
@@ -264,16 +363,23 @@ impl PeerState {
     fn received(&self, family: AddressFamily) -> usize {
         self.adj_in_count.get(family).copied().unwrap_or(0)
     }
+
+    /// Routes of `family` held in the Adj-RIB-In and no candidates.
+    fn held(&self, family: AddressFamily) -> usize {
+        self.adj_in_held.get(family).copied().unwrap_or(0)
+    }
 }
 
 /// Counters about one peer, for the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerStats {
     /// Routes accepted from the peer, per family it may send, with those
-    /// import policy rejects for their validation state alone, which the
-    /// Adj-RIB-In holds too (RFC 6811 §2): what the RFC 4271 §6.7 limit
-    /// counts.
+    /// held for their validation state ([`Held`]), which the Adj-RIB-In
+    /// holds too (RFC 6811 §2): what the RFC 4271 §6.7 limit counts.
     pub received: Vec<(AddressFamily, usize)>,
+    /// How many of `received` are held and no candidate ([`Held`]), in
+    /// the same families and order.
+    pub held: Vec<(AddressFamily, usize)>,
     /// Routes advertised to the peer, per negotiated family.
     pub advertised: Vec<(AddressFamily, usize)>,
 }
@@ -331,6 +437,9 @@ struct Context {
     /// every route `Disabled`, until [`Rib::validation_changed`] says
     /// otherwise.
     validation: Arc<dyn ValidationSource>,
+    /// What the validation state does to a route's use beyond policy:
+    /// [`Enforcement::Off`] until [`Rib::set_enforcement`] says otherwise.
+    enforcement: Enforcement,
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -379,6 +488,8 @@ struct Scratch {
     released: Vec<Arc<PathAttrs>>,
     /// Routes added minus routes removed, per family.
     delta: FamilyMap<isize>,
+    /// Held routes added minus held routes removed, per family.
+    held_delta: FamilyMap<isize>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
     /// §6.3), reported before what the UPDATE changed.
     ignored: Vec<Output>,
@@ -386,6 +497,37 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// Count `route`, added to the Adj-RIB-In of `family`.
+    fn note_added(&mut self, family: AddressFamily, route: &Route) {
+        *self.delta.or_default(family) += 1;
+        if route.held.is_some() {
+            *self.held_delta.or_default(family) += 1;
+        }
+    }
+
+    /// Count `route`, removed from the Adj-RIB-In of `family`.
+    fn note_removed(&mut self, family: AddressFamily, route: &Route) {
+        *self.delta.or_default(family) -= 1;
+        if route.held.is_some() {
+            *self.held_delta.or_default(family) -= 1;
+        }
+    }
+
+    /// Add what the routes added and removed came to to `state`'s
+    /// counts, and start again from zero.
+    fn count_into(&mut self, state: &mut PeerState) {
+        for (family, d) in self.delta.iter_mut() {
+            let n = state.adj_in_count.or_default(family);
+            *n = n.saturating_add_signed(*d);
+            *d = 0;
+        }
+        for (family, d) in self.held_delta.iter_mut() {
+            let n = state.adj_in_held.or_default(family);
+            *n = n.saturating_add_signed(*d);
+            *d = 0;
+        }
+    }
+
     /// Entries a buffer keeps room for between inputs: more than the
     /// largest UPDATE needs (a 65535-octet message holds about 16 000
     /// IPv4 prefixes), far fewer than an input that touches a whole
@@ -415,7 +557,9 @@ impl Rib {
 
     /// An empty RIB for a speaker in `local_as` with the given policies.
     /// Validation is off ([`NullSource`]: every route `Disabled`) until
-    /// [`Rib::validation_changed`] gives it a source.
+    /// [`Rib::validation_changed`] gives it a source, and nothing acts on
+    /// the state beyond policy ([`Enforcement::Off`]) until
+    /// [`Rib::set_enforcement`] says otherwise.
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
@@ -426,6 +570,10 @@ impl Rib {
                     policies,
                     interner: Interner::default(),
                     validation: Arc::new(NullSource),
+                    // RFC 8481 §5: "Absent specific operator
+                    // configuration, policy MUST NOT be applied"; the
+                    // daemon sets the configured mode.
+                    enforcement: Enforcement::Off,
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
@@ -488,6 +636,7 @@ impl Rib {
             disabled: Vec::new(),
             advertised: FamilyMap::default(),
             adj_in_count: FamilyMap::default(),
+            adj_in_held: FamilyMap::default(),
             pacing: FamilyMap::default(),
             leaving: false,
         });
@@ -566,11 +715,15 @@ impl Rib {
         let addr = self.s.peer(id).info.addr;
         self.s.peer_mut(id).leaving = true;
         for (f, table) in self.tables.iter_mut() {
-            drop_routes(&self.s.peers, table, f, id, scratch);
+            drop_routes(self.s.decide(), table, f, id, scratch);
         }
         // The peer goes with its counts: what the removals added up to
         // must not carry over to the next UPDATE's peer.
-        for (_, d) in scratch.delta.iter_mut() {
+        for (_, d) in scratch
+            .delta
+            .iter_mut()
+            .chain(scratch.held_delta.iter_mut())
+        {
             *d = 0;
         }
         out.put(Output::PrefixLimitExceeded {
@@ -833,6 +986,10 @@ impl Rib {
             self.disable_family(id, d.family, scratch);
         }
         let Sessions { cx, peers, .. } = &mut self.s;
+        let decide = Decide {
+            peers,
+            enforcement: cx.enforcement,
+        };
         // invariant: ids are only handed out for occupied slots.
         let state = peers[id.index()].as_ref().unwrap();
         let info = &state.info;
@@ -851,7 +1008,7 @@ impl Rib {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(peers, table, family, prefix, id, scratch);
+                withdraw(decide, table, family, prefix, id, scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
@@ -872,7 +1029,7 @@ impl Rib {
             if info.is_own_address(&next_hop) {
                 if let Some(table) = self.tables.get_mut(family) {
                     for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 scratch.ignored.push(Output::InvalidNextHop {
@@ -897,7 +1054,7 @@ impl Rib {
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
                 if let Some(table) = self.tables.get_mut(family) {
                     for &prefix in prefixes {
-                        withdraw(peers, table, family, prefix, id, scratch);
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 scratch.released.push(attrs);
@@ -921,6 +1078,7 @@ impl Rib {
                 let rov = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
+                    cx.enforcement,
                     &mut cx.interner,
                     info,
                     (family, prefix),
@@ -930,13 +1088,13 @@ impl Rib {
                 match judged.into_route(&attrs, id, rov, aspa) {
                     Some(route) => {
                         let table = self.tables.or_default(family);
-                        announce(peers, table, family, prefix, route, scratch);
+                        announce(decide, table, family, prefix, route, scratch);
                     }
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it.
                     None => {
                         if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(peers, table, family, prefix, id, scratch);
+                            withdraw(decide, table, family, prefix, id, scratch);
                         }
                     }
                 }
@@ -946,11 +1104,12 @@ impl Rib {
                 // the loop checks and import policy, the ones "the speaker
                 // is willing to accept" (§6.7): a route import policy
                 // rejects is not kept, so counting it would take the
-                // memory the limit is there to bound. One rejected for its
-                // validation state alone is kept (RFC 6811 §2, see
-                // `judge`) and counted; whether a route is kept does not
-                // depend on its state, so a change of validation state
-                // never moves the count.
+                // memory the limit is there to bound. One held for its
+                // validation state, by policy or by enforcement, is kept
+                // (RFC 6811 §2, see `judge`) and counted; whether a route
+                // is kept does not depend on its state or on the
+                // enforcement mode, so a change of either never moves the
+                // count.
                 // NOTE(interop): FRR's `maximum-prefix` without `force`
                 // and BIRD's `import limit` count accepted routes too.
                 if let Some(limit) = limit {
@@ -966,12 +1125,7 @@ impl Rib {
             }
             scratch.released.push(attrs);
         }
-        let state = self.s.peer_mut(id);
-        for (family, d) in scratch.delta.iter_mut() {
-            let n = state.adj_in_count.or_default(family);
-            *n = n.saturating_add_signed(*d);
-            *d = 0;
-        }
+        scratch.count_into(self.s.peer_mut(id));
         exceeded
     }
 
@@ -988,11 +1142,13 @@ impl Rib {
         }
         state.disabled.push(family);
         state.adj_in_count.insert(family, 0);
+        state.adj_in_held.insert(family, 0);
         if let Some(table) = self.tables.get_mut(family) {
-            drop_routes(&self.s.peers, table, family, id, scratch);
+            drop_routes(self.s.decide(), table, family, id, scratch);
         }
-        // The count is zero now, whatever the removals added up to.
+        // The counts are zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
+        scratch.held_delta.insert(family, 0);
     }
 
     /// Phase 3 for every destination whose best route an input changed,
@@ -1040,8 +1196,8 @@ impl Rib {
 
     /// The candidate routes to `prefix`, the best first: those import
     /// policy accepted, with the attributes it gave them. The routes the
-    /// Adj-RIB-In holds for their validation state alone are not among
-    /// them.
+    /// Adj-RIB-In holds for their validation state ([`Held`]) are not
+    /// among them.
     #[must_use]
     pub fn candidates(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
         self.tables
@@ -1051,6 +1207,50 @@ impl Rib {
             .iter()
             .map(|r| self.s.route_ref(r))
             .collect()
+    }
+
+    /// Every route the Adj-RIBs-In hold for `prefix`: the candidates, the
+    /// best first, then the routes held for their validation state, each
+    /// with why ([`RouteRef::held`]).
+    #[must_use]
+    pub fn routes(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
+        self.tables
+            .get(family)
+            .and_then(|t| t.get(prefix))
+            .map_or(&[][..], Destination::routes)
+            .iter()
+            .map(|r| self.s.route_ref(r))
+            .collect()
+    }
+
+    /// Every route of `family` the Adj-RIBs-In hold for its validation
+    /// state and that is no candidate, in prefix order.
+    pub fn held(&self, family: AddressFamily) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
+        self.held_after(family, None)
+    }
+
+    /// [`Rib::held`] for the destinations after `from`: a long listing
+    /// taken a part at a time, each part starting where the last ended.
+    pub fn held_after(
+        &self,
+        family: AddressFamily,
+        from: Option<Prefix>,
+    ) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
+        self.tables
+            .get(family)
+            .into_iter()
+            .flat_map(move |t| t.after(from))
+            .flat_map(move |(p, d)| {
+                d.routes()[d.candidates()..]
+                    .iter()
+                    .map(move |r| (p, self.s.route_ref(r)))
+            })
+    }
+
+    /// What the validation state does to a route's use beyond policy.
+    #[must_use]
+    pub fn enforcement(&self) -> Enforcement {
+        self.s.cx.enforcement
     }
 
     /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
@@ -1124,6 +1324,7 @@ impl Rib {
         taken.dedup();
         for family in taken {
             stats.received.push((family, p.received(family)));
+            stats.held.push((family, p.held(family)));
         }
         for family in &p.info.families {
             stats
@@ -1238,12 +1439,22 @@ impl Sessions {
         }
     }
 
+    /// What Phase 2 needs of the sessions.
+    fn decide(&self) -> Decide<'_> {
+        Decide {
+            peers: &self.peers,
+            enforcement: self.cx.enforcement,
+        }
+    }
+
     fn route_ref<'a>(&self, r: &'a Route) -> RouteRef<'a> {
         RouteRef {
             peer: self.peer(r.peer).neighbor.addr,
             attrs: &r.attrs,
             rov: r.rov,
+            rov_set: r.rov_set,
             aspa: r.aspa,
+            held: r.held,
         }
     }
 
@@ -1263,7 +1474,7 @@ impl Sessions {
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
-        decide(&self.peers, dest);
+        self.decide().run(dest);
         self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
         drop(old);
         self.release_route(removed);
@@ -1373,7 +1584,9 @@ impl Sessions {
             return None;
         }
         let policies = policies.unwrap_or(&*self.cx.policies);
-        match policies.export(to, family, prefix, &best.attrs, best.rov) {
+        // RFC 6811 §3: the state policy set is the one the route is used
+        // with, here too.
+        match policies.export(to, family, prefix, &best.attrs, best.effective_rov()) {
             Verdict::Reject => None,
             Verdict::Accept => export::permitted(family, &best.attrs, to)
                 .then(|| Exported::Own(Arc::clone(&best.attrs))),
@@ -1469,7 +1682,7 @@ impl Sessions {
         family: AddressFamily,
         prefix: Prefix,
         at: Tick,
-    ) -> Option<Held> {
+    ) -> Option<pacing::Held> {
         let now = self.at;
         let pacing = self.peer_mut(id).pacing.get_mut(family)?;
         // One that an earlier wake-up replaced: nothing to do.
@@ -1499,7 +1712,7 @@ impl Sessions {
         id: PeerId,
         family: AddressFamily,
         prefix: Prefix,
-        held: Held,
+        held: pacing::Held,
         after: Option<Exported>,
         batch: &mut Batch,
     ) {
@@ -1665,23 +1878,42 @@ fn shrink_heap<T: Ord>(heap: &mut BinaryHeap<T>) {
     }
 }
 
-/// Phase 2: put the best of `dest`'s candidates first.
-fn decide(peers: &[Option<PeerState>], dest: &mut Destination) {
-    let routes = dest.routes();
-    let best = decision::best(dest.candidates(), |i| Candidate {
-        // invariant: a route's peer slot is occupied (Sessions::peer).
-        from: peers[routes[i].peer.index()].as_ref().unwrap().neighbor,
-        attrs: &routes[i].attrs,
-    });
-    if let Some(i) = best {
-        dest.promote(i);
+/// What Phase 2 needs of the RIB: the peers the routes name, and the
+/// enforcement mode, which may rank the routes by validation state.
+#[derive(Clone, Copy)]
+struct Decide<'a> {
+    peers: &'a [Option<PeerState>],
+    enforcement: Enforcement,
+}
+
+impl Decide<'_> {
+    /// Phase 2: put the best of `dest`'s candidates first.
+    fn run(self, dest: &mut Destination) {
+        let routes = dest.routes();
+        let best = decision::best(
+            dest.candidates(),
+            |i| Candidate {
+                // invariant: a route's peer slot is occupied
+                // (Sessions::peer).
+                from: self.peers[routes[i].peer.index()]
+                    .as_ref()
+                    .unwrap()
+                    .neighbor,
+                attrs: &routes[i].attrs,
+                rov: routes[i].effective_rov(),
+            },
+            self.enforcement,
+        );
+        if let Some(i) = best {
+            dest.promote(i);
+        }
     }
 }
 
 /// Remove every route `id` sent from `table`, a table of `family`, noting
 /// each destination's best route before and after.
 fn drop_routes(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     id: PeerId,
@@ -1691,10 +1923,10 @@ fn drop_routes(
         if let Some(i) = dest.position(id) {
             let old = dest.best().cloned();
             let removed = dest.remove(i);
+            scratch.note_removed(family, &removed);
             scratch.released.push(removed.attrs);
             scratch.released.extend(removed.received);
-            decide(peers, dest);
-            *scratch.delta.or_default(family) -= 1;
+            decide.run(dest);
             scratch.dirty.push(Dirty {
                 family,
                 prefix,
@@ -1710,7 +1942,7 @@ fn drop_routes(
 /// Remove peer `id`'s route to `prefix`, if there is one, and note the
 /// destination's best route before and after.
 fn withdraw(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -1718,13 +1950,13 @@ fn withdraw(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(peers, &mut table.v4, k, family, prefix, id, scratch),
-        None => withdraw_in(peers, &mut table.v6, prefix, family, prefix, id, scratch),
+        Some(k) => withdraw_in(decide, &mut table.v4, k, family, prefix, id, scratch),
+        None => withdraw_in(decide, &mut table.v6, prefix, family, prefix, id, scratch),
     }
 }
 
 fn withdraw_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -1741,14 +1973,14 @@ fn withdraw_in<K: Ord>(
     };
     let old = dest.best().cloned();
     let removed = dest.remove(i);
+    scratch.note_removed(family, &removed);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
-    decide(peers, dest);
+    decide.run(dest);
     let new = dest.best().cloned();
     if dest.is_empty() {
         slot.remove();
     }
-    *scratch.delta.or_default(family) -= 1;
     scratch.dirty.push(Dirty {
         family,
         prefix,
@@ -1761,7 +1993,7 @@ fn withdraw_in<K: Ord>(
 /// Add or replace `route`'s peer's route to `prefix` and note the
 /// destination's best route before and after.
 fn announce(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
@@ -1769,13 +2001,21 @@ fn announce(
     scratch: &mut Scratch,
 ) {
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(peers, &mut table.v4, k, family, prefix, route, scratch),
-        None => announce_in(peers, &mut table.v6, prefix, family, prefix, route, scratch),
+        Some(k) => announce_in(decide, &mut table.v4, k, family, prefix, route, scratch),
+        None => announce_in(
+            decide,
+            &mut table.v6,
+            prefix,
+            family,
+            prefix,
+            route,
+            scratch,
+        ),
     }
 }
 
 fn announce_in<K: Ord>(
-    peers: &[Option<PeerState>],
+    decide: Decide<'_>,
     map: &mut BTreeMap<K, Destination>,
     key: K,
     family: AddressFamily,
@@ -1787,9 +2027,9 @@ fn announce_in<K: Ord>(
         Slot::Vacant(slot) => {
             // A new destination: its one route is the best, unless it is
             // held.
-            let new = (!route.held).then(|| route.clone());
+            let new = route.held.is_none().then(|| route.clone());
+            scratch.note_added(family, &route);
             slot.insert(Destination::One(route));
-            *scratch.delta.or_default(family) += 1;
             (None, new)
         }
         Slot::Occupied(mut slot) => {
@@ -1806,14 +2046,16 @@ fn announce_in<K: Ord>(
                     // An implicit re-announcement of the same route.
                     return;
                 }
+                scratch.note_added(family, &route);
                 let replaced = dest.replace(i, route);
+                scratch.note_removed(family, &replaced);
                 scratch.released.push(replaced.attrs);
                 scratch.released.extend(replaced.received);
             } else {
+                scratch.note_added(family, &route);
                 dest.push(route);
-                *scratch.delta.or_default(family) += 1;
             }
-            decide(peers, dest);
+            decide.run(dest);
             (old, dest.best().cloned())
         }
     };
@@ -1884,11 +2126,15 @@ fn merge_all(dirty: &mut [Dirty], order: &mut Vec<u32>) {
 
 /// What import policy makes of a route (see [`judge`]).
 enum Judged {
-    /// A candidate for Phase 2, with these attributes.
-    Accepted(Arc<PathAttrs>),
-    /// Rejected with the route's validation state, accepted with another:
-    /// held in the Adj-RIB-In, and no candidate.
-    Held,
+    /// A candidate for Phase 2, with these attributes, used with the
+    /// validation state policy set, if it set one.
+    Accepted {
+        attrs: Arc<PathAttrs>,
+        rov_set: Option<RovState>,
+    },
+    /// Held in the Adj-RIB-In, and no candidate, for why `by` says;
+    /// used with the validation state policy set, if it set one.
+    Held { by: Held, rov_set: Option<RovState> },
     /// Rejected whatever the route's validation state: not kept.
     Dropped,
 }
@@ -1904,9 +2150,9 @@ impl Judged {
         rov: RovState,
         aspa: AspaState,
     ) -> Option<Route> {
-        let (attrs, held) = match self {
-            Judged::Accepted(a) => (a, false),
-            Judged::Held => (Arc::clone(received), true),
+        let (attrs, rov_set, held) = match self {
+            Judged::Accepted { attrs, rov_set } => (attrs, rov_set, None),
+            Judged::Held { by, rov_set } => (Arc::clone(received), rov_set, Some(by)),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -1915,6 +2161,7 @@ impl Judged {
             received,
             peer,
             rov,
+            rov_set,
             aspa,
             held,
         })
@@ -1923,44 +2170,77 @@ impl Judged {
 
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
 /// sent for `prefix` of `family`, with `attrs` as received and validation
-/// state `rov`, is a candidate for Phase 2, and with which attributes.
+/// state `rov`, is a candidate for Phase 2, with which attributes, and,
+/// RFC 6811 §3, with which validation state it is used; then
+/// `enforcement` decides whether that state may be a candidate.
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
 /// explicitly configured to do so", and §4 runs the decision process
 /// again when the state changes. So a route policy rejects is put to it
-/// again with each other state, and is held when one of them would make
-/// policy accept it: once its state changes it is taken without a
-/// ROUTE-REFRESH. A route policy rejects whatever its state is dropped,
-/// as rejected routes were before validation existed: no change of state
-/// can bring it back, and holding it would let a filtered peer fill
-/// memory, past any `maximum-prefix`, with routes nothing uses.
+/// again with each other state, and is held ([`Held::Policy`]) when one of
+/// them would make policy accept it: once its state changes it is taken
+/// without a ROUTE-REFRESH. A route policy rejects whatever its state is
+/// dropped, as rejected routes were before validation existed: no change
+/// of state can bring it back, and holding it would let a filtered peer
+/// fill memory, past any `maximum-prefix`, with routes nothing uses. A
+/// policy that does not read the state ([`Policies::import_reads_rov`])
+/// rejects with every state what it rejects with one, so it is not asked
+/// again: a filtered table costs one question per route, not four.
+///
+/// A route policy accepts but whose state `enforcement` rules out (RFC
+/// 6811 §5, "rejecting all "invalid" routes", configured) is held
+/// ([`Held::Enforcement`]) whatever the other states would give: a change
+/// of state or of the enforcement mode, which a reload makes with no
+/// ROUTE-REFRESH, may bring it back, and the Adj-RIB-In keeps it as RFC
+/// 6811 §2 asks. Policy alone decides what is kept, so that costs no
+/// further question to policy.
 ///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
 fn judge(
     policies: &dyn Policies,
+    enforcement: Enforcement,
     interner: &mut Interner,
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
     attrs: &Arc<PathAttrs>,
     rov: RovState,
 ) -> Judged {
-    match policies.import(info, family, prefix, attrs, rov) {
-        Verdict::Accept => Judged::Accepted(Arc::clone(attrs)),
-        Verdict::Modified(a) => Judged::Accepted(interner.intern(a)),
+    let Imported {
+        verdict,
+        rov: rov_set,
+    } = policies.import(info, family, prefix, attrs, rov);
+    let attrs = match verdict {
+        Verdict::Accept => Arc::clone(attrs),
+        Verdict::Modified(a) => interner.intern(a),
         Verdict::Reject => {
-            let admitted = RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
-                !matches!(
-                    policies.import(info, family, prefix, attrs, s),
-                    Verdict::Reject
-                )
-            });
-            if admitted {
-                Judged::Held
+            let admitted = policies.import_reads_rov(info)
+                && RovState::ALL.into_iter().filter(|s| *s != rov).any(|s| {
+                    !matches!(
+                        policies.import(info, family, prefix, attrs, s).verdict,
+                        Verdict::Reject
+                    )
+                });
+            return if admitted {
+                Judged::Held {
+                    by: Held::Policy,
+                    rov_set: None,
+                }
             } else {
                 Judged::Dropped
-            }
+            };
+        }
+    };
+    if enforcement.admits(rov_set.unwrap_or(rov)) {
+        Judged::Accepted { attrs, rov_set }
+    } else {
+        // Held as received, like any held route: the set policy made of
+        // it goes back to the interner.
+        interner.release(attrs);
+        Judged::Held {
+            by: Held::Enforcement,
+            rov_set,
         }
     }
 }

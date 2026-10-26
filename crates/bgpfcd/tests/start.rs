@@ -1,7 +1,8 @@
 //! The daemon as a process, where no privilege is needed: a cache of an
 //! external `rpki` block that has no address stops the start, naming the
 //! cache, before anything is opened (issue #60), while `--check` judges
-//! the file alone and looks nothing up (`docs/config.md`, "RPKI").
+//! the file alone and looks nothing up (`docs/config.md`, "RPKI"); and the
+//! start line names the `rpki` block's enforcement.
 
 use std::fs;
 use std::path::PathBuf;
@@ -57,5 +58,44 @@ fn a_cache_that_cannot_be_found_stops_the_start() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_start_line_names_the_rpki_enforcement() {
+    // Design §D1.3: the operator sees the configured action next to the
+    // mode, `drop-invalid` unless another is written (issue #61). The
+    // cache that cannot be found ends the start right after the line.
+    let dir = scratch("enforcement");
+    let config = dir.join("bgpfcd.conf");
+    for (statement, shown) in [
+        ("", "drop-invalid"),
+        ("enforcement prefer-valid;", "prefer-valid"),
+        ("enforcement off;", "off"),
+    ] {
+        fs::write(
+            &config,
+            format!(
+                "router-id 192.0.2.1;\nlocal-as 65000;\n\
+                 rpki {{ mode external; {statement} cache rtr.invalid; }}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
+            .arg("-c")
+            .arg(&config)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        let start = stderr
+            .lines()
+            .find(|l| l.contains("msg=\"bgpfcd starting\""))
+            .unwrap_or_else(|| panic!("{stderr}"));
+        assert!(
+            start.ends_with(&format!(" rpki=external enforcement={shown}")),
+            "{start}"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }

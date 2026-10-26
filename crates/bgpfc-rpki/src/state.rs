@@ -1,7 +1,8 @@
 //! Validation verdicts attached to a route.
 //!
 //! Implements: RFC 6811 §2 (`Valid`, `Invalid`, `NotFound`; a route not
-//! validated is `NotFound`); RFC 6483 §2 ("unknown", synonymously "not
+//! validated is `NotFound`), §3 (policy matching a state, see
+//! [`RovState::satisfies`]); RFC 6483 §2 ("unknown", synonymously "not
 //! found"). The spelling of each state in logs, configuration and control
 //! output is the one [`RovState`]'s `Display` produces.
 
@@ -61,6 +62,29 @@ impl RovState {
         match self {
             RovState::Disabled => RovState::NotFound,
             other => other,
+        }
+    }
+
+    /// Whether a route in this state satisfies a policy's `match rpki
+    /// wanted` (RFC 6811 §3: "An implementation MUST provide the ability
+    /// to match and set the validation state of routes as part of its
+    /// route policy filtering function").
+    ///
+    /// `valid`, `invalid` and `not-found` are RFC 6811 states, and for
+    /// them a route not validated reads as `NotFound`, which RFC 6811 §2
+    /// says it SHOULD be ("If validation is not performed on a Route, the
+    /// implementation SHOULD initialize the validation state of such a
+    /// route to "NotFound""): so a policy written for validation does
+    /// with an unvalidated route what it does with a `NotFound` one.
+    /// `disabled` holds for a route not validated only, so that policy can
+    /// still tell the two apart.
+    #[must_use]
+    pub const fn satisfies(self, wanted: RovState) -> bool {
+        match wanted {
+            RovState::Disabled => matches!(self, RovState::Disabled),
+            RovState::Valid => matches!(self.as_rfc6811(), RovState::Valid),
+            RovState::Invalid => matches!(self.as_rfc6811(), RovState::Invalid),
+            RovState::NotFound => matches!(self.as_rfc6811(), RovState::NotFound),
         }
     }
 }
@@ -176,6 +200,31 @@ mod tests {
         for state in [RovState::Valid, RovState::Invalid, RovState::NotFound] {
             assert_eq!(state.as_rfc6811(), state);
         }
+    }
+
+    #[test]
+    fn satisfies_reads_disabled_as_not_found_but_not_the_reverse() {
+        use RovState::{Disabled, Invalid, NotFound, Valid};
+        // (state, wanted) pairs that match; every other pair does not.
+        let matching = [
+            (Valid, Valid),
+            (Invalid, Invalid),
+            (NotFound, NotFound),
+            // RFC 6811 §2: a route not validated reads as NotFound...
+            (Disabled, NotFound),
+            // ...and only it is `disabled`.
+            (Disabled, Disabled),
+        ];
+        for state in RovState::ALL {
+            for wanted in RovState::ALL {
+                assert_eq!(
+                    state.satisfies(wanted),
+                    matching.contains(&(state, wanted)),
+                    "{state} matched against {wanted}"
+                );
+            }
+        }
+        assert!(!NotFound.satisfies(Disabled));
     }
 
     #[test]

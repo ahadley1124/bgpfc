@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Output, PeerInfo, Rib};
+use bgpfc_rib::{Enforcement, Output, PeerInfo, Rib};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -308,6 +308,24 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
                 on()
             };
             black_box(outputs(|o| rib.validation_changed(change, now, o)))
+        });
+    });
+    // A reload that changes the enforcement mode judges every route again
+    // (`Rib::set_enforcement`): the same walk as `all`, with the states
+    // kept. Every route is Valid here, so none moves.
+    if flip {
+        outputs(|o| rib.validation_changed(on(), now, o));
+    }
+    let mut drop = false;
+    group.bench_function(format!("set_enforcement_{routes}"), |b| {
+        b.iter(|| {
+            drop = !drop;
+            let mode = if drop {
+                Enforcement::DropInvalid
+            } else {
+                Enforcement::Off
+            };
+            black_box(outputs(|o| rib.set_enforcement(mode, now, o)))
         });
     });
     group.finish();

@@ -9,6 +9,7 @@ description = "bgpfc configuration language lexer, parser and validation"
 
 [dependencies]
 bgpfc-log.workspace = true
+bgpfc-rpki.workspace = true
 bgpfc-wire.workspace = true
 
 [lints]

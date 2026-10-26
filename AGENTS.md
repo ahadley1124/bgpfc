@@ -111,7 +111,9 @@ COMPLIANCE.md           RFC requirement matrix (see §6).
 The dependency direction is strictly downward:
 `bgpfcd → {control, rib, policy, fsm, config, fib, log} → wire`, and `fib → sys`.
 Route origin validation adds `rpki → wire`, `rtr → {rpki, wire, log}`,
-`sidecar → {sys, log}`, and `rib → rpki`; `bgpfcd` may depend on all three.
+`sidecar → {sys, log}`, `rib → rpki`, and `config → rpki`, so that the
+configuration reads validation states and enforcement modes as `bgpfc-rpki`
+spells them; `bgpfcd` may depend on all three.
 `wire`, `fsm`, `policy`, `config`, `rpki`, and `rtr` must not depend on
 `sys`. Keep protocol logic pure so it can be tested without sockets or time.
 `bgpfc-prof` is a leaf below `wire`; `wire`, `rib` and `bgpfcd` reach it only
@@ -241,9 +243,11 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
   Each term has match clauses and then actions. A term ends with `accept`,
   `reject`, or `next`. If no term decides, the route is rejected.
 - Match clauses: `prefix`, `prefix-list` (with `ge`/`le`), `as-path` regex,
-  `community`/`ext-community`/`large-community`, `origin`, and `neighbor`.
+  `community`/`ext-community`/`large-community`, `origin`, `neighbor`, and
+  `rpki` (the RFC 6811 validation state).
 - Set actions: `local-pref`, `med`, add/remove/replace communities (all three
-  kinds), `as-path prepend`, and `next-hop self`.
+  kinds), `as-path prepend`, `next-hop self`, and, in import policies only,
+  `rpki` (the validation state the route is used with, RFC 6811 §3).
 - The AS-path regex engine is our own. Operators match on ASN tokens, not
   characters: `^ $ . * + ? [ ] ( ) |` and `_`. Build it as a Thompson NFA or
   a backtracker with a step limit, so that pathological patterns cannot hang
@@ -293,7 +297,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 |---|---|
 | `bgpfc-wire` | Unit tests with byte vectors copied from the RFCs and from real captures. `proptest` round-trips (`decode(encode(x)) == x`, and `encode(decode(b)) == b` for canonical inputs). A fuzz target per top-level decoder. Miri. |
 | `bgpfc-fsm` | Table-driven tests covering every (state, event) pair in RFC 4271 §8.2.2, with injected time. |
-| `bgpfc-rib` | Decision-process tests per tie-break step (§9.1.2.2). Proptest invariants: Loc-RIB is a function of the Adj-RIBs-In and policy, and is independent of arrival order. |
+| `bgpfc-rib` | Decision-process tests per step of route selection, the validation step of `prefer-valid` included (§9.1.2.2), and a proptest of route selection against a model of §9.1.2.2's elimination. Tests that hold and release routes per `enforcement` mode and per state import policy sets. Proptest invariants: Loc-RIB is a function of the Adj-RIBs-In, policy and the `enforcement`, and is independent of arrival order. |
 | `bgpfc-policy` | Regex engine tests, including pathological-pattern step-limit tests. A fuzz target. |
 | `bgpfc-config` | Golden tests: input file → AST/debug output, and input file → error message snapshot. A fuzz target. |
 | `bgpfc-fib` | Netlink encode/decode tests against byte captures from `ip -d monitor` or strace. Miri on the pure parts. A reconcile-logic proptest. |
@@ -301,7 +305,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. Miri, since the RTR decoder fills its VRP set. No fuzz target: the crate decodes no bytes. |
 | `bgpfc-rtr` | Unit tests with PDU byte vectors laid out as in the figures of RFC 8210 §5 and RFC 6810 §5, and from a capture of a real version 0 session. `proptest` round-trips of the codec, and framer properties: the same PDUs, and the same error, however the stream is cut. Fuzz targets for the PDU decoder and framer and for the client session. Miri. Table-driven session tests with injected time: every PDU type and every transport and timer event in every state, then the RFC 8210 §8 sequences, the §7 version fallback, the §6 timers and stale data. A proptest of the session against a simulated cache that updates, restarts, goes away and runs out of data: every commit is a whole set the cache held, and the session ends in sync with it. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
-| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`; a stub cache of the crate's own stands in where StayRTR cannot. Uses network namespaces and needs root, so it runs in CI and on demand. |
+| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`. What acts on the state: Invalid routes held by the default `drop-invalid` and kept from the kernel and a relay, ROAs created, changed and deleted moving installed routes with the per-route log lines and `show rpki transitions`, `prefer-valid` against a higher LOCAL_PREF, a reload of the `enforcement` that leaves the RTR client alone, `enforcement off`, and import policy that matches and sets the state; a stub cache of the crate's own stands in where StayRTR cannot. Uses network namespaces and needs root, so it runs in CI and on demand. |
 | benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation; std-only micro-benchmarks in `bgpfc-bench`. Do not regress them without saying so in the PR. |
 | `bgpfc-prof`, `bgpfc-bench`, profiling | Histogram bucket and percentile math; allocator arithmetic on a private instance, under Miri; UPDATE packing against the size limit and round-tripped through the daemon's decoder; MRT parsing from hand-built records; the ignored loadgen-to-daemon test (`cargo test -p bgpfcd --features profiling -- --ignored`). `bgp_bench` keeps the time and memory history (`docs/PROFILING.md`); quote it when a change claims to be faster or smaller. |
 
@@ -416,11 +420,11 @@ Work roughly in this order. Each step should end with a green gate run and an
 updated COMPLIANCE.md.
 
 Steps 0–9 are complete: they built v1. Their text stays as a record of what
-v1 covers. Steps 10 to 12 are complete as well, and their text stays as a
+v1 covers. Steps 10 to 13 are complete as well, and their text stays as a
 record of what they added; step 11 also did the part of step 13 that
 re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4), and step
 12 the part that adds the `rpki` config, external caches or disabled. Work
-continues at step 13.
+continues at step 14.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.

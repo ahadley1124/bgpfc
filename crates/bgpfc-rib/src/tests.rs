@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rpki::{AspaState, RovState};
+use bgpfc_rpki::{AspaState, Enforcement, RovState};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
 use bgpfc_wire::community::Community;
@@ -16,7 +16,7 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 
 use crate::attrs::{PathAttrs, announced};
-use crate::decision::{Candidate, Neighbor, best};
+use crate::decision::{Candidate, Neighbor, ORDER, Step, best};
 use crate::export::{Source, export};
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
@@ -113,12 +113,34 @@ fn now() -> Instant {
     Instant::now()
 }
 
-/// Phase 2 over routes given as (peer, attributes).
+/// Phase 2 over routes given as (peer, attributes), with no enforcement.
 fn best_of(routes: &[(&PeerInfo, PathAttrs)]) -> Option<usize> {
-    best(routes.len(), |i| Candidate {
-        from: Neighbor::of(routes[i].0),
-        attrs: &routes[i].1,
-    })
+    best(
+        routes.len(),
+        |i| Candidate {
+            from: Neighbor::of(routes[i].0),
+            attrs: &routes[i].1,
+            rov: RovState::Disabled,
+        },
+        Enforcement::Off,
+    )
+}
+
+/// Phase 2 under `enforcement` over routes given as (peer, attributes,
+/// the validation state each is used with).
+fn best_under(
+    routes: &[(&PeerInfo, PathAttrs, RovState)],
+    enforcement: Enforcement,
+) -> Option<usize> {
+    best(
+        routes.len(),
+        |i| Candidate {
+            from: Neighbor::of(routes[i].0),
+            attrs: &routes[i].1,
+            rov: routes[i].2,
+        },
+        enforcement,
+    )
 }
 
 fn announce(prefixes: &[&str], a: &PathAttrs) -> DecodedUpdate {
@@ -288,8 +310,9 @@ fn med_compares_within_the_neighboring_as_only() {
 fn med_outcome_does_not_depend_on_candidate_order() {
     // Pairwise MED comparison is not transitive here: a beats b on MED
     // (same AS), b beats c on router id (different AS, MED not
-    // compared), c beats a on router id. Ranking each route against all
-    // routes of its AS first makes the winner the same in every order.
+    // compared), c beats a on router id. Removing from consideration, as
+    // §9.1.2.2 c) does, every route another route still under
+    // consideration beats makes the winner the same in every order.
     let e1 = peer("10.0.0.1", 65_001, 3);
     let e2 = peer("10.0.0.2", 65_001, 1);
     let e3 = peer("10.0.0.3", 65_003, 2);
@@ -356,6 +379,214 @@ fn lower_router_id_then_lower_peer_address() {
     ];
     assert_eq!(best_of(&c), Some(1));
     assert_eq!(best_of(&[]), None);
+}
+
+#[test]
+fn med_is_compared_only_among_routes_still_under_consideration() {
+    // RFC 4271 §9.1.2.2 c): "for m = all routes still under consideration
+    // / for n = all routes still under consideration". Three routes from
+    // AS 65001: a) removes 10.0.0.3, whose path is longest, and its MED 0
+    // goes with it; c) then compares 10 with 20 and removes 10.0.0.2. A
+    // MED taken over every candidate would leave .1 and .2 tied on MED and
+    // let the router ID choose .2.
+    let e1 = peer("10.0.0.1", 65_001, 3);
+    let e2 = peer("10.0.0.2", 65_001, 1);
+    let e3 = peer("10.0.0.3", 65_001, 2);
+    let with_med = |path: &[u32], next_hop: &str, med: u32| {
+        let mut a = attrs(path, next_hop);
+        a.med = Some(med);
+        a
+    };
+    let mut c = [
+        (&e1, with_med(&[65_001, 1], "10.0.0.1", 10)),
+        (&e2, with_med(&[65_001, 2], "10.0.0.2", 20)),
+        (&e3, with_med(&[65_001, 3, 4], "10.0.0.3", 0)),
+    ];
+    assert_eq!(best_of(&c), Some(0));
+    // The same through the RIB, as the routes arrive from the peers.
+    let mut rib = Rib::new(LOCAL_AS);
+    for (info, _) in &c {
+        outputs(|o| rib.peer_up((*info).clone(), now(), o));
+    }
+    for (info, a) in &c {
+        outputs(|o| rib.update(info.addr, &announce(&["192.0.2.0/24"], a), now(), o));
+    }
+    assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e1.addr);
+    // A route the degree of preference removes takes its MED with it too.
+    c[2].1 = with_med(&[65_001, 3], "10.0.0.3", 0);
+    c[2].1.local_pref = Some(50);
+    assert_eq!(best_of(&c), Some(0));
+    // Still under consideration, it removes both.
+    c[2].1.local_pref = None;
+    assert_eq!(best_of(&c), Some(2));
+}
+
+/// Make a route `step` prefers, or one it does not, for
+/// [`each_step_decides_what_the_earlier_ones_leave_tied`].
+fn preferred_by(
+    step: Step,
+    preferred: bool,
+    (info, a, rov): (&mut PeerInfo, &mut PathAttrs, &mut RovState),
+) {
+    match step {
+        Step::Validation => {
+            *rov = if preferred {
+                RovState::Valid
+            } else {
+                RovState::Invalid
+            };
+        }
+        Step::DegreeOfPreference => a.local_pref = Some(if preferred { 200 } else { 100 }),
+        Step::AsPathLength => {
+            let path: &[u32] = if preferred {
+                &[65_001]
+            } else {
+                &[65_001, 64_496, 64_497]
+            };
+            a.as_path = AsPath::sequence(&path.iter().map(|n| Asn(*n)).collect::<Vec<_>>());
+        }
+        Step::Origin => {
+            a.origin = if preferred {
+                Origin::Igp
+            } else {
+                Origin::Incomplete
+            };
+        }
+        // From the same neighboring AS, 65001, whatever the other steps
+        // make of the route: its path always starts with it.
+        Step::Med => a.med = Some(if preferred { 0 } else { 50 }),
+        Step::External => {
+            (info.kind, info.remote_as) = if preferred {
+                (PeerKind::External, Asn(65_001))
+            } else {
+                (PeerKind::Internal, LOCAL_AS)
+            };
+        }
+        // §9.1.2.2 e): no IGP, so no route is ever preferred by it.
+        Step::InteriorCost => {}
+        Step::RouterId => info.router_id = RouterId::new(if preferred { 1 } else { 9 }).unwrap(),
+        Step::PeerAddress => info.addr = ip(if preferred { "10.0.0.1" } else { "10.0.0.9" }),
+    }
+}
+
+#[test]
+fn each_step_decides_what_the_earlier_ones_leave_tied() {
+    // Issue #47, RFC 4271 §9.1.2.2: "The criteria MUST be applied in the
+    // order specified." For each step, two routes that every earlier step
+    // finds equal: the one the step prefers wins, although every later
+    // step prefers the other. With prefer-valid, so that the validation
+    // step applies (RFC 6811 §5).
+    for (k, &step) in ORDER.iter().enumerate() {
+        if step == Step::InteriorCost {
+            continue;
+        }
+        let build = |wins: bool| {
+            let mut info = peer("10.0.0.5", 65_001, 5);
+            let mut a = attrs(&[65_001], "10.0.0.5");
+            let mut rov = RovState::NotFound;
+            for (j, &s) in ORDER.iter().enumerate() {
+                let preferred = match j.cmp(&k) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => wins,
+                    std::cmp::Ordering::Greater => !wins,
+                };
+                preferred_by(s, preferred, (&mut info, &mut a, &mut rov));
+            }
+            (info, a, rov)
+        };
+        let (winner, loser) = (build(true), build(false));
+        assert_ne!(winner.0.addr, loser.0.addr);
+        let w = (&winner.0, winner.1.clone(), winner.2);
+        let l = (&loser.0, loser.1.clone(), loser.2);
+        let e = Enforcement::PreferValid;
+        assert_eq!(best_under(&[w.clone(), l.clone()], e), Some(0), "{step:?}");
+        assert_eq!(best_under(&[l, w], e), Some(1), "{step:?}");
+    }
+}
+
+#[test]
+fn validation_state_wins_before_degree_of_preference_with_prefer_valid() {
+    // Issue #47, RFC 6811 §5: with prefer-valid the state ranks first, so
+    // an Invalid route with the higher LOCAL_PREF (a forged origin heard
+    // from a customer) loses to a Valid one from transit; NotFound sits
+    // between.
+    use RovState::{Invalid, NotFound, Valid};
+    let customer = peer("10.0.0.1", 65_001, 1);
+    let transit = peer("10.0.0.2", 65_002, 2);
+    let mut high = attrs(&[65_001], "10.0.0.1");
+    high.local_pref = Some(200);
+    let low = attrs(&[65_002, 64_496, 64_497], "10.0.0.2");
+    let e = Enforcement::PreferValid;
+    for (customer_state, transit_state, best) in [
+        (Invalid, Valid, 1),
+        (Invalid, NotFound, 1),
+        (NotFound, Valid, 1),
+        (Valid, Invalid, 0),
+        (Valid, NotFound, 0),
+        (NotFound, Invalid, 0),
+        // The same rank: the degree of preference decides.
+        (Valid, Valid, 0),
+        (Invalid, Invalid, 0),
+    ] {
+        let c = [
+            (&customer, high.clone(), customer_state),
+            (&transit, low.clone(), transit_state),
+        ];
+        assert_eq!(
+            best_under(&c, e),
+            Some(best),
+            "{customer_state} {transit_state}"
+        );
+        // A third route ties nothing, and still the rank comes first.
+        let other = peer("10.0.0.3", 65_003, 3);
+        let mut three = c.to_vec();
+        three.push((&other, attrs(&[65_003, 1, 2, 3], "10.0.0.3"), Invalid));
+        assert_eq!(best_under(&three, e), Some(best));
+    }
+}
+
+#[test]
+fn validation_state_is_ignored_unless_prefer_valid() {
+    // RFC 8481 §5, "Set State, Don't Act", and drop-invalid, which acts by
+    // holding routes rather than by ranking them: the state does not enter
+    // route selection, and LOCAL_PREF decides.
+    let customer = peer("10.0.0.1", 65_001, 1);
+    let transit = peer("10.0.0.2", 65_002, 2);
+    let mut high = attrs(&[65_001], "10.0.0.1");
+    high.local_pref = Some(200);
+    let c = [
+        (&customer, high, RovState::Invalid),
+        (&transit, attrs(&[65_002], "10.0.0.2"), RovState::Valid),
+    ];
+    for e in [Enforcement::Off, Enforcement::DropInvalid] {
+        assert_eq!(best_under(&c, e), Some(0), "{e}");
+    }
+    assert_eq!(best_under(&c, Enforcement::PreferValid), Some(1));
+    assert!(!Step::Validation.applies(Enforcement::Off));
+    assert!(!Step::Validation.applies(Enforcement::DropInvalid));
+    assert!(Step::Validation.applies(Enforcement::PreferValid));
+    assert!(ORDER.iter().skip(1).all(|s| s.applies(Enforcement::Off)));
+}
+
+#[test]
+fn prefer_valid_ranks_disabled_with_not_found() {
+    // RFC 6811 §2: a route not validated SHOULD read as NotFound, so
+    // `disabled` ties with NotFound, and the next step decides: here the
+    // router ID, where the first route has the lower.
+    use RovState::{Disabled, Invalid, NotFound, Valid};
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    let routes = |a: RovState, b: RovState| {
+        [
+            (&e1, attrs(&[65_001], "10.0.0.1"), a),
+            (&e2, attrs(&[65_002], "10.0.0.2"), b),
+        ]
+    };
+    let e = Enforcement::PreferValid;
+    assert_eq!(best_under(&routes(Disabled, NotFound), e), Some(0));
+    assert_eq!(best_under(&routes(NotFound, Disabled), e), Some(0));
+    assert_eq!(best_under(&routes(Disabled, Valid), e), Some(1));
+    assert_eq!(best_under(&routes(Invalid, Disabled), e), Some(1));
 }
 
 // --- RFC 4271 §5.1, §9.2 export rules ----------------------------------
@@ -1096,6 +1327,34 @@ fn as_loop_routes_are_excluded() {
 }
 
 #[test]
+fn every_next_hop_counts_as_resolvable() {
+    // RFC 4271 §9.1.2: "If the NEXT_HOP attribute of a BGP route depicts
+    // an address that is not resolvable ... the BGP route MUST be excluded
+    // from the Phase 2 decision function." bgpfcd runs no IGP and reads no
+    // route from the kernel, so it cannot tell (COMPLIANCE.md, RFC 4271
+    // §9.1.2; docs/config.md, "Route selection"): a next hop on no
+    // network the router is attached to is chosen, installed and
+    // advertised like any other.
+    let mut rib = Rib::new(LOCAL_AS);
+    let e1 = peer("10.0.0.1", 65_001, 1);
+    let e2 = peer("10.0.0.2", 65_002, 2);
+    outputs(|o| rib.peer_up(e1.clone(), now(), o));
+    outputs(|o| rib.peer_up(e2.clone(), now(), o));
+    let far = attrs(&[65_001], "203.0.113.99");
+    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &far), now(), o));
+    assert_eq!(
+        fib(&out),
+        vec![FibChange {
+            family: V4,
+            prefix: p("192.0.2.0/24"),
+            next_hop: Some(ip("203.0.113.99")),
+            previous: None,
+        }]
+    );
+    assert_eq!(sends(&out, e2.addr).len(), 1);
+}
+
+#[test]
 fn new_peer_receives_the_loc_rib_and_route_refresh_resends_it() {
     let mut rib = Rib::new(LOCAL_AS);
     let e1 = peer("10.0.0.1", 65_001, 1);
@@ -1414,7 +1673,7 @@ fn interner_shares_and_sweeps() {
 
 #[test]
 fn reexport_sends_only_the_difference() {
-    use crate::{Policies, Verdict};
+    use crate::{Imported, Policies, Verdict};
     struct DropOdd;
     impl Policies for DropOdd {
         fn import(
@@ -1424,8 +1683,8 @@ fn reexport_sends_only_the_difference() {
             _: Prefix,
             _: &PathAttrs,
             _: RovState,
-        ) -> Verdict {
-            Verdict::Accept
+        ) -> Imported {
+            Verdict::Accept.into()
         }
         fn export(
             &self,
@@ -1517,11 +1776,11 @@ impl crate::Policies for RejectOne {
         p: Prefix,
         _: &PathAttrs,
         _: RovState,
-    ) -> crate::Verdict {
+    ) -> crate::Imported {
         if p == self.0 {
-            crate::Verdict::Reject
+            crate::Verdict::Reject.into()
         } else {
-            crate::Verdict::Accept
+            crate::Verdict::Accept.into()
         }
     }
     fn export(
@@ -2028,7 +2287,7 @@ fn mrai_zero_sends_every_change_at_once() {
 
 #[test]
 fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
-    use crate::{Policies, Verdict};
+    use crate::{Imported, Policies, Verdict};
     /// Exports everything with a community.
     struct Tag;
     impl Policies for Tag {
@@ -2039,8 +2298,8 @@ fn mrai_route_refresh_and_policy_changes_go_through_the_pacing() {
             _: Prefix,
             _: &PathAttrs,
             _: RovState,
-        ) -> Verdict {
-            Verdict::Accept
+        ) -> Imported {
+            Verdict::Accept.into()
         }
         fn export(
             &self,

@@ -9,9 +9,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
-#[cfg(feature = "profiling")]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
 use bgpfc_wire::error::{CeaseSubcode, DecodeError};
@@ -180,7 +178,7 @@ pub(crate) enum RibQuery {
     /// Per-peer route counts and session facts.
     Peers,
     /// Loc-RIB routes of a family, a page after `after`; or one prefix
-    /// with all its candidates.
+    /// with every route the Adj-RIBs-In hold for it.
     Routes {
         /// The family.
         family: AddressFamily,
@@ -188,6 +186,11 @@ pub(crate) enum RibQuery {
         prefix: Option<Prefix>,
         /// Without `prefix`: the last route of the page before, if any.
         after: Option<Prefix>,
+        /// Only the routes held for their validation state, which are no
+        /// candidates (RFC 6811 §2): of the destination, or without
+        /// `prefix`, a page of the family's after `after`, which ends
+        /// between two destinations.
+        held: bool,
     },
     /// The next hop of the destinations after `after`, as the FIB is to
     /// install them: a page.
@@ -195,9 +198,12 @@ pub(crate) enum RibQuery {
         /// The last route of the page before, if any.
         after: Option<Prefix>,
     },
+    /// The most recent changes of a route's RFC 6811 state (issue #59).
+    Transitions,
 }
 
-/// One Loc-RIB route or candidate in a reply.
+/// One route in a reply: of the Loc-RIB, a candidate, or a route held
+/// for its validation state.
 #[derive(Clone, Debug)]
 pub(crate) struct RouteReport {
     /// The destination.
@@ -211,6 +217,11 @@ pub(crate) struct RouteReport {
     /// Its RFC 6811 §2 origin validation state, judged on the route as
     /// received; `Disabled` while there is no validation source.
     pub(crate) rov: bgpfc_rib::RovState,
+    /// The state import policy set, which the route is used with in
+    /// place of `rov` (RFC 6811 §3), if it set one.
+    pub(crate) rov_set: Option<bgpfc_rib::RovState>,
+    /// Why the Adj-RIB-In holds it while it is no candidate, if it does.
+    pub(crate) held: Option<bgpfc_rib::Held>,
 }
 
 /// The RIB's answer.
@@ -222,6 +233,36 @@ pub(crate) enum RibReply {
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
     FibRoutes(Vec<(Prefix, IpAddr)>),
+    /// Answer to [`RibQuery::Transitions`].
+    Transitions(TransitionsReport),
+}
+
+/// A route's move from one RFC 6811 state to another, as the RIB thread
+/// keeps it (issue #59: "An operator needs to see that a prefix went
+/// Valid → Invalid at a specific time").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Recorded {
+    /// When the RIB thread applied the change (a log timestamp, AGENTS.md
+    /// §3): the time of its log lines, give or take the moment it took to
+    /// write them.
+    pub(crate) at: SystemTime,
+    /// The same moment on the monotonic clock, for how long ago it was.
+    pub(crate) when: Instant,
+    /// The route, its move, and what became of it.
+    pub(crate) transition: bgpfc_rib::Transition,
+}
+
+/// The changes of state the RIB thread keeps: the most recent of those
+/// the RIB listed (`bgpfc_rib::Revalidation::transitions`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransitionsReport {
+    /// The most it keeps.
+    pub(crate) capacity: usize,
+    /// Changes of state it was never given, since it started: those
+    /// beyond what the RIB lists for one change of the validation source.
+    pub(crate) unrecorded: u64,
+    /// The changes kept, oldest first.
+    pub(crate) entries: Vec<Recorded>,
 }
 
 /// What the coordinator reports about the `rpki` block.
@@ -316,6 +357,10 @@ pub(crate) enum RibMsg {
     /// queued and cannot outrun the RIB thread (AGENTS.md §3); so does the
     /// coordinator when a reload turns validation off.
     Validation(bgpfc_rpki::ValidationChange),
+    /// The `rpki` block's `enforcement` after a reload changed it: judge
+    /// every route again under it (RFC 6811 §5), holding or releasing
+    /// routes and choosing again, with no UPDATE and no ROUTE-REFRESH.
+    SetEnforcement(bgpfc_rpki::Enforcement),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.

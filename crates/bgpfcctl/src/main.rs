@@ -20,10 +20,11 @@ usage: bgpfcctl [-s SOCKET] COMMAND...
 commands:
   show neighbors
   show neighbor ADDR
-  show routes [ipv4|ipv6] [PREFIX]
+  show routes [ipv4|ipv6] [PREFIX] [held]
   show fib
   show status
   show rpki
+  show rpki transitions
   show rpki validate PREFIX ASN
   clear neighbor ADDR [soft] [MESSAGE]
   reload
