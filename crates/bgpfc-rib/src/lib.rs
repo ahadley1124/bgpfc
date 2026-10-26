@@ -26,10 +26,14 @@
 //! RFC 6811 §2 (every route received gets its validation state from a
 //! lookup, kept as a property of the route; the state never keeps a
 //! route out of the Adj-RIB-In: one import policy rejects for its state
-//! alone is kept), §3 (policy sees the validation state and may set it,
-//! see [`Policies`] and [`Verdict`]), §4 (the affected routes are
-//! validated again when the validation source changes, see
-//! [`Rib::validation_changed`]);
+//! alone, or the RIB refuses for being Invalid, is kept), §3 (policy sees
+//! the validation state and may set it, see [`Policies`] and
+//! [`Verdict`]), §4 (the affected routes are validated again when the
+//! validation source changes, see [`Rib::validation_changed`]), §5 (the
+//! Invalid are dropped or lose in the decision process when the operator
+//! says so, see [`Rib::set_invalid_action`]); RFC 8481 §5 (no action on
+//! the state unless the operator names it: the RIB starts with
+//! `InvalidAction::Policy`, nothing);
 //! RFC 9234 §5 (the Only to Customer procedures of a session with a BGP
 //! Role: a route leak is not kept, see [`Output::RouteLeak`], and the
 //! attribute is added and checked on the way out, see [`otc`] and
