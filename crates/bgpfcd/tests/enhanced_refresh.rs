@@ -558,6 +558,122 @@ fn a_borr_or_eorr_of_the_wrong_length_ends_the_session_with_a_route_refresh_erro
     d.wait_for("show routes", |r| !r.contains(ROUTES[0]));
 }
 
+/// A session without the procedures of RFC 7313 §4 and §5 reads what they
+/// would have it act on as RFC 2918 does (COMPLIANCE.md, the `deviates` row
+/// for the receiving side): a `BoRR`, an `EoRR` and a subtype of no meaning are
+/// requests, so each has our table sent again and none marks a route stale
+/// or removes one, and a length other than four is a header error. The
+/// session ends with that error, so this comes last.
+fn subtypes_are_not_read(d: &Daemon, a: &mut Stub) {
+    a.announce(&["100.64.0.0/10"], &[65_001]);
+    d.wait_for("show routes", |r| r.contains("100.64.0.0/10"));
+    for subtype in [BORR, EORR, RefreshSubtype::Unknown(3)] {
+        a.refresh(subtype);
+        let got = a
+            .read_until(d, |r| r.announced.len() == ROUTES.len())
+            .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+        assert_eq!(
+            got.refreshes(),
+            vec![],
+            "{subtype:?}: the table, no brackets"
+        );
+        assert!(a.is_quiet_for(Duration::from_millis(300)));
+    }
+    let routes = d.ask("show routes").join("\n");
+    assert!(routes.contains("100.64.0.0/10"), "{routes}");
+    assert!(!routes.contains(" stale"), "{routes}");
+    let body = [0, 1, 1, 1, 0];
+    a.stream
+        .write_all(&frame(MessageType::RouteRefresh, &body).unwrap())
+        .unwrap();
+    let n = a
+        .read_until(d, |_| false)
+        .unwrap_err()
+        .expect("a NOTIFICATION");
+    assert_eq!((n.code, n.subcode), (ErrorCode::MessageHeader, 2));
+}
+
+/// RFC 7313 §4 has a speaker that received the capability bracket its
+/// refreshes. bgpfcd does so only when both sides advertised it and the peer
+/// advertised Route Refresh too (COMPLIANCE.md, RFC 7313 §4, the `deviates`
+/// rows): with `enhanced-refresh no` it has told the peer nothing, and a peer
+/// that applies the procedures only to a speaker it received the capability
+/// from would take a `BoRR` for a request and send its table again. So the
+/// refresh is RFC 2918's.
+#[test]
+fn with_enhanced_refresh_off_a_peer_that_advertised_it_gets_plain_refreshes() {
+    let (d, la, lb) = lab("err-off-plain", "enhanced-refresh no;");
+    let mut b = Stub::accept(&lb, 65_002, 0xc000_0202, vec![], &d);
+    b.announce(&ROUTES, &[65_002]);
+    d.wait_for("show routes", |r| r.contains(ROUTES[2]));
+    let mut a = Stub::accept(&la, 65_001, 0xc000_0201, err(), &d);
+    let first = a
+        .read_until(&d, |r| r.announced.len() == ROUTES.len())
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(first.refreshes(), vec![]);
+    let detail = d.wait_for("show neighbor 127.0.0.1", |r| r.contains("capabilities"));
+    assert!(detail.contains("enhanced-route-refresh=false"), "{detail}");
+    // A normal request: the table, and nothing around it.
+    a.refresh(REQUEST);
+    let got = a
+        .read_until(&d, |r| r.announced.len() == ROUTES.len())
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(got.refreshes(), vec![], "no brackets");
+    assert!(a.is_quiet_for(Duration::from_millis(300)));
+    // A soft reset: a plain request for A's routes, and our table again.
+    d.ask("clear neighbor 127.0.0.1 soft");
+    let got = a
+        .read_until(&d, |r| {
+            r.refreshes().contains(&REQUEST) && r.announced.len() == ROUTES.len()
+        })
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(got.refreshes(), vec![REQUEST], "no brackets");
+    assert!(a.is_quiet_for(Duration::from_millis(300)));
+    subtypes_are_not_read(&d, &mut a);
+}
+
+/// The same for a peer that advertised the capability without Route
+/// Refresh: RFC 2918 §4 has a ROUTE-REFRESH go only to a peer that
+/// advertised Route Refresh, and a `BoRR` is one. Its request, which we
+/// advertised Route Refresh for, gets the table and no brackets, and a soft
+/// reset has no request to send it.
+#[test]
+fn a_peer_that_advertised_it_without_route_refresh_gets_plain_refreshes() {
+    let (d, la, lb) = lab("err-only", "");
+    let mut b = Stub::accept(&lb, 65_002, 0xc000_0202, vec![], &d);
+    b.announce(&ROUTES, &[65_002]);
+    d.wait_for("show routes", |r| r.contains(ROUTES[2]));
+    let mut a = Stub::accept(
+        &la,
+        65_001,
+        0xc000_0201,
+        vec![Capability::EnhancedRouteRefresh],
+        &d,
+    );
+    let first = a
+        .read_until(&d, |r| r.announced.len() == ROUTES.len())
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(first.refreshes(), vec![]);
+    let detail = d.wait_for("show neighbor 127.0.0.1", |r| r.contains("capabilities"));
+    assert!(detail.contains("enhanced-route-refresh=false"), "{detail}");
+    a.refresh(REQUEST);
+    let got = a
+        .read_until(&d, |r| r.announced.len() == ROUTES.len())
+        .unwrap_or_else(|e| panic!("{e:?}\n{}", d.log()));
+    assert_eq!(got.refreshes(), vec![], "no brackets");
+    assert!(a.is_quiet_for(Duration::from_millis(300)));
+    // RFC 2918 §4: no ROUTE-REFRESH for a peer without the capability, so
+    // the soft reset is refused and nothing is sent.
+    d.ask("clear neighbor 127.0.0.1 soft");
+    let deadline = Instant::now() + TIMEOUT;
+    while !d.log().contains("peer did not advertise the capability") {
+        assert!(Instant::now() < deadline, "no refusal logged:\n{}", d.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(a.is_quiet_for(Duration::from_millis(300)));
+    subtypes_are_not_read(&d, &mut a);
+}
+
 #[test]
 fn without_the_capability_the_message_subtype_is_ignored() {
     let (d, la, lb) = lab("err-plain", "");
