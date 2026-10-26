@@ -385,6 +385,13 @@ impl<'a> Pass<'a> {
     /// gets the destination with its best route before and after if its
     /// candidates changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
+        // A change of the action concerns the Invalid routes alone, and
+        // most destinations have none: look before cloning the best route.
+        if self.cause == Cause::Action
+            && (0..dest.len()).all(|i| dest.route(i).rov != RovState::Invalid)
+        {
+            return;
+        }
         let old = dest.best().cloned();
         let mut found = Found::default();
         for i in 0..dest.len() {
