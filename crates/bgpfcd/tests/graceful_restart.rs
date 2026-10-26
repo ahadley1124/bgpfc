@@ -90,28 +90,54 @@ impl Daemon {
         )
     }
 
-    /// Start it on the stubs' ports.
+    /// Start it on the stubs' ports. The port it listens on is one that was
+    /// free a moment ago: bound and released, as the daemon takes its
+    /// address from the configuration file. Another test or process can
+    /// take it in between, and the daemon then exits with "cannot listen"
+    /// before it opens its control socket; it is started again on another
+    /// port.
     fn start(dir: &Path, port_a: u16, port_b: u16) -> Daemon {
         let conf = dir.join("bgpfcd.conf");
-        let listen = TcpListener::bind("127.0.0.2:0").unwrap();
-        let listen_port = listen.local_addr().unwrap().port();
-        drop(listen);
         let ports = (port_a, port_b);
-        fs::write(&conf, Daemon::config(dir, listen_port, ports, false)).unwrap();
-        let log = fs::File::create(dir.join("bgpfcd.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
-            .arg("-c")
-            .arg(&conf)
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        Daemon {
-            child,
-            dir: dir.to_owned(),
-            listen_port,
-            ports,
+        for _ in 0..8 {
+            let listen = TcpListener::bind("127.0.0.2:0").unwrap();
+            let listen_port = listen.local_addr().unwrap().port();
+            drop(listen);
+            fs::write(&conf, Daemon::config(dir, listen_port, ports, false)).unwrap();
+            let log = fs::File::create(dir.join("bgpfcd.log")).unwrap();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
+                .arg("-c")
+                .arg(&conf)
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            // The listeners are open before the control socket is.
+            let socket = dir.join("ctl.sock");
+            let deadline = Instant::now() + TIMEOUT;
+            while !socket.exists() && Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if socket.exists() {
+                return Daemon {
+                    child,
+                    dir: dir.to_owned(),
+                    listen_port,
+                    ports,
+                };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let log = fs::read_to_string(dir.join("bgpfcd.log")).unwrap_or_default();
+            assert!(
+                log.contains("Address already in use"),
+                "the daemon did not start:\n{log}"
+            );
         }
+        panic!("no port to listen on was free in 8 tries");
     }
 
     /// Remove neighbor A from the configuration file and reload.
