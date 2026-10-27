@@ -477,8 +477,9 @@ connection in use at once as well as every later one (the summary says
 `rpki tcp-keepalive idle N interval N count N`, the log `rpki: tcp
 keep-alive changed`).
 `router-id` and `local-as` changes are refused, and `listen`,
-`control`, `fib { table }` and `fib { protocol }` changes are noted for the
-next restart.
+`control`, `fib { table }`, `fib { protocol }` and `netns` changes are
+noted for the next restart (`netns changed: takes effect at the next
+restart; bgpfcd stays in PATH`).
 
 A route an import policy rejects whatever its validation state is not
 kept, so importing again cannot bring it back: when import policy has

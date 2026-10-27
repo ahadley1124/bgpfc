@@ -8,7 +8,10 @@
 //! stops the start (issue #60); and, with `mode sidecar`, `--check` and
 //! the start warn when the owner check of Routinator's port is weaker,
 //! as for `nobody` or in a user namespace, and go on (COMPLIANCE.md, RFC
-//! 8210 §9, §13).
+//! 8210 §9, §13). With a network namespace (`docs/config.md`, "Network
+//! namespace"), `--check` opens it and joins nothing, and the start in the
+//! namespace it was started in needs no privilege and gives up
+//! `CAP_SYS_ADMIN` all the same.
 
 use std::fs;
 use std::net::TcpListener;
@@ -142,6 +145,120 @@ fn the_start_line_names_the_rpki_enforcement_and_startup() {
             "{start}"
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--check` opens the namespace that `netns` or `--netns` names, which
+/// needs no privilege, says so, and refuses one it cannot open or that is
+/// not a network namespace; `--netns` overrides the statement.
+#[test]
+fn check_opens_the_network_namespace() {
+    let dir = scratch("netns-check");
+    let config = dir.join("bgpfcd.conf");
+    let write = |netns: &str| {
+        fs::write(
+            &config,
+            format!("router-id 192.0.2.1;\nlocal-as 65000;\n{netns}\n"),
+        )
+        .unwrap();
+    };
+    let check = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
+            .arg("-c")
+            .arg(&config)
+            .arg("--check")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // bgpfcd's own namespace, by the statement, then by the flag.
+    write("netns /proc/self/ns/net;");
+    let out = check(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout.ends_with("ok (0 neighbors, 0 policies, netns /proc/self/ns/net)\n"),
+        "{stdout}"
+    );
+    write("netns /nonexistent/netns;");
+    let out = check(&["--netns", "/proc/self/ns/net"]);
+    assert!(out.status.success(), "{out:?}");
+    // A namespace that is not there, by name, and a file that is not one.
+    let out = check(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("network namespace /nonexistent/netns: cannot open: "),
+        "{stderr}"
+    );
+    let out = check(&["--netns", "bgpfc-test-no-such-namespace"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("network namespace /run/netns/bgpfc-test-no-such-namespace: "),
+        "{stderr}"
+    );
+    let out = check(&["--netns", "/proc/self/ns/uts"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("not a network namespace"), "{stderr}");
+    // Without one, the line is as before.
+    write("");
+    let out = check(&[]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with("ok (0 neighbors, 0 policies)\n"),
+        "{out:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Told to run in the namespace it is in, bgpfcd does not call setns(2),
+/// so it needs no privilege, and still gives up `CAP_SYS_ADMIN`, before
+/// anything else: the start line names the namespace, and the cache that
+/// cannot be found ends the start right after it.
+#[test]
+fn the_start_in_its_own_namespace_needs_no_join() {
+    let dir = scratch("netns-start");
+    let config = dir.join("bgpfcd.conf");
+    fs::write(
+        &config,
+        "router-id 192.0.2.1;\nlocal-as 65000;\nnetns /proc/self/ns/net;\n\
+         rpki { mode external; cache rtr.invalid; }\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_bgpfcd"))
+        .arg("-c")
+        .arg(&config)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let at = |msg: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(&format!("msg=\"{msg}\"")))
+            .unwrap_or_else(|| panic!("no {msg}:\n{stderr}"))
+    };
+    let (there, dropped, starting) = (
+        at("network namespace already in use"),
+        at("capability dropped"),
+        at("bgpfcd starting"),
+    );
+    assert!(there < dropped && dropped < starting, "{stderr}");
+    assert!(
+        lines[there].contains(" netns=/proc/self/ns/net id="),
+        "{stderr}"
+    );
+    assert!(
+        lines[dropped].ends_with(" capability=CAP_SYS_ADMIN"),
+        "{stderr}"
+    );
+    assert!(
+        lines[starting].contains(" netns=/proc/self/ns/net "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("network namespace joined"), "{stderr}");
     let _ = fs::remove_dir_all(&dir);
 }
 

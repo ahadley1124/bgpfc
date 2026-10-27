@@ -962,8 +962,9 @@ namespace `/run/netns/NAME`, the file `ip netns add NAME` creates
 (iproute2's convention); a value that starts with `/` is a path used as
 it is, such as `/proc/PID/ns/net`, the namespace process PID is in, or
 `/var/run/netns/NAME`. Any other value, such as `a/b`, `..` or an empty
-string, is an error. Without the statement bgpfcd runs in the namespace
-it is started in.
+string, is an error. `bgpfcd --netns` overrides the statement (see
+**Command line**). Without either, bgpfcd runs in the namespace it is
+started in.
 
 bgpfcd joins the namespace itself, at startup, before it opens a socket
 or starts a thread, so that everything it does happens there, as if it
@@ -1052,7 +1053,10 @@ one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 A changed `netns`, added or removed, takes effect at the next restart,
 as a changed `listen` or `control` block, `fib { table }` or `fib {
 protocol }` does: the reload applies everything else and its summary
-says `netns changed: takes effect at the next restart`. The running
+says `netns changed: takes effect at the next restart; bgpfcd stays in
+PATH`, PATH being the namespace bgpfcd joined, or `the namespace it was
+started in`. With `--netns` the statement is overridden, so a change of
+it is none. The running
 daemon stays in the namespace it joined, where its sockets are: moving
 would need every one of them opened again, and the `CAP_SYS_ADMIN` it
 gave up. Refusing the whole reload, as for `router-id`, would hold back
@@ -1132,18 +1136,25 @@ block alone: bgpfcd keeps retrying it at the back-off's cap.
 
 ```
 bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
-       [--user USER [--group GROUP]]
+       [--netns NAME|PATH] [--user USER [--group GROUP]]
 ```
 
 `--check` parses and validates the file (policies included), prints any
 errors, and exits with status 0 or 1 without starting anything; it does not
-look up the names of `rpki` caches or run Routinator.
-`--log-level` and `--fib` override the corresponding settings in the file
-for this run. `--user` is for a daemon started as root: the listeners and
+look up the names of `rpki` caches or run Routinator. With a network
+namespace, from `netns` or `--netns`, it also opens the namespace's file
+and checks that it is one, which needs no privilege, and says `netns PATH`
+after the counts; it does not join it.
+`--log-level`, `--fib` and `--netns` override the corresponding settings in
+the file for this run, and at every reload. `--netns` takes what `netns`
+takes: a name in `/run/netns` or an absolute path (see **Network
+namespace**). `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user
 (README, "Option B"). Without it, an unprivileged daemon must hold
 `CAP_NET_BIND_SERVICE` for a listen port below 1024 and `CAP_NET_ADMIN`
 for `fib { mode install; }`; the daemon checks and names what is missing.
+To join a network namespace it needs `CAP_SYS_ADMIN` as well, root or
+not, which it gives up right after the join (see **Network namespace**).
 
 `SIGTERM` and `SIGINT` shut the daemon down: every session gets a Cease
 (Administrative Shutdown) and every route it installed is removed.
