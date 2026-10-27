@@ -240,8 +240,13 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
   - that the HTTP listen address is loopback.
 - Reload is triggered by SIGHUP or `bgpfcctl reload`. It diffs the old and new
   config, applies only what changed, and resets only the sessions whose
-  session parameters changed. Policy-only changes trigger a soft
-  re-evaluation, using route refresh where the peer supports it.
+  session parameters changed. Policy-only changes are applied on the RIB
+  thread without a reset: a changed export policy to the Loc-RIB, and a
+  changed import policy to the routes the Adj-RIBs-In kept, held ones
+  included (RFC 4271 §3 (a), `Rib::reimport`). Route refresh (RFC 2918) is
+  sent only for the routes the RIB did not keep, those an import policy
+  rejected whatever their validation state, and only where the peer
+  supports it.
 
 **Policy (v1).**
 - Per-neighbor `import` and `export` policies are ordered lists of terms.
@@ -302,7 +307,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 |---|---|
 | `bgpfc-wire` | Unit tests with byte vectors copied from the RFCs and from real captures. `proptest` round-trips (`decode(encode(x)) == x`, and `encode(decode(b)) == b` for canonical inputs). A fuzz target per top-level decoder. Miri. |
 | `bgpfc-fsm` | Table-driven tests covering every (state, event) pair in RFC 4271 §8.2.2, with injected time. |
-| `bgpfc-rib` | Decision-process tests per step of route selection, the validation step of `prefer-valid` included (§9.1.2.2), and a proptest of route selection against a model of §9.1.2.2's elimination. Tests that hold and release routes per `enforcement` mode and per state import policy sets. Proptest invariants: Loc-RIB is a function of the Adj-RIBs-In, policy and the `enforcement`, and is independent of arrival order. |
+| `bgpfc-rib` | Decision-process tests per step of route selection, the validation step of `prefer-valid` included (§9.1.2.2), and a proptest of route selection against a model of §9.1.2.2's elimination. Tests that hold and release routes per `enforcement` mode and per state import policy sets. Proptest invariants: Loc-RIB is a function of the Adj-RIBs-In, policy and the `enforcement`, and is independent of arrival order; after a change of import policy applied from the Adj-RIBs-In, with the route refresh it asks for answered, it equals a RIB built under the new policy. |
 | `bgpfc-policy` | Regex engine tests, including pathological-pattern step-limit tests. A fuzz target. |
 | `bgpfc-config` | Golden tests: input file → AST/debug output, and input file → error message snapshot. A fuzz target. |
 | `bgpfc-fib` | Netlink encode/decode tests against byte captures from `ip -d monitor` or strace. Miri on the pure parts. A reconcile-logic proptest. |
