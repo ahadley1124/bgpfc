@@ -487,10 +487,21 @@ last asked, a reload that changes the neighbor's import policy also sends
 it a ROUTE-REFRESH for the family (RFC 2918), if it advertised the
 capability and the family, and the routes it
 sends again meet the new policy as they come (`route refresh sent` in the
-log). A neighbor without the capability gets them back only when it sends
-them again or after `clear neighbor` (a warning, `rib: re-import cannot
-ask the peer for the routes import policy dropped`, names the neighbor and
-family). One line counts what importing again did, whatever the number of
+log). A ROUTE-REFRESH names a family and nothing finer (RFC 2918 §3), so
+the neighbor sends every route of the family again, not only those
+dropped, and bgpfcd asks whether or not the new policy would take any of
+them, which only the routes could tell. So under an import policy that
+rejects any route at all, as one that filters bogons or too-specific
+prefixes usually does, every reload that changes that neighbor's import
+policy, even only a `set local-pref`, has it send the family again: as
+much work for both sides as before re-import existed, though the change
+itself applies at once, from the routes kept. Not keeping the routes
+import policy rejects is what bounds a filtered neighbor's memory by its
+`maximum-prefix`, which counts only the routes kept. A neighbor without
+the capability gets them back only when it sends them again or after
+`clear neighbor` (a warning, `rib: re-import cannot ask the peer for the
+routes import policy dropped`, names the neighbor and family). One line
+counts what importing again did, whatever the number of
 routes: the neighbors, the routes put through the new policy, those it
 made something else of (`changed`: other attributes, another `set rpki`,
 held or used, or not kept), took out of use (`held`), put back into use

@@ -988,8 +988,11 @@ again, and what it changes is installed and advertised, or withdrawn,
 with no UPDATE and no route refresh. A route an import policy rejected
 whatever its validation state was not kept, so for a neighbor that had
 such routes the reload also asks for them again with a route refresh
-(RFC 2918), where the neighbor supports it, for the families concerned;
-without it they come back when the neighbor sends them again, or after
+(RFC 2918), where the neighbor supports it, for the families concerned.
+The neighbor then sends the whole family again, as a route refresh names
+nothing finer, so with an import policy that rejects any route at all,
+every change of it costs one (`docs/control.md`, "Reload"). Without the
+capability they come back when the neighbor sends them again, or after
 `bgpfcctl clear neighbor`. A changed `export` policy sends each neighbor
 the difference, with no route refresh. A changed
 `advertisement-interval` applies to the running session at once, also
