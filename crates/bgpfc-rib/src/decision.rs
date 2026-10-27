@@ -49,9 +49,11 @@
 //! or fold the state into `LOCAL_PREF` by policy instead (`match rpki`,
 //! `set local-pref`), which does travel.
 //!
-//! §9.1.2 also excludes a route whose `NEXT_HOP` cannot be resolved. There
-//! is no IGP here, so every next hop counts as resolvable (COMPLIANCE.md,
-//! RFC 4271 §9.1.2).
+//! §9.1.2 also excludes a route whose `NEXT_HOP` cannot be resolved. That
+//! is a filter before Phase 2, not a step of it: such a route is held
+//! ([`Held::NextHop`](crate::Held::NextHop), see [`crate::nexthop`]) and
+//! never reaches the candidates this module chooses among. A RIB given no
+//! kernel table resolves every next hop to itself.
 
 use std::cmp::{Ordering, Reverse};
 use std::net::IpAddr;

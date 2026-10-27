@@ -47,7 +47,6 @@
 //! UPDATE: with every route refused, its failures cost three lines a
 //! second at most, as its counts cost one.
 
-use std::net::IpAddr;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -125,11 +124,15 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
     Ok(tx)
 }
 
-/// The hop of a route through `gateway`, as the FIB takes it: the RIB
-/// names its next hop and no interface, and the kernel chooses the
-/// interface that reaches it.
-pub(crate) fn fib_hop(gateway: IpAddr) -> Hop {
-    Hop { gateway, oif: None }
+/// The RIB's hop of a route as the FIB takes it: the gateway, and the
+/// interface of the kernel route that resolves the next hop; none while
+/// the RIB has no kernel table, and the kernel chooses (the two crates
+/// are siblings, AGENTS.md §2, so their types meet here).
+pub(crate) fn fib_hop(hop: bgpfc_rib::nexthop::Hop) -> Hop {
+    Hop {
+        gateway: hop.gateway,
+        oif: hop.oif,
+    }
 }
 
 /// What writes the thread's lines to the log; the tests keep them
@@ -851,10 +854,31 @@ mod tests {
             .map(|i| FibChange {
                 family: AddressFamily::IPV4_UNICAST,
                 prefix: p(&nth(i)),
-                next_hop: Some(ip("192.0.2.1")),
+                next_hop: Some(bgpfc_rib::nexthop::Hop {
+                    gateway: ip("192.0.2.1"),
+                    oif: None,
+                }),
                 previous: None,
             })
             .collect()
+    }
+
+    /// The RIB's hop reaches the FIB as it is: gateway and interface.
+    #[test]
+    fn rib_hops_reach_the_fib_with_their_interface() {
+        for oif in [None, Some(3)] {
+            let rib = bgpfc_rib::nexthop::Hop {
+                gateway: ip("fe80::1"),
+                oif,
+            };
+            assert_eq!(
+                fib_hop(rib),
+                Hop {
+                    gateway: ip("fe80::1"),
+                    oif
+                }
+            );
+        }
     }
 
     fn changes(range: std::ops::Range<usize>, more: bool) -> Step {

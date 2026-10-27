@@ -215,7 +215,7 @@ fn a_route_import_policy_rejected_is_used_once_policy_accepts_it_again() {
     // attributes (no LOCAL_PREF set any more) and is installed again.
     let f = fib(&out);
     assert_eq!(f.len(), 2, "{f:?}");
-    assert!(f.iter().all(|c| c.next_hop == Some(ip("10.0.0.1"))));
+    assert!(f.iter().all(|c| c.next_hop == Some(gw("10.0.0.1"))));
     assert!(f.iter().any(|c| c.prefix == rejected));
     // To an external peer only the new route is news.
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
@@ -498,7 +498,10 @@ fn held_routes_follow_the_candidates() {
             family: V4,
             prefix,
             next_hop: None,
-            previous: Some(e[1].addr),
+            previous: Some(Hop {
+                gateway: e[1].addr,
+                oif: None
+            }),
         }]
     );
     assert!(order(&rib).iter().all(|r| r.1 == policy));

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
 use bgpfc_log::Level;
+use bgpfc_rib::nexthop::{NextHopsChanged, Resolution};
 use bgpfc_rib::{
     FibChange, Output, PeerInfo, Reimport, Rejudged, Revalidation, Rib, RouteStatus, Sink,
     StartupChange, Transition,
@@ -281,8 +282,8 @@ fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: S
     let mut ok = send(FibMsg::SetMode(mode));
     if mode == bgpfc_fib::Mode::Install {
         let mut batch = Vec::with_capacity(RECONCILE_BATCH);
-        for (prefix, gateway) in rib.fib_routes() {
-            batch.push((prefix, crate::fib::fib_hop(gateway)));
+        for (prefix, hop) in rib.fib_routes() {
+            batch.push((prefix, crate::fib::fib_hop(hop)));
             if batch.len() == RECONCILE_BATCH {
                 ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
                 batch.reserve(RECONCILE_BATCH);
@@ -548,6 +549,16 @@ impl Sink for Deliver<'_> {
                 }
             }
             Output::RequestRoutes { peer, families } => self.request_routes(peer, families),
+            Output::NextHops(r) => {
+                // RFC 4271 §9.1.2: a change of the kernel's routing table
+                // moved what next hops resolve to. One line however many
+                // routes it moved; the routes show in the FIB's folded
+                // `fib: changes` lines, and a line per next hop at debug.
+                let debug = bgpfc_log::enabled(Level::Debug);
+                for line in next_hop_lines(&r, debug) {
+                    log_line(line.level, line.msg, &line.fields);
+                }
+            }
         }
     }
 }
@@ -639,6 +650,78 @@ pub(crate) const LOGGED: usize = 100;
 /// The message of the line per route a change of the validation source
 /// moved (issue #59).
 const TRANSITION: &str = "rib: route validation state changed";
+
+/// The message of the line logged when a change of the kernel's routing
+/// table changed what next hops resolve to.
+const NEXT_HOPS_CHANGED: &str = "rib: next hops changed";
+
+/// The message of the line, at debug, for each next hop it changed.
+const NEXT_HOP_CHANGED: &str = "rib: next hop changed";
+
+/// The next hops the line names; `...` marks the rest.
+const NEXT_HOPS_SHOWN: usize = 8;
+
+/// What a change of the kernel's routing table is logged with: a line at
+/// info with the next hops that now resolve, no longer resolve, or
+/// resolve through another hop, the routes that change took out of use
+/// (`held`) and put back (`released`), the destinations whose best route
+/// changed, and the first [`NEXT_HOPS_SHOWN`] next hops as they are now
+/// (`10.0.0.9 via 10.99.7.1 dev v12b`, `198.51.100.9 unresolved`); and
+/// with `debug` a line for each next hop. Never a line per route: a next
+/// hop that covers a full table moves a million routes.
+fn next_hop_lines(r: &NextHopsChanged, debug: bool) -> Vec<Line> {
+    let mut shown: Vec<String> = r
+        .next_hops
+        .iter()
+        .take(NEXT_HOPS_SHOWN)
+        .map(ToString::to_string)
+        .collect();
+    if r.next_hops.len() > NEXT_HOPS_SHOWN {
+        shown.push("...".to_owned());
+    }
+    let mut lines = vec![Line {
+        level: Level::Info,
+        msg: NEXT_HOPS_CHANGED,
+        fields: vec![
+            ("resolved", r.resolved.to_string()),
+            ("unresolved", r.unresolved.to_string()),
+            ("moved", r.moved.to_string()),
+            ("held", r.held.to_string()),
+            ("released", r.released.to_string()),
+            ("best_changed", r.best_changed.to_string()),
+            ("next_hops", shown.join(",")),
+        ],
+    }];
+    if !debug {
+        return lines;
+    }
+    for n in &r.next_hops {
+        let mut fields = vec![("next_hop", n.addr.to_string())];
+        match n.resolution {
+            Resolution::Unresolved => fields.push(("state", "unresolved".to_owned())),
+            Resolution::Resolved { hop, through } => {
+                fields.push(("state", "resolved".to_owned()));
+                fields.push(("gateway", hop.gateway.to_string()));
+                if let Some(oif) = hop.oif {
+                    fields.push(("oif", oif.to_string()));
+                }
+                if let Some(name) = &n.interface {
+                    fields.push(("interface", name.clone()));
+                }
+                if let Some(through) = through {
+                    fields.push(("through", through.to_string()));
+                }
+            }
+        }
+        fields.push(("routes", n.routes.to_string()));
+        lines.push(Line {
+            level: Level::Debug,
+            msg: NEXT_HOP_CHANGED,
+            fields,
+        });
+    }
+    lines
+}
 
 /// One line to log, its field values already text.
 #[derive(Debug, PartialEq, Eq)]
@@ -976,9 +1059,12 @@ fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
             }
             RibReply::Routes(page)
         }
-        RibQuery::FibRoutes { after } => {
-            RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
-        }
+        RibQuery::FibRoutes { after } => RibReply::FibRoutes(
+            rib.fib_routes_after(*after)
+                .take(PAGE)
+                .map(|(prefix, hop)| (prefix, hop.gateway))
+                .collect(),
+        ),
     }
 }
 
@@ -1968,6 +2054,71 @@ mod tests {
         bgpfc_log::format_line(std::time::UNIX_EPOCH, level, msg, &fields)
     }
 
+    /// A change of the kernel's table is one line at info, however many
+    /// next hops it moved, the first eight named as they are now; and at
+    /// debug a line per next hop.
+    #[test]
+    fn next_hop_changes_are_one_line() {
+        use bgpfc_rib::nexthop::{Hop, NextHopReport};
+        let unresolved = |i: u8| NextHopReport {
+            addr: IpAddr::from([198, 51, 100, i]),
+            resolution: Resolution::Unresolved,
+            interface: None,
+            routes: 3,
+        };
+        let moved = NextHopReport {
+            addr: ip("10.255.7.30"),
+            resolution: Resolution::Resolved {
+                hop: Hop {
+                    gateway: ip("10.99.7.1"),
+                    oif: Some(4),
+                },
+                through: Some("10.255.7.30/32".parse().unwrap()),
+            },
+            interface: Some("v12b".to_owned()),
+            routes: 1,
+        };
+        let mut r = NextHopsChanged {
+            resolved: 0,
+            unresolved: 9,
+            moved: 1,
+            next_hops: vec![moved],
+            held: 27,
+            released: 0,
+            best_changed: 27,
+        };
+        r.next_hops.extend((1..10).map(unresolved));
+        let written = |lines: &[Line]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| formatted(l.level, l.msg, &l.fields))
+                .collect()
+        };
+        let lines = next_hop_lines(&r, false);
+        assert_eq!(
+            written(&lines),
+            [
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: next hops changed\" resolved=0 \
+              unresolved=9 moved=1 held=27 released=0 best_changed=27 \
+              next_hops=\"10.255.7.30 via 10.99.7.1 dev v12b,198.51.100.1 unresolved,\
+              198.51.100.2 unresolved,198.51.100.3 unresolved,198.51.100.4 unresolved,\
+              198.51.100.5 unresolved,198.51.100.6 unresolved,198.51.100.7 unresolved,...\"\n"
+            ]
+        );
+        let lines = next_hop_lines(&r, true);
+        assert_eq!(lines.len(), 11);
+        assert_eq!(
+            written(&lines[1..3]),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: next hop changed\" \
+                 next_hop=10.255.7.30 state=resolved gateway=10.99.7.1 oif=4 interface=v12b \
+                 through=10.255.7.30/32 routes=1\n",
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: next hop changed\" \
+                 next_hop=198.51.100.1 state=unresolved routes=3\n",
+            ]
+        );
+    }
+
     /// The FIB thread logs a line per input (`crate::fib`, "Logging"):
     /// an input's changes go in batches of [`FIB_BATCH`] at most, all but
     /// the last marked `more`, and one that filled its last batch exactly
@@ -1978,7 +2129,10 @@ mod tests {
             Output::Fib(FibChange {
                 family: V4,
                 prefix: format!("10.{}.{}.0/24", i / 256, i % 256).parse().unwrap(),
-                next_hop: Some(ip("192.0.2.1")),
+                next_hop: Some(bgpfc_rib::nexthop::Hop {
+                    gateway: ip("192.0.2.1"),
+                    oif: None,
+                }),
                 previous: None,
             })
         };
