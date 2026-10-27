@@ -137,7 +137,7 @@ bgpfcd can also run the validator itself (step 14). The one line
 software, as a child process, with its command line derived from the
 block (TALs, the ARIN agreement, refresh, cache directory, binary, and
 extra arguments or a Routinator config file as an escape hatch). bgpfcd
-checks Routinator's version at start: it is tested with 0.15.2, accepts
+checks Routinator's version at start: it is tested with 0.15.3, accepts
 any 0.15.x and refuses other releases with an error. Routinator serves
 RTR on a loopback port bgpfcd picks, and the RTR client connects to it
 with nothing else configured. bgpfcd restarts it with a back-off when it
@@ -364,7 +364,7 @@ need a restart.
 
 ### Routinator sidecar
 
-With `rpki { mode sidecar; }` bgpfcd runs Routinator, tested with 0.15.2;
+With `rpki { mode sidecar; }` bgpfcd runs Routinator, tested with 0.15.3;
 any 0.15.x is accepted, and another release stops the start with `cannot
 start rpki` naming both versions.
 

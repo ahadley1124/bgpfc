@@ -124,7 +124,7 @@ Example objects:
 {"mode":"sidecar","enforcement":"drop-invalid","validation":"active","waiting_seconds":null,
  "sidecar":{"state":"failed","alarm":true,"pid":null,"running_seconds":null,"retry_in_seconds":280,
             "restarts":6,"consecutive_failures":7,"last_exit":"exited with status 1",
-            "rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","version":"0.15.2"},
+            "rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","version":"0.15.3"},
  "caches":[{"host":"127.0.0.1","port":41234,"preference":0,"in_use":true,"current":true}],
  "running":true,"state":"connecting","connected":false,"version":1,"session_id":4242,
  "serial":17,"synced_seconds_ago":1250,"expires_in_seconds":5950,
@@ -345,7 +345,7 @@ mode sidecar
 enforcement drop-invalid
 startup accept
 validation active
-sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)
+sidecar running pid 4242 for 312s, routinator 0.15.3 (/usr/bin/routinator)
 sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, last exit: killed by signal 9 (SIGKILL)
 cache 127.0.0.1:41234 (sidecar) preference 0, in use, current
 state idle, connected, version 1

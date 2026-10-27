@@ -1050,7 +1050,9 @@ const CHILD_SECONDS: u32 = 300;
 /// what it does, and its own copy of `rtr-stub`, which a bgpfcd run as
 /// `nobody` can execute whatever the permissions of the checkout. The
 /// directory belongs to [`NOBODY`], so that the script can write its
-/// records, and bgpfcd the repository directory, there.
+/// records, and bgpfcd the repository directory, there. 0.15.2 is a patch
+/// release before the one bgpfcd is tested with, 0.15.3, and bgpfcd
+/// accepts it as the same series.
 pub struct FakeRoutinator {
     /// The directory of the script, its records and its controls.
     pub dir: PathBuf,

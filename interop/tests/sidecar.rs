@@ -5,12 +5,13 @@
 //!
 //! Routinator itself never runs (AGENTS.md §5). A [`FakeRoutinator`]
 //! stands in for it: a shell script that answers `--version` as Routinator
-//! 0.15.2, records the arguments bgpfcd derives from the block, and then
-//! becomes this crate's `rtr-stub` on the `--rtr` address, serving the VRPs
-//! of `rpki.rs` under a new Session ID at each start, as a restarted
-//! Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root with `--user
-//! nobody`, as README's Option B: it refuses to run Routinator as root, and
-//! Routinator is born as `nobody` with no capabilities.
+//! 0.15.2, a patch release before the tested 0.15.3 that bgpfcd accepts as
+//! the same series, records the arguments bgpfcd derives from the block,
+//! and then becomes this crate's `rtr-stub` on the `--rtr` address,
+//! serving the VRPs of `rpki.rs` under a new Session ID at each start, as a
+//! restarted Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root
+//! with `--user nobody`, as README's Option B: it refuses to run Routinator
+//! as root, and Routinator is born as `nobody` with no capabilities.
 //!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`
 //! and `curl` on `PATH`, and a built `bgpfcd`. CI runs them with
@@ -636,7 +637,7 @@ fn a_bad_sidecar_stops_the_start() {
     fake.set_version("Routinator 0.14.1");
     let log = run(&fake.block("", ""), true);
     assert!(
-        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: Routinator 0.14.1 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2\""),
+        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: Routinator 0.14.1 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.3\""),
         "{log}"
     );
     assert_eq!(fake.version_checks(), 1);

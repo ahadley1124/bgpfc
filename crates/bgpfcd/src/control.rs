@@ -3049,7 +3049,7 @@ mod tests {
                 "enforcement drop-invalid",
                 "startup accept",
                 "validation active",
-                "sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)",
+                "sidecar running pid 4242 for 312s, routinator 0.15.3 (/usr/bin/routinator)",
                 "sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, \
                  last exit: killed by signal 9 (SIGKILL)",
                 "cache 127.0.0.1:41234 (sidecar) preference 0, in use, current",
@@ -3069,7 +3069,7 @@ mod tests {
                 r#""running_seconds":312,"retry_in_seconds":null,"restarts":1,"#,
                 r#""consecutive_failures":0,"last_exit":"killed by signal 9 (SIGKILL)","#,
                 r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
-                r#""version":"0.15.2"},"#,
+                r#""version":"0.15.3"},"#,
                 r#""caches":[{"host":"127.0.0.1","port":41234,"preference":0,"#,
                 r#""in_use":true,"current":true}],"#,
                 r#""running":true,"state":"idle","connected":true,"version":1,"#,
@@ -3169,7 +3169,7 @@ mod tests {
             let r = render_rpki(&sidecar_report(now, state), now);
             assert_eq!(
                 r.lines[4],
-                format!("sidecar {line}, routinator 0.15.2 (/usr/bin/routinator)")
+                format!("sidecar {line}, routinator 0.15.3 (/usr/bin/routinator)")
             );
             let alarm = matches!(state, SidecarState::Failed { .. });
             let json = format!(
@@ -3198,7 +3198,7 @@ mod tests {
             r.lines[4..6],
             [
                 "sidecar FAILED after 7 failures in a row, next attempt in 280s, \
-                 routinator 0.15.2 (/usr/bin/routinator)",
+                 routinator 0.15.3 (/usr/bin/routinator)",
                 "sidecar rtr 127.0.0.1:41234, restarts 6, failures 7, \
                  last exit: exited with status 1",
             ]
@@ -3209,7 +3209,7 @@ mod tests {
                 r#""running_seconds":null,"retry_in_seconds":280,"restarts":6,"#,
                 r#""consecutive_failures":7,"last_exit":"exited with status 1","#,
                 r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
-                r#""version":"0.15.2"},"#
+                r#""version":"0.15.3"},"#
             )),
             "{}",
             r.json

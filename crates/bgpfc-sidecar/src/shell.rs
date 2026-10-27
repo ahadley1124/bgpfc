@@ -136,7 +136,7 @@ impl Options {
 ///   up, but Routinator runs `rsync` by name.
 ///
 /// Everything else is left out, such as `RSYNC_RSH`, which Routinator
-/// 0.15.2 refuses to start with, and proxy and locale settings: the
+/// refuses to start with since 0.15.2, and proxy and locale settings: the
 /// child's behaviour depends on bgpfcd's settings only.
 ///
 /// The child gets no ambient capabilities, so the `CAP_NET_ADMIN` and
@@ -1221,7 +1221,7 @@ mod tests {
         assert_eq!(err, expected);
         assert_eq!(
             err.to_string(),
-            "Routinator 0.14.2 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2"
+            "Routinator 0.14.2 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.3"
         );
         let pid: u32 = fs::read_to_string(&pid_file)
             .unwrap()
@@ -1350,11 +1350,11 @@ mod tests {
             "the Routinator binary changed and fails the version check; not running it";
         const ACCEPTED: &str = "the Routinator binary changed; found a supported Routinator";
         let dir = TempDir::new("upgrade");
-        let binary = dir.stub("echo 'serving 0.15.2'\nexec sleep 30");
+        let binary = dir.stub("echo 'serving the tested release'\nexec sleep 30");
         let capture = Capture::default();
         let sidecar = Sidecar::start_with(config(&dir, binary.clone()), capture.options()).unwrap();
         let first = wait_until("a running child", || running_pid(&sidecar));
-        capture.wait_for("serving 0.15.2");
+        capture.wait_for("serving the tested release");
         assert_eq!(sidecar.version(), TESTED_VERSION);
         assert!(
             capture.find(REFUSED).is_empty(),
@@ -1367,7 +1367,7 @@ mod tests {
             let found = capture.find(REFUSED);
             (found.len() >= 2).then_some(found)
         });
-        let not_supported = "Routinator 0.16.0 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2";
+        let not_supported = "Routinator 0.16.0 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.3";
         assert_eq!(refused[0].level, Level::Error);
         assert_eq!(refused[0].field("error"), Some(not_supported));
         let failed = wait_until("the refusal as a failure", || {
@@ -1380,14 +1380,14 @@ mod tests {
         );
         assert_eq!(sidecar.version(), TESTED_VERSION);
 
-        dir.upgrade(&binary, "0.15.3", "echo 'serving 0.15.3'\nexec sleep 30");
-        capture.wait_for("serving 0.15.3");
+        dir.upgrade(&binary, "0.15.4", "echo 'serving 0.15.4'\nexec sleep 30");
+        capture.wait_for("serving 0.15.4");
         let accepted = capture.wait_for(ACCEPTED);
-        assert_eq!(accepted.field("version"), Some("0.15.3"));
+        assert_eq!(accepted.field("version"), Some("0.15.4"));
         let patch = Version {
             major: 0,
             minor: 15,
-            patch: 3,
+            patch: 4,
             pre: None,
         };
         assert_eq!(sidecar.version(), patch);
@@ -1485,7 +1485,7 @@ mod tests {
     fn check_validates_before_running() {
         let dir = TempDir::new("check-invalid");
         let ran = dir.join("ran");
-        let body = format!("touch '{}'\necho 'Routinator 0.15.2'", ran.display());
+        let body = format!("touch '{}'\necho 'Routinator 0.15.3'", ran.display());
         let binary = dir.script("routinator", &body);
         // The stub's own path made relative: from `/`, the child's working
         // directory, it names the stub.

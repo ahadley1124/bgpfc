@@ -610,7 +610,7 @@ would never run. The other statements of the `rpki` block apply to that
 one session as they apply to an external cache: `enforcement`, `version`,
 the timeouts, `max-expire`, `max-vrps`, `backoff` and `tcp-keepalive`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
-Routinator 0.15.x, and is tested with 0.15.2.
+Routinator 0.15.x, and is tested with 0.15.3.
 
 The smallest file that validates every route:
 
