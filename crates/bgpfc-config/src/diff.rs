@@ -24,7 +24,8 @@ pub struct ConfigDiff {
     /// Those of `policy_changed` whose import policy changed: the routes
     /// they sent are put through it again, from the Adj-RIB-In (RFC 4271
     /// §3: "retain the current version of the routes advertised to it"),
-    /// with route refresh (RFC 2918) only for what it did not keep.
+    /// with route refresh (RFC 2918) only for the families of what it did
+    /// not keep.
     pub import_changed: Vec<IpAddr>,
     /// Those of `policy_changed` whose export policy changed: what they
     /// are sent is exported again from the Loc-RIB, with no route

@@ -366,7 +366,8 @@ pub(crate) enum RibMsg {
     /// export policy changed and whose Adj-RIB-Out is recomputed from the
     /// Loc-RIB, then `reimport` those whose import policy changed and
     /// whose routes are imported again from the Adj-RIB-In (RFC 4271 §3),
-    /// with ROUTE-REFRESH only for what it did not keep (RFC 2918).
+    /// with ROUTE-REFRESH only for the families of what it did not keep
+    /// (RFC 2918).
     SetPolicies {
         /// The compiled policies.
         policies: NewPolicies,

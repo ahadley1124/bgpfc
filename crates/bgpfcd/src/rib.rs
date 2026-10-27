@@ -253,7 +253,8 @@ fn handle(
 /// so that they have what the new export policy makes of the Loc-RIB
 /// before importing again changes it; then import again from the
 /// Adj-RIBs-In the routes of those in `reimport` (RFC 4271 §3), with no
-/// ROUTE-REFRESH but for what the RIB did not keep (RFC 2918).
+/// ROUTE-REFRESH but for the families of what the RIB did not keep (RFC
+/// 2918), each of which the peer then sends again whole.
 fn set_policies(
     rib: &mut Rib,
     policies: Box<dyn bgpfc_rib::Policies>,

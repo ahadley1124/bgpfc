@@ -1,8 +1,9 @@
 //! A changed import policy is applied from the Adj-RIBs-In (RFC 4271 §3
 //! (a)): every route a peer sent that the RIB kept, held ones included,
 //! goes through it again at once, with no UPDATE; the peer is asked again
-//! with ROUTE-REFRESH (§3 (b), RFC 2918 §4) only for the families whose
-//! routes a policy dropped, which the RIB did not keep.
+//! with ROUTE-REFRESH (§3 (b), RFC 2918 §4) for the whole of each family
+//! whose routes a policy dropped, which the RIB did not keep, and for no
+//! other.
 
 use crate::{Held, Imported, Policies, Reimport, Verdict};
 

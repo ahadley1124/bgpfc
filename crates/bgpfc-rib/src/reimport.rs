@@ -1,6 +1,8 @@
 //! Import policy run again over the routes the Adj-RIBs-In kept, after it
-//! changed (a reload): no ROUTE-REFRESH is needed for them, and the peer
-//! is asked again only for what import policy dropped earlier.
+//! changed (a reload): no ROUTE-REFRESH is needed for them. The peer is
+//! asked again for each family in which import policy dropped a route
+//! earlier, which the RIB did not keep; ROUTE-REFRESH names a family and
+//! nothing finer (RFC 2918 §3), so the peer sends the whole family again.
 //!
 //! Implements: RFC 4271 §3 ("To allow local policy changes to have the
 //! correct effect without resetting any BGP connections, a BGP speaker
@@ -82,8 +84,13 @@ impl Rib {
     /// or since the peer was last asked, an [`Output::RequestRoutes`]
     /// follows, which the caller turns into a ROUTE-REFRESH (RFC 2918 §4),
     /// if the peer advertised the capability and the family; the routes it
-    /// brings back meet the policy in use as they arrive. Families it
-    /// cannot ask for are reported as [`Reimport::missing`].
+    /// brings back meet the policy in use as they arrive. That is the
+    /// whole family, as a ROUTE-REFRESH names nothing finer (RFC 2918 §3),
+    /// and it is asked for whether or not the new policy would take any
+    /// route the old one dropped, which only the routes could tell: under
+    /// an import policy that drops any route of a family, every change of
+    /// it asks for the family again. Families it cannot ask for are
+    /// reported as [`Reimport::missing`].
     ///
     /// Peers that are not up are skipped; nothing happens when none is.
     /// Export changes need nothing of this: what peers are sent comes

@@ -586,9 +586,10 @@ const EXPORT_MED: &str = "policy OUT { term all { set med 5; action accept; } }"
 /// Reloads with policy changes, refusal of a broken file, and a hard
 /// reset carrying a shutdown communication. A new import policy applies at
 /// once to the routes bgpfcd kept, with no ROUTE-REFRESH (RFC 4271 §3);
-/// a new export policy needs none either; one that takes back a route an
-/// import policy dropped, which bgpfcd did not keep, asks BIRD for it with
-/// ROUTE-REFRESH (RFC 2918 §4), and the route comes back.
+/// a new export policy needs none either; the next import change, after
+/// an import policy dropped a route, which bgpfcd did not keep, asks BIRD
+/// for the whole family again with ROUTE-REFRESH (RFC 2918 §4), and the
+/// route comes back.
 #[test]
 #[ignore = "needs root, bird and iproute2"]
 fn control_plane_reload_and_reset() {

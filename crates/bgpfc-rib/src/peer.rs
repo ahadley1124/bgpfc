@@ -41,7 +41,7 @@ pub struct PeerInfo {
     /// The peer advertised the Route Refresh Capability (RFC 2918 §2), so
     /// it may be asked for its routes of a family it advertised again
     /// (§4): what [`Rib::reimport`](crate::Rib::reimport) needs for the
-    /// routes the Adj-RIB-In did not keep.
+    /// families of the routes the Adj-RIB-In did not keep.
     pub route_refresh: bool,
     /// Families whose routes may go to this peer with an IPv6 next hop,
     /// because it advertised Extended Next Hop Encoding for them, and so
