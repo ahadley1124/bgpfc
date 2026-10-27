@@ -12,6 +12,7 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
 use crate::netlink::{self, Attr, NetlinkError};
+use crate::reconcile::Hop;
 
 /// `RTM_NEWROUTE`.
 pub const RTM_NEWROUTE: u16 = 24;
@@ -83,15 +84,16 @@ pub struct RouteMsg {
 }
 
 impl RouteMsg {
-    /// A unicast route to `dst` via `gateway` with our metric.
+    /// A unicast route to `dst` through `hop` (its gateway, and its
+    /// interface as `RTA_OIF` when it has one) with our metric.
     #[must_use]
-    pub fn unicast(dst: Prefix, gateway: IpAddr, table: u32, protocol: u8) -> RouteMsg {
+    pub fn unicast(dst: Prefix, hop: Hop, table: u32, protocol: u8) -> RouteMsg {
         RouteMsg {
             dst,
             table,
             protocol,
-            gateway: Some(gateway),
-            oif: None,
+            gateway: Some(hop.gateway),
+            oif: hop.oif,
             priority: Some(METRIC),
             kind: RTN_UNICAST,
             flags: 0,
@@ -325,6 +327,14 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A hop through `gateway`, with no interface.
+    fn h(gateway: &str) -> Hop {
+        Hop {
+            gateway: ip(gateway),
+            oif: None,
+        }
+    }
+
     /// Replace the sequence number and flags of a framed message so a
     /// capture from `ip route` (which uses `NLM_F_EXCL|NLM_F_CREATE` and
     /// its own sequence) compares equal.
@@ -368,12 +378,7 @@ mod tests {
 
     #[test]
     fn requests_match_iproute2_captures() {
-        let r = RouteMsg::unicast(
-            p("192.0.2.0/24"),
-            ip("127.0.0.1"),
-            RT_TABLE_MAIN,
-            RTPROT_BGP,
-        );
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), h("127.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
         assert_eq!(
             normalise(r.encode_set(5)),
             framed(RTM_NEWROUTE, &ADD4_PAYLOAD)
@@ -382,12 +387,12 @@ mod tests {
             normalise(r.encode_delete(5)),
             framed(RTM_DELROUTE, &DEL4_PAYLOAD)
         );
-        let r6 = RouteMsg::unicast(p("2001:db8:1::/48"), ip("::1"), RT_TABLE_MAIN, RTPROT_BGP);
+        let r6 = RouteMsg::unicast(p("2001:db8:1::/48"), h("::1"), RT_TABLE_MAIN, RTPROT_BGP);
         assert_eq!(
             normalise(r6.encode_set(1)),
             framed(RTM_NEWROUTE, &ADD6_PAYLOAD)
         );
-        let mut t = RouteMsg::unicast(p("203.0.113.0/24"), ip("127.0.0.1"), 300, RTPROT_BGP);
+        let mut t = RouteMsg::unicast(p("203.0.113.0/24"), h("127.0.0.1"), 300, RTPROT_BGP);
         t.priority = None;
         assert_eq!(
             normalise(t.encode_set(1)),
@@ -453,7 +458,7 @@ mod tests {
         // RFC 8950 §3 next hop in the FIB: RTA_VIA, never RTA_GATEWAY.
         let r = RouteMsg::unicast(
             p("198.51.100.0/24"),
-            ip("2001:db8::1"),
+            h("2001:db8::1"),
             RT_TABLE_MAIN,
             RTPROT_BGP,
         );
@@ -514,7 +519,7 @@ mod tests {
             ("0.0.0.0/0", "10.0.0.1", 300),
             ("::/0", "2001:db8::1", RT_TABLE_MAIN),
         ] {
-            let r = RouteMsg::unicast(p(prefix), ip(gw), table, RTPROT_BGP);
+            let r = RouteMsg::unicast(p(prefix), h(gw), table, RTPROT_BGP);
             let m = r.encode_set(1);
             let back = RouteMsg::decode(&m[netlink::HEADER_LEN..])
                 .unwrap()
@@ -522,7 +527,7 @@ mod tests {
             assert_eq!(back, r, "{prefix}");
         }
         // Not unicast, cloned, unknown family: None.
-        let r = RouteMsg::unicast(p("192.0.2.0/24"), ip("10.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), h("10.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
         let mut m = r.encode_set(1);
         m[netlink::HEADER_LEN + 7] = 6; // RTN_BLACKHOLE
         assert_eq!(RouteMsg::decode(&m[netlink::HEADER_LEN..]).unwrap(), None);
@@ -538,5 +543,26 @@ mod tests {
         let mut m = r.encode_set(1);
         m[netlink::HEADER_LEN + 1] = 40;
         assert_eq!(RouteMsg::decode(&m[netlink::HEADER_LEN..]).unwrap(), None);
+    }
+
+    /// A hop with an interface: `RTA_OIF` after the gateway, as `ip route
+    /// add ... via GATEWAY dev DEV` sends it, in a set and in a delete,
+    /// and back.
+    #[test]
+    fn a_hop_with_an_interface_names_it() {
+        let hop = Hop {
+            gateway: ip("10.0.0.9"),
+            oif: Some(3),
+        };
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), hop, RT_TABLE_MAIN, RTPROT_BGP);
+        assert_eq!(r.oif, Some(3));
+        for m in [r.encode_set(1), r.encode_delete(1)] {
+            let attrs = netlink::parse_attrs(&m[netlink::HEADER_LEN + RTMSG_LEN..]).unwrap();
+            let types: Vec<u16> = attrs.iter().map(|a| a.ty).collect();
+            assert_eq!(types, [RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY]);
+            assert_eq!(attrs[2].value, 3u32.to_ne_bytes());
+        }
+        let back = RouteMsg::decode(&r.encode_set(1)[netlink::HEADER_LEN..]).unwrap();
+        assert_eq!(back, Some(r));
     }
 }

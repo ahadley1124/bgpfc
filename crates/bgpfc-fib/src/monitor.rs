@@ -557,7 +557,10 @@ mod root_tests {
                     let [a, b] = i.to_be_bytes();
                     Change {
                         prefix: Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap(),
-                        gateway: Some(IpAddr::from([192, 0, 2, 1])),
+                        hop: Some(crate::Hop {
+                            gateway: IpAddr::from([192, 0, 2, 1]),
+                            oif: None,
+                        }),
                         previous: None,
                     }
                 })

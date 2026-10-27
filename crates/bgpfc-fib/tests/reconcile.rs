@@ -2,13 +2,15 @@
 //! installed table yields the desired table, for any pair of tables, and
 //! the merge the FIB runs against the RIB's routes plans the same; and a
 //! route message we send decodes back to the same route, with an IPv4 or
-//! an IPv6 gateway (`RTA_GATEWAY` or `RTA_VIA`).
+//! an IPv6 gateway (`RTA_GATEWAY` or `RTA_VIA`) and with or without an
+//! interface. A hop is a gateway and an interface: one gateway on two
+//! interfaces is two hops.
 #![cfg(not(miri))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bgpfc_fib::netlink::HEADER_LEN;
-use bgpfc_fib::reconcile::{Merge, Op, Routes, Table, apply, plan};
+use bgpfc_fib::reconcile::{Hop, Merge, Op, Routes, Table, apply, plan};
 use bgpfc_fib::route::{RT_TABLE_MAIN, RTPROT_BGP, RouteMsg};
 use bgpfc_wire::prefix::Prefix;
 use proptest::prelude::*;
@@ -20,6 +22,12 @@ fn gateway() -> impl Strategy<Value = IpAddr> {
         (1u8..4).prop_map(|g| IpAddr::V4(Ipv4Addr::new(192, 0, 2, g))),
         (1u16..4).prop_map(|g| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, g))),
     ]
+}
+
+/// A hop: a gateway, on one of two interfaces or none, so that a route
+/// also moves between interfaces with one gateway.
+fn hop() -> impl Strategy<Value = Hop> {
+    (gateway(), proptest::option::of(2u32..4)).prop_map(|(gateway, oif)| Hop { gateway, oif })
 }
 
 fn table() -> impl Strategy<Value = Table> {
@@ -34,7 +42,7 @@ fn table() -> impl Strategy<Value = Table> {
                 Prefix::new(IpAddr::V4(Ipv4Addr::new(10, i, 0, 0)), 16 + len).unwrap()
             }
         }),
-        gateway(),
+        hop(),
         0..10,
     )
 }
@@ -63,10 +71,11 @@ proptest! {
             any::<u32>().prop_map(|a| IpAddr::V4(Ipv4Addr::from(a))),
             any::<u128>().prop_map(|a| IpAddr::V6(Ipv6Addr::from(a))),
         ],
+        oif in proptest::option::of(any::<u32>()),
         table in prop_oneof![Just(RT_TABLE_MAIN), 1u32..=u32::MAX],
     ) {
         let dst = Prefix::new(IpAddr::V4(Ipv4Addr::from(addr)), len).unwrap();
-        let r = RouteMsg::unicast(dst, gw, table, RTPROT_BGP);
+        let r = RouteMsg::unicast(dst, Hop { gateway: gw, oif }, table, RTPROT_BGP);
         let m = r.encode_set(7);
         prop_assert_eq!(RouteMsg::decode(&m[HEADER_LEN..]).unwrap(), Some(r));
     }
@@ -74,7 +83,7 @@ proptest! {
     /// Merging the desired table, cut in any places, against what is
     /// installed gives the operations `plan` gives (in prefix order rather
     /// than sets first), reaches the desired table, and gives back every
-    /// gateway once nothing uses it.
+    /// hop once nothing uses it.
     #[test]
     fn merge_plans_like_the_tables(
         desired in table(),
@@ -84,7 +93,7 @@ proptest! {
         let mut r = Routes::new();
         r.set_installed(&installed);
         prop_assert_eq!(r.installed_table(), installed.clone());
-        let want: Vec<(Prefix, IpAddr)> = desired.iter().map(|(p, g)| (*p, *g)).collect();
+        let want: Vec<(Prefix, Hop)> = desired.iter().map(|(p, g)| (*p, *g)).collect();
         cuts.sort_unstable();
         let mut merge = Merge::default();
         let mut ops = Vec::new();
@@ -107,7 +116,7 @@ proptest! {
         for op in r.delete_all() {
             r.apply(&op);
         }
-        prop_assert_eq!(r.gateways(), 0);
+        prop_assert_eq!(r.hops(), 0);
         prop_assert!(r.is_empty());
     }
 }

@@ -281,8 +281,8 @@ fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: S
     let mut ok = send(FibMsg::SetMode(mode));
     if mode == bgpfc_fib::Mode::Install {
         let mut batch = Vec::with_capacity(RECONCILE_BATCH);
-        for route in rib.fib_routes() {
-            batch.push(route);
+        for (prefix, gateway) in rib.fib_routes() {
+            batch.push((prefix, crate::fib::fib_hop(gateway)));
             if batch.len() == RECONCILE_BATCH {
                 ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
                 batch.reserve(RECONCILE_BATCH);

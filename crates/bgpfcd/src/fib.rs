@@ -36,7 +36,9 @@
 //!   shutdown.
 //!
 //! Each operation also has a line of its own at debug (`fib: dry-run` or
-//! `fib: applied`, with the prefix and gateway), written as it is done. A
+//! `fib: applied`, with the prefix and gateway; `fib: already gone` for a
+//! delete of a route the kernel had removed itself, which counts as a
+//! delete), written as it is done. A
 //! failed one has a line at error (`fib: failed`) instead, at once, for
 //! the first [`FAILURES_LOGGED`] of a change, and for no more than
 //! [`FAILURES_LOGGED`] in all between two `fib: changes` lines, and at
@@ -45,11 +47,12 @@
 //! UPDATE: with every route refused, its failures cost three lines a
 //! second at most, as its counts cost one.
 
+use std::net::IpAddr;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
+use bgpfc_fib::{Applied, Change, Fib, Hop, Merge, Mode, Op};
 use bgpfc_log::Level;
 use bgpfc_wire::prefix::Prefix;
 
@@ -122,6 +125,13 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
     Ok(tx)
 }
 
+/// The hop of a route through `gateway`, as the FIB takes it: the RIB
+/// names its next hop and no interface, and the kernel chooses the
+/// interface that reaches it.
+pub(crate) fn fib_hop(gateway: IpAddr) -> Hop {
+    Hop { gateway, oif: None }
+}
+
 /// What writes the thread's lines to the log; the tests keep them
 /// instead.
 fn logger() -> impl FnMut(Line) {
@@ -177,8 +187,8 @@ fn serve(
             FibMsg::Changes { changes, more } => {
                 let changes = changes.iter().map(|c| Change {
                     prefix: c.prefix,
-                    gateway: c.next_hop,
-                    previous: c.previous,
+                    hop: c.next_hop.map(fib_hop),
+                    previous: c.previous.map(fib_hop),
                 });
                 fib.set_all(changes, &mut applied);
                 fold.add(&applied, debug(), now(), out);
@@ -223,7 +233,11 @@ fn serve(
             FibMsg::Query { after, reply } => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    installed: fib.installed_after(after, PAGE),
+                    installed: fib
+                        .installed_after(after, PAGE)
+                        .into_iter()
+                        .map(|(prefix, hop)| (prefix, hop.gateway))
+                        .collect(),
                 });
             }
             FibMsg::Shutdown(done) => {
@@ -283,6 +297,8 @@ impl Fold {
                     Level::Debug,
                     if a.dry_run {
                         "fib: dry-run"
+                    } else if a.already_gone {
+                        "fib: already gone"
                     } else {
                         "fib: applied"
                     },
@@ -345,8 +361,8 @@ impl Fold {
 /// kernel's error if it failed.
 fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
     let (op, prefix, gateway) = match &a.op {
-        Op::Set { prefix, gateway } => ("install", prefix, gateway),
-        Op::Delete { prefix, gateway } => ("delete", prefix, gateway),
+        Op::Set { prefix, hop } => ("install", prefix, hop.gateway),
+        Op::Delete { prefix, hop } => ("delete", prefix, hop.gateway),
     };
     let mut fields = vec![
         ("op", op.to_owned()),
@@ -466,14 +482,23 @@ mod tests {
         format!("10.{}.{}.0/24", i / 256, i % 256)
     }
 
+    /// A hop through `gateway`, with no interface.
+    fn gw(gateway: &str) -> Hop {
+        Hop {
+            gateway: ip(gateway),
+            oif: None,
+        }
+    }
+
     fn set(prefix: &str, dry_run: bool) -> Applied {
         Applied {
             op: Op::Set {
                 prefix: p(prefix),
-                gateway: ip("192.0.2.1"),
+                hop: gw("192.0.2.1"),
             },
             result: Ok(()),
             dry_run,
+            already_gone: false,
         }
     }
 
@@ -481,10 +506,11 @@ mod tests {
         Applied {
             op: Op::Delete {
                 prefix: p(prefix),
-                gateway: ip("192.0.2.1"),
+                hop: gw("192.0.2.1"),
             },
             result: Ok(()),
             dry_run,
+            already_gone: false,
         }
     }
 
@@ -596,6 +622,27 @@ mod tests {
         let lines = change_lines(&[&[set("192.0.2.0/24", false)]], true);
         assert_eq!(lines[0].msg, "fib: applied");
         assert_eq!(lines[1].fields[0], ("mode", "install".to_owned()));
+    }
+
+    /// A delete the kernel answered `ESRCH` had nothing left to remove:
+    /// the kernel removed the route itself. It has a line of its own at
+    /// debug that says so, and counts as a delete, not a failure.
+    #[test]
+    fn a_route_already_gone_counts_as_deleted() {
+        let gone = Applied {
+            already_gone: true,
+            ..delete("198.51.100.0/24", false)
+        };
+        let lines = change_lines(&[&[gone]], true);
+        assert_eq!(
+            written(&lines),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: already gone\" op=delete \
+                 prefix=198.51.100.0/24 gateway=192.0.2.1\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"fib: changes\" mode=install install=0 \
+                 delete=1 failed=0 prefixes=198.51.100.0/24\n",
+            ]
+        );
     }
 
     /// The first three failures of a change are at error, the others at
@@ -848,7 +895,7 @@ mod tests {
                 Step::Msg(FibMsg::SetMode(Mode::Install)),
                 Step::Msg(FibMsg::Reconcile(vec![(
                     p("192.0.2.0/24"),
-                    ip("192.0.2.1"),
+                    gw("192.0.2.1"),
                 )])),
                 Step::Msg(FibMsg::ReconcileEnd(end_tx)),
                 // Half an input, then the shutdown, before its line is due.

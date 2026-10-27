@@ -163,7 +163,7 @@ pub(crate) enum FibMsg {
     SetMode(bgpfc_fib::Mode),
     /// The RIB's routes, continuing in prefix order those sent since
     /// `SetMode`.
-    Reconcile(Vec<(Prefix, IpAddr)>),
+    Reconcile(Vec<(Prefix, bgpfc_fib::Hop)>),
     /// The end of a switch; the reply says how many operations it took.
     ReconcileEnd(SyncSender<usize>),
     /// Report the mode on the sender.
