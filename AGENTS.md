@@ -523,7 +523,8 @@ decisions after reviewing step 14, and the answers that followed.
   use.
 - The FIB thread's log folded: a `fib: changes` line at info at most once a
   second, counts by operation, sample prefixes and dry-run or install;
-  each route at debug, and at most three failure lines a change at error.
+  each route at debug, and at most three failure lines a change, and
+  three between two `fib: changes` lines, at error.
 - The sidecar's owner check is `partial` in COMPLIANCE.md (RFC 8210 §9,
   §13), as it tells users apart and nothing finer; bgpfcd warns, and starts
   all the same, when it runs as `nobody`, as the overflow user or in a user
