@@ -3,15 +3,17 @@
 //! privilege drop, wires the RTR client to it on loopback, supervises it,
 //! and stops it, for routes from BIRD 2 (AGENTS.md §5, `interop/` row).
 //!
-//! Routinator itself never runs (AGENTS.md §5). A [`FakeRoutinator`]
-//! stands in for it: a shell script that answers `--version` as Routinator
-//! 0.15.2, a patch release before the tested 0.15.3 that bgpfcd accepts as
-//! the same series, records the arguments bgpfcd derives from the block,
-//! and then becomes this crate's `rtr-stub` on the `--rtr` address,
-//! serving the VRPs of `rpki.rs` under a new Session ID at each start, as a
-//! restarted Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root
-//! with `--user nobody`, as README's Option B: it refuses to run Routinator
-//! as root, and Routinator is born as `nobody` with no capabilities.
+//! Routinator itself never runs here (AGENTS.md §5): these scenarios need
+//! a Routinator that fails, hangs or changes its version on demand, and
+//! `routinator.rs` runs the real one. A [`FakeRoutinator`] stands in for
+//! it: a shell script that answers `--version` as Routinator 0.15.2, a
+//! patch release before the tested 0.15.3 that bgpfcd accepts as the same
+//! series, records the arguments bgpfcd derives from the block, and then
+//! becomes this crate's `rtr-stub` on the `--rtr` address, serving the
+//! VRPs of `rpki.rs` under a new Session ID at each start, as a restarted
+//! Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root with `--user
+//! nobody`, as README's Option B: it refuses to run Routinator as root, and
+//! Routinator is born as `nobody` with no capabilities.
 //!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`
 //! and `curl` on `PATH`, and a built `bgpfcd`. CI runs them with
