@@ -66,7 +66,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   it concerns, through the same path as an UPDATE; each route that changed
   state is logged, and `bgpfcctl show rpki transitions` keeps the latest.
   Interop tests run it against StayRTR and BIRD, and the sidecar against a
-  stand-in for Routinator.
+  stand-in for Routinator and against Routinator 0.15 itself, offline, on
+  an RPKI repository the test signs and serves on loopback.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -118,7 +119,12 @@ to version 0 (RFC 6810), from the block's external caches, with failover in
 order of preference, a reconnect back-off, and the last VRPs kept while no
 cache answers, until they expire. Without the block, or with `mode
 disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
-8210 §9), so the cache belongs on loopback or a trusted network.
+8210 §9), so the cache belongs on loopback or a trusted network. Every RTR
+connection has TCP keep-alive on, as §9 asks of routers: by default a first
+probe after a minute without traffic and one every 10 seconds after it, so
+that a cache that vanished without closing the connection is noticed within
+two minutes rather than at the next query, an hour on. `tcp-keepalive`
+changes the times, and a reload applies them to the connection in use.
 
 bgpfcd acts on the states (step 13) as the block's `enforcement` says
 ([`docs/config.md`](docs/config.md), "RPKI"): `drop-invalid`, the default,
@@ -186,7 +192,7 @@ crates/
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
-interop/         tests against BIRD / FRR / GoBGP, StayRTR and a fake Routinator (dev-only)
+interop/         tests against BIRD / FRR / GoBGP, StayRTR, a fake and the real Routinator (dev-only)
 ```
 
 ## Build
@@ -244,6 +250,7 @@ control {
 #     mode external;
 #     enforcement drop-invalid;   # drop-invalid | prefer-valid | off
 #     startup accept;             # accept | hold: routes until the first data
+#     tcp-keepalive idle 60;      # idle, interval, count: 60, 10, 6 by default
 #     cache 127.0.0.1 port 3323;
 # }
 #
