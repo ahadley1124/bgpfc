@@ -361,11 +361,16 @@ pub(crate) enum RibMsg {
     },
     /// A control-plane question.
     Query(RibQuery, SyncSender<RibReply>),
-    /// New policies after a reload; `reexport` lists the peers whose
-    /// export policy changed and whose Adj-RIB-Out is recomputed.
+    /// New policies after a reload: `reexport` lists the peers whose
+    /// export policy changed and whose Adj-RIB-Out is recomputed from the
+    /// Loc-RIB, then `reimport` those whose import policy changed and
+    /// whose routes are imported again from the Adj-RIB-In (RFC 4271 §3),
+    /// with ROUTE-REFRESH only for what it did not keep (RFC 2918).
     SetPolicies {
         /// The compiled policies.
         policies: NewPolicies,
+        /// Peers to import from again.
+        reimport: Vec<IpAddr>,
         /// Peers to re-export to.
         reexport: Vec<IpAddr>,
     },

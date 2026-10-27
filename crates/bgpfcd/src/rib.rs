@@ -200,12 +200,11 @@ fn handle(
         RibMsg::Query(q, reply) => {
             let _ = reply.send(answer(rib, transitions, &q));
         }
-        RibMsg::SetPolicies { policies, reexport } => {
-            for peer in &reexport {
-                bgpfc_log::info!("rib: re-export", peer = peer);
-            }
-            rib.set_policies(policies.0, &reexport, now, out);
-        }
+        RibMsg::SetPolicies {
+            policies,
+            reimport,
+            reexport,
+        } => set_policies(rib, policies.0, (&reimport, &reexport), now, out),
         RibMsg::SetIntervals(new) => {
             settings.intervals = new;
             follow_intervals(rib, settings, now, out);
@@ -248,6 +247,25 @@ fn handle(
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
     }
+}
+
+/// A reload's policies: export again to the peers in `reexport`, first,
+/// so that they have what the new export policy makes of the Loc-RIB
+/// before importing again changes it; then import again from the
+/// Adj-RIBs-In the routes of those in `reimport` (RFC 4271 §3), with no
+/// ROUTE-REFRESH but for what the RIB did not keep (RFC 2918).
+fn set_policies(
+    rib: &mut Rib,
+    policies: Box<dyn bgpfc_rib::Policies>,
+    (reimport, reexport): (&[IpAddr], &[IpAddr]),
+    now: Instant,
+    out: &mut impl Sink,
+) {
+    for peer in reexport {
+        bgpfc_log::info!("rib: re-export", peer = peer);
+    }
+    rib.set_policies(policies, reexport, now, out);
+    rib.reimport(reimport, now, out);
 }
 
 /// Routes in one `FibMsg::Reconcile`.
@@ -1476,6 +1494,116 @@ mod tests {
             families: vec![V4],
         }];
         deliver(other, &table, &fib_tx);
+    }
+
+    /// A configuration with neighbor 192.0.2.1 under import policy `IN`
+    /// and export policy `OUT`, as `policies` defines them, and the
+    /// internal 192.0.2.2 under `OUT` and an import policy that takes all.
+    fn policy_config(policies: &str) -> bgpfc_config::Config {
+        bgpfc_config::parse_str(
+            "t",
+            &format!(
+                "router-id 192.0.2.254; local-as 65000; {policies}
+                 policy ALL {{ term all {{ action accept; }} }}
+                 neighbor 192.0.2.1 {{ remote-as 65001; import IN; export OUT; }}
+                 neighbor 192.0.2.2 {{ remote-as 65000; import ALL; export OUT; }}"
+            ),
+        )
+        .unwrap()
+    }
+
+    /// What a reload from `old` to `new` tells the RIB thread about the
+    /// policies, as the coordinator builds it.
+    fn set_policies(old: &bgpfc_config::Config, new: &bgpfc_config::Config) -> RibMsg {
+        let diff = bgpfc_config::diff::ConfigDiff::between(old, new);
+        RibMsg::SetPolicies {
+            policies: crate::messages::NewPolicies(Box::new(
+                bgpfc_policy::Engine::new(new).unwrap(),
+            )),
+            reimport: diff.import_changed,
+            reexport: diff.export_changed,
+        }
+    }
+
+    #[test]
+    fn a_policy_reload_imports_again_with_no_route_refresh() {
+        // RFC 4271 §3 (a): a new import policy for 192.0.2.1 applies to
+        // its routes at once, from the Adj-RIB-In; an export change alone
+        // imports nothing; only the route import policy dropped needs the
+        // peer again, and is asked for (§3 (b), RFC 2918 §4).
+        let accept = "policy IN { term all { action accept; } }
+                      policy OUT { term all { action accept; } }";
+        let strict = "policy IN {
+                          term drop { match prefix 198.51.100.0/24; action reject; }
+                          term all { set local-pref 200; action accept; }
+                      }
+                      policy OUT { term all { action accept; } }";
+        let tagged = "policy IN { term all { action accept; } }
+                      policy OUT { term all { set med 7; action accept; } }";
+        let (a, b, c) = (
+            policy_config(accept),
+            policy_config(strict),
+            policy_config(tagged),
+        );
+        let now = Instant::now();
+        let mut rib = Rib::with_policies(
+            Asn(65_000),
+            Box::new(bgpfc_policy::Engine::new(&a).unwrap()),
+        );
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.2", 65_000, PeerKind::Internal),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let asked = |out: &[Output]| -> Vec<(IpAddr, Vec<AddressFamily>)> {
+            out.iter()
+                .filter_map(|o| match o {
+                    Output::RequestRoutes { peer, families } => Some((*peer, families.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let out = handle(&mut rib, &mut settings, set_policies(&a, &b), now);
+        let Some(Output::Reimported(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(r.peers, vec![ip("192.0.2.1")]);
+        assert_eq!((r.routes, r.changed, r.dropped), (2, 2, 1));
+        assert_eq!(asked(&out), vec![]);
+        assert_eq!(rib.loc_rib(V4).count(), 1);
+        let (_, best) = rib.loc_rib(V4).next().unwrap();
+        assert_eq!(best.attrs.local_pref, Some(200));
+
+        // Back: the dropped route only the peer can send again.
+        let out = handle(&mut rib, &mut settings, set_policies(&b, &a), now);
+        let Some(Output::Reimported(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(r.refresh, vec![(ip("192.0.2.1"), V4)]);
+        assert_eq!(asked(&out), vec![(ip("192.0.2.1"), vec![V4])]);
+        let (_, best) = rib.loc_rib(V4).next().unwrap();
+        assert_eq!(best.attrs.local_pref, None);
+
+        // An export change alone: sent again to both, imported again from
+        // neither, no ROUTE-REFRESH.
+        let out = handle(&mut rib, &mut settings, set_policies(&a, &c), now);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::Reimported(_) | Output::RequestRoutes { .. })),
+            "{out:?}"
+        );
+        assert_eq!(rib.loc_rib(V4).count(), 1);
     }
 
     #[test]

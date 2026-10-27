@@ -442,10 +442,12 @@ named with `-c`. A file that fails to parse, validate or compile leaves the
 running configuration untouched and reports the errors. Otherwise, per
 `docs/config.md`: new neighbors start; removed ones stop with Cease / Peer
 De-configured; neighbors whose session parameters changed stop with Cease /
-Other Configuration Change and start again; neighbors whose import or
-export policy changed get a ROUTE-REFRESH and a re-export of the
-difference; a changed `advertisement-interval` applies to the running
-session without a reset, and so does a changed `maximum-prefix` (a session
+Other Configuration Change and start again; neighbors whose import policy
+changed have the routes they sent imported again under it at once, from
+the routes bgpfcd kept, with no ROUTE-REFRESH (the log says `rib:
+re-import`, below), and those whose export policy changed are sent the
+difference (`rib: re-export`), with no ROUTE-REFRESH either; a changed
+`advertisement-interval` applies to the running session without a reset, and so does a changed `maximum-prefix` (a session
 already over its new limit ends with Cease / Maximum Number of Prefixes
 Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
@@ -459,3 +461,29 @@ summary says `rpki startup SETTING`, the log `rib: rpki startup changed`).
 `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.
+
+A route an import policy rejects whatever its validation state is not
+kept, so importing again cannot bring it back: when import policy has
+dropped a route of a neighbor since its session came up, or since it was
+last asked, a reload that changes the neighbor's import policy also sends
+it a ROUTE-REFRESH for the family (RFC 2918), if it advertised the
+capability and the family, and the routes it
+sends again meet the new policy as they come (`route refresh sent` in the
+log). A neighbor without the capability gets them back only when it sends
+them again or after `clear neighbor` (a warning, `rib: re-import cannot
+ask the peer for the routes import policy dropped`, names the neighbor and
+family). One line counts what importing again did, whatever the number of
+routes: the neighbors, the routes put through the new policy, those it
+made something else of (`changed`: other attributes, another `set rpki`,
+held or used, or not kept), took out of use (`held`), put back into use
+(`released`) or no longer keeps (`dropped`), the destinations whose best
+route changed, and the families each neighbor is asked for again
+(`refresh`, `FAMILY@NEIGHBOR`, or `none`):
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: re-import" peers=198.51.100.1 routes=950000 changed=950000 held=0 released=0 dropped=12 best_changed=930000 refresh=none
+```
+
+On a full table this takes about a second of the RIB thread, as long as
+the neighbor sending the table again would (`benches/rib.rs`,
+`reimport_*`, in `bgpfc-rib`).

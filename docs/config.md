@@ -406,12 +406,17 @@ Each route goes through these steps in order:
    held for their state: by `startup` or `enforcement`, or because the
    import policy rejects them only in their current state, which it would
    accept in another. A route the import policy rejects whatever its state
-   is not kept.
+   is not kept: a reload that changes the policy asks the neighbor for it
+   again (see **Reload**).
 6. Route selection among the routes not held, ranking by state first under
    `prefer-valid`.
 7. The export policy of each neighbor, which sees the state the route is
    used with, the rewriting of RFC 4271 §5.1, and the neighbor's
    `advertisement-interval`.
+
+A reload that changes a neighbor's import policy puts every route of the
+neighbor the Adj-RIB-In keeps, held or not, through steps 3 to 7 again,
+with the state it has (see **Reload**).
 
 When the VRPs change, the routes whose state they change go through steps
 3 to 7 again (RFC 6811 §4: "When a mapping is added or deleted, the
@@ -941,10 +946,17 @@ parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`; `restart-limit` included)
 reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
-are re-evaluated without a reset, using route refresh where the peer
-supports it. A route held for its validation state (see **RPKI**) meets
-the new import policy the same way, when its neighbor sends it again, or
-at once when the same reload also changes `enforcement`. A changed
+are re-evaluated without a reset. A changed `import` policy applies at
+once to the routes the neighbor sent, from those bgpfcd kept (RFC 4271
+§3), held ones included (see **RPKI**): each goes through the new policy
+again, and what it changes is installed and advertised, or withdrawn,
+with no UPDATE and no route refresh. A route an import policy rejected
+whatever its validation state was not kept, so for a neighbor that had
+such routes the reload also asks for them again with a route refresh
+(RFC 2918), where the neighbor supports it, for the families concerned;
+without it they come back when the neighbor sends them again, or after
+`bgpfcctl clear neighbor`. A changed `export` policy sends each neighbor
+the difference, with no route refresh. A changed
 `advertisement-interval` applies to the running session at once, also
 without a reset. So does a changed `maximum-prefix`:
 a session that already holds more routes than its new limit ends as if it

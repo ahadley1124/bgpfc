@@ -31,7 +31,6 @@ use std::sync::{Arc, RwLock};
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
-use bgpfc_wire::types::AddressFamily;
 
 use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
@@ -424,18 +423,6 @@ impl Coordinator<'_> {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
         }
         self.reload_rib(&new, engine, &diff);
-        // Import policy changes need the peer's routes again (RFC 2918),
-        // of every family it negotiated, which the peer thread knows.
-        if let Ok(t) = self.table.read() {
-            for addr in &diff.policy_changed {
-                if let Some(h) = t.get(addr) {
-                    let _ = h.tx.try_send(PeerInput::RequestRoutes(vec![
-                        AddressFamily::IPV4_UNICAST,
-                        AddressFamily::IPV6_UNICAST,
-                    ]));
-                }
-            }
-        }
         let mut started = Vec::new();
         for addr in diff.added.iter().chain(&diff.reset) {
             if let Some(n) = new.neighbor(*addr) {
@@ -475,10 +462,15 @@ impl Coordinator<'_> {
         diff: &ConfigDiff,
     ) {
         // Policies always follow the new file: the engine knows every
-        // neighbor's policy names.
+        // neighbor's policy names. RFC 4271 §3: the routes of neighbors
+        // whose import policy changed are imported again from the
+        // Adj-RIBs-In, with no ROUTE-REFRESH but for the routes import
+        // policy dropped, which the RIB asks for itself (RFC 2918); those
+        // whose export policy changed are sent the difference.
         let _ = self.rib_tx.send(RibMsg::SetPolicies {
             policies: messages::NewPolicies(Box::new(engine)),
-            reexport: diff.policy_changed.clone(),
+            reimport: diff.import_changed.clone(),
+            reexport: diff.export_changed.clone(),
         });
         // RFC 6811 §5: a new `enforcement` judges every route again, under
         // the new import policies, with no restart of the RTR client.
