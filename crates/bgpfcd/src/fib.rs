@@ -51,9 +51,12 @@ const SAMPLE: usize = 8;
 /// rest are counted on the change's line, and have a line at debug. A
 /// kernel that refuses one route often refuses the whole table, as when
 /// bgpfcd lacks `CAP_NET_ADMIN` or a peer's next hop is not reachable
-/// directly, and then the first few already name the reason; a line for
-/// each of a million would bury the rest of the log.
-pub(crate) const FAILURES_LOGGED: usize = 10;
+/// directly, and then the first already names the reason; a line for
+/// each of a million would bury the rest of the log. Three rather than
+/// one, so that a change whose routes fail for different reasons, such
+/// as a next hop that is unreachable for some of them, shows more than
+/// one of the reasons at error.
+pub(crate) const FAILURES_LOGGED: usize = 3;
 
 /// Open the socket, flush stale routes (AGENTS.md §3: only those with
 /// our protocol number), and start the thread.
@@ -463,10 +466,11 @@ mod tests {
             ]
         );
         let summary = &written(&lines)[FAILURES_LOGGED];
+        assert_eq!(FAILURES_LOGGED, 3);
         assert!(
             summary.starts_with(
                 "1970-01-01T00:00:00.000Z ERROR msg=\"fib: changes\" mode=install \
-                 install=1 delete=0 failed=15 prefixes=10.0.0.0/24,"
+                 install=1 delete=0 failed=8 prefixes=10.0.0.0/24,"
             ),
             "{summary}"
         );

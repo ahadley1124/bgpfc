@@ -308,11 +308,11 @@ shutdown. A table that loads from a peer arrives in many UPDATEs, and so
 gets a line for each UPDATE that changed the FIB, never one per route.
 Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
 applied`, with `op`, `prefix` and `gateway`). A failed operation has one
-at error (`fib: failed`, with the kernel's `error`), the first ten of a
-change, the others at `debug`, and the change's line is then at error
+at error (`fib: failed`, with the kernel's `error`), the first three of
+a change, the others at `debug`, and the change's line is then at error
 too, counting them all: a kernel that refuses one route, for want of
 `CAP_NET_ADMIN` or for a next hop it cannot reach directly, often refuses
-the whole table, and the first ten already name the reason. At `log {
+the whole table, and the first already names the reason. At `log {
 level warn; }` the FIB thread writes only its failures.
 
 ## RPKI
