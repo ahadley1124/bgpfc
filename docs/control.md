@@ -330,6 +330,56 @@ that loads from a peer, a change an UPDATE, so costs at most three error
 lines and one `fib: changes` line a second, not a line a route. At
 `log { level warn; }` the FIB thread writes only its failures.
 
+## Next hops
+
+A route is used only if its next hop resolves in the kernel's main
+routing table (RFC 4271 §9.1.2; `docs/config.md`, "Route selection"). A
+kernel thread follows that table: it reads it whole at startup, before
+the RIB judges any route, and then the kernel's notifications of the
+routes of both families, of the interfaces and of the addresses removed.
+It keeps the routes a next hop may resolve through: neither bgpfcd's own
+nor a default route. It reads the table whole again when the kernel drops
+notifications, and when an interface goes down or away or an address is
+removed, since IPv4 then removes the routes through it without a
+notification of their own; the RIB keeps its copy until the new one
+arrives whole. The thread never writes to the kernel, in dry-run and
+install mode alike.
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="kernel: table read" routes=12 links=4 reason=startup
+```
+
+`routes` is the routes kept, `links` the interfaces. The line is at info
+at startup and after the thread opened a new socket (`reopened`, after
+an error of the old one, which is logged at error); at `debug` for the
+reads an interface going down (`link-down`) or away (`link-gone`), an
+address removed (`address-removed`) or lost notifications (`lost-events`)
+ask for. Lost notifications also have a line at warn, at once and then
+at most one a minute, `times` counting those since the line before:
+
+```
+2026-10-27T12:34:56.789Z WARN  msg="kernel: route events lost, reading the table again" times=1
+```
+
+A change of the table that changes what a next hop in use resolves to is
+one line at info, however many routes it moves:
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="rib: next hops changed" resolved=0 unresolved=1 moved=1 held=3 released=0 best_changed=3 next_hops="10.0.0.9 via 10.99.7.1 dev v12b,198.51.100.9 unresolved"
+```
+
+`resolved` next hops resolve now and did not, `unresolved` no longer do,
+and `moved` resolve through another gateway or interface. `held` routes
+the change took out of use, `released` it put back into use, and
+`best_changed` destinations then have another best route, or none. A
+route whose next hop moved stays the best and goes to the kernel again
+through the new hop, with no UPDATE to any neighbor. `next_hops` names
+the first eight next hops it changed as they are now, `...` marking the
+rest; at `debug` each has a line of its own (`rib: next hop changed`,
+with its `gateway`, `oif`, `interface`, the kernel route it resolves
+`through`, and its `routes`). The routes it moves show in the FIB
+thread's `fib: changes` lines, never a line a route at info.
+
 ## RPKI
 
 `show rpki` and `GET /v1/rpki` report the `rpki` block (`docs/config.md`,

@@ -46,6 +46,18 @@ for one that listens.
 ./target/profiling/bgpfcd -c contrib/bgpfc-bench.conf
 ```
 
+bgpfcd uses a route only if its next hop resolves in the kernel's main
+routing table (RFC 4271 §9.1.2), in dry-run as in install mode, and never
+through a default route. A route whose next hop does not resolve is held:
+received and counted, but not in the Loc-RIB, the FIB or any UPDATE sent
+on, which is less work than a measurement means to measure. So run where
+the load generator's next hops resolve: on a host where 192.0.2.0/24 (its
+default next hops, 192.0.2.1–4) is a connected network, or in a network
+namespace of their own with an address in it, as for install mode below;
+`bgp_bench` too, which starts both programs itself. An MRT replay keeps
+the collector's next hops: give that namespace a route to each, such as
+`ip route add NEXT_HOP/32 dev lo`.
+
 In a second terminal, one of the scenarios:
 
 ```sh

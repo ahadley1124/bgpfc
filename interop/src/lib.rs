@@ -144,6 +144,12 @@ impl Lab {
         }
     }
 
+    /// The interface of A on its link to B.
+    #[must_use]
+    pub fn a_link(&self) -> String {
+        format!("v{}a", self.id)
+    }
+
     /// Add a third namespace `c`, joined to `a` by a second veth pair on
     /// `10.98.<subnet>.0/24`; the namespace name is returned and kept in
     /// `self.c`.

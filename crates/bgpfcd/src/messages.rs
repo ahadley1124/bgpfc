@@ -3,8 +3,9 @@
 //! Each peer thread owns one channel of [`PeerInput`]; connection reader
 //! threads, the coordinator and the control plane write to it. Peer
 //! threads send [`RibMsg`] to the RIB thread over a bounded channel so
-//! that a flooding peer blocks instead of growing memory, and so does the
-//! RTR client with its validation changes.
+//! that a flooding peer blocks instead of growing memory, and so do the
+//! RTR client with its validation changes and the kernel thread with the
+//! kernel's routing table.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
@@ -419,6 +420,13 @@ pub(crate) enum RibMsg {
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.
     FibMode(bgpfc_fib::Mode, SyncSender<usize>),
+    /// The kernel's routing table, whole or what changed in it, from the
+    /// kernel thread (`crate::kernel`): resolve again the next hops it may
+    /// change, and decide again the destinations of those whose
+    /// resolution it changed (RFC 4271 §9.1.2). On the same bounded
+    /// channel as the peers, so a busy RIB slows the kernel thread, whose
+    /// socket may then overflow and is read again whole.
+    Kernel(bgpfc_rib::nexthop::KernelUpdate),
 }
 
 /// A policy set on its way to the RIB thread (`dyn Policies` has no

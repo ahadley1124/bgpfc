@@ -6,13 +6,16 @@
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
 //! client of the `rpki` block, which feeds the RIB thread, and since step
-//! 14, with `mode sidecar`, Routinator as the client's cache.
+//! 14, with `mode sidecar`, Routinator as the client's cache. Since step
+//! 15 a kernel thread follows the kernel's routing table, which the RIB
+//! resolves next hops against (RFC 4271 §9.1.2).
 #![forbid(unsafe_code)]
 
 mod args;
 mod control;
 mod coordinator;
 mod fib;
+mod kernel;
 mod messages;
 mod netns;
 mod owner;
@@ -30,6 +33,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
@@ -229,6 +233,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
             std::process::exit(1);
         }
     };
+    let (kernel, kernel_table) = open_kernel(&config);
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
     let table: PeerTable = Arc::new(RwLock::new(HashMap::new()));
     let mut peers = Vec::new();
@@ -264,13 +269,23 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     // the `startup` are set before the thread starts, so that no route is
     // judged without them: under `startup hold` every route that arrives
     // before that set is held.
+    //
+    // The kernel's table goes in first, before any route, so that no
+    // route is judged against none (m15 design 3.8): every next hop
+    // looking unresolvable would withdraw everything, every one looking
+    // resolvable would install routes that fail. Then the kernel thread
+    // follows it, before any peer starts; what changed since the table
+    // was read waits on its socket.
+    let mut rib = wiring::rib(&config, Box::new(engine));
+    rib.kernel(kernel_table, Instant::now(), &mut Vec::new());
     rib::spawn(
-        wiring::rib(&config, Box::new(engine)),
+        rib,
         wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
     );
+    kernel::spawn(kernel, rib_tx.clone());
     // After the privilege drop, so that Routinator, with `mode sidecar`,
     // is born with the service user's credentials and no capabilities
     // (m14 design §4.1); its version check may take up to ten seconds,
@@ -315,6 +330,23 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
                 }
                 let _ = reply.send(r);
             }
+        }
+    }
+}
+
+/// The kernel's routing table, which next hops resolve against (RFC 4271
+/// §9.1.2), and the socket that follows it: opened while privileged, for
+/// the larger receive buffer `CAP_NET_ADMIN` allows. Exits if the table
+/// cannot be read, as a failed FIB sync does: without it no route could
+/// be judged.
+fn open_kernel(
+    config: &bgpfc_config::Config,
+) -> (kernel::Tracker, bgpfc_rib::nexthop::KernelUpdate) {
+    match kernel::open(config.fib.protocol) {
+        Ok(k) => k,
+        Err(e) => {
+            bgpfc_log::error!("cannot read the kernel's routing table", error = e);
+            std::process::exit(1);
         }
     }
 }
