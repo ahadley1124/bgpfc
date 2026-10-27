@@ -9,7 +9,7 @@ use bgpfc_rpki::Enforcement::{self, DropInvalid, Off, PreferValid};
 use super::*;
 
 /// Two external peers: e1 sends, e2 receives.
-fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
+pub(super) fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     outputs(|o| rib.peer_up(e1.clone(), now(), o));
@@ -19,23 +19,23 @@ fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
 
 /// A ROA for 192.0.2.0/24 that makes e1's routes to it, from AS 64496,
 /// Invalid; e1's route to 198.51.100.0/24 is `NotFound`.
-fn other_origin() -> VrpSet {
+pub(super) fn other_origin() -> VrpSet {
     vrps(&[("192.0.2.0/24", 24, 64_497)])
 }
 
 /// The ROA that makes them Valid.
-fn their_origin() -> VrpSet {
+pub(super) fn their_origin() -> VrpSet {
     vrps(&[("192.0.2.0/24", 24, 64_496)])
 }
 
 /// e1's routes to `prefixes`, from AS 64496.
-fn send(rib: &mut Rib, e1: &PeerInfo, prefixes: &[&str]) -> Vec<Output> {
+pub(super) fn send(rib: &mut Rib, e1: &PeerInfo, prefixes: &[&str]) -> Vec<Output> {
     let a = attrs(&[65_001, 64_496], "10.0.0.1");
     outputs(|o| rib.update(e1.addr, &announce(prefixes, &a), now(), o))
 }
 
 /// The announcements and withdrawals sent to `to`: (NLRI, withdrawn).
-fn sent(out: &[Output], to: &PeerInfo) -> (Vec<Prefix>, Vec<Prefix>) {
+pub(super) fn sent(out: &[Output], to: &PeerInfo) -> (Vec<Prefix>, Vec<Prefix>) {
     let mut nlri = Vec::new();
     let mut withdrawn = Vec::new();
     for messages in sends(out, to.addr) {
@@ -63,7 +63,7 @@ fn rejudged(out: &[Output]) -> &Rejudged {
 
 /// The routes the RIB holds for `prefix` of IPv4: peer, looked-up state
 /// and why it is held.
-fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
+pub(super) fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
     rib.routes(V4, p(prefix))
         .iter()
         .map(|r| (r.peer, r.rov, r.held))
@@ -71,7 +71,7 @@ fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
 }
 
 /// What `peer_stats` counts for `addr` in IPv4: received, held.
-fn counted(rib: &Rib, addr: IpAddr) -> (usize, usize) {
+pub(super) fn counted(rib: &Rib, addr: IpAddr) -> (usize, usize) {
     let s = rib.peer_stats(addr).unwrap();
     (s.received[0].1, s.held[0].1)
 }

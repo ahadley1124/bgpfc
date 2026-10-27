@@ -2,9 +2,10 @@
 //! same announcements and withdrawals arrive in, the best routes and the
 //! final Adj-RIBs-Out are the same (AGENTS.md §5, `bgpfc-rib` row). With
 //! policy that acts on the validation state, it is a function of the
-//! Adj-RIBs-In, policy, the enforcement mode and the current validation
-//! source, whatever the interleaving of UPDATEs, validation changes
-//! (RFC 6811 §4) and changes of mode. The FIB changes on the way chain up
+//! Adj-RIBs-In, policy, the enforcement mode, the startup setting and the
+//! current validation source, whatever the interleaving of UPDATEs,
+//! validation changes (RFC 6811 §4) and changes of mode or setting. The
+//! FIB changes on the way chain up
 //! to the same routes, and the count of held routes each peer has is
 //! right after every input.
 #![cfg(not(miri))]
@@ -15,7 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bgpfc_rib::{
-    Enforcement, Held, Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Verdict,
+    Enforcement, Held, Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Startup,
+    Verdict,
 };
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
@@ -258,12 +260,25 @@ impl Policies for ByState {
     }
 }
 
-fn enforcement() -> impl Strategy<Value = Enforcement> {
-    prop_oneof![
-        Just(Enforcement::DropInvalid),
-        Just(Enforcement::PreferValid),
-        Just(Enforcement::Off),
-    ]
+/// What acts on the state beyond policy: an enforcement mode and a
+/// startup setting.
+type Acting = (Enforcement, Startup);
+
+fn acting() -> impl Strategy<Value = Acting> {
+    (
+        prop_oneof![
+            Just(Enforcement::DropInvalid),
+            Just(Enforcement::PreferValid),
+            Just(Enforcement::Off),
+        ],
+        prop_oneof![Just(Startup::Accept), Just(Startup::Hold)],
+    )
+}
+
+/// Apply `acting` to `rib`, the enforcement mode first.
+fn set_acting(rib: &mut Rib, (enforcement, startup): Acting, now: Instant) {
+    outputs(|o| rib.set_enforcement(enforcement, now, o));
+    outputs(|o| rib.set_startup(startup, now, o));
 }
 
 /// A VRP over the prefixes the steps use: one of them, or 192.0.0.0/16
@@ -347,8 +362,8 @@ fn check_counts(rib: &Rib, infos: &[PeerInfo]) {
 
 /// Apply `steps` with the validation sources `sources` given in order
 /// between them: source `k` after the first `at[k]` steps; and the
-/// enforcement modes `modes` likewise, mode `k` after the first
-/// `mode_at[k]` steps, after the sources due then. The first change of
+/// enforcement modes and startup settings `modes` likewise, `k` after the
+/// first `mode_at[k]` steps, after the sources due then. The first change of
 /// source affects every route, as one from the null source must; each
 /// later one only the prefixes its VRPs differ in from the last, and a
 /// change marked in `merged` is held back and given together with the
@@ -357,7 +372,7 @@ fn check_counts(rib: &Rib, infos: &[PeerInfo]) {
 fn interleaved(
     steps: &[Step],
     (sources, at, merged): (&[VrpSet], &[usize], &[bool]),
-    (modes, mode_at): (&[Enforcement], &[usize]),
+    (modes, mode_at): (&[Acting], &[usize]),
 ) -> Outcome {
     let infos = peers();
     let now = Instant::now();
@@ -398,7 +413,7 @@ fn interleaved(
             check_counts(&rib, &infos);
         }
         while next_mode < modes.len() && (mode_at[next_mode] <= i || i == steps.len()) {
-            outputs(|o| rib.set_enforcement(modes[next_mode], now, o));
+            set_acting(&mut rib, modes[next_mode], now);
             next_mode += 1;
             check_counts(&rib, &infos);
         }
@@ -412,13 +427,13 @@ fn interleaved(
     outcome(&rib, &infos)
 }
 
-/// The enforcement mode and the final validation source first, then the
-/// decisive steps.
-fn source_first(steps: &[Step], source: Option<&VrpSet>, mode: Enforcement) -> Outcome {
+/// The enforcement mode, the startup setting and the final validation
+/// source first, then the decisive steps.
+fn source_first(steps: &[Step], source: Option<&VrpSet>, mode: Acting) -> Outcome {
     let infos = peers();
     let now = Instant::now();
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
-    outputs(|o| rib.set_enforcement(mode, now, o));
+    set_acting(&mut rib, mode, now);
     if let Some(source) = source {
         outputs(|o| {
             rib.validation_changed(
@@ -465,10 +480,11 @@ proptest! {
         ),
         at in proptest::collection::vec(0usize..13, 4),
         merged in proptest::collection::vec(any::<bool>(), 4),
-        mode in enforcement(),
+        mode in acting(),
         seed in any::<u64>(),
     ) {
-        // Under each enforcement mode, set before anything arrives.
+        // Under each enforcement mode and startup setting, set before
+        // anything arrives.
         let sources: Vec<VrpSet> =
             sources.into_iter().map(|v| v.into_iter().collect()).collect();
         let mut at = at[..sources.len()].to_vec();
@@ -489,12 +505,12 @@ proptest! {
         ),
         at in proptest::collection::vec(0usize..13, 4),
         merged in proptest::collection::vec(any::<bool>(), 4),
-        modes in proptest::collection::vec(enforcement(), 0..4),
+        modes in proptest::collection::vec(acting(), 0..4),
         mode_at in proptest::collection::vec(0usize..13, 4),
     ) {
-        // Changes of mode at any point too: `interleaved` checks the
-        // counts after every input, and the end is what the last source
-        // and mode give.
+        // Changes of mode and setting at any point too: `interleaved`
+        // checks the counts after every input, and the end is what the
+        // last source, mode and setting give.
         let sources: Vec<VrpSet> =
             sources.into_iter().map(|v| v.into_iter().collect()).collect();
         let mut at = at[..sources.len()].to_vec();
@@ -502,7 +518,10 @@ proptest! {
         let mut mode_at = mode_at[..modes.len()].to_vec();
         mode_at.sort_unstable();
         let got = interleaved(&steps, (&sources, &at, &merged), (&modes, &mode_at));
-        let last = modes.last().copied().unwrap_or(Enforcement::Off);
+        let last = modes
+            .last()
+            .copied()
+            .unwrap_or((Enforcement::Off, Startup::Accept));
         let expected = source_first(&last_words(&steps), sources.last(), last);
         prop_assert_eq!(got, expected);
     }
@@ -511,11 +530,11 @@ proptest! {
     fn loc_rib_after_set_enforcement_equals_a_fresh_rib(
         steps in proptest::collection::vec(step(), 0..12),
         source in proptest::collection::vec(vrp(), 0..4),
-        from in enforcement(),
-        to in enforcement(),
+        from in acting(),
+        to in acting(),
     ) {
-        // A RIB switched to a mode ends as one built under it from the
-        // start: Loc-RIB, held routes and Adj-RIBs-Out.
+        // A RIB switched to a mode and setting ends as one built under
+        // them from the start: Loc-RIB, held routes and Adj-RIBs-Out.
         let source: VrpSet = source.into_iter().collect();
         let switched = interleaved(
             &steps,

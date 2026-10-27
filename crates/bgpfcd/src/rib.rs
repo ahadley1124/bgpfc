@@ -8,7 +8,8 @@
 //! for a semantically incorrect next hop are logged (RFC 4271 §6.3), and
 //! so is what a change of the validation source did to the routes' RFC
 //! 6811 states, in one line per change, and what a change of the `rpki`
-//! block's `enforcement` did to their use (RFC 6811 §5), in one line too.
+//! block's `enforcement` did to their use (RFC 6811 §5), in one line too,
+//! as does a change of its `startup` (RFC 6811 §2).
 //!
 //! Issue #59: "An operator needs to see that a prefix went Valid → Invalid
 //! at a specific time." After the line of a change of the validation
@@ -34,7 +35,8 @@ use std::time::{Duration, Instant, SystemTime};
 use bgpfc_fsm::Session;
 use bgpfc_log::Level;
 use bgpfc_rib::{
-    FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, RouteStatus, Sink, Transition,
+    FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, RouteStatus, Sink, StartupChange,
+    Transition,
 };
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
@@ -503,6 +505,11 @@ impl Sink for Deliver<'_> {
                 // operator's new enforcement mode, counted in one line.
                 log_line(Level::Info, ENFORCEMENT_CHANGED, &rejudged(&r));
             }
+            Output::Startup(r) => {
+                // RFC 6811 §2: the routes not validated yet held or used
+                // under the operator's new startup setting, in one line.
+                log_line(Level::Info, STARTUP_CHANGED, &startup_changed(&r));
+            }
         }
     }
 }
@@ -713,6 +720,25 @@ const ENFORCEMENT_CHANGED: &str = "rib: rpki enforcement changed";
 /// of use and put back into use, and the destinations whose best route
 /// changed.
 fn rejudged(r: &Rejudged) -> [(&'static str, String); 6] {
+    [
+        ("from", r.from.to_string()),
+        ("to", r.to.to_string()),
+        ("routes", r.routes.to_string()),
+        ("held", r.held.to_string()),
+        ("released", r.released.to_string()),
+        ("best_changed", r.best_changed.to_string()),
+    ]
+}
+
+/// The message of the line logged when the `startup` setting the RIB
+/// applies changes.
+const STARTUP_CHANGED: &str = "rib: rpki startup changed";
+
+/// The fields of that line: the setting before and after, the routes
+/// judged again (those not validated yet, `disabled`), those the new
+/// setting took out of use and put back into use, and the destinations
+/// whose best route changed.
+fn startup_changed(r: &StartupChange) -> [(&'static str, String); 6] {
     [
         ("from", r.from.to_string()),
         ("to", r.to.to_string()),
@@ -1822,6 +1848,57 @@ mod tests {
         assert_eq!(
             rejudged(r).map(|(_, v)| v),
             ["drop-invalid", "off", "2", "0", "1", "1"].map(str::to_owned)
+        );
+        assert_eq!(states(&rib).len(), 2);
+    }
+
+    #[test]
+    fn a_startup_change_is_one_info_line() {
+        // RFC 6811 §2: with no validation data yet, every route is
+        // `disabled`; `startup hold` holds both, and `accept` uses them
+        // again, each change in one line.
+        use bgpfc_rib::Startup;
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
+        handle(&mut rib, &mut settings, msg, now);
+        let mut out = Vec::new();
+        rib.set_startup(Startup::Hold, now, &mut out);
+        let Some(Output::Startup(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            formatted(bgpfc_log::Level::Info, STARTUP_CHANGED, &startup_changed(r)),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: rpki startup changed\" \
+             from=accept to=hold routes=2 held=2 released=0 best_changed=2\n"
+        );
+        // Both destinations lose their only route, after the line.
+        let (fib_tx, fib_rx) = sync_channel(4);
+        deliver(out, &PeerTable::default(), &fib_tx);
+        match fib_rx.try_recv() {
+            Ok(FibMsg::Changes { changes: c, more }) => {
+                assert!(!more);
+                assert_eq!(c.len(), 2);
+                assert!(c.iter().all(|c| c.next_hop.is_none()), "{c:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(states(&rib), []);
+        let mut out = Vec::new();
+        rib.set_startup(Startup::Accept, now, &mut out);
+        let Some(Output::Startup(r)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            startup_changed(r).map(|(_, v)| v),
+            ["hold", "accept", "2", "0", "2", "2"].map(str::to_owned)
         );
         assert_eq!(states(&rib).len(), 2);
     }

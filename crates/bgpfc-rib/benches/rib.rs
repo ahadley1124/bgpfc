@@ -2,7 +2,8 @@
 //! peer and from two that send the same table, as a multi-homed network
 //! has it, churn
 //! under the RFC 4271 §9.2.1.1 advertisement interval, and validating
-//! routes again when the validation source changes (RFC 6811 §4). The
+//! routes again when the validation source changes (RFC 6811 §4), with the
+//! routes held until the first data under `startup hold` too. The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
 
@@ -11,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Enforcement, Output, PeerInfo, Rib};
+use bgpfc_rib::{Enforcement, Output, PeerInfo, Rib, Startup};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -19,7 +20,8 @@ use bgpfc_wire::mp::{MpReach, NextHop};
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind, UpdateMessage};
-use criterion::Criterion;
+use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, Criterion};
 
 /// Run one RIB input and collect what it produced.
 fn outputs(input: impl FnOnce(&mut Vec<Output>)) -> Vec<Output> {
@@ -328,7 +330,49 @@ fn revalidation(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[Deco
             black_box(outputs(|o| rib.set_enforcement(mode, now, o)))
         });
     });
+    startup(&mut group, &mut rib, &on, routes);
     group.finish();
+}
+
+/// `startup hold` (`Rib::set_startup`) on `rib`, whose routes `on` makes
+/// Valid: without validation data every route is held, and the first full
+/// set releases the table, to the FIB and the other peer; turning
+/// validation off holds it all again. The walk of `revalidate_all`, with
+/// every route moving between held and used.
+fn startup(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    rib: &mut Rib,
+    on: &dyn Fn() -> ValidationChange,
+    routes: u32,
+) {
+    let now = Instant::now();
+    outputs(|o| rib.validation_changed(on(), now, o));
+    outputs(|o| rib.set_startup(Startup::Hold, now, o));
+    let mut flip = false;
+    group.bench_function(format!("revalidate_all_held_{routes}"), |b| {
+        b.iter(|| {
+            flip = !flip;
+            let change = if flip {
+                ValidationChange::disabled()
+            } else {
+                on()
+            };
+            black_box(outputs(|o| rib.validation_changed(change, now, o)))
+        });
+    });
+    // A reload that changes the setting while the routes wait for data
+    // holds or releases every route, with the states kept.
+    if !flip {
+        outputs(|o| rib.validation_changed(ValidationChange::disabled(), now, o));
+    }
+    let mut hold = true;
+    group.bench_function(format!("set_startup_{routes}"), |b| {
+        b.iter(|| {
+            hold = !hold;
+            let startup = if hold { Startup::Hold } else { Startup::Accept };
+            black_box(outputs(|o| rib.set_startup(startup, now, o)))
+        });
+    });
 }
 
 /// Entry point; `criterion_main!` is not used because its generated items

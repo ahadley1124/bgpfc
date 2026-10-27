@@ -29,7 +29,9 @@
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]), §5 (enforcement: Invalid routes left out
 //! of the decision process, or Valid ones preferred before anything else,
-//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]).
+//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]); and,
+//! RFC 6811 §2 again, routes not validated yet left out of it only when
+//! configured to ([`Rib::set_startup`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -66,11 +68,11 @@ use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
-pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState};
+pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState, Startup};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-pub use validation::{Rejudged, Revalidation, RouteStatus, Transition};
+pub use validation::{Rejudged, Revalidation, RouteStatus, StartupChange, Transition};
 
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
@@ -114,16 +116,22 @@ pub enum Held {
     /// out the state it is used with (Invalid under `drop-invalid`, RFC
     /// 6811 §5: "rejecting all "invalid" routes").
     Enforcement,
+    /// Import policy accepted it, but it has not been validated yet: it is
+    /// used with state `disabled`, and the operator's [`Startup::Hold`]
+    /// holds such routes until validation data judges them (RFC 6811 §2,
+    /// "unless explicitly configured to do so").
+    Startup,
 }
 
 impl Held {
-    /// The name used in logs and control output: `policy` or
-    /// `enforcement`.
+    /// The name used in logs and control output: `policy`,
+    /// `enforcement` or `startup`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Held::Policy => "policy",
             Held::Enforcement => "enforcement",
+            Held::Startup => "startup",
         }
     }
 }
@@ -282,6 +290,11 @@ pub enum Output {
     /// it: one report, counted, followed by the FIB changes and UPDATEs
     /// that follow. The caller logs it.
     Enforcement(Rejudged),
+    /// The operator's startup setting changed (see [`Rib::set_startup`]),
+    /// and every route used with state `disabled` was judged again under
+    /// it: one report, counted, followed by the FIB changes and UPDATEs
+    /// that follow. The caller logs it.
+    Startup(StartupChange),
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -440,6 +453,9 @@ struct Context {
     /// What the validation state does to a route's use beyond policy:
     /// [`Enforcement::Off`] until [`Rib::set_enforcement`] says otherwise.
     enforcement: Enforcement,
+    /// What a route not validated yet does: [`Startup::Accept`] until
+    /// [`Rib::set_startup`] says otherwise.
+    startup: Startup,
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -558,8 +574,9 @@ impl Rib {
     /// An empty RIB for a speaker in `local_as` with the given policies.
     /// Validation is off ([`NullSource`]: every route `Disabled`) until
     /// [`Rib::validation_changed`] gives it a source, and nothing acts on
-    /// the state beyond policy ([`Enforcement::Off`]) until
-    /// [`Rib::set_enforcement`] says otherwise.
+    /// the state beyond policy ([`Enforcement::Off`], [`Startup::Accept`])
+    /// until [`Rib::set_enforcement`] and [`Rib::set_startup`] say
+    /// otherwise.
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
@@ -574,6 +591,10 @@ impl Rib {
                     // configuration, policy MUST NOT be applied"; the
                     // daemon sets the configured mode.
                     enforcement: Enforcement::Off,
+                    // RFC 6811 §2: no route leaves the decision process
+                    // for its state "unless explicitly configured to do
+                    // so"; the daemon sets the configured setting.
+                    startup: Startup::Accept,
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
@@ -1078,7 +1099,7 @@ impl Rib {
                 let rov = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
-                    cx.enforcement,
+                    (cx.enforcement, cx.startup),
                     &mut cx.interner,
                     info,
                     (family, prefix),
@@ -1251,6 +1272,12 @@ impl Rib {
     #[must_use]
     pub fn enforcement(&self) -> Enforcement {
         self.s.cx.enforcement
+    }
+
+    /// What a route not validated yet does: used, or held.
+    #[must_use]
+    pub fn startup(&self) -> Startup {
+        self.s.cx.startup
     }
 
     /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
@@ -2171,8 +2198,8 @@ impl Judged {
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
 /// sent for `prefix` of `family`, with `attrs` as received and validation
 /// state `rov`, is a candidate for Phase 2, with which attributes, and,
-/// RFC 6811 §3, with which validation state it is used; then
-/// `enforcement` decides whether that state may be a candidate.
+/// RFC 6811 §3, with which validation state it is used; then `startup`
+/// and `enforcement` decide whether that state may be a candidate.
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -2196,11 +2223,20 @@ impl Judged {
 /// 6811 §2 asks. Policy alone decides what is kept, so that costs no
 /// further question to policy.
 ///
+/// A route policy accepts that has not been validated yet, used with
+/// state `disabled`, is held likewise ([`Held::Startup`]) under
+/// [`Startup::Hold`], the operator's explicit configuration to use no
+/// route before validation data judges it (RFC 6811 §2). The state
+/// import policy sets is the one used, as for `enforcement`, so a route
+/// policy gives a state is not held; nor is one policy holds for its
+/// state, which stays [`Held::Policy`]. Its first lookup with data gives
+/// it a state, and judges it again (RFC 6811 §4).
+///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
 fn judge(
     policies: &dyn Policies,
-    enforcement: Enforcement,
+    (enforcement, startup): (Enforcement, Startup),
     interner: &mut Interner,
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
@@ -2232,15 +2268,16 @@ fn judge(
             };
         }
     };
-    if enforcement.admits(rov_set.unwrap_or(rov)) {
-        Judged::Accepted { attrs, rov_set }
+    let used = rov_set.unwrap_or(rov);
+    let by = if !startup.admits(used) {
+        Held::Startup
+    } else if !enforcement.admits(used) {
+        Held::Enforcement
     } else {
-        // Held as received, like any held route: the set policy made of
-        // it goes back to the interner.
-        interner.release(attrs);
-        Judged::Held {
-            by: Held::Enforcement,
-            rov_set,
-        }
-    }
+        return Judged::Accepted { attrs, rov_set };
+    };
+    // Held as received, like any held route: the set policy made of it
+    // goes back to the interner.
+    interner.release(attrs);
+    Judged::Held { by, rov_set }
 }

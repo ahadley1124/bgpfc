@@ -12,6 +12,7 @@ use super::*;
 use crate::{Held, Imported, Policies, Rejudged, Revalidation, RouteOrigin, RouteStatus, Verdict};
 
 mod enforcement;
+mod startup;
 
 /// What a policy was asked about, and the validation state it was told.
 type Seen = Arc<Mutex<Vec<(&'static str, Prefix, RovState)>>>;
