@@ -34,9 +34,10 @@ fn bgpfcd_opts(lab: &Lab, passive: bool) -> BgpfcdOpts {
     BgpfcdOpts::single(BGPFC_AS, lab.a_addr, n)
 }
 
-/// Whether bgpfcd logged a line for a change of the FIB (`fib: changes`,
-/// at info whatever the level) in `mode` with at least one `op`
-/// (`install` or `delete`) and `prefix` among the prefixes it names.
+/// Whether bgpfcd logged a line for changes of the FIB (`fib: changes`,
+/// at info whatever the level, at most one a second) in `mode` with at
+/// least one `op` (`install` or `delete`) and `prefix` among the prefixes
+/// it names.
 fn fib_change(log: &str, mode: &str, op: &str, prefix: &str) -> bool {
     let count = format!("{op}=");
     log.lines()
@@ -411,12 +412,15 @@ fn fib_install_and_clean_shutdown() {
     assert!(ok, "routes not installed:\n{r}\n{}", bgpfcd.log_text());
     assert!(r.contains(&format!("via {}", lab.b_addr)), "{r}");
     assert!(r.contains("metric 20"), "{r}");
-    let log = bgpfcd.log_text();
-    assert!(
+    // The lines of the two installs: at once, or for the second, should
+    // it come within a second of the first, a second after it.
+    let ok = wait_for(Duration::from_secs(5), || {
+        let log = bgpfcd.log_text();
         fib_change(&log, "install", "install", "192.0.2.0/24")
-            && fib_change(&log, "install", "install", "198.51.100.0/24"),
-        "{log}"
-    );
+            && fib_change(&log, "install", "install", "198.51.100.0/24")
+    });
+    let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
     assert!(log.contains("msg=\"fib: applied\" op=install"), "{log}");
 
     // Withdraw one: only the other stays.

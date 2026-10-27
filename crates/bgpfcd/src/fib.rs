@@ -4,11 +4,28 @@
 //!
 //! # Logging
 //!
-//! The thread logs what it does once per change, as the RIB logs a change
-//! of the validation source: a line at info (`fib: changes`) with the mode
-//! the change ran in (`dry-run`, only reported, or `install`), the routes
-//! it installed or replaced and those it removed, the operations that
-//! failed, and its first few prefixes. A change is
+//! The thread folds what it does into lines at info (`fib: changes`), as
+//! the RIB folds a change of the validation source: each with the mode its
+//! operations ran in (`dry-run`, only reported, or `install`), the routes
+//! installed or replaced and those removed, the operations that failed,
+//! and the first few prefixes. A line counts what was done since the line
+//! before, and comes
+//!
+//! - at once for a change that ends at least [`FOLD`] after the line
+//!   before, so that a lone UPDATE is logged as it is applied;
+//! - otherwise [`FOLD`] after the line before, with everything done since:
+//!   a table that loads from a peer, an UPDATE at a time, or a burst of
+//!   VRP changes, costs a line a second however many changes it makes;
+//! - [`FOLD`] after the first operation it counts while that operation's
+//!   change goes on, so that a change that takes longer has a line a
+//!   second with the counts so far;
+//! - at once before a switch of mode, so that no line mixes the modes,
+//!   and at shutdown, so that nothing counted goes unwritten.
+//!
+//! The thread wakes for a line that is due even when nothing else comes,
+//! so the last one is written within [`FOLD`] of the last change.
+//!
+//! A change is
 //!
 //! - what the RIB made of one of its inputs: an UPDATE, a session that
 //!   went down, a change of the VRPs or of `enforcement`, a reload; the
@@ -18,16 +35,15 @@
 //! - the removal of stale routes at startup, and of every route at
 //!   shutdown.
 //!
-//! A change that moves a whole table, such as VRPs that expire or a new
-//! `enforcement`, thus costs one line rather than one per route. Each
-//! operation also has a line of its own at debug (`fib: dry-run` or
-//! `fib: applied`, with the prefix and gateway). A failed one has a line
-//! at error (`fib: failed`) instead, for the first [`FAILURES_LOGGED`] of
-//! a change and at debug after them, and the change's line is then at
-//! error too, counting them all.
+//! Each operation also has a line of its own at debug (`fib: dry-run` or
+//! `fib: applied`, with the prefix and gateway), written as it is done. A
+//! failed one has a line at error (`fib: failed`) instead, at once, for
+//! the first [`FAILURES_LOGGED`] of a change and at debug after them, and
+//! the line that counts it is at error too.
 
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
 use bgpfc_log::Level;
@@ -40,12 +56,20 @@ use crate::rib::{Line, listed, log_line};
 /// is one RIB input's changes, or [`crate::rib::FIB_BATCH`] of a long one.
 const QUEUE: usize = 64;
 
-/// The message of the line logged for each change.
+/// The message of the lines that count what the thread did.
 const CHANGES: &str = "fib: changes";
 
-/// Prefixes the line of a change names, the first it operated on; `...`
-/// marks the rest.
+/// Prefixes a line names, the first operated on since the line before;
+/// `...` marks the rest.
 const SAMPLE: usize = 8;
+
+/// The shortest time between two lines while the routes keep changing,
+/// and the longest a change waits for its line. A table that loads from a
+/// peer comes in tens of thousands of UPDATEs, each a change: a line a
+/// second shows its progress, at a few hundred bytes a second, where a
+/// line per UPDATE would bury the rest of the log; and a change that comes
+/// alone is still logged at once.
+pub(crate) const FOLD: Duration = Duration::from_secs(1);
 
 /// Failed operations of one change that get a line at error each; the
 /// rest are counted on the change's line, and have a line at debug. A
@@ -66,15 +90,25 @@ pub(crate) const FAILURES_LOGGED: usize = 3;
 pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibError> {
     fib.open()?;
     let flushed = fib.sync()?;
-    // The flush is a change of its own.
-    let mut change = Tally::default();
+    // The flush is a change of its own, written at once.
+    let mut fold = Fold::default();
     let mut log = logger();
-    report(&mut change, &flushed, debug(), &mut log);
-    finish(&mut change, &mut log);
+    fold.add(&flushed, debug(), Instant::now(), &mut log);
+    fold.end_change();
+    fold.flush(Instant::now(), &mut log);
     let (tx, rx) = sync_channel(QUEUE);
     thread::Builder::new()
         .name("fib".to_owned())
-        .spawn(move || serve(fib, &rx, &debug, &mut logger()))
+        .spawn(move || {
+            serve(
+                fib,
+                fold,
+                &mut receiver(&rx),
+                &Instant::now,
+                &debug,
+                &mut logger(),
+            );
+        })
         .expect("spawning the fib thread");
     Ok(tx)
 }
@@ -91,11 +125,26 @@ fn debug() -> bool {
     bgpfc_log::enabled(Level::Debug)
 }
 
-/// The thread's loop, until a shutdown or until every sender is gone,
-/// the lines it logs going to `out`.
+/// The thread's wait for its next message on `rx`: until a deadline, if
+/// it has one, when a line is due. The tests script the messages and the
+/// time instead.
+fn receiver(
+    rx: &Receiver<FibMsg>,
+) -> impl FnMut(Option<Instant>) -> Result<FibMsg, RecvTimeoutError> + '_ {
+    move |deadline| match deadline {
+        None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+    }
+}
+
+/// The thread's loop, until a shutdown or until every sender is gone:
+/// messages from `recv`, which waits no longer than the deadline it is
+/// given, the time from `now`, and the lines it logs going to `out`.
 fn serve(
     mut fib: Fib,
-    rx: &Receiver<FibMsg>,
+    mut fold: Fold,
+    recv: &mut impl FnMut(Option<Instant>) -> Result<FibMsg, RecvTimeoutError>,
+    now: &impl Fn() -> Instant,
     debug: &impl Fn() -> bool,
     out: &mut impl FnMut(Line),
 ) {
@@ -104,14 +153,17 @@ fn serve(
     // A switch to install in progress, and the operations it took.
     let mut merge: Option<Merge> = None;
     let mut ops = 0;
-    // What the change under way did so far.
-    let mut change = Tally::default();
-    while let Ok(msg) = rx.recv() {
+    loop {
+        let msg = match recv(fold.due()) {
+            Ok(msg) => msg,
+            // Nothing came before a line was due.
+            Err(RecvTimeoutError::Timeout) => {
+                fold.flush_due(now(), out);
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         applied.clear();
-        // Whether the message ends the change it belongs to. The control
-        // thread's queries come between a change's batches too, and leave
-        // it open.
-        let mut ends = false;
         match msg {
             FibMsg::Changes { changes, more } => {
                 let changes = changes.iter().map(|c| Change {
@@ -120,12 +172,17 @@ fn serve(
                     previous: c.previous,
                 });
                 fib.set_all(changes, &mut applied);
-                ends = !more;
+                fold.add(&applied, debug(), now(), out);
+                // The control thread's queries come between a change's
+                // batches too, and leave it open.
+                if !more {
+                    fold.end_change();
+                }
             }
             FibMsg::SetMode(mode) => {
-                // A switch is a change of its own; the RIB sends it
-                // between inputs, so no change of the RIB is open.
-                finish(&mut change, out);
+                // No line mixes the modes. The RIB sends a switch between
+                // its inputs, so no change of the RIB is open.
+                fold.flush(now(), out);
                 out(Line {
                     level: Level::Info,
                     msg: "fib: mode",
@@ -139,6 +196,8 @@ fn serve(
                 if let Some(m) = &mut merge {
                     fib.reconcile(m, &routes, &mut applied);
                 }
+                ops += applied.len();
+                fold.add(&applied, debug(), now(), out);
             }
             FibMsg::ReconcileEnd(reply) => {
                 if let Some(m) = merge.take() {
@@ -146,7 +205,8 @@ fn serve(
                 }
                 let _ = reply.send(ops + applied.len());
                 ops = 0;
-                ends = true;
+                fold.add(&applied, debug(), now(), out);
+                fold.end_change();
             }
             FibMsg::Mode(reply) => {
                 let _ = reply.send(fib.mode());
@@ -158,41 +218,133 @@ fn serve(
                 });
             }
             FibMsg::Shutdown(done) => {
-                // What the RIB sent of a change it had not finished,
-                // then the cleanup, a change of its own.
-                finish(&mut change, out);
-                report(&mut change, &fib.clear(), debug(), out);
-                finish(&mut change, out);
+                // What was counted, of a change the RIB may not have
+                // finished, then the cleanup, a change of its own: both
+                // at once, as nothing follows.
+                fold.end_change();
+                fold.flush(now(), out);
+                fold.add(&fib.clear(), debug(), now(), out);
+                fold.end_change();
+                fold.flush(now(), out);
                 let _ = done.send(());
                 return;
             }
         }
-        ops += applied.len();
-        report(&mut change, &applied, debug(), out);
-        if ends {
-            finish(&mut change, out);
-        }
+        fold.flush_due(now(), out);
     }
-    finish(&mut change, out);
+    fold.flush(now(), out);
 }
 
-/// Count `applied` into `change` and write the lines of its operations.
-fn report(change: &mut Tally, applied: &[Applied], debug: bool, out: &mut impl FnMut(Line)) {
-    for a in applied {
-        if let Some(line) = change.add(a, debug) {
+/// What the thread did since its last `fib: changes` line, and when the
+/// next is due (see the module documentation, "Logging").
+#[derive(Debug, Default)]
+struct Fold {
+    /// The operations since the last line.
+    tally: Tally,
+    /// When the first of them was counted; `None` while there is none.
+    since: Option<Instant>,
+    /// When the last line was written.
+    last_line: Option<Instant>,
+    /// Whether the change under way has more to come: further batches of
+    /// a RIB input, or the rest of a reconcile.
+    in_change: bool,
+    /// The failed operations of the change under way, for
+    /// [`FAILURES_LOGGED`].
+    change_failed: usize,
+}
+
+impl Fold {
+    /// Count `applied`, done at `now` in the change under way, and write
+    /// the lines of its operations: at debug with `debug`, and at error
+    /// for the first failures of the change.
+    fn add(&mut self, applied: &[Applied], debug: bool, now: Instant, out: &mut impl FnMut(Line)) {
+        self.in_change = true;
+        if applied.is_empty() {
+            return;
+        }
+        self.since.get_or_insert(now);
+        for a in applied {
+            self.tally.add(a);
+            let (level, msg) = match a.result {
+                Ok(()) if debug => (
+                    Level::Debug,
+                    if a.dry_run {
+                        "fib: dry-run"
+                    } else {
+                        "fib: applied"
+                    },
+                ),
+                Ok(()) => continue,
+                Err(_) => {
+                    self.change_failed += 1;
+                    if self.change_failed <= FAILURES_LOGGED {
+                        (Level::Error, "fib: failed")
+                    } else if debug {
+                        (Level::Debug, "fib: failed")
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            out(op_line(a, level, msg));
+        }
+    }
+
+    /// The change under way has ended: the next operation starts another.
+    fn end_change(&mut self) {
+        self.in_change = false;
+        self.change_failed = 0;
+    }
+
+    /// When the operations counted are to be written, if there are any:
+    /// [`FOLD`] after the first of them while their change goes on;
+    /// otherwise [`FOLD`] after the line before, or at once after none.
+    fn due(&self) -> Option<Instant> {
+        let since = self.since?;
+        let after = |t: Instant| t.checked_add(FOLD).unwrap_or(t);
+        Some(if self.in_change {
+            after(since)
+        } else {
+            self.last_line.map_or(since, after)
+        })
+    }
+
+    /// Write the line of what was counted if it is due at `now`.
+    fn flush_due(&mut self, now: Instant, out: &mut impl FnMut(Line)) {
+        if self.due().is_some_and(|due| due <= now) {
+            self.flush(now, out);
+        }
+    }
+
+    /// Write the line of what was counted, if anything was, at `now`.
+    fn flush(&mut self, now: Instant, out: &mut impl FnMut(Line)) {
+        if let Some(line) = std::mem::take(&mut self.tally).summary() {
             out(line);
+            self.last_line = Some(now);
         }
+        self.since = None;
     }
 }
 
-/// Write the line of `change`, if it did anything, and start the next.
-fn finish(change: &mut Tally, out: &mut impl FnMut(Line)) {
-    if let Some(line) = std::mem::take(change).summary() {
-        out(line);
+/// The line of one operation: its kind, prefix and gateway, and the
+/// kernel's error if it failed.
+fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
+    let (op, prefix, gateway) = match &a.op {
+        Op::Set { prefix, gateway } => ("install", prefix, gateway),
+        Op::Delete { prefix, gateway } => ("delete", prefix, gateway),
+    };
+    let mut fields = vec![
+        ("op", op.to_owned()),
+        ("prefix", prefix.to_string()),
+        ("gateway", gateway.to_string()),
+    ];
+    if let Err(e) = &a.result {
+        fields.push(("error", e.to_string()));
     }
+    Line { level, msg, fields }
 }
 
-/// What the FIB thread did for one change, for the change's line.
+/// What the operations of one line did.
 #[derive(Debug, Default)]
 struct Tally {
     /// Routes installed or replaced, or in dry-run that would be.
@@ -201,7 +353,8 @@ struct Tally {
     delete: usize,
     /// Operations that failed.
     failed: usize,
-    /// Whether the operations were only reported (dry-run).
+    /// Whether the operations were only reported (dry-run). A switch of
+    /// mode writes the line before it, so all of them were or none.
     dry_run: bool,
     /// The first [`SAMPLE`] prefixes operated on.
     sample: Vec<Prefix>,
@@ -213,13 +366,10 @@ impl Tally {
         self.install + self.delete + self.failed
     }
 
-    /// Count `a`, and return its own line, if it gets one: a failure at
-    /// error while fewer than [`FAILURES_LOGGED`] failed before it in the
-    /// change, and any operation at debug with `debug`.
-    fn add(&mut self, a: &Applied, debug: bool) -> Option<Line> {
-        let (op, prefix, gateway) = match &a.op {
-            Op::Set { prefix, gateway } => ("install", prefix, gateway),
-            Op::Delete { prefix, gateway } => ("delete", prefix, gateway),
+    /// Count `a`.
+    fn add(&mut self, a: &Applied) {
+        let prefix = match &a.op {
+            Op::Set { prefix, .. } | Op::Delete { prefix, .. } => prefix,
         };
         if self.ops() == 0 {
             self.dry_run = a.dry_run;
@@ -227,48 +377,15 @@ impl Tally {
         if self.sample.len() < SAMPLE {
             self.sample.push(*prefix);
         }
-        // Counted first; the fields are built only for a line written.
-        let (level, msg, error) = match &a.result {
-            Ok(()) => {
-                match a.op {
-                    Op::Set { .. } => self.install += 1,
-                    Op::Delete { .. } => self.delete += 1,
-                }
-                if !debug {
-                    return None;
-                }
-                let msg = if a.dry_run {
-                    "fib: dry-run"
-                } else {
-                    "fib: applied"
-                };
-                (Level::Debug, msg, None)
-            }
-            Err(e) => {
-                self.failed += 1;
-                let level = if self.failed <= FAILURES_LOGGED {
-                    Level::Error
-                } else if debug {
-                    Level::Debug
-                } else {
-                    return None;
-                };
-                (level, "fib: failed", Some(e))
-            }
-        };
-        let mut fields = vec![
-            ("op", op.to_owned()),
-            ("prefix", prefix.to_string()),
-            ("gateway", gateway.to_string()),
-        ];
-        if let Some(e) = error {
-            fields.push(("error", e.to_string()));
+        match (&a.result, &a.op) {
+            (Err(_), _) => self.failed += 1,
+            (Ok(()), Op::Set { .. }) => self.install += 1,
+            (Ok(()), Op::Delete { .. }) => self.delete += 1,
         }
-        Some(Line { level, msg, fields })
     }
 
-    /// The change's line, or `None` if it did nothing: at error if an
-    /// operation failed.
+    /// The line, or `None` if nothing was done: at error if an operation
+    /// failed.
     fn summary(self) -> Option<Line> {
         let ops = self.ops();
         if ops == 0 {
@@ -309,6 +426,8 @@ pub(crate) const fn mode_of(m: bgpfc_config::ast::FibMode) -> Mode {
 mod tests {
     use super::*;
 
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::net::IpAddr;
 
     use bgpfc_fib::FibError;
@@ -321,6 +440,10 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
     }
 
     /// The `i`th of a run of /24s, 10.0.0.0/24 first.
@@ -373,22 +496,40 @@ mod tests {
             .collect()
     }
 
-    /// The lines of `applied`, in batches, as one change.
+    /// The value of the field `key` of `line`.
+    fn field(line: &Line, key: &str) -> String {
+        let (_, value) = line
+            .fields
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("no {key} in {line:?}"));
+        value.clone()
+    }
+
+    /// The number in the field `key` of `line`.
+    fn count(line: &Line, key: &str) -> usize {
+        field(line, key).parse().unwrap()
+    }
+
+    /// The lines of `applied`, in batches, as one change that comes alone.
     fn change_lines(batches: &[&[Applied]], debug: bool) -> Vec<Line> {
         let mut lines = Vec::new();
-        let mut change = Tally::default();
+        let mut fold = Fold::default();
+        let now = Instant::now();
         for batch in batches {
-            report(&mut change, batch, debug, &mut |l| lines.push(l));
+            fold.add(batch, debug, now, &mut |l| lines.push(l));
         }
-        finish(&mut change, &mut |l| lines.push(l));
-        // Finished: the next change starts empty.
-        finish(&mut change, &mut |l| lines.push(l));
+        fold.end_change();
+        fold.flush_due(now, &mut |l| lines.push(l));
+        // Written: nothing is left to write.
+        assert_eq!(fold.due(), None);
+        fold.flush(now, &mut |l| lines.push(l));
         lines
     }
 
-    /// A change that moves a table is one line at info however many
-    /// routes it moved, in however many batches: the counts by
-    /// operation, the mode and the first prefixes.
+    /// A change that moves a table, and comes alone, is one line at info
+    /// at once however many routes it moved, in however many batches: the
+    /// counts by operation, the mode and the first prefixes.
     #[test]
     fn a_change_is_one_line_at_info() {
         let installs: Vec<Applied> = (0..1000).map(|i| set(&nth(i), true)).collect();
@@ -415,8 +556,8 @@ mod tests {
         assert_eq!(change_lines(&[&[], &[]], true), []);
     }
 
-    /// At debug every operation has a line of its own too, as before the
-    /// change's line, with its prefix and gateway.
+    /// At debug every operation has a line of its own too, as it is done,
+    /// with its prefix and gateway.
     #[test]
     fn each_operation_has_a_line_at_debug() {
         let lines = change_lines(
@@ -442,10 +583,11 @@ mod tests {
         assert_eq!(lines[1].fields[0], ("mode", "install".to_owned()));
     }
 
-    /// The first failures of a change are at error, the others at debug,
-    /// and the change's line is at error, counting them all.
+    /// The first three failures of a change are at error, the others at
+    /// debug, and the change's line is at error, counting them all.
     #[test]
     fn failures_are_at_error_up_to_a_bound() {
+        assert_eq!(FAILURES_LOGGED, 3);
         let ops: Vec<Applied> = (0..FAILURES_LOGGED + 5)
             .map(|i| refused(&nth(i)))
             .chain([set("192.0.2.0/24", false)])
@@ -466,7 +608,6 @@ mod tests {
             ]
         );
         let summary = &written(&lines)[FAILURES_LOGGED];
-        assert_eq!(FAILURES_LOGGED, 3);
         assert!(
             summary.starts_with(
                 "1970-01-01T00:00:00.000Z ERROR msg=\"fib: changes\" mode=install \
@@ -482,109 +623,278 @@ mod tests {
                 .iter()
                 .all(|l| l.level == Level::Debug && l.msg == "fib: failed")
         );
-        // The bound is per change: the next one starts again.
-        let mut change = Tally::default();
-        let mut errors = 0;
+        // The bound is per change, not per line: a change that starts
+        // before the line of the one before is written starts again, and
+        // its errors are written at once.
+        let mut fold = Fold::default();
+        let now = Instant::now();
+        let mut errors = Vec::new();
         for _ in 0..2 {
-            report(&mut change, &ops, false, &mut |l| {
-                errors += usize::from(l.msg == "fib: failed");
-            });
-            finish(&mut change, &mut |_| {});
+            fold.add(&ops, false, now, &mut |l| errors.push(l));
+            fold.end_change();
         }
-        assert_eq!(errors, 2 * FAILURES_LOGGED);
+        assert_eq!(errors.len(), 2 * FAILURES_LOGGED);
+        assert!(errors.iter().all(|l| l.msg == "fib: failed"));
+        fold.flush(now, &mut |l| errors.push(l));
+        assert_eq!(count(&errors[2 * FAILURES_LOGGED], "failed"), 16);
     }
 
-    /// The thread writes a line per change: once the RIB's last batch of
-    /// an input is in, however many came and whatever the control thread
-    /// asked in between; for a switch to install mode, with its
-    /// reconcile; and for what is left of a change at shutdown.
+    /// Changes that keep coming get a line a second, each counting what
+    /// was done since the line before; one that comes after a quiet
+    /// second gets its line at once.
     #[test]
-    fn the_thread_writes_a_line_per_change() {
-        let batch = |range: std::ops::Range<usize>| -> Vec<FibChange> {
-            range
-                .map(|i| FibChange {
-                    family: AddressFamily::IPV4_UNICAST,
-                    prefix: p(&nth(i)),
-                    next_hop: Some(ip("192.0.2.1")),
-                    previous: None,
-                })
-                .collect()
-        };
-        let (tx, rx) = sync_channel(16);
-        let send = |msg| tx.send(msg).unwrap();
-        // An input of two full batches and a closing empty one, with a
-        // query of the control thread between them.
-        send(FibMsg::Changes {
-            changes: batch(0..256),
-            more: true,
-        });
-        let (mode_tx, mode_rx) = sync_channel(1);
-        send(FibMsg::Mode(mode_tx));
-        send(FibMsg::Changes {
-            changes: batch(256..512),
-            more: true,
-        });
-        send(FibMsg::Changes {
-            changes: Vec::new(),
-            more: false,
-        });
-        // An input of one route.
-        send(FibMsg::Changes {
-            changes: batch(512..513),
-            more: false,
-        });
-        // A switch to install: with no socket, every operation of its
-        // reconcile fails.
-        send(FibMsg::SetMode(Mode::Install));
-        send(FibMsg::Reconcile(vec![(
-            p("192.0.2.0/24"),
-            ip("192.0.2.1"),
-        )]));
-        let (end_tx, end_rx) = sync_channel(1);
-        send(FibMsg::ReconcileEnd(end_tx));
-        // Half an input, then the shutdown.
-        send(FibMsg::Changes {
-            changes: batch(600..610),
-            more: true,
-        });
-        let (done_tx, done_rx) = sync_channel(1);
-        send(FibMsg::Shutdown(done_tx));
+    fn changes_that_keep_coming_get_a_line_a_second() {
+        let t0 = Instant::now();
+        let mut fold = Fold::default();
         let mut lines = Vec::new();
-        serve(Fib::new(Mode::DryRun, 254, 186), &rx, &|| false, &mut |l| {
-            lines.push(l);
-        });
+        let change = |fold: &mut Fold, at: Duration, prefix: &str, lines: &mut Vec<_>| {
+            let mut out = |l| lines.push((at, l));
+            fold.add(&[set(prefix, true)], false, t0 + at, &mut out);
+            fold.end_change();
+            fold.flush_due(t0 + at, &mut out);
+        };
+        // The first comes alone: written at once.
+        change(&mut fold, ms(0), "192.0.2.0/24", &mut lines);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(fold.due(), None);
+        // Two more within the second: folded, due a second after the
+        // first line, and written then, or once the thread wakes after.
+        change(&mut fold, ms(100), "198.51.100.0/24", &mut lines);
+        change(&mut fold, ms(300), "203.0.113.0/24", &mut lines);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(fold.due(), Some(t0 + ms(1000)));
+        fold.flush_due(t0 + ms(999), &mut |l| lines.push((ms(999), l)));
+        assert_eq!(lines.len(), 1);
+        fold.flush_due(t0 + ms(1000), &mut |l| lines.push((ms(1000), l)));
+        assert_eq!(lines.len(), 2);
+        let (at, line) = &lines[1];
+        assert_eq!(*at, ms(1000));
+        assert_eq!(count(line, "install"), 2);
+        assert_eq!(field(line, "prefixes"), "198.51.100.0/24,203.0.113.0/24");
+        // One within a second of that line waits for the next second.
+        change(&mut fold, ms(1500), "192.0.2.0/24", &mut lines);
+        assert_eq!(fold.due(), Some(t0 + ms(2000)));
+        fold.flush_due(t0 + ms(2000), &mut |l| lines.push((ms(2000), l)));
+        // After a quiet second, one is written at once again.
+        change(&mut fold, ms(5000), "192.0.2.0/24", &mut lines);
+        let times: Vec<Duration> = lines.iter().map(|(at, _)| *at).collect();
+        assert_eq!(times, [ms(0), ms(1000), ms(2000), ms(5000)]);
+    }
+
+    /// A change that takes longer than a second, such as one that moves a
+    /// whole table, has a line a second with the counts so far, and the
+    /// rest when it ends; nothing is counted twice or lost.
+    #[test]
+    fn a_long_change_has_a_line_a_second_with_the_counts_so_far() {
+        let t0 = Instant::now();
+        let mut fold = Fold::default();
+        let mut lines = Vec::new();
+        // A batch of 256 every 400 ms, the last at 2.4 s ending it.
+        for (n, at) in (0..=6).map(|n| (n, ms(400 * n))) {
+            let batch: Vec<Applied> = (0..256)
+                .map(|i| set(&nth(usize::try_from(n).unwrap() * 256 + i), true))
+                .collect();
+            let mut out = |l| lines.push((at, l));
+            fold.add(&batch, false, t0 + at, &mut out);
+            if n == 6 {
+                fold.end_change();
+            }
+            fold.flush_due(t0 + at, &mut out);
+        }
+        let seen: Vec<(Duration, usize)> = lines
+            .iter()
+            .map(|(at, l)| (*at, count(l, "install")))
+            .collect();
+        // Due a second after the first batch: written with the batch at
+        // 1.2 s. The next due a second after the batch at 1.6 s; the end
+        // of the change makes it due a second after the line at 1.2 s.
+        assert_eq!(seen, [(ms(1200), 4 * 256), (ms(2400), 3 * 256)]);
+        assert_eq!(fold.due(), None);
+    }
+
+    /// The message sequence the tests feed the thread: a message, or a
+    /// wait with nothing coming.
+    enum Step {
+        Msg(FibMsg),
+        Wait(Duration),
+    }
+
+    /// Run the thread over `script`, on a clock of its own that starts at
+    /// `t0` and moves only with the script's waits, and for as long as
+    /// the thread waits for a line that is due. The lines it writes, with
+    /// the time from `t0` at which it wrote them.
+    fn run(t0: Instant, script: Vec<Step>) -> Vec<(Duration, Line)> {
+        let clock = Cell::new(t0);
+        let script = RefCell::new(VecDeque::from(script));
+        let mut recv = |deadline: Option<Instant>| loop {
+            let step = script.borrow_mut().pop_front();
+            match step {
+                None => return Err(RecvTimeoutError::Disconnected),
+                Some(Step::Msg(msg)) => return Ok(msg),
+                Some(Step::Wait(d)) => {
+                    let until = clock.get() + d;
+                    match deadline {
+                        // The thread wakes at its deadline; the rest of
+                        // the wait follows.
+                        Some(due) if due <= until => {
+                            clock.set(due.max(clock.get()));
+                            script
+                                .borrow_mut()
+                                .push_front(Step::Wait(until - clock.get()));
+                            return Err(RecvTimeoutError::Timeout);
+                        }
+                        _ => clock.set(until),
+                    }
+                }
+            }
+        };
+        let mut lines = Vec::new();
+        serve(
+            Fib::new(Mode::DryRun, 254, 186),
+            Fold::default(),
+            &mut recv,
+            &|| clock.get(),
+            &|| false,
+            &mut |l| lines.push((clock.get() - t0, l)),
+        );
+        lines
+    }
+
+    fn batch(range: std::ops::Range<usize>) -> Vec<FibChange> {
+        range
+            .map(|i| FibChange {
+                family: AddressFamily::IPV4_UNICAST,
+                prefix: p(&nth(i)),
+                next_hop: Some(ip("192.0.2.1")),
+                previous: None,
+            })
+            .collect()
+    }
+
+    fn changes(range: std::ops::Range<usize>, more: bool) -> Step {
+        Step::Msg(FibMsg::Changes {
+            changes: batch(range),
+            more,
+        })
+    }
+
+    /// The thread writes a line at once for a change that comes alone,
+    /// once the RIB's last batch of it is in, whatever the control thread
+    /// asked in between; folds those that follow within a second, and
+    /// wakes to write them when nothing else comes; writes what it
+    /// counted before a switch of mode, and at shutdown.
+    #[test]
+    fn the_thread_folds_its_lines_by_time() {
+        let (mode_tx, mode_rx) = sync_channel(1);
+        let (end_tx, end_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let lines = run(
+            Instant::now(),
+            vec![
+                // An input of two full batches and a closing empty one,
+                // with a query of the control thread between them.
+                changes(0..256, true),
+                Step::Msg(FibMsg::Mode(mode_tx)),
+                changes(256..512, true),
+                changes(0..0, false),
+                // Two inputs of a few routes within the next second.
+                Step::Wait(ms(100)),
+                changes(512..513, false),
+                Step::Wait(ms(200)),
+                changes(513..515, false),
+                // Nothing for two seconds: the thread wakes at 1 s.
+                Step::Wait(ms(2000)),
+                // A switch to install at 2.3 s: with no socket, every
+                // operation of its reconcile fails.
+                Step::Msg(FibMsg::SetMode(Mode::Install)),
+                Step::Msg(FibMsg::Reconcile(vec![(
+                    p("192.0.2.0/24"),
+                    ip("192.0.2.1"),
+                )])),
+                Step::Msg(FibMsg::ReconcileEnd(end_tx)),
+                // Half an input, then the shutdown, before its line is due.
+                changes(600..610, true),
+                Step::Wait(ms(500)),
+                Step::Msg(FibMsg::Shutdown(done_tx)),
+            ],
+        );
         assert_eq!(mode_rx.try_recv().unwrap(), Mode::DryRun);
         assert_eq!(end_rx.try_recv().unwrap(), 1);
         assert!(done_rx.try_recv().is_ok());
-        let summary = |l: &Line| {
-            let value = |k| l.fields.iter().find(|(f, _)| *f == k).unwrap().1.clone();
-            (l.msg, value("mode"), value("install"), value("failed"))
-        };
-        let changes: Vec<_> = lines
+        let summaries: Vec<_> = lines
             .iter()
-            .filter(|l| l.msg != "fib: failed" && l.msg != "fib: mode")
-            .map(summary)
+            .filter(|(_, l)| l.msg == CHANGES)
+            .map(|(at, l)| {
+                (
+                    *at,
+                    field(l, "mode"),
+                    count(l, "install"),
+                    count(l, "failed"),
+                )
+            })
             .collect();
-        let own = |mode: &str, install: &str, failed: &str| {
-            (
-                CHANGES,
-                mode.to_owned(),
-                install.to_owned(),
-                failed.to_owned(),
-            )
-        };
+        let line = |at, mode: &str, install, failed| (ms(at), mode.to_owned(), install, failed);
         assert_eq!(
-            changes,
+            summaries,
             [
-                own("dry-run", "512", "0"),
-                own("dry-run", "1", "0"),
-                own("install", "0", "1"),
-                own("install", "0", "10"),
+                line(0, "dry-run", 512, 0),
+                line(1000, "dry-run", 3, 0),
+                line(2300, "install", 0, 1),
+                line(2800, "install", 0, 10),
             ]
         );
-        // The mode line comes before the switch's line.
-        let mode = lines.iter().position(|l| l.msg == "fib: mode").unwrap();
-        assert_eq!(lines[mode].fields, [("mode", "install".to_owned())]);
-        assert_eq!(lines[mode + 1].msg, "fib: failed");
+        // The mode line comes before the switch's error line, which is
+        // written at once; of the ten failures of the half input, the
+        // first three are, at once too.
+        let at = |msg: &str| -> Vec<Duration> {
+            lines
+                .iter()
+                .filter(|(_, l)| l.msg == msg)
+                .map(|(at, _)| *at)
+                .collect()
+        };
+        assert_eq!(at("fib: mode"), [ms(2300)]);
+        assert_eq!(at("fib: failed"), [ms(2300); 4]);
+        let mode = lines
+            .iter()
+            .position(|(_, l)| l.msg == "fib: mode")
+            .unwrap();
+        assert_eq!(lines[mode + 1].1.msg, "fib: failed");
+    }
+
+    /// While changes keep coming, a line a second at most, each at least
+    /// a second after the one before; the last within a second of the
+    /// last change; and every operation counted once.
+    #[test]
+    fn a_stream_of_changes_is_a_line_a_second() {
+        let mut script = Vec::new();
+        for i in 0..1000 {
+            script.push(changes(i..i + 1, false));
+            script.push(Step::Wait(ms(10)));
+        }
+        script.push(Step::Wait(ms(5000)));
+        let lines = run(Instant::now(), script);
+        let times: Vec<Duration> = lines.iter().map(|(at, _)| *at).collect();
+        assert_eq!(times.len(), 11, "{times:?}");
+        assert!(
+            times.windows(2).all(|w| w[1].saturating_sub(w[0]) >= FOLD),
+            "{times:?}"
+        );
+        // The last change came at 9.99 s.
+        assert!(times[10] <= ms(9990) + FOLD, "{times:?}");
+        let total: usize = lines.iter().map(|(_, l)| count(l, "install")).sum();
+        assert_eq!(total, 1000);
+    }
+
+    /// Every sender gone: what was counted is written before the thread
+    /// ends.
+    #[test]
+    fn nothing_counted_is_lost_when_the_senders_go() {
+        let lines = run(
+            Instant::now(),
+            vec![changes(0..1, false), changes(1..3, false)],
+        );
+        let installs: Vec<usize> = lines.iter().map(|(_, l)| count(l, "install")).collect();
+        assert_eq!(installs, [1, 2]);
     }
 }

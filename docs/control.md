@@ -285,16 +285,16 @@ Nothing is uncounted: the first line counts every move per pair of
 states, and `show routes` gives every route's current state. A knob
 would change no outcome, only how much is written.
 
-The FIB thread folds its lines the same way. Whatever made a change, it
-writes one line at info for it (`fib: changes`): the `mode` it ran in
+The FIB thread folds its lines too, by time. It writes a line at info
+(`fib: changes`) at most once a second while the routes keep changing,
+each counting what was done since the line before: the `mode` it ran in
 (`dry-run`, only reported, or `install`, sent to the kernel), the routes
 installed or replaced (`install`) and removed (`delete`), the operations
 that failed (`failed`), and the first eight prefixes, `...` marking the
 rest. A change of state or of `enforcement` takes at most one operation
 for each destination it counts in `best_changed`: a removal for one whose
 only route it held, an install for one whose best route has another next
-hop. They come in one line, however many there are; the `enforcement`
-change above, `best_changed=4800`, comes with
+hop. The `enforcement` change above, `best_changed=4800`, comes with
 
 ```
 2026-10-22T12:34:56.789Z INFO  msg="fib: changes" mode=install install=1300 delete=3500 failed=0 prefixes=192.0.2.0/24,192.0.2.128/25,198.51.100.0/24,198.51.100.0/25,203.0.113.0/24,203.0.113.0/25,203.0.113.128/25,2001:db8::/32,...
@@ -304,16 +304,27 @@ For the FIB thread a change is what the RIB made of one of its inputs (an
 UPDATE, a session that went down, a change of the VRPs or of
 `enforcement`, a reload), a switch to install mode with its reconcile,
 the removal of stale routes at startup, or that of every route at
-shutdown. A table that loads from a peer arrives in many UPDATEs, and so
-gets a line for each UPDATE that changed the FIB, never one per route.
+shutdown. A change that comes a second or more after the last line gets
+its line at once, as soon as it is applied. Those that follow within the
+second are added up and written a second after that line: a table that
+loads from a peer, an UPDATE at a time, or a burst of VRP changes, costs
+one line a second however many changes it makes, never one per route or
+per UPDATE. A change that takes more than a second to apply, such as one
+that moves a whole table, has a line a second with the counts so far. The
+thread writes what it counted within a second of the last change even if
+nothing else happens, at once before a switch of mode, so that no line
+mixes the modes, and at shutdown, so that every operation is counted on
+some line. The lines' counts add up to every operation done.
+
 Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
-applied`, with `op`, `prefix` and `gateway`). A failed operation has one
-at error (`fib: failed`, with the kernel's `error`), the first three of
-a change, the others at `debug`, and the change's line is then at error
-too, counting them all: a kernel that refuses one route, for want of
-`CAP_NET_ADMIN` or for a next hop it cannot reach directly, often refuses
-the whole table, and the first already names the reason. At `log {
-level warn; }` the FIB thread writes only its failures.
+applied`, with `op`, `prefix` and `gateway`), written as it is done. A
+failed operation has one at error (`fib: failed`, with the kernel's
+`error`), at once, the first three of a change, the others at `debug`,
+and the `fib: changes` line that counts it is then at error too: a kernel
+that refuses one route, for want of `CAP_NET_ADMIN` or for a next hop it
+cannot reach directly, often refuses the whole table, and the first
+already names the reason. At `log { level warn; }` the FIB thread writes
+only its failures.
 
 ## RPKI
 

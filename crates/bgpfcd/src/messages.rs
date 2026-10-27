@@ -141,7 +141,8 @@ pub(crate) enum FibMsg {
         /// The changes.
         changes: Vec<bgpfc_rib::FibChange>,
         /// Whether more batches of the same input follow. The FIB thread
-        /// logs a line per input, once its last batch is in (see
+        /// writes the line of an input that comes alone once its last
+        /// batch is in, and bounds its error lines per input (see
         /// `crate::fib`, "Logging"); an input whose changes all went in
         /// batches marked so ends with an empty one.
         more: bool,

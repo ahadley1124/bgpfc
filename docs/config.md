@@ -884,8 +884,8 @@ every interior cost counts as equal in step 7. A route whose next hop is
 unreachable can therefore be chosen and advertised. With `fib { mode
 install; }` the kernel refuses to install a route whose gateway it cannot
 reach directly, and the failure is logged at error as `fib: failed` (the
-first three of a change, and every one counted on the change's line,
-`docs/control.md`), but the route stays chosen.
+first three of a change, and every one counted on the `fib: changes`
+lines, `docs/control.md`), but the route stays chosen.
 
 Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
 first, as the most significant part of the degree of preference that RFC

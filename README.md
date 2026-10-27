@@ -291,9 +291,10 @@ In `fib { mode dry-run; }`, bgpfc computes every kernel route change and logs it
 but never writes to the kernel. `mode install` applies the changes. The mode can
 be overridden at startup with `bgpfcd --fib dry-run|install` and changed at
 runtime with `bgpfcctl fib mode <dry-run|install>`. **Dry-run is the default.**
-In either mode the log has one line at info per change of the routing table,
-counting the routes installed and removed and naming the first few, and a line
-per route at debug (`docs/control.md`, "Validation state").
+In either mode the log has a line at info at most once a second while the
+routing table changes, counting the routes installed and removed since the line
+before and naming the first few, and a line per route at debug
+(`docs/control.md`, "Validation state").
 
 In install mode, bgpfc only touches routes tagged with its own protocol number.
 At startup it flushes stale routes left by a previous run, and it never modifies
