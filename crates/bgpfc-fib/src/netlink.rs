@@ -199,9 +199,36 @@ pub fn parse_error(payload: &[u8]) -> Result<i32, NetlinkError> {
     }
 }
 
+/// The value of an `NLMSG_DONE` payload: how the dump ended, a negative
+/// errno for an error, zero when it ended well. The kernel writes it in
+/// `netlink_dump_done` (`dump_done_errno`), iproute2 reads it
+/// (`rtnl_dump_done`), and a dump that ends with an error is not the whole
+/// table. A payload too short to hold one says nothing more than that the
+/// dump ended: zero.
+#[must_use]
+pub fn parse_done(payload: &[u8]) -> i32 {
+    payload
+        .first_chunk::<4>()
+        .map_or(0, |b| i32::from_ne_bytes(*b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a dump carries how it ended: an error such as `ENOMEM`
+    /// (12) as its negative, zero for success; no payload, success.
+    #[test]
+    fn the_end_of_a_dump_says_how_it_ended() {
+        assert_eq!(parse_done(&(-12i32).to_ne_bytes()), -12);
+        assert_eq!(parse_done(&0i32.to_ne_bytes()), 0);
+        assert_eq!(parse_done(&[]), 0);
+        assert_eq!(parse_done(&[0xff, 0xff]), 0);
+        // Extended acknowledgement attributes may follow the errno.
+        let mut long = (-4i32).to_ne_bytes().to_vec();
+        long.extend_from_slice(&[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(parse_done(&long), -4);
+    }
 
     #[test]
     fn encode_pads_and_parse_splits() {

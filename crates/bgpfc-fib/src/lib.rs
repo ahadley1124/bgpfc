@@ -501,24 +501,45 @@ impl Fib {
         loop {
             let n = socket.recv(&mut buf)?;
             for m in netlink::parse(&buf[..n])? {
-                if m.header.seq != seq {
-                    continue;
-                }
-                match m.header.ty {
-                    netlink::NLMSG_DONE => return Ok(routes),
-                    netlink::NLMSG_ERROR => {
-                        let code = netlink::parse_error(m.payload)?;
-                        return Err(FibError::Kernel(-code));
-                    }
-                    route::RTM_NEWROUTE => {
-                        if let Some(r) = RouteMsg::decode(m.payload)? {
-                            routes.push(r);
-                        }
-                    }
-                    _ => {}
+                if dump_reply(&m, seq, &mut routes)? {
+                    return Ok(routes);
                 }
             }
         }
+    }
+}
+
+/// Take one message of the reply to the dump `seq` into `routes`: whether
+/// it ended the dump.
+///
+/// # Errors
+/// A dump the kernel refuses, or ends with an error
+/// ([`netlink::parse_done`]), which is not the whole table; a malformed
+/// message.
+fn dump_reply(
+    m: &netlink::Message<'_>,
+    seq: u32,
+    routes: &mut Vec<RouteMsg>,
+) -> Result<bool, FibError> {
+    if m.header.seq != seq {
+        return Ok(false);
+    }
+    match m.header.ty {
+        netlink::NLMSG_DONE => match netlink::parse_done(m.payload) {
+            code if code < 0 => Err(FibError::Kernel(-code)),
+            _ => Ok(true),
+        },
+        netlink::NLMSG_ERROR => {
+            let code = netlink::parse_error(m.payload)?;
+            Err(FibError::Kernel(-code))
+        }
+        route::RTM_NEWROUTE => {
+            if let Some(r) = RouteMsg::decode(m.payload)? {
+                routes.push(r);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -739,6 +760,37 @@ mod tests {
         assert!(gone.result.is_ok() && gone.already_gone, "{gone:?}");
         assert!(fib.clear().iter().all(|a| a.result.is_ok()));
         assert_eq!(installed().len(), 0);
+    }
+
+    /// The routes a dump lists are kept until its end, which fails it if
+    /// it carries an error: a table the kernel could not finish listing
+    /// is not the whole table, and the startup flush must not take it as
+    /// one.
+    #[test]
+    fn a_dump_that_ends_with_an_error_fails() {
+        let payload = |code: i32| code.to_ne_bytes();
+        let ours = RouteMsg::unicast(p("192.0.2.0/24"), h("10.0.0.1"), 254, 186);
+        let mut part = ours.encode_set(5);
+        // A part of a dump: NLM_F_MULTI, the type of the routes it lists.
+        part[6..8].copy_from_slice(&netlink::NLM_F_MULTI.to_ne_bytes());
+        let done = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 5, &payload(0));
+        let failed = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 5, &payload(-12));
+        let mut routes = Vec::new();
+        let take = |bytes: &[u8], routes: &mut Vec<RouteMsg>| {
+            let m = netlink::parse(bytes).unwrap();
+            dump_reply(&m[0], 5, routes)
+        };
+        assert!(matches!(take(&part, &mut routes), Ok(false)));
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].dst, p("192.0.2.0/24"));
+        assert!(matches!(take(&done, &mut routes), Ok(true)));
+        assert!(matches!(
+            take(&failed, &mut routes),
+            Err(FibError::Kernel(12))
+        ));
+        // Another request's messages are not this dump's.
+        let other = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 6, &payload(-12));
+        assert!(matches!(take(&other, &mut routes), Ok(false)));
     }
 
     #[test]

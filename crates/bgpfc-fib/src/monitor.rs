@@ -171,38 +171,8 @@ impl Monitor {
                 Err(e) => return Err(e.into()),
             };
             for m in netlink::parse(&self.buf[..n])? {
-                if m.header.seq == seq && m.header.ty == netlink::NLMSG_ERROR {
-                    match netlink::parse_error(m.payload)? {
-                        // The receive buffer was full when the dump was
-                        // asked for: the kernel answers ENOBUFS, if the
-                        // answer fits, and sends the dump as room frees up
-                        // (`__netlink_dump_start`, `netlink_recvmsg`).
-                        code if -code == ENOBUFS => d.lost = true,
-                        code => return Err(FibError::Kernel(-code)),
-                    }
-                } else if m.header.seq == seq && is_reply(&m) {
-                    d.started = true;
-                    match m.header.ty {
-                        netlink::NLMSG_DONE => return Ok(()),
-                        RTM_NEWROUTE => {
-                            if let Some(r) = kernel::decode_route(m.payload)?
-                                && kernel::relevant(&r, self.protocol)
-                            {
-                                d.routes.insert((r.dst, r.metric), r);
-                            }
-                        }
-                        kernel::RTM_NEWLINK => {
-                            if let Some(l) = kernel::decode_link(m.payload)? {
-                                d.links.insert(l.index, l);
-                            }
-                        }
-                        _ => {}
-                    }
-                } else if d.started
-                    && !is_reply(&m)
-                    && let Some(e) = kernel::event(&m, self.protocol)?
-                {
-                    d.events.push(e);
+                if d.take(&m, seq, self.protocol)? {
+                    return Ok(());
                 }
             }
         }
@@ -212,6 +182,57 @@ impl Monitor {
     #[cfg(test)]
     fn socket(&self) -> &NetlinkSocket {
         &self.socket
+    }
+}
+
+impl Dumps {
+    /// Take one message read while the dump `seq` runs: a part of it, its
+    /// end (`true`), or a notification, kept once the dump has begun.
+    ///
+    /// # Errors
+    /// A dump the kernel refuses, or ends with an error
+    /// ([`netlink::parse_done`]): what came of it is not the whole table.
+    /// A malformed message.
+    fn take(&mut self, m: &netlink::Message<'_>, seq: u32, protocol: u8) -> Result<bool, FibError> {
+        if m.header.seq == seq && m.header.ty == netlink::NLMSG_ERROR {
+            match netlink::parse_error(m.payload)? {
+                // The receive buffer was full when the dump was asked for:
+                // the kernel answers ENOBUFS, if the answer fits, and sends
+                // the dump as room frees up (`__netlink_dump_start`,
+                // `netlink_recvmsg`).
+                code if -code == ENOBUFS => self.lost = true,
+                code => return Err(FibError::Kernel(-code)),
+            }
+        } else if m.header.seq == seq && is_reply(m) {
+            self.started = true;
+            match m.header.ty {
+                netlink::NLMSG_DONE => {
+                    return match netlink::parse_done(m.payload) {
+                        code if code < 0 => Err(FibError::Kernel(-code)),
+                        _ => Ok(true),
+                    };
+                }
+                RTM_NEWROUTE => {
+                    if let Some(r) = kernel::decode_route(m.payload)?
+                        && kernel::relevant(&r, protocol)
+                    {
+                        self.routes.insert((r.dst, r.metric), r);
+                    }
+                }
+                kernel::RTM_NEWLINK => {
+                    if let Some(l) = kernel::decode_link(m.payload)? {
+                        self.links.insert(l.index, l);
+                    }
+                }
+                _ => {}
+            }
+        } else if self.started
+            && !is_reply(m)
+            && let Some(e) = kernel::event(m, protocol)?
+        {
+            self.events.push(e);
+        }
+        Ok(false)
     }
 }
 
@@ -296,6 +317,44 @@ mod tests {
         let one = |b: &[u8]| is_reply(&netlink::parse(b).unwrap()[0]);
         assert!(one(&part) && one(&done) && one(&error));
         assert!(!one(&note));
+    }
+
+    /// A dump ends with its `NLMSG_DONE`; one that carries an error, such
+    /// as `ENOMEM` (12) from the kernel's dump of a table it could not
+    /// finish, is no whole table and fails the snapshot, as a refused
+    /// dump does.
+    #[test]
+    fn a_dump_that_ends_with_an_error_fails() {
+        let done = |code: i32| {
+            netlink::encode(
+                netlink::NLMSG_DONE,
+                netlink::NLM_F_MULTI,
+                3,
+                &code.to_ne_bytes(),
+            )
+        };
+        let mut d = Dumps::default();
+        let ok = done(0);
+        let ok = netlink::parse(&ok).unwrap();
+        assert!(matches!(d.take(&ok[0], 3, RTPROT_BGP), Ok(true)));
+        assert!(d.started);
+        let failed = done(-12);
+        let failed = netlink::parse(&failed).unwrap();
+        assert!(matches!(
+            d.take(&failed[0], 3, RTPROT_BGP),
+            Err(FibError::Kernel(12))
+        ));
+        // Another dump's end is not this one's.
+        let other = done(0);
+        let other = netlink::parse(&other).unwrap();
+        assert!(matches!(d.take(&other[0], 4, RTPROT_BGP), Ok(false)));
+        // ENOBUFS before the dump: notifications lost, the dump goes on.
+        let mut nobufs = (-ENOBUFS).to_ne_bytes().to_vec();
+        nobufs.extend_from_slice(&[0; 16]);
+        let nobufs = netlink::encode(netlink::NLMSG_ERROR, 0, 3, &nobufs);
+        let nobufs = netlink::parse(&nobufs).unwrap();
+        assert!(matches!(d.take(&nobufs[0], 3, RTPROT_BGP), Ok(false)));
+        assert!(d.lost);
     }
 
     fn route(dst: &str, metric: u32) -> Route {
