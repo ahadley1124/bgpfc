@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use crate::ast::{Config, Neighbor};
+use crate::ast::Config;
 
 /// The difference between an old and a new configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -18,9 +18,18 @@ pub struct ConfigDiff {
     /// (Cease / Other Configuration Change, RFC 4486 §4).
     pub reset: Vec<IpAddr>,
     /// Neighbors in both, not reset, whose import or export policy (or
-    /// anything those policies reference) changed: re-evaluate their
-    /// routes, with route refresh where the peer supports it.
+    /// anything those policies reference) changed: the union of
+    /// `import_changed` and `export_changed`, in file order.
     pub policy_changed: Vec<IpAddr>,
+    /// Those of `policy_changed` whose import policy changed: the routes
+    /// they sent are put through it again, from the Adj-RIB-In (RFC 4271
+    /// §3: "retain the current version of the routes advertised to it"),
+    /// with route refresh (RFC 2918) only for what it did not keep.
+    pub import_changed: Vec<IpAddr>,
+    /// Those of `policy_changed` whose export policy changed: what they
+    /// are sent is exported again from the Loc-RIB, with no route
+    /// refresh.
+    pub export_changed: Vec<IpAddr>,
     /// Neighbors in both, not reset, whose `advertisement-interval`
     /// changed: the RIB paces the running session with the new value
     /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
@@ -114,11 +123,19 @@ impl ConfigDiff {
                 d.reset.push(n.addr);
                 continue;
             }
-            let policy = policy_differs(old, o, new, n);
+            let import = policy_differs(old, &o.import, new, &n.import);
+            let export = policy_differs(old, &o.export, new, &n.export);
+            let policy = import || export;
             let interval = o.advertisement_interval != n.advertisement_interval;
             let limit = o.maximum_prefix != n.maximum_prefix;
             if policy {
                 d.policy_changed.push(n.addr);
+            }
+            if import {
+                d.import_changed.push(n.addr);
+            }
+            if export {
+                d.export_changed.push(n.addr);
             }
             if interval {
                 d.interval_changed.push(n.addr);
@@ -146,12 +163,11 @@ impl ConfigDiff {
     }
 }
 
-/// Whether the import or export policy of a neighbor, including the
-/// prefix lists they use, differs between the configurations.
-fn policy_differs(old: &Config, o: &Neighbor, new: &Config, n: &Neighbor) -> bool {
-    [(&o.import, &n.import), (&o.export, &n.export)]
-        .into_iter()
-        .any(|(a, b)| policy_fingerprint(old, a) != policy_fingerprint(new, b))
+/// Whether the policy a neighbor names `o` in `old` and `n` in `new`, its
+/// import or its export policy, differs between the configurations,
+/// prefix lists it uses included.
+fn policy_differs(old: &Config, o: &str, new: &Config, n: &str) -> bool {
+    policy_fingerprint(old, o) != policy_fingerprint(new, n)
 }
 
 /// The policy's terms and every prefix list they reference, with
@@ -250,6 +266,8 @@ mod tests {
         ));
         let d = ConfigDiff::between(a, &b);
         assert_eq!(d.policy_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.import_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.export_changed, Vec::<IpAddr>::new());
         assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
         assert_eq!(d.reset, Vec::<IpAddr>::new());
         // A prefix list edit reaches every neighbor whose policy uses it.
@@ -285,6 +303,70 @@ mod tests {
             );
         }
         assert!(ConfigDiff::between(&valid, &rpki("invalid", "valid")).is_empty());
+    }
+
+    #[test]
+    fn import_and_export_changes_are_told_apart() {
+        // A reload imports again only for the neighbors whose import
+        // policy changed, and exports again only to those whose export
+        // policy changed (RFC 4271 §3, RFC 2918): a change of one is not
+        // a change of the other.
+        let a = cfg(BASE);
+        let both = |d: &ConfigDiff| {
+            (
+                d.policy_changed.clone(),
+                d.import_changed.clone(),
+                d.export_changed.clone(),
+            )
+        };
+        let none = Vec::<IpAddr>::new();
+        let n2 = addr("192.0.2.2");
+        let n3 = addr("192.0.2.3");
+        // The export policy's terms: every neighbor exports with it.
+        let export = cfg(&BASE.replace(
+            "policy OUT { term all { action accept; } }",
+            "policy OUT { term all { set med 5; action accept; } }",
+        ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &export)),
+            (vec![n2, n3], none.clone(), vec![n2, n3])
+        );
+        // The prefix list only the import policy uses.
+        let list = cfg(&BASE.replace("le 24", "le 32"));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &list)),
+            (vec![n2, n3], vec![n2, n3], none.clone())
+        );
+        // One neighbor's export policy named anew.
+        let renamed = cfg(&BASE.replace(
+            "remote-as 65002; import IN; export OUT;",
+            "remote-as 65002; import IN; export IN;",
+        ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &renamed)),
+            (vec![n3], none.clone(), vec![n3])
+        );
+        // A policy both use, for one neighbor: both change.
+        let shared = cfg(&BASE
+            .replace(
+                "remote-as 65002; import IN; export OUT;",
+                "remote-as 65002; import OUT; export OUT;",
+            )
+            .replace(
+                "policy OUT { term all { action accept; } }",
+                "policy OUT { term all { set med 5; action accept; } }",
+            ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &shared)),
+            (vec![n2, n3], vec![n3], vec![n2, n3])
+        );
+        // A reset neighbor is in neither: its session starts again.
+        let reset = cfg(&BASE
+            .replace("le 24", "le 32")
+            .replace("remote-as 65002;", "remote-as 65002; hold-time 30;"));
+        let d = ConfigDiff::between(&a, &reset);
+        assert_eq!(d.reset, vec![n3]);
+        assert_eq!(both(&d), (vec![n2], vec![n2], none));
     }
 
     #[test]
