@@ -311,9 +311,11 @@ hop. The `enforcement` change above, `best_changed=4800`, comes with
 
 For the FIB thread a change is what the RIB made of one of its inputs (an
 UPDATE, a session that went down, a change of the VRPs or of
-`enforcement`, a reload), a switch to install mode with its reconcile,
-the removal of stale routes at startup, or that of every route at
-shutdown. A change that comes a second or more after the last line gets
+`enforcement`, a reload, a change of the kernel's routing table that
+changed what a next hop resolves to), a switch to install mode with its
+reconcile, the removal of stale routes at startup, or that of every route
+at shutdown.
+A change that comes a second or more after the last line gets
 its line at once, as soon as it is applied. Those that follow within the
 second are added up and written a second after that line: a table that
 loads from a peer, an UPDATE at a time, or a burst of VRP changes, costs
@@ -339,9 +341,9 @@ failed operation has one at error (`fib: failed`, with the kernel's
 two `fib: changes` lines, whatever the number of changes; the others at
 `debug`. The `fib: changes` line that counts them is then at error too,
 with every failure in `failed`. A kernel that refuses one route, for want
-of `CAP_NET_ADMIN` or for a next hop it cannot reach directly, often
-refuses the whole table, and the first already names the reason; a table
-that loads from a peer, a change an UPDATE, so costs at most three error
+of `CAP_NET_ADMIN` for instance, often refuses the whole table, and the
+first already names the reason; a table that loads from a peer, a change
+an UPDATE, so costs at most three error
 lines and one `fib: changes` line a second, not a line a route. At
 `log { level warn; }` the FIB thread writes only its failures.
 

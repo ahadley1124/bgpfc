@@ -962,10 +962,11 @@ Routinator 0.15 also wants such a file to set `repository-dir`, although
 the command line overrides it.
 
 **Route selection.** Of the routes to a destination that the import
-policy accepted and that are not held, bgpfcd uses one, chosen by removing
-routes from consideration in this order until one is left (RFC 4271
-§9.1.2.2: "The criteria MUST be applied in the order specified"; issue
-#47):
+policy accepted and that are not held, for their validation state (see
+**RPKI**) or for a next hop that does not resolve (see **Next hops**
+below), bgpfcd uses one, chosen by removing routes from consideration in
+this order until one is left (RFC 4271 §9.1.2.2: "The criteria MUST be
+applied in the order specified"; issue #47):
 
 1. Under `enforcement prefer-valid` only, the validation state the route is
    used with: Valid, then `not-found` and `disabled`, then Invalid (RFC
@@ -979,22 +980,12 @@ routes from consideration in this order until one is left (RFC 4271
    still under consideration count: a route an earlier step removed takes
    no other out, however low its MULTI_EXIT_DISC.
 6. d): routes from external neighbors over routes from internal ones.
-7. e): the lowest interior cost to the next hop. bgpfcd runs no IGP, so
-   every route ties, as with BIRD and FRR when they know no IGP metric.
+7. e): the lowest interior cost to the next hop. bgpfcd runs no IGP, and
+   does not take the metric of the kernel route a next hop resolves
+   through for one, so every route ties, as with BIRD and FRR when they
+   know no IGP metric.
 8. f): the lowest BGP Identifier of the neighbor.
 9. g): the lowest neighbor address.
-
-RFC 4271 §9.1.2 also takes out of route selection a route whose NEXT_HOP
-cannot be resolved ("the BGP route MUST be excluded from the Phase 2
-decision function"), and issue #47 makes routes with an unreachable next
-hop ineligible. bgpfcd does not apply this rule: it runs no IGP and reads
-no routes from the kernel, so every next hop counts as resolvable, as
-every interior cost counts as equal in step 7. A route whose next hop is
-unreachable can therefore be chosen and advertised. With `fib { mode
-install; }` the kernel refuses to install a route whose gateway it cannot
-reach directly, and the failure is logged at error as `fib: failed` (the
-first three of a change, three a second at most, and every one counted on
-the `fib: changes` lines, `docs/control.md`), but the route stays chosen.
 
 Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
 first, as the most significant part of the degree of preference that RFC
@@ -1027,6 +1018,74 @@ The other common behaviours are policies:
   `match rpki invalid; action reject;` in those neighbors' import policies.
   Such routes are held for their state too (see **RPKI** above), so they
   are used again once they are no longer Invalid.
+
+**Next hops.** RFC 4271 §9.1.2 takes out of route selection a route
+whose NEXT_HOP cannot be resolved ("the BGP route MUST be excluded from
+the Phase 2 decision function"), and issue #47 makes routes with an
+unreachable next hop ineligible. bgpfcd resolves every next hop in the
+kernel's main routing table, the routes that connected networks, static
+routes and an IGP daemon put there, which a thread of its own reads
+whole at startup, before any route is judged, and then follows through
+the kernel's notifications (`docs/control.md`, "Next hops"):
+
+- The next hop resolved is the one the route is used with, after import
+  policy, so that `set next-hop self` on import counts. Of an IPv6 next
+  hop it is the global address; a link-local address the neighbor sends
+  after it (RFC 2545 §3) is neither resolved nor installed, as with
+  BIRD's `next hop prefer global`. An IPv4 route with an IPv6 next hop
+  (RFC 8950) resolves in the IPv6 routes.
+- It resolves through the longest matching route ("only the longest
+  matching route SHOULD be considered", RFC 4271 §9.1.2.1), and among
+  routes to the same prefix through the one of lowest metric, as the
+  kernel does.
+- Never through a route of bgpfcd's own, those that carry the `fib {
+  protocol }` number, so never through another BGP route, and never
+  through a default route (`0.0.0.0/0`, `::/0`): FRR's defaults, as
+  without `resolve-via-default`. A next hop only such a route covers
+  does not resolve. So no route resolves through itself or through
+  another that resolves through it (the mutual recursion of RFC 4271
+  §9.1.2.1), and installing a route never changes what a next hop
+  resolves to. A blackhole, unreachable, prohibit or throw route resolves
+  nothing, and hides a less specific route as in the kernel.
+- Only the main table counts, whatever `fib { table }` says: policy
+  routing rules and VRFs are not looked at. A route of another program
+  with bgpfcd's protocol number is taken for bgpfcd's own.
+
+A route whose next hop does not resolve stays in the Adj-RIB-In, counted
+as received and held, but is no candidate, so it is neither installed nor
+advertised: `show routes` marks it `next hop unresolvable`. A route held
+for its validation state shows that reason whatever its next hop, since
+the RPKI rules come first; once they admit it, its next hop is checked.
+When its next hop resolves again, it is a candidate again at once, with
+no UPDATE from the neighbor and no run of import policy.
+
+With `fib { mode install; }` a route goes to the kernel through the hop
+its next hop resolves to: the next hop itself, on the interface of the
+connected route that covers it, or else the gateway and interface of the
+kernel route that resolves it, the immediate next hop, as BIRD's
+`gateway recursive` and FRR do. The interface is always given, so that a
+next hop that comes back through another interface is installed again
+through it. Dry-run mode resolves the same way and installs nothing.
+
+A change of the kernel's table decides again only the destinations with a
+route through a next hop whose resolution it changed, however large the
+table, and is one line at info, `rib: next hops changed`, never a line a
+route (`docs/control.md`, "Next hops"). A next hop that no longer resolves
+takes its routes out of use: each destination then uses its next best
+route, or its route is withdrawn from the kernel and from the neighbors at
+once. When the next hop resolves again they are installed again at once,
+and announced again as any change is under `advertisement-interval` (see
+**Neighbors**): within the interval since the prefix was last announced it
+waits for the interval's end, so that a next hop that flaps costs a
+neighbor at most one announcement an interval. A next hop that only moves
+to another gateway or interface has its routes installed again through it
+and sends no neighbor anything, since nothing a neighbor sees changed.
+IPv4 removes the routes through an interface that goes down, or that loses
+its address, without a notification each, so bgpfcd then reads the table
+whole again: a route through an interface counts only while the interface
+is up (RFC 4271 §9.1.2.1 2)). Until a new reading is whole the RIB keeps
+the one it has, so neither at startup nor after lost notifications does a
+next hop look unresolvable, or resolvable, for want of a table.
 
 **Network namespace.** `netns NAME;` makes bgpfcd join the network
 namespace `/run/netns/NAME`, the file `ip netns add NAME` creates
