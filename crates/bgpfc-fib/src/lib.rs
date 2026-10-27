@@ -13,11 +13,14 @@
 //!
 //! It also reads, without writing, what the kernel's main table holds
 //! and how it changes ([`kernel`]: route, interface and address
-//! notifications, decoded and filtered), for the RIB to resolve next hops
+//! notifications, decoded and filtered; `monitor`: the subscribed socket,
+//! a snapshot and the changes after it), for the RIB to resolve next hops
 //! against (RFC 4271 §9.1.2, §9.1.2.1).
 #![forbid(unsafe_code)]
 
 pub mod kernel;
+#[cfg(not(miri))]
+pub mod monitor;
 pub mod netlink;
 pub mod reconcile;
 pub mod route;

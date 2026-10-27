@@ -3,7 +3,7 @@
 //! `<linux/if_link.h>`, `<linux/if_addr.h>`, `<linux/if.h>`), decoded, and
 //! the filter that keeps the routes a BGP next hop may resolve through.
 //! Pure: bytes in, values out, every access bounds-checked, so Miri covers
-//! it; reading the socket is the caller's business.
+//! it; `monitor` reads the socket.
 //!
 //! Implements, for the RIB's resolution of next hops (RFC 4271 §9.1.2,
 //! §9.1.2.1): the kernel's routes in its main table, each with the
