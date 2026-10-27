@@ -30,9 +30,10 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail: the session's `local address` (the connection's, else the configured `local-address`, else `-`), the `ttl` bgpfcd sends the neighbor with (`1` for an external neighbor without `multihop`, the `multihop` value, or `system default`), and until a session comes up the `last error` of a connection, with how long ago it was (a failed connect, or a socket error a connection closed with, such as the `No route to host` of a neighbor TTL 1 does not reach: `docs/config.md`, "Neighbors"); routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement`, `held by startup` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
-| `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
+| `show neighbor ADDR` | the same in detail: the session's `local address` (the connection's, else the configured `local-address`, else `-`), the `ttl` bgpfcd sends the neighbor with (`1` for an external neighbor without `multihop`, the `multihop` value, or `system default`), and until a session comes up the `last error` of a connection, with how long ago it was (a failed connect, or a socket error a connection closed with, such as the `No route to host` of a neighbor TTL 1 does not reach: `docs/config.md`, "Neighbors"); routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state or an unresolvable next hop, see [Validation state](#validation-state) and [Next hops](#next-hops)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the held routes, marked `!`: those held for their validation state followed by `held by enforcement`, `held by startup` or `held by policy`, and those whose next hop does not resolve by `next hop unresolvable` (see [Next hops](#next-hops)); with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
+| `show fib` | FIB mode and every desired route, with its gateway and the index of its interface (`oif`, `-` when unknown), `installed` when the FIB has it through that gateway and interface or `pending`, and every installed route not desired as `stale`, in prefix order |
+| `show nexthops` | every next hop the routes use, whether it resolves in the kernel's routing table, the gateway and interface the routes through it are installed with, the kernel route it resolves through, and how many routes use it; then how many routes the copy of the kernel's table holds (see [Next hops](#next-hops)) |
 | `show rpki` | the `rpki` mode and enforcement, whether validation is off, waiting for its first data or active, Routinator's state with `mode sidecar`, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki transitions` | the latest routes whose origin validation state changed, oldest first, each with its time (see [Changes of state](#changes-of-state)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -82,6 +83,7 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/neighbors/{addr}` | `show neighbor ADDR` (`404` if unknown) |
 | `GET /v1/routes?family=ipv4\|ipv6[&prefix=P][&held=1]` | `show routes` |
 | `GET /v1/fib` | `show fib` |
+| `GET /v1/nexthops` | `show nexthops` |
 | `GET /v1/rpki` | `show rpki` |
 | `GET /v1/rpki/transitions` | `show rpki transitions` |
 | `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
@@ -113,7 +115,12 @@ Example objects:
   "peer":"198.51.100.2","best":false,"rov":"invalid","rov_set":null,"held":"enforcement",
   "as_path":[64497],"communities":[],"large_communities":[]}]
 
-{"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
+{"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","oif":3,"installed":true}]}
+
+{"kernel_routes":12,"next_hops":[{"next_hop":"10.255.7.30","resolved":true,"gateway":"10.99.7.1",
+ "oif":3,"interface":"v12b","through":"10.255.7.30/32","routes":1},
+ {"next_hop":"198.51.100.9","resolved":false,"gateway":null,"oif":null,"interface":null,
+ "through":null,"routes":3}]}
 
 {"mode":"external","enforcement":"drop-invalid","validation":"active","waiting_seconds":null,
  "sidecar":null,"caches":[{"host":"127.0.0.1","port":3323,
@@ -189,7 +196,8 @@ enforcement` (the `enforcement` rules out the state it is used with),
 `held by startup` (`startup hold`: it is `disabled`, waiting for the first
 full set to give it a state) or `held by policy` (the import policy
 rejects it in its state and would accept it in another); the JSON has
-`held` (`enforcement`, `startup`, `policy` or `null`). A held route keeps the attributes its neighbor sent, and is shown
+`held` (`enforcement`, `startup`, `policy` or `null`, and `next-hop` for
+a route held for its next hop, see [Next hops](#next-hops)). A held route keeps the attributes its neighbor sent, and is shown
 with them: the import policy runs on them again when the route is used
 again, so what the policy sets, such as a `set local-pref`, shows only
 then. `show routes held` lists every held route of a family, and `show
@@ -340,8 +348,32 @@ lines and one `fib: changes` line a second, not a line a route. At
 ## Next hops
 
 A route is used only if its next hop resolves in the kernel's main
-routing table (RFC 4271 §9.1.2; `docs/config.md`, "Route selection"). A
-kernel thread follows that table: it reads it whole at startup, before
+routing table (RFC 4271 §9.1.2; `docs/config.md`, "Route selection"):
+`show nexthops` and `GET /v1/nexthops` list every next hop the routes
+use, in address order, held routes included:
+
+```
+next-hop                                state      gateway                                 interface       through                                       routes
+10.255.7.30                             resolved   10.99.7.1                               v12b            10.255.7.30/32                                     1
+198.51.100.9                            unresolved -                                       -               -                                                  3
+kernel routes 12
+```
+
+A resolved next hop gives the hop its routes are installed through: the
+next hop itself on a connected network, else the gateway of the kernel
+route that resolves it (`through`), with the interface it is reached on
+(its name, or its index when the name is unknown). A route whose next hop
+does not resolve stays in the Adj-RIB-In, counted as received and held,
+but is no candidate for route selection, so it is neither installed nor
+advertised; it is used again, with no UPDATE from its neighbor, once its
+next hop resolves. `show routes PREFIX` lists it after the candidates,
+marked `!`, followed by `next hop unresolvable`, and its JSON has
+`"held":"next-hop"`. A route held for its validation state shows that
+reason, whatever its next hop: the RPKI rules come first. In the JSON,
+`gateway`, `oif`, `interface` and `through` are `null` where the text
+has `-`; `kernel_routes` counts the routes the copy below holds.
+
+A kernel thread follows that table: it reads it whole at startup, before
 the RIB judges any route, and then the kernel's notifications of the
 routes of both families, of the interfaces and of the addresses removed.
 It keeps the routes a next hop may resolve through: neither bgpfcd's own

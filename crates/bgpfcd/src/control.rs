@@ -35,6 +35,7 @@ use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::{Hop, Mode};
+use bgpfc_rib::nexthop::Resolution;
 use bgpfc_rib::{Held, RouteStatus};
 use bgpfc_rpki::{RouteOrigin, RovState, Startup, Vrp, VrpSet};
 use bgpfc_sidecar::SidecarState;
@@ -43,8 +44,8 @@ use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, FibReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply, RouteReport,
-    RpkiReport, SidecarReport, TransitionsReport,
+    FibMsg, FibReport, NextHopsReport, PAGE, PeerInput, PeerReport, RibMsg, RibQuery, RibReply,
+    RouteReport, RpkiReport, SidecarReport, TransitionsReport,
 };
 
 /// How long a request may take to arrive or a reply to be written.
@@ -93,10 +94,14 @@ pub(crate) enum Command {
     ShowRoutes {
         family: AddressFamily,
         prefix: Option<Prefix>,
-        /// Only the routes held for their validation state.
+        /// Only the held routes: for their validation state, or for an
+        /// unresolvable next hop.
         held: bool,
     },
     ShowFib,
+    /// Every next hop the routes use and what it resolves to in the
+    /// kernel's routing table (RFC 4271 §9.1.2).
+    ShowNextHops,
     ShowStatus,
     ShowRpki,
     /// The latest routes whose RFC 6811 state changed (issue #59).
@@ -162,6 +167,7 @@ impl Command {
                 })
             }
             ["show", "fib"] => Ok(Command::ShowFib),
+            ["show", "nexthops"] => Ok(Command::ShowNextHops),
             ["show", "status"] => Ok(Command::ShowStatus),
             ["show", "rpki"] => Ok(Command::ShowRpki),
             ["show", "rpki", "transitions"] => Ok(Command::ShowRpkiTransitions),
@@ -234,6 +240,7 @@ impl Command {
                 })
             }
             ("GET", ["v1", "fib"]) => Ok(Command::ShowFib),
+            ("GET", ["v1", "nexthops"]) => Ok(Command::ShowNextHops),
             ("GET", ["v1", "rpki"]) => Ok(Command::ShowRpki),
             ("GET", ["v1", "rpki", "transitions"]) => Ok(Command::ShowRpkiTransitions),
             ("GET", ["v1", "rpki", "validate"]) => {
@@ -346,6 +353,7 @@ fn reply(ctx: &Ctx, cmd: &Command) -> Result<Reply, String> {
         )?)),
         // invariant: execute answers it with a listing.
         Command::ShowFib => unreachable!("show fib is a listing"),
+        Command::ShowNextHops => Ok(render_next_hops(&rib_next_hops(ctx)?)),
         Command::ShowStatus => status(ctx),
         Command::ShowRpki => Ok(render_rpki(&rpki_report(ctx)?, Instant::now())),
         Command::ShowRpkiTransitions => {
@@ -1379,6 +1387,67 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
     }
 }
 
+/// `show nexthops`: each next hop the routes use, whether it resolves,
+/// the gateway and interface the routes through it are installed with,
+/// the kernel route it resolves through and how many routes use it; then
+/// how many routes the RIB's copy of the kernel's table holds. In JSON an
+/// object with the same, `null` where the text has `-`.
+fn render_next_hops(r: &NextHopsReport) -> Reply {
+    let mut lines = vec![format!(
+        "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
+        "next-hop", "state", "gateway", "interface", "through", "routes"
+    )];
+    let mut j = Json::new();
+    j.begin_object()
+        .field_opt_num("kernel_routes", r.kernel_routes.map(num))
+        .key("next_hops")
+        .begin_array();
+    for n in &r.next_hops {
+        let hop = n.resolution.hop();
+        let through = match n.resolution {
+            Resolution::Resolved { through, .. } => through,
+            Resolution::Unresolved => None,
+        };
+        // The interface's name, else its index, as the kernel numbers it.
+        let interface = n
+            .interface
+            .clone()
+            .or_else(|| hop.and_then(|h| h.oif).map(|i| i.to_string()));
+        let dash = |s: Option<String>| s.unwrap_or_else(|| "-".to_owned());
+        lines.push(format!(
+            "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
+            n.addr.to_string(),
+            if hop.is_some() {
+                "resolved"
+            } else {
+                "unresolved"
+            },
+            dash(hop.map(|h| h.gateway.to_string())),
+            dash(interface),
+            dash(through.map(|p| p.to_string())),
+            n.routes
+        ));
+        j.begin_object()
+            .field_display("next_hop", n.addr)
+            .field_bool("resolved", hop.is_some())
+            .field_opt("gateway", hop.map(|h| h.gateway))
+            .field_opt_num("oif", hop.and_then(|h| h.oif))
+            .field_opt("interface", n.interface.as_deref())
+            .field_opt("through", through)
+            .field_num("routes", num(n.routes))
+            .end_object();
+    }
+    j.end_array().end_object();
+    lines.push(match r.kernel_routes {
+        Some(n) => format!("kernel routes {n}"),
+        None => "no kernel table: every next hop resolves to itself".to_owned(),
+    });
+    Reply {
+        lines,
+        json: j.finish(),
+    }
+}
+
 const ROUTES_HEADER: &str = "prefix                                       next-hop                                 origin   lpref     med rov       path";
 
 /// Routes few enough to answer whole.
@@ -1397,8 +1466,9 @@ fn render_routes(routes: &[RouteReport]) -> Reply {
     }
 }
 
-/// One route of `show routes`: `*` marks the best, `!` a route held for
-/// its validation state, whose reason follows the peer. The `rov` column
+/// One route of `show routes`: `*` marks the best, `!` a held route,
+/// whose reason follows the peer: `held by` the RPKI rule that holds it,
+/// or `next hop unresolvable` (RFC 4271 §9.1.2). The `rov` column
 /// has the state the lookup gave the route (RFC 6811 §2) and, after `>`,
 /// the one import policy set (RFC 6811 §3), which the route is used with;
 /// it outgrows its column then.
@@ -1430,7 +1500,11 @@ fn route_line(r: &RouteReport) -> String {
             path.join(" ")
         },
         r.peer,
-        r.held.map_or(String::new(), |by| format!(" held by {by}"))
+        match r.held {
+            None => String::new(),
+            Some(Held::NextHop) => " next hop unresolvable".to_owned(),
+            Some(by) => format!(" held by {by}"),
+        }
     )
 }
 
@@ -1487,6 +1561,19 @@ fn rib_routes(
         .map_err(|_| "rib thread gone".to_owned())?;
     match rx.recv_timeout(QUERY_TIMEOUT) {
         Ok(RibReply::Routes(routes)) => Ok(routes),
+        Ok(_) => Err("unexpected reply".to_owned()),
+        Err(_) => Err("rib did not answer".to_owned()),
+    }
+}
+
+/// The next hops the RIB's routes use.
+fn rib_next_hops(ctx: &Ctx) -> Result<NextHopsReport, String> {
+    let (tx, rx) = sync_channel(1);
+    ctx.rib
+        .send(RibMsg::Query(RibQuery::NextHops, tx))
+        .map_err(|_| "rib thread gone".to_owned())?;
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(RibReply::NextHops(report)) => Ok(report),
         Ok(_) => Err("unexpected reply".to_owned()),
         Err(_) => Err("rib did not answer".to_owned()),
     }
@@ -1690,8 +1777,12 @@ impl<'a> Listing<'a> {
                     // `Prefix` writes itself without the padding a width
                     // asks for.
                     let prefix = r.prefix.to_string();
-                    out.line(&format!("{prefix:<44} via {:<40} {state}", r.hop.gateway))
-                        .map_err(io)?;
+                    let oif = r.hop.oif.map_or("-".to_owned(), |i| i.to_string());
+                    out.line(&format!(
+                        "{prefix:<44} via {:<40} oif {oif:<10} {state}",
+                        r.hop.gateway
+                    ))
+                    .map_err(io)?;
                 }
             }
         }
@@ -1733,6 +1824,7 @@ impl<'a> Listing<'a> {
                     j.begin_object()
                         .field_display("prefix", r.prefix)
                         .field_display("gateway", r.hop.gateway)
+                        .field_opt_num("oif", r.hop.oif)
                         .field_bool("installed", r.installed);
                     if r.stale {
                         j.field_bool("stale", true);
@@ -2320,15 +2412,198 @@ mod tests {
             lines[2..],
             [
                 format!(
-                    "{:<44} via {:<40} installed",
-                    "192.0.2.0/24", "198.51.100.1"
+                    "{:<44} via {:<40} oif {:<10} installed",
+                    "192.0.2.0/24", "198.51.100.1", "-"
                 ),
                 format!(
-                    "{:<44} via {:<40} pending",
-                    "198.51.100.0/24", "198.51.100.1"
+                    "{:<44} via {:<40} oif {:<10} pending",
+                    "198.51.100.0/24", "198.51.100.1", "-"
                 ),
-                format!("{:<44} via {:<40} stale", "203.0.113.0/24", "198.51.100.1"),
+                format!(
+                    "{:<44} via {:<40} oif {:<10} stale",
+                    "203.0.113.0/24", "198.51.100.1", "-"
+                ),
             ]
+        );
+    }
+
+    /// `show fib` names the interface each route goes out of, desired and
+    /// installed alike, in text and JSON.
+    #[test]
+    fn fib_rows_show_the_interface() {
+        let none = |_| Ok(Vec::new());
+        let listing = || Listing::Fib {
+            mode: Mode::Install,
+            desired: Pages::starting(
+                vec![fib_route_on("192.0.2.0/24", "10.99.7.1", Some(4))],
+                none,
+                |r| r.0,
+            ),
+            installed: Pages::starting(
+                vec![
+                    fib_route_on("192.0.2.0/24", "10.99.7.1", Some(4)),
+                    fib_route("203.0.113.0/24", "10.99.7.1"),
+                ],
+                none,
+                |r| r.0,
+            ),
+        };
+        let mut text = Vec::new();
+        let mut lines = proto::Lines::begin(&mut text).unwrap();
+        listing().write_lines(&mut lines).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[2..4],
+            [
+                format!(
+                    "{:<44} via {:<40} oif {:<10} installed",
+                    "192.0.2.0/24", "10.99.7.1", "4"
+                ),
+                format!(
+                    "{:<44} via {:<40} oif {:<10} stale",
+                    "203.0.113.0/24", "10.99.7.1", "-"
+                ),
+            ]
+        );
+        let mut json = Vec::new();
+        listing().write_json(&mut json).unwrap();
+        assert_eq!(
+            String::from_utf8(json).unwrap(),
+            concat!(
+                r#"{"mode":"install","routes":["#,
+                r#"{"prefix":"192.0.2.0/24","gateway":"10.99.7.1","oif":4,"installed":true},"#,
+                r#"{"prefix":"203.0.113.0/24","gateway":"10.99.7.1","oif":null,"#,
+                r#""installed":true,"stale":true}]}"#
+            )
+        );
+    }
+
+    /// `show nexthops`: each next hop in use, resolved through a gateway
+    /// on a named interface, on a connected network whose interface has
+    /// no name known, or unresolved; then the kernel routes.
+    #[test]
+    fn next_hops_render_as_lines_and_json() {
+        use bgpfc_rib::nexthop::{Hop, NextHopReport};
+        let report = NextHopsReport {
+            next_hops: vec![
+                NextHopReport {
+                    addr: "10.255.7.30".parse().unwrap(),
+                    resolution: Resolution::Resolved {
+                        hop: Hop {
+                            gateway: "10.99.7.1".parse().unwrap(),
+                            oif: Some(3),
+                        },
+                        through: Some("10.255.7.30/32".parse().unwrap()),
+                    },
+                    interface: Some("v12b".to_owned()),
+                    routes: 1,
+                },
+                NextHopReport {
+                    addr: "10.99.7.1".parse().unwrap(),
+                    resolution: Resolution::Resolved {
+                        hop: Hop {
+                            gateway: "10.99.7.1".parse().unwrap(),
+                            oif: Some(5),
+                        },
+                        through: Some("10.99.7.0/24".parse().unwrap()),
+                    },
+                    interface: None,
+                    routes: 2,
+                },
+                NextHopReport {
+                    addr: "198.51.100.9".parse().unwrap(),
+                    resolution: Resolution::Unresolved,
+                    interface: None,
+                    routes: 3,
+                },
+            ],
+            kernel_routes: Some(12),
+        };
+        let r = render_next_hops(&report);
+        let row = |a: &str, s: &str, g: &str, i: &str, t: &str, n: usize| {
+            format!("{a:<39} {s:<10} {g:<39} {i:<15} {t:<43} {n:>8}")
+        };
+        assert_eq!(
+            r.lines,
+            [
+                format!(
+                    "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
+                    "next-hop", "state", "gateway", "interface", "through", "routes"
+                ),
+                row(
+                    "10.255.7.30",
+                    "resolved",
+                    "10.99.7.1",
+                    "v12b",
+                    "10.255.7.30/32",
+                    1
+                ),
+                row("10.99.7.1", "resolved", "10.99.7.1", "5", "10.99.7.0/24", 2),
+                row("198.51.100.9", "unresolved", "-", "-", "-", 3),
+                "kernel routes 12".to_owned(),
+            ]
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"kernel_routes":12,"next_hops":["#,
+                r#"{"next_hop":"10.255.7.30","resolved":true,"gateway":"10.99.7.1","oif":3,"#,
+                r#""interface":"v12b","through":"10.255.7.30/32","routes":1},"#,
+                r#"{"next_hop":"10.99.7.1","resolved":true,"gateway":"10.99.7.1","oif":5,"#,
+                r#""interface":null,"through":"10.99.7.0/24","routes":2},"#,
+                r#"{"next_hop":"198.51.100.9","resolved":false,"gateway":null,"oif":null,"#,
+                r#""interface":null,"through":null,"routes":3}]}"#
+            )
+        );
+        // Without a kernel table, which bgpfcd always has, nothing to list
+        // but that.
+        let r = render_next_hops(&NextHopsReport {
+            next_hops: Vec::new(),
+            kernel_routes: None,
+        });
+        assert_eq!(
+            r.lines[1..],
+            ["no kernel table: every next hop resolves to itself"]
+        );
+        assert_eq!(r.json, r#"{"kernel_routes":null,"next_hops":[]}"#);
+    }
+
+    /// RFC 4271 §9.1.2: a route whose next hop does not resolve is listed
+    /// held, marked `!`, and says so; the JSON names the reason
+    /// `next-hop`.
+    #[test]
+    fn routes_held_for_their_next_hop_say_it_is_unresolvable() {
+        let mut held = route("192.0.2.0/24", "198.51.100.9", &[64_496], None, None);
+        held.held = Some(Held::NextHop);
+        let r = render_routes(&[held]);
+        assert_eq!(
+            r.lines[1],
+            format!(
+                "{:<44} {:<40} {:<8} {:>5} {:>7} {:<9} 64496 via 198.51.100.9 \
+                 next hop unresolvable",
+                "!192.0.2.0/24", "198.51.100.9", "igp", "-", "-", "disabled"
+            )
+        );
+        assert!(r.json.contains(r#""best":false,"#), "{}", r.json);
+        assert!(r.json.contains(r#""held":"next-hop","#), "{}", r.json);
+    }
+
+    #[test]
+    fn parses_next_hops_commands() {
+        assert_eq!(
+            Command::parse(&words("show nexthops")),
+            Ok(Command::ShowNextHops)
+        );
+        assert!(Command::parse(&words("show nexthops all")).is_err());
+        assert!(!Command::ShowNextHops.is_write());
+        let get = |path: &str| {
+            http::Request::read_from(&mut format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+                .unwrap()
+        };
+        assert_eq!(
+            Command::from_http(&get("/v1/nexthops")),
+            Ok(Command::ShowNextHops)
         );
     }
 

@@ -210,8 +210,9 @@ pub(crate) enum RibQuery {
         prefix: Option<Prefix>,
         /// Without `prefix`: the last route of the page before, if any.
         after: Option<Prefix>,
-        /// Only the routes held for their validation state, which are no
-        /// candidates (RFC 6811 §2): of the destination, or without
+        /// Only the routes held, for their validation state (RFC 6811 §2)
+        /// or an unresolvable next hop (RFC 4271 §9.1.2), which are no
+        /// candidates: of the destination, or without
         /// `prefix`, a page of the family's after `after`, which ends
         /// between two destinations.
         held: bool,
@@ -224,6 +225,9 @@ pub(crate) enum RibQuery {
     },
     /// The most recent changes of a route's RFC 6811 state (issue #59).
     Transitions,
+    /// Every next hop the routes use, and what it resolves to (RFC 4271
+    /// §9.1.2).
+    NextHops,
 }
 
 /// One route in a reply: of the Loc-RIB, a candidate, or a route held
@@ -259,6 +263,20 @@ pub(crate) enum RibReply {
     FibRoutes(Vec<(Prefix, bgpfc_fib::Hop)>),
     /// Answer to [`RibQuery::Transitions`].
     Transitions(TransitionsReport),
+    /// Answer to [`RibQuery::NextHops`].
+    NextHops(NextHopsReport),
+}
+
+/// The next hops the RIB's routes use, and the size of its copy of the
+/// kernel's routing table they resolve against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NextHopsReport {
+    /// Each next hop in use, in address order.
+    pub(crate) next_hops: Vec<bgpfc_rib::nexthop::NextHopReport>,
+    /// Routes in the copy of the kernel's table; `None` without one, when
+    /// every next hop resolves to itself (never in bgpfcd, which gives
+    /// the RIB a table before any route).
+    pub(crate) kernel_routes: Option<usize>,
 }
 
 /// A route's move from one RFC 6811 state to another, as the RIB thread

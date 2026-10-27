@@ -22,6 +22,7 @@ commands:
   show neighbor ADDR
   show routes [ipv4|ipv6] [PREFIX] [held]
   show fib
+  show nexthops
   show status
   show rpki
   show rpki transitions

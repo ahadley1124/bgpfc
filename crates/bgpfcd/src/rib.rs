@@ -57,8 +57,8 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply, RibSettings,
-    RouteReport, TransitionsReport,
+    FibMsg, Intervals, NextHopsReport, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply,
+    RibSettings, RouteReport, TransitionsReport,
 };
 use crate::peer::SendError;
 
@@ -1066,6 +1066,10 @@ fn route_report(prefix: Prefix, r: &bgpfc_rib::RouteRef<'_>, best: bool) -> Rout
 fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
     match q {
         RibQuery::Transitions => RibReply::Transitions(transitions.report()),
+        RibQuery::NextHops => RibReply::NextHops(NextHopsReport {
+            next_hops: rib.next_hops(),
+            kernel_routes: rib.kernel_routes(),
+        }),
         RibQuery::Peers => RibReply::Peers(
             rib.peers()
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
@@ -2263,6 +2267,25 @@ mod tests {
                 Output::Fib(c) if c.next_hop == Some(hop) && c.previous.is_none()
             )),
             "{out:?}"
+        );
+        // `show nexthops` asks the RIB thread: the next hop, what it
+        // resolves through, and the routes of the kernel's table.
+        let RibReply::NextHops(report) = answer(&rib, &Transitions::default(), &RibQuery::NextHops)
+        else {
+            panic!("expected next hops");
+        };
+        assert_eq!(report.kernel_routes, Some(1));
+        assert_eq!(
+            report.next_hops,
+            [bgpfc_rib::nexthop::NextHopReport {
+                addr: ip("192.0.2.1"),
+                resolution: Resolution::Resolved {
+                    hop,
+                    through: Some(connected.prefix),
+                },
+                interface: Some("eth0".to_owned()),
+                routes: 1,
+            }]
         );
     }
 

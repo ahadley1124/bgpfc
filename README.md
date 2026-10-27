@@ -476,6 +476,7 @@ bgpfcctl show neighbors
 bgpfcctl show neighbor 198.51.100.1
 bgpfcctl show routes [ipv4|ipv6] [prefix] [held]
 bgpfcctl show fib
+bgpfcctl show nexthops
 bgpfcctl show rpki
 bgpfcctl show rpki transitions
 bgpfcctl clear neighbor 198.51.100.1 [soft]

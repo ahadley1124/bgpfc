@@ -836,10 +836,18 @@ fn ipv6_on_link_to_b(lab: &Lab) -> bool {
 }
 
 /// RFC 4271 §9.1.2: BIRD's route, whose IPv6 next hop nothing resolves,
-/// is held in the Adj-RIB-In for it, and the FIB is asked for nothing.
+/// is held in the Adj-RIB-In and said to be so, its next hop is listed
+/// unresolved, and the FIB is asked for nothing.
 fn assert_unresolvable_next_hop_held(ctl: &impl Fn(&[&str]) -> (String, bool)) {
     let (out, ok) = ctl(&["show", "routes", "192.0.2.0/24"]);
-    assert!(ok && out.contains("held by next-hop"), "{out}");
+    assert!(ok && out.contains("next hop unresolvable"), "{out}");
+    let (out, ok) = ctl(&["show", "nexthops"]);
+    assert!(
+        ok && out
+            .lines()
+            .any(|l| l.starts_with("2001:db8::1 ") && l.contains(" unresolved ")),
+        "{out}"
+    );
     let (out, ok) = ctl(&["show", "fib"]);
     assert!(ok && !out.contains("192.0.2.0/24"), "{out}");
 }
