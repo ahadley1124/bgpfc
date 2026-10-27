@@ -38,8 +38,12 @@
 //! Each operation also has a line of its own at debug (`fib: dry-run` or
 //! `fib: applied`, with the prefix and gateway), written as it is done. A
 //! failed one has a line at error (`fib: failed`) instead, at once, for
-//! the first [`FAILURES_LOGGED`] of a change and at debug after them, and
-//! the line that counts it is at error too.
+//! the first [`FAILURES_LOGGED`] of a change, and for no more than
+//! [`FAILURES_LOGGED`] in all between two `fib: changes` lines, and at
+//! debug after them; the line that counts it is at error too. The second
+//! bound is the one a table that loads from a peer meets, a change an
+//! UPDATE: with every route refused, its failures cost three lines a
+//! second at most, as its counts cost one.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -71,15 +75,20 @@ const SAMPLE: usize = 8;
 /// alone is still logged at once.
 pub(crate) const FOLD: Duration = Duration::from_secs(1);
 
-/// Failed operations of one change that get a line at error each; the
-/// rest are counted on the change's line, and have a line at debug. A
-/// kernel that refuses one route often refuses the whole table, as when
-/// bgpfcd lacks `CAP_NET_ADMIN` or a peer's next hop is not reachable
-/// directly, and then the first already names the reason; a line for
-/// each of a million would bury the rest of the log. Three rather than
-/// one, so that a change whose routes fail for different reasons, such
-/// as a next hop that is unreachable for some of them, shows more than
-/// one of the reasons at error.
+/// Failed operations that get a line at error each: the first of one
+/// change, and no more in all between two `fib: changes` lines; the rest
+/// are counted on those lines, and have a line at debug. A kernel that
+/// refuses one route often refuses the whole table, as when bgpfcd lacks
+/// `CAP_NET_ADMIN` or a peer's next hop is not reachable directly, and
+/// then the first already names the reason; a line for each of a million
+/// would bury the rest of the log. The bound per change alone would not
+/// do: a table that loads from a peer is a change per UPDATE, a few
+/// routes each, so it would still cost about a line a route. Between two
+/// lines, which come a second apart while changes keep coming ([`FOLD`]),
+/// it costs three a second. Three rather than one, so that a change whose
+/// routes fail for different reasons, such as a next hop that is
+/// unreachable for some of them, shows more than one of the reasons at
+/// error.
 pub(crate) const FAILURES_LOGGED: usize = 3;
 
 /// Open the socket, flush stale routes (AGENTS.md §3: only those with
@@ -251,12 +260,16 @@ struct Fold {
     /// The failed operations of the change under way, for
     /// [`FAILURES_LOGGED`].
     change_failed: usize,
+    /// The `fib: failed` lines written at error since the last line, for
+    /// [`FAILURES_LOGGED`].
+    logged: usize,
 }
 
 impl Fold {
     /// Count `applied`, done at `now` in the change under way, and write
     /// the lines of its operations: at debug with `debug`, and at error
-    /// for the first failures of the change.
+    /// for the first failures of the change, unless as many were written
+    /// since the last line.
     fn add(&mut self, applied: &[Applied], debug: bool, now: Instant, out: &mut impl FnMut(Line)) {
         self.in_change = true;
         if applied.is_empty() {
@@ -277,7 +290,8 @@ impl Fold {
                 Ok(()) => continue,
                 Err(_) => {
                     self.change_failed += 1;
-                    if self.change_failed <= FAILURES_LOGGED {
+                    if self.change_failed <= FAILURES_LOGGED && self.logged < FAILURES_LOGGED {
+                        self.logged += 1;
                         (Level::Error, "fib: failed")
                     } else if debug {
                         (Level::Debug, "fib: failed")
@@ -321,6 +335,7 @@ impl Fold {
         if let Some(line) = std::mem::take(&mut self.tally).summary() {
             out(line);
             self.last_line = Some(now);
+            self.logged = 0;
         }
         self.since = None;
     }
@@ -623,9 +638,10 @@ mod tests {
                 .iter()
                 .all(|l| l.level == Level::Debug && l.msg == "fib: failed")
         );
-        // The bound is per change, not per line: a change that starts
-        // before the line of the one before is written starts again, and
-        // its errors are written at once.
+        // The bound holds between two lines too: a change that starts
+        // before the line of the one before is written has no error line
+        // of its own once three were written, and is counted all the same;
+        // after the line, the next change has its three again.
         let mut fold = Fold::default();
         let now = Instant::now();
         let mut errors = Vec::new();
@@ -633,10 +649,26 @@ mod tests {
             fold.add(&ops, false, now, &mut |l| errors.push(l));
             fold.end_change();
         }
-        assert_eq!(errors.len(), 2 * FAILURES_LOGGED);
+        assert_eq!(errors.len(), FAILURES_LOGGED);
         assert!(errors.iter().all(|l| l.msg == "fib: failed"));
         fold.flush(now, &mut |l| errors.push(l));
-        assert_eq!(count(&errors[2 * FAILURES_LOGGED], "failed"), 16);
+        assert_eq!(count(&errors[FAILURES_LOGGED], "failed"), 16);
+        fold.add(&ops, false, now, &mut |l| errors.push(l));
+        assert_eq!(errors.len(), 2 * FAILURES_LOGGED + 1);
+        assert!(
+            errors[FAILURES_LOGGED + 1..]
+                .iter()
+                .all(|l| l.level == Level::Error && l.msg == "fib: failed")
+        );
+        // Under the bound between lines, a change has no more than its own
+        // three: one that starts after a single error line was written
+        // gets three, not more.
+        let mut fold = Fold::default();
+        let mut errors = Vec::new();
+        fold.add(&ops[..1], false, now, &mut |l| errors.push(l));
+        fold.end_change();
+        fold.add(&ops, false, now, &mut |l| errors.push(l));
+        assert_eq!(errors.len(), FAILURES_LOGGED);
     }
 
     /// Changes that keep coming get a line a second, each counting what
@@ -719,11 +751,18 @@ mod tests {
         Wait(Duration),
     }
 
-    /// Run the thread over `script`, on a clock of its own that starts at
-    /// `t0` and moves only with the script's waits, and for as long as
-    /// the thread waits for a line that is due. The lines it writes, with
-    /// the time from `t0` at which it wrote them.
+    /// Run the thread over `script` in dry-run (see [`run_in`]).
     fn run(t0: Instant, script: Vec<Step>) -> Vec<(Duration, Line)> {
+        run_in(Mode::DryRun, t0, script)
+    }
+
+    /// Run the thread over `script`, starting in `mode` with no socket,
+    /// so that in install mode the kernel refuses every operation, on a
+    /// clock of its own that starts at `t0` and moves only with the
+    /// script's waits, and for as long as the thread waits for a line
+    /// that is due. The lines it writes, with the time from `t0` at which
+    /// it wrote them.
+    fn run_in(mode: Mode, t0: Instant, script: Vec<Step>) -> Vec<(Duration, Line)> {
         let clock = Cell::new(t0);
         let script = RefCell::new(VecDeque::from(script));
         let mut recv = |deadline: Option<Instant>| loop {
@@ -750,7 +789,7 @@ mod tests {
         };
         let mut lines = Vec::new();
         serve(
-            Fib::new(Mode::DryRun, 254, 186),
+            Fib::new(mode, 254, 186),
             Fold::default(),
             &mut recv,
             &|| clock.get(),
@@ -884,6 +923,63 @@ mod tests {
         assert!(times[10] <= ms(9990) + FOLD, "{times:?}");
         let total: usize = lines.iter().map(|(_, l)| count(l, "install")).sum();
         assert_eq!(total, 1000);
+    }
+
+    /// A table the kernel refuses route by route as it loads from a
+    /// peer, a change an UPDATE: three error lines between two
+    /// `fib: changes` lines at most, so a few a second rather than one a
+    /// route, and every failure counted on those lines.
+    #[test]
+    fn a_refused_table_costs_three_error_lines_a_second() {
+        // A thousand single-route UPDATEs within a second, then a thousand
+        // more over ten seconds.
+        let mut script = Vec::new();
+        for i in 0..1000 {
+            script.push(changes(i..i + 1, false));
+            script.push(Step::Wait(ms(1)));
+        }
+        for i in 1000..2000 {
+            script.push(changes(i..i + 1, false));
+            script.push(Step::Wait(ms(10)));
+        }
+        script.push(Step::Wait(ms(5000)));
+        let lines = run_in(Mode::Install, Instant::now(), script);
+        assert!(
+            lines
+                .iter()
+                .all(|(_, l)| l.level == Level::Error && [CHANGES, "fib: failed"].contains(&l.msg)),
+            "{lines:?}"
+        );
+        // Between two lines, and before the first, three at most.
+        let mut errors = 0;
+        let mut summaries = Vec::new();
+        for (at, l) in &lines {
+            if l.msg == CHANGES {
+                summaries.push((*at, count(l, "failed")));
+                errors = 0;
+            } else {
+                errors += 1;
+                assert!(errors <= FAILURES_LOGGED, "{lines:?}");
+            }
+        }
+        // The first second: the first UPDATE's error and line at once,
+        // three errors more, and the line that counts the rest.
+        let second = lines
+            .iter()
+            .filter(|(_, l)| l.msg == CHANGES)
+            .nth(1)
+            .map(|(at, _)| *at);
+        assert_eq!(second, Some(FOLD));
+        let first = lines.iter().take_while(|(at, _)| *at < FOLD).count();
+        assert_eq!(first, 1 + 1 + FAILURES_LOGGED, "{lines:?}");
+        assert_eq!(summaries[..2], [(ms(0), 1), (FOLD, 999)]);
+        // Then a line a second, eleven seconds in all, with three errors
+        // at most each.
+        assert_eq!(summaries.len(), 12, "{summaries:?}");
+        let errors = lines.len() - summaries.len();
+        assert!(errors <= FAILURES_LOGGED * summaries.len(), "{errors}");
+        let failed: usize = summaries.iter().map(|(_, n)| n).sum();
+        assert_eq!(failed, 2000);
     }
 
     /// Every sender gone: what was counted is written before the thread

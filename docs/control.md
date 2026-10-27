@@ -319,12 +319,15 @@ some line. The lines' counts add up to every operation done.
 Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
 applied`, with `op`, `prefix` and `gateway`), written as it is done. A
 failed operation has one at error (`fib: failed`, with the kernel's
-`error`), at once, the first three of a change, the others at `debug`,
-and the `fib: changes` line that counts it is then at error too: a kernel
-that refuses one route, for want of `CAP_NET_ADMIN` or for a next hop it
-cannot reach directly, often refuses the whole table, and the first
-already names the reason. At `log { level warn; }` the FIB thread writes
-only its failures.
+`error`), at once, the first three of a change, and three at most between
+two `fib: changes` lines, whatever the number of changes; the others at
+`debug`. The `fib: changes` line that counts them is then at error too,
+with every failure in `failed`. A kernel that refuses one route, for want
+of `CAP_NET_ADMIN` or for a next hop it cannot reach directly, often
+refuses the whole table, and the first already names the reason; a table
+that loads from a peer, a change an UPDATE, so costs at most three error
+lines and one `fib: changes` line a second, not a line a route. At
+`log { level warn; }` the FIB thread writes only its failures.
 
 ## RPKI
 
