@@ -33,6 +33,10 @@ pub struct Config {
     pub control: Control,
     /// `rpki { ... }`; [`Rpki::implicit`] when there is none.
     pub rpki: Rpki,
+    /// `netns`: the file of the network namespace bgpfcd joins at startup,
+    /// as [`netns_path`](crate::netns_path) resolves it; `None` runs it in
+    /// the namespace it is started in.
+    pub netns: Option<PathBuf>,
     /// `prefix-list NAME { ... }` blocks, in file order.
     pub prefix_lists: Vec<PrefixList>,
     /// `policy NAME { ... }` blocks, in file order.

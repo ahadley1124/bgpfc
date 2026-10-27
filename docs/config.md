@@ -44,7 +44,9 @@ global       = "router-id" ipv4 ";"              (* required; not 0.0.0.0 *)
              | "listen" "{" "address" ip ";" [ "port" u16 ";" ] "}"   (* repeatable *)
              | "fib" "{" { fib-item } "}"
              | "control" "{" { control-item } "}"
-             | "rpki" "{" { rpki-item } "}" ;    (* none: validation disabled *)
+             | "rpki" "{" { rpki-item } "}"      (* none: validation disabled *)
+             | "netns" netns ";" ;               (* once; default: the namespace
+                                                    bgpfcd is started in *)
 
 level        = "error" | "warn" | "info" | "debug" | "trace" ;    (* default info *)
 
@@ -161,6 +163,7 @@ Value syntax:
 | `large-community` | `global:local1:local2`, each 32-bit |
 | `name` | any word |
 | `path` | any word or string |
+| `netns` | a name in `/run/netns`: one path component, not empty, without `/`, not `.` or `..`, at most 255 octets (iproute2's rule); or an absolute path, starting with `/` |
 
 ## Semantics
 
@@ -954,11 +957,55 @@ The other common behaviours are policies:
   Such routes are held for their state too (see **RPKI** above), so they
   are used again once they are no longer Invalid.
 
+**Network namespace.** `netns NAME;` makes bgpfcd join the network
+namespace `/run/netns/NAME`, the file `ip netns add NAME` creates
+(iproute2's convention); a value that starts with `/` is a path used as
+it is, such as `/proc/PID/ns/net`, the namespace process PID is in, or
+`/var/run/netns/NAME`. Any other value, such as `a/b`, `..` or an empty
+string, is an error. Without the statement bgpfcd runs in the namespace
+it is started in.
+
+bgpfcd joins the namespace itself, at startup, before it opens a socket
+or starts a thread, so that everything it does happens there, as if it
+had been started with `ip netns exec NAME`: the BGP listeners and
+sessions, the routes it installs (`fib { table }` names a table of that
+namespace), the HTTP API's listener, the connections to RTR caches, and
+Routinator with `mode sidecar`. The control socket is a file, so
+`bgpfcctl` reaches it from any namespace. The configuration file, the
+`token-file` and every other file are read as before the join: the
+namespace changes the network, not the file system.
+
+Joining needs `CAP_SYS_ADMIN` (`setns(2)`): root has it, and a bgpfcd run
+as an unprivileged user needs it besides the others (README, "Run").
+bgpfcd checks for it before the join, and stops with `cannot join network
+namespace` and `setns(2) needs CAP_SYS_ADMIN` without it. It gives the
+capability up right after the join, as root and as a user alike, so that
+nothing it runs later holds it; the log says `network namespace joined`,
+with the namespace's identity (`dev:inode` of its file), then
+`capability dropped`. Started inside the namespace already, such as with
+`ip netns exec`, bgpfcd does not join and needs no capability. Whatever
+stops the join stops the start: bgpfcd never runs in another namespace
+than the one it was told.
+
+`ip netns exec` does more than join the namespace: it gives the program
+a mount namespace of its own, in which `/sys` shows the namespace's
+interfaces, and the files of `/etc/netns/NAME/`, typically `resolv.conf`
+and `hosts`, stand in for those of `/etc`. bgpfcd does neither. It reads
+nothing under `/sys` and no setting under `/proc/sys/net`, and the
+socket tables it reads, `/proc/net/tcp` and `/proc/net/tcp6` for the
+sidecar's port, are the namespace's. What differs is name resolution:
+the host names of `rpki` caches, and Routinator's repository hosts, are
+looked up from inside the namespace with the host's `/etc/resolv.conf`
+and `/etc/hosts`, and a resolver on the host's loopback, such as
+systemd-resolved's `127.0.0.53`, cannot be reached from there. Give the
+caches by address, or use a resolver the namespace reaches.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; no neighbor's `export` policy has
-`set rpki`; the HTTP listen address is a loopback address; timer
+`set rpki`; the HTTP listen address is a loopback address; `netns` is a
+name or an absolute path (above); timer
 constraints above; `extended-next-hop` only with `ipv4-unicast` in
 `families`; `maximum-prefix` only for a family in `families`; an `rpki`
 block has a `mode`, at least one `cache` with `mode external`, no cache
@@ -1001,6 +1048,15 @@ a session that already holds more routes than its new limit ends as if it
 had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 `local-as` resets every session.
+
+A changed `netns`, added or removed, takes effect at the next restart,
+as a changed `listen` or `control` block, `fib { table }` or `fib {
+protocol }` does: the reload applies everything else and its summary
+says `netns changed: takes effect at the next restart`. The running
+daemon stays in the namespace it joined, where its sockets are: moving
+would need every one of them opened again, and the `CAP_SYS_ADMIN` it
+gave up. Refusing the whole reload, as for `router-id`, would hold back
+the other changes for no gain.
 
 A changed `rpki` block restarts the RTR client with the new settings. The
 VRPs the old client had stay in use until a cache of the new list has sent

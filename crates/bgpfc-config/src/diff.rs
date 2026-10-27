@@ -60,6 +60,10 @@ pub enum GlobalChange {
     Log,
     /// The `control` block.
     Control,
+    /// The `netns` statement: the network namespace bgpfcd joined at
+    /// startup, whose sockets it holds, so the change waits for the next
+    /// restart.
+    Netns,
     /// The `rpki` block's mode, or the RTR client's or the sidecar's
     /// settings, an absent block counting as
     /// [`Rpki::implicit`](crate::ast::Rpki::implicit): the RTR client
@@ -103,6 +107,7 @@ impl ConfigDiff {
             (old.fib != new.fib, GlobalChange::Fib),
             (old.log_level != new.log_level, GlobalChange::Log),
             (old.control != new.control, GlobalChange::Control),
+            (old.netns != new.netns, GlobalChange::Netns),
             (!old.rpki.same_as(&new.rpki), GlobalChange::Rpki),
             (
                 old.rpki.enforcement != new.rpki.enforcement,
@@ -462,6 +467,23 @@ mod tests {
             ConfigDiff::between(&a, &c).global,
             vec![GlobalChange::Fib, GlobalChange::Log, GlobalChange::Control]
         );
+    }
+
+    /// A name and the path it stands for are the same namespace; adding,
+    /// changing or removing the statement is a change.
+    #[test]
+    fn netns_changes_are_a_global_change() {
+        let a = cfg(BASE);
+        let blue = cfg(&format!("{BASE} netns blue;"));
+        let path = cfg(&format!("{BASE} netns /run/netns/blue;"));
+        let red = cfg(&format!("{BASE} netns red;"));
+        assert!(ConfigDiff::between(&blue, &path).is_empty());
+        for (old, new) in [(&a, &blue), (&blue, &red), (&path, &a)] {
+            let d = ConfigDiff::between(old, new);
+            assert_eq!(d.global, vec![GlobalChange::Netns]);
+            // No session resets for it.
+            assert!(d.reset.is_empty(), "{d:?}");
+        }
     }
 
     #[test]

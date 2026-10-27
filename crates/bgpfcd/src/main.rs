@@ -416,6 +416,9 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
+                GlobalChange::Netns => {
+                    notes.push("netns changed: takes effect at the next restart".to_owned());
+                }
                 // Applied below: the block from the one in effect, then the
                 // keep-alive, once the client the block runs is known.
                 GlobalChange::Rpki | GlobalChange::RpkiKeepalive => {}

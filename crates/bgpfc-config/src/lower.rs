@@ -15,7 +15,9 @@
 //! 6811 §2 and §5 (`enforcement`: what the validation state does,
 //! configured; `startup`: routes held until the first data only when
 //! configured), §3 (`match rpki`, `set rpki`). Issues #70-#72: the
-//! `sidecar` block of `rpki`, within the bounds of `bgpfc-sidecar`.
+//! `sidecar` block of `rpki`, within the bounds of `bgpfc-sidecar`. The
+//! `netns` statement, a name as iproute2 takes one or an absolute path
+//! ([`netns_path`](crate::netns_path)).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -190,6 +192,7 @@ impl Lowerer {
         let mut fib = Once::new("fib");
         let mut control = Once::new("control");
         let mut rpki = Once::new("rpki");
+        let mut netns = Once::new("netns");
         let mut listen = Vec::new();
         let mut prefix_lists: Vec<PrefixList> = Vec::new();
         let mut policies: Vec<Policy> = Vec::new();
@@ -229,6 +232,14 @@ impl Lowerer {
                     let v = self.rpki(s);
                     rpki.set(self, s.pos, v);
                 }
+                "netns" => {
+                    let v = self.arg(s).and_then(|a| {
+                        crate::netns_path(&a.value)
+                            .map_err(|e| self.err(a.pos, format!("`netns` {e}")))
+                            .ok()
+                    });
+                    netns.set(self, s.pos, v);
+                }
                 "prefix-list" => {
                     if let Some(p) = self.prefix_list(s) {
                         if prefix_lists.iter().any(|q| q.name == p.name) {
@@ -266,6 +277,7 @@ impl Lowerer {
             fib: fib.value.unwrap_or_default(),
             control: control.value.unwrap_or_default(),
             rpki: rpki.value.unwrap_or_else(Rpki::implicit),
+            netns: netns.value,
             prefix_lists,
             policies,
             neighbors,

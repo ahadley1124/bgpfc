@@ -83,6 +83,9 @@ Config {
             count: 4,
         },
     },
+    netns: Some(
+        "/run/netns/blue",
+    ),
     prefix_lists: [
         PrefixList {
             pos: Pos {

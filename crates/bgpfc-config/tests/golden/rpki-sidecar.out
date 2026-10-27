@@ -74,6 +74,7 @@ Config {
             count: 3,
         },
     },
+    netns: None,
     prefix_lists: [],
     policies: [],
     neighbors: [],

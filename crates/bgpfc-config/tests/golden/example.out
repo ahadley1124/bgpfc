@@ -64,6 +64,7 @@ Config {
             count: 6,
         },
     },
+    netns: None,
     prefix_lists: [
         PrefixList {
             pos: Pos {

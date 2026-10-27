@@ -14,7 +14,8 @@
 //! acting on the validation state, and holding routes not validated yet,
 //! only as configured). Issues #26 and #70-#72: the
 //! `sidecar` block, Routinator's settings within the bounds of
-//! `bgpfc-sidecar`.
+//! `bgpfc-sidecar`. The `netns` statement: the network namespace bgpfcd
+//! joins, named as iproute2 names them ([`netns_path`]).
 //!
 //! ```
 //! let text = "router-id 192.0.2.1; local-as 65000;
@@ -33,7 +34,7 @@ mod lower;
 pub mod parser;
 mod validate;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use ast::Config;
 pub use diff::ConfigDiff;
@@ -109,6 +110,59 @@ pub fn parse_file_with(
     let text =
         std::fs::read_to_string(path).map_err(|e| LoadError::Io(path.display().to_string(), e))?;
     parse_str_with(&path.display().to_string(), &text, check).map_err(LoadError::Config)
+}
+
+/// Where iproute2 keeps the network namespaces `ip netns add` names
+/// (`ip-netns(8)`).
+pub const NETNS_DIR: &str = "/run/netns";
+
+/// The longest name of a file, `NAME_MAX` (`<linux/limits.h>`).
+const NAME_MAX: usize = 255;
+
+/// The file that names a network namespace, from the value of `netns` or
+/// of `bgpfcd --netns`: a NAME means `/run/netns/NAME`, the file
+/// `ip netns add NAME` creates; a value that starts with `/` is a path used
+/// as it is, such as `/proc/PID/ns/net`. A NAME is what iproute2 accepts
+/// as one (`invalid_name()` in `ip/ipnetns.c`): one path component, not
+/// empty, without `/`, not `.` or `..`, at most `NAME_MAX` octets; and,
+/// as in any path, without a NUL character. Nothing is opened here.
+///
+/// ```
+/// use std::path::Path;
+/// assert_eq!(bgpfc_config::netns_path("blue").unwrap(), Path::new("/run/netns/blue"));
+/// assert_eq!(
+///     bgpfc_config::netns_path("/proc/1/ns/net").unwrap(),
+///     Path::new("/proc/1/ns/net")
+/// );
+/// assert!(bgpfc_config::netns_path("a/b").is_err());
+/// ```
+///
+/// # Errors
+/// What is wrong with the value, to follow `netns` or `--netns`.
+pub fn netns_path(value: &str) -> Result<PathBuf, String> {
+    const WANT: &str = "takes a name in /run/netns or an absolute path";
+    if value.contains('\0') {
+        return Err(format!("{WANT}, not one with a NUL character"));
+    }
+    if value.starts_with('/') {
+        return Ok(PathBuf::from(value));
+    }
+    if value.is_empty() {
+        return Err(format!("{WANT}, not an empty string"));
+    }
+    if value == "." || value == ".." {
+        return Err(format!("{WANT}, not `{value}`"));
+    }
+    if value.contains('/') {
+        return Err(format!("{WANT}, not the relative path `{value}`"));
+    }
+    if value.len() > NAME_MAX {
+        return Err(format!(
+            "{WANT}: a name is at most {NAME_MAX} octets, not {}",
+            value.len()
+        ));
+    }
+    Ok(Path::new(NETNS_DIR).join(value))
 }
 
 /// The check of [`parse_str`] and [`parse_file`]: none.
@@ -207,6 +261,48 @@ neighbor 192.0.2.3 { remote-as 65002; import ANY; export ANY; }
         let errors = parse_str_with("t.conf", &lowering, &check).unwrap_err();
         assert!(!errors.to_string().contains("never"), "{errors}");
         assert!(!checked.get(), "the check ran on a file that did not lower");
+    }
+
+    /// iproute2's names, and absolute paths as they are; nothing else.
+    #[test]
+    fn netns_names_and_paths() {
+        for (value, path) in [
+            ("blue", "/run/netns/blue"),
+            ("ns-1.lab_2", "/run/netns/ns-1.lab_2"),
+            ("...", "/run/netns/..."),
+            ("/proc/42/ns/net", "/proc/42/ns/net"),
+            ("/var/run/netns/x", "/var/run/netns/x"),
+            ("/", "/"),
+        ] {
+            assert_eq!(netns_path(value).unwrap(), Path::new(path), "{value}");
+        }
+        let longest = "n".repeat(NAME_MAX);
+        assert_eq!(
+            netns_path(&longest).unwrap(),
+            Path::new(NETNS_DIR).join(&longest)
+        );
+        for (value, why) in [
+            ("", "not an empty string"),
+            (".", "not `.`"),
+            ("..", "not `..`"),
+            ("a/b", "not the relative path `a/b`"),
+            ("./x", "not the relative path `./x`"),
+            ("x/", "not the relative path `x/`"),
+            ("a\0b", "not one with a NUL character"),
+            ("/run/netns/a\0", "not one with a NUL character"),
+        ] {
+            let err = netns_path(value).unwrap_err();
+            assert_eq!(
+                err,
+                format!("takes a name in /run/netns or an absolute path, {why}"),
+                "{value:?}"
+            );
+        }
+        let err = netns_path(&format!("{longest}n")).unwrap_err();
+        assert!(
+            err.ends_with("a name is at most 255 octets, not 256"),
+            "{err}"
+        );
     }
 
     /// A file that cannot be read is an I/O error; one that can is

@@ -67,6 +67,7 @@ Config {
             count: 6,
         },
     },
+    netns: None,
     prefix_lists: [],
     policies: [],
     neighbors: [],

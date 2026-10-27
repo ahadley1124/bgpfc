@@ -271,3 +271,18 @@ value-errors.conf:79:1: `rpki` needs a `mode` (`disabled`, `external` or `sideca
 value-errors.conf:79:1: `rpki` is given more than once
   rpki { cache 192.0.2.9; }
   ^
+value-errors.conf:80:7: `netns` takes a name in /run/netns or an absolute path, not the relative path `a/b`
+  netns a/b;
+        ^
+value-errors.conf:81:1: `netns` is given more than once
+  netns ..;
+  ^
+value-errors.conf:81:7: `netns` takes a name in /run/netns or an absolute path, not `..`
+  netns ..;
+        ^
+value-errors.conf:82:1: `netns` is given more than once
+  netns "";
+  ^
+value-errors.conf:82:7: `netns` takes a name in /run/netns or an absolute path, not an empty string
+  netns "";
+        ^
