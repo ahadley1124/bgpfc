@@ -50,8 +50,10 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)); a changed
-  import policy applies at once to the routes already received, with a route
-  refresh only for those an import policy had rejected.
+  import policy applies at once to the routes already received. Routes an
+  import policy rejected are not kept, so when it has rejected any route of
+  a family, the neighbor is also asked to send that whole family again with
+  a route refresh.
 - RPKI route origin validation (RFC 6811): a validation state on every
   route, from VRPs fetched over RTR (RFC 8210, falling back to RFC 6810) from
   the caches of an `rpki` block, with failover in order of preference, or
