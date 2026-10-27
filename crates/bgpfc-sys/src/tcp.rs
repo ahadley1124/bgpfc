@@ -26,7 +26,7 @@
 use std::ffi::{c_int, c_void};
 use std::io;
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::time::Duration;
 
 use crate::ffi;
@@ -77,7 +77,7 @@ pub fn set_tcp_keepalive(stream: &TcpStream, keepalive: TcpKeepalive) -> io::Res
     let interval = seconds(keepalive.interval)?;
     let probes = c_int::try_from(keepalive.probes)
         .map_err(|_| invalid("too many keep-alive probes for the kernel"))?;
-    let fd = stream.as_raw_fd();
+    let fd = stream.as_fd();
     set_int(fd, ffi::IPPROTO_TCP, ffi::TCP_KEEPIDLE, idle)?;
     set_int(fd, ffi::IPPROTO_TCP, ffi::TCP_KEEPINTVL, interval)?;
     set_int(fd, ffi::IPPROTO_TCP, ffi::TCP_KEEPCNT, probes)?;
@@ -90,7 +90,7 @@ pub fn set_tcp_keepalive(stream: &TcpStream, keepalive: TcpKeepalive) -> io::Res
 /// # Errors
 /// The `getsockopt(2)` failure.
 pub fn tcp_keepalive(stream: &TcpStream) -> io::Result<Option<TcpKeepalive>> {
-    let fd = stream.as_raw_fd();
+    let fd = stream.as_fd();
     if get_int(fd, ffi::SOL_SOCKET, ffi::SO_KEEPALIVE)? == 0 {
         return Ok(None);
     }
@@ -117,21 +117,25 @@ fn invalid(what: &'static str) -> io::Error {
 }
 
 /// The length of an `int` option.
-fn int_len() -> ffi::socklen_t {
+pub(crate) fn int_len() -> ffi::socklen_t {
     // invariant: sizeof(int) is 4 on every Linux target.
     ffi::socklen_t::try_from(size_of::<c_int>()).unwrap_or(4)
 }
 
 /// `setsockopt(fd, level, name, &value, sizeof(int))`.
 #[allow(unsafe_code, reason = "FFI call with a borrowed int")]
-fn set_int(fd: c_int, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
-    // SAFETY: `fd` comes from a `TcpStream` the caller borrows for the
-    // whole call, so it stays open; `value` lives on this frame until the
-    // call returns, and the length given is its size. The kernel only
-    // reads it.
+pub(crate) fn set_int(
+    fd: BorrowedFd<'_>,
+    level: c_int,
+    name: c_int,
+    value: c_int,
+) -> io::Result<()> {
+    // SAFETY: `fd` is borrowed for the whole call, so it stays open;
+    // `value` lives on this frame until the call returns, and the length
+    // given is its size. The kernel only reads it.
     let rc = unsafe {
         ffi::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             level,
             name,
             (&raw const value).cast::<c_void>(),
@@ -146,16 +150,16 @@ fn set_int(fd: c_int, level: c_int, name: c_int, value: c_int) -> io::Result<()>
 
 /// `getsockopt(fd, level, name, &value, &len)` for an `int` option.
 #[allow(unsafe_code, reason = "FFI call with a borrowed int")]
-fn get_int(fd: c_int, level: c_int, name: c_int) -> io::Result<c_int> {
+pub(crate) fn get_int(fd: BorrowedFd<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
     let mut value: c_int = 0;
     let mut len = int_len();
-    // SAFETY: `fd` comes from a `TcpStream` the caller borrows for the
-    // whole call, so it stays open; `value` and `len` live on this frame
-    // until the call returns, and `len` says how many bytes `value` has
-    // room for, which bounds what the kernel writes there.
+    // SAFETY: `fd` is borrowed for the whole call, so it stays open;
+    // `value` and `len` live on this frame until the call returns, and
+    // `len` says how many bytes `value` has room for, which bounds what
+    // the kernel writes there.
     let rc = unsafe {
         ffi::getsockopt(
-            fd,
+            fd.as_raw_fd(),
             level,
             name,
             (&raw mut value).cast::<c_void>(),

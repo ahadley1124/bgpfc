@@ -60,8 +60,16 @@ impl NetlinkSocket {
             nl_groups: 0,
         };
         // SAFETY: `addr` is a valid, fully initialised `sockaddr_nl` that
-        // outlives the call, and the length is its size.
-        let rc = unsafe { ffi::bind(fd.as_raw_fd(), &raw const addr, sockaddr_len()) };
+        // outlives the call, and the length is its size: the kernel reads
+        // that many bytes through the generic `sockaddr` pointer, as
+        // bind(2) is meant to be called.
+        let rc = unsafe {
+            ffi::bind(
+                fd.as_raw_fd(),
+                (&raw const addr).cast::<ffi::sockaddr>(),
+                sockaddr_len(),
+            )
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }

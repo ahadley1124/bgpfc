@@ -23,11 +23,16 @@
 //!
 //! It joins a network namespace (`setns(2)`), for a daemon told to run in
 //! one, and drops the capability that took (`capset(2)`).
+//!
+//! And it opens outgoing TCP connections with a TTL and a source address
+//! set before the SYN, and sets the TTL of an accepted one, which std
+//! cannot either, for bgpfcd's BGP sessions (`multihop`, `local-address`).
 #![cfg(target_os = "linux")]
 
 #[cfg(feature = "profiling")]
 pub mod alloc;
 mod caps;
+mod connect;
 mod ffi;
 mod inherit;
 mod netlink;
@@ -38,6 +43,7 @@ mod signal;
 mod tcp;
 
 pub use caps::{Capability, Effective, drop_capability};
+pub use connect::{TcpConnect, set_ttl, ttl};
 pub use inherit::clear_ambient_capabilities;
 pub use inherit::inherit_only_standard_streams;
 pub use netlink::NetlinkSocket;
