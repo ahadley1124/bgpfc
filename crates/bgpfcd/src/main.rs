@@ -84,7 +84,8 @@ fn main() {
         router_id = config.router_id,
         fib_mode = config.fib.mode,
         rpki = config.rpki.mode,
-        enforcement = config.rpki.enforcement
+        enforcement = config.rpki.enforcement,
+        startup = config.rpki.startup
     );
     // Issue #60: a cache that cannot be found stops the start, before
     // anything is opened, rather than leaving every route unvalidated.
@@ -190,8 +191,10 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 
     // No validation source yet (issue #56): every route is `disabled`
-    // until the RTR client sends its first full set. The `enforcement` is
-    // set before the thread starts, so that no route is judged without it.
+    // until the RTR client sends its first full set. The `enforcement` and
+    // the `startup` are set before the thread starts, so that no route is
+    // judged without them: under `startup hold` every route that arrives
+    // before that set is held.
     rib::spawn(
         wiring::rib(&config, Box::new(engine)),
         wiring::rib_settings(&config),
@@ -417,30 +420,7 @@ impl Coordinator<'_> {
         for addr in &diff.reset {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
         }
-        // Policies always follow the new file: the engine knows every
-        // neighbor's policy names.
-        let _ = self.rib_tx.send(RibMsg::SetPolicies {
-            policies: messages::NewPolicies(Box::new(engine)),
-            reexport: diff.policy_changed.clone(),
-        });
-        // RFC 6811 §5: a new `enforcement` judges every route again, under
-        // the new import policies, with no restart of the RTR client.
-        if diff.global.contains(&GlobalChange::RpkiEnforcement) {
-            let _ = self
-                .rib_tx
-                .send(RibMsg::SetEnforcement(new.rpki.enforcement));
-        }
-        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
-        // file without a reset. Sent before new peers start, so their
-        // sessions come up with the new values.
-        let _ = self
-            .rib_tx
-            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(&new)));
-        // RFC 4271 §6.7: so do the prefix limits; a session already over a
-        // lowered limit ends.
-        let _ = self
-            .rib_tx
-            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
+        self.reload_rib(&new, engine, &diff);
         // Import policy changes need the peer's routes again (RFC 2918).
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
@@ -475,6 +455,52 @@ impl Coordinator<'_> {
         );
         self.config = new;
         Ok(summary)
+    }
+
+    /// What a reload tells the RIB thread, in this order, after the `rpki`
+    /// block is reconfigured and before new peers start: the new
+    /// policies, then what acts on the validation state, which judges
+    /// routes again under them, then the per-neighbor settings.
+    fn reload_rib(
+        &self,
+        new: &bgpfc_config::Config,
+        engine: bgpfc_policy::Engine,
+        diff: &ConfigDiff,
+    ) {
+        // Policies always follow the new file: the engine knows every
+        // neighbor's policy names.
+        let _ = self.rib_tx.send(RibMsg::SetPolicies {
+            policies: messages::NewPolicies(Box::new(engine)),
+            reexport: diff.policy_changed.clone(),
+        });
+        // RFC 6811 §5: a new `enforcement` judges every route again, under
+        // the new import policies, with no restart of the RTR client.
+        if diff.global.contains(&GlobalChange::RpkiEnforcement) {
+            let _ = self
+                .rib_tx
+                .send(RibMsg::SetEnforcement(new.rpki.enforcement));
+        }
+        // RFC 6811 §2: the startup setting of the block now in effect, so
+        // that the routes not validated yet are held or used as it says:
+        // `hold` while a client waits for its first full set, `accept` once
+        // validation is off, which `Rpki::disable` has already told the
+        // RIB before it turned validation off. The same setting again
+        // changes nothing; a new one judges those routes again, under the
+        // new import policies, with no restart of the RTR client.
+        let _ = self.rib_tx.send(RibMsg::SetStartup(rpki::startup(
+            &self.rpki.in_effect(&new.rpki),
+        )));
+        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
+        // file without a reset. Sent before new peers start, so their
+        // sessions come up with the new values.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(new)));
+        // RFC 4271 §6.7: so do the prefix limits; a session already over a
+        // lowered limit ends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(new)));
     }
 
     /// The running `rpki` block, its client and its sidecar.

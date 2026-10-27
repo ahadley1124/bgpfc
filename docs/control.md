@@ -31,7 +31,7 @@ failure, 2 on a usage error.
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement`, `held by startup` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode and enforcement, whether validation is off, waiting for its first data or active, Routinator's state with `mode sidecar`, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki transitions` | the latest routes whose origin validation state changed, oldest first, each with its time (see [Changes of state](#changes-of-state)) |
@@ -159,7 +159,8 @@ from one that no VRP covers (issue #52). Every route is `disabled` until
 the `rpki` block (`docs/config.md`, "RPKI") gives bgpfcd the VRPs of an
 RPKI cache, external (`mode external`) or Routinator run by bgpfcd (`mode
 sidecar`), and that cache has sent its first full set (`show rpki` says
-`validation waiting` meanwhile); from then on the states follow the
+`validation waiting` meanwhile, and whether the routes are used or held
+until then, as `startup` says); from then on the states follow the
 cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
@@ -168,7 +169,9 @@ What acts on it is the `rpki` block's `enforcement`, which `show rpki`
 prints, and the import policy (`docs/config.md`, "RPKI"): under
 `drop-invalid`, the default, an Invalid route is held; under
 `prefer-valid` route selection ranks Valid routes first; under `off`
-nothing acts on the state but policy.
+nothing acts on the state but policy. Before the first full set, the
+block's `startup` decides: `accept`, the default, uses the `disabled`
+routes, and `hold` holds them until that set gives them a state.
 
 When import policy sets the state a route is used with (`set rpki`, RFC
 6811 §3), `show routes` prints it after the looked-up one, as in
@@ -181,10 +184,11 @@ installed nor advertised (RFC 6811 §2: kept in the Adj-RIB-In, and out
 of the decision process only as configured). It is used again, with no
 UPDATE from its neighbor, once its state allows. `show routes PREFIX`
 lists it after the candidates, marked `!`, followed by `held by
-enforcement` (the `enforcement` rules out the state it is used with) or
-`held by policy` (the import policy rejects it in its state and would
-accept it in another); the JSON has `held` (`enforcement`, `policy` or
-`null`). A held route keeps the attributes its neighbor sent, and is shown
+enforcement` (the `enforcement` rules out the state it is used with),
+`held by startup` (`startup hold`: it is `disabled`, waiting for the first
+full set to give it a state) or `held by policy` (the import policy
+rejects it in its state and would accept it in another); the JSON has
+`held` (`enforcement`, `startup`, `policy` or `null`). A held route keeps the attributes its neighbor sent, and is shown
 with them: the import policy runs on them again when the route is used
 again, so what the policy sets, such as a `set local-pref`, shows only
 then. `show routes held` lists every held route of a family, and `show
@@ -236,6 +240,20 @@ too:
 
 ```
 2026-10-22T12:34:56.789Z INFO  msg="rib: rpki enforcement changed" from=off to=drop-invalid routes=1250000 held=5000 released=0 best_changed=4800
+```
+
+So is a change of the startup setting the RIB applies (`rib: rpki
+startup changed`), which judges again only the routes not validated yet,
+`disabled`: a reload that changes `startup` while the routes wait for the
+first full set, one that turns validation on with `startup hold`, which
+holds them all, or one that turns it off, before which the hold goes.
+`routes` counts those routes, `held` and `released` what the change did
+to them. When the first full set arrives, the routes `startup hold` held
+are released, or held by `enforcement`, on the `rib: validation states
+changed` line, as `released` and `held`:
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: rpki startup changed" from=accept to=hold routes=1250000 held=1250000 released=0 best_changed=1100000
 ```
 
 `show rpki transitions` and `GET /v1/rpki/transitions` give the latest
@@ -314,6 +332,7 @@ at preference 0.
 ```
 mode sidecar
 enforcement drop-invalid
+startup accept
 validation active
 sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)
 sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, last exit: killed by signal 9 (SIGKILL)
@@ -329,7 +348,8 @@ failures 0
 |---|---|---|
 | `mode` | `mode` | `disabled`, `external` or `sidecar` |
 | `enforcement` | `enforcement` | what acts on the validation state: `drop-invalid`, `prefer-valid` or `off` (see [Validation state](#validation-state)); written or the default, and shown in every mode |
-| `validation` | `validation` | `off`: no RTR client runs, so every route is `disabled`, as with `mode disabled` or after a reload that could not start the client or Routinator; `waiting` (`waiting Ns for the first full set: ...`): the client has had no full set yet, so every route is `disabled` and used as received, and `enforcement` acts once the set arrives (`docs/config.md`, "Startup window"); `active`: the RIB validates with a cache's VRPs, or with VRPs held from one until they expire |
+| `startup` | `startup` | what becomes of the routes while validation waits for the first full set: `accept` or `hold` (`docs/config.md`, "Startup window"); written or the default, and shown in every mode, although with `mode disabled` it holds nothing |
+| `validation` | `validation` | `off`: no RTR client runs, so every route is `disabled` and used, as with `mode disabled` or after a reload that could not start the client or Routinator; `waiting` (`waiting Ns for the first full set: ...`): the client has had no full set yet, so every route is `disabled`, and used as received (`every route is disabled and used unvalidated`) or, under `startup hold`, held (`every route is disabled and held (startup hold)`); `enforcement` acts once the set arrives (`docs/config.md`, "Startup window"); `active`: the RIB validates with a cache's VRPs, or with VRPs held from one until they expire |
 | `waiting_seconds` | `waiting Ns` | while `validation` is `waiting`, for how long; `null` otherwise |
 | `sidecar` | `sidecar` | Routinator, while bgpfcd runs it: see below. `null` without; with `mode sidecar` that means a reload could not start it, and the text says `sidecar not running` |
 | `caches` | `cache` | the configured caches, and with a sidecar the client's cache at Routinator's address, marked `(sidecar)` in the text: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
@@ -345,8 +365,8 @@ failures 0
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
 Without a client, in `mode disabled`, every member but `mode`,
-`enforcement`, `validation` (`off`) and `caches` is `null`, `false` or 0,
-and the text lists only those four. The members are the same in every
+`enforcement`, `startup`, `validation` (`off`) and `caches` is `null`,
+`false` or 0, and the text lists only those five. The members are the same in every
 mode.
 
 The `sidecar` object and its two lines, `sidecar STATE, routinator VERSION

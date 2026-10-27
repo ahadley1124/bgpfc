@@ -545,7 +545,7 @@ fn the_sidecar_is_started_wired_and_validates() {
     let out = s.wait_for_rpki(
         Duration::ZERO,
         &[
-            "mode sidecar\nenforcement drop-invalid\nvalidation active\n",
+            "mode sidecar\nenforcement drop-invalid\nstartup accept\nvalidation active\n",
             &format!("sidecar running pid {pid} for "),
             &format!(", routinator 0.15.2 ({})\n", s.fake.binary.display()),
             &format!("sidecar rtr {rtr}, restarts 0, failures 0\n"),
@@ -571,7 +571,7 @@ fn the_sidecar_is_started_wired_and_validates() {
 
     // Issue #71: the wait for the first full set is said, then its end.
     let waiting = s
-        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\" mode=sidecar enforcement=drop-invalid hint=")
+        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\" mode=sidecar enforcement=drop-invalid startup=accept hint=")
         .unwrap_or_else(|| panic!("no waiting line:\n{}", s.report()));
     let arrived = s
         .first(

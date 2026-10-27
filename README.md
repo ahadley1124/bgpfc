@@ -148,8 +148,9 @@ a separate program that bgpfc neither bundles nor links; see "Routinator
 sidecar" under "Run". Its first validation run takes minutes from a cold
 cache, and bgpfcd does not wait for it: routes are used unvalidated until
 the first full set, then validated and acted on, and the wait is logged
-and shown ([`docs/config.md`](docs/config.md), "Startup window", which
-also shows how to hold routes until then instead). An external validator
+and shown ([`docs/config.md`](docs/config.md), "Startup window").
+`rpki { startup hold; }` holds every route until that set instead, in
+either mode, and `show rpki` and the log say that the routes are held. An external validator
 (`mode external`) and no validation (`mode disabled`, or no `rpki` block)
 work as before, without Routinator on the host.
 
@@ -240,14 +241,15 @@ control {
 # rpki {
 #     mode external;
 #     enforcement drop-invalid;   # drop-invalid | prefer-valid | off
+#     startup accept;             # accept | hold: routes until the first data
 #     cache 127.0.0.1 port 3323;
 # }
 #
 # Or let bgpfcd run Routinator 0.15.x itself, serving RTR on loopback
 # only and restarting it when it fails (README, "Routinator sidecar").
 # Routes are used unvalidated until its first validation run ends,
-# minutes from a cold start; ARIN's TAL needs `sidecar { accept-arin-rpa
-# yes; }`.
+# minutes from a cold start, unless `startup hold;` holds them; ARIN's
+# TAL needs `sidecar { accept-arin-rpa yes; }`.
 # rpki { mode sidecar; }
 
 prefix-list BOGONS {
@@ -404,7 +406,8 @@ start rpki` naming both versions.
   logged at warn in bgpfcd's log, each line with `sidecar=routinator
   stream=stderr`; its standard output at info.
 - **The first validation run** takes minutes from a cold cache, less
-  from a warm one, and Routinator serves RTR only after it. `show rpki`
+  from a warm one, and Routinator serves RTR only after it. Routes are
+  used unvalidated meanwhile, or held with `startup hold;`. `show rpki`
   says `validation waiting` meanwhile, and `sidecar running` with
   Routinator's pid; a Routinator that keeps failing shows as `sidecar
   FAILED` there and as an alarm in `show status` (`docs/control.md`,

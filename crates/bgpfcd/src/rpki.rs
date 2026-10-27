@@ -10,7 +10,11 @@
 //! outrun the RIB (AGENTS.md §3, "Backpressure"), and the RIB applies the
 //! changes in the order the client published them (RFC 6811 §4). The RIB
 //! starts with no source, every route `disabled`, and the client's first
-//! full set replaces that for every route.
+//! full set replaces that for every route. Until then the block's
+//! `startup` decides whether those routes are used or held ([`startup`]):
+//! the RIB holds a `disabled` route under `hold`, so the setting is in
+//! effect only while a client runs, and [`Rpki::disable`] turns the hold
+//! off before it turns validation off.
 //!
 //! With `mode sidecar`, [`Rpki::start`] first creates Routinator's
 //! repository directory and starts a [`Sidecar`]: it checks the binary's
@@ -69,7 +73,8 @@
 //! and used only from a server of bgpfcd's own user), §10 (the cache list with preferences; the data kept
 //! across a new cache list, and across a restart of Routinator); RFC 6811
 //! §4 (each change of the VRPs reaches the RIB, which validates the
-//! affected routes again).
+//! affected routes again), §2 (routes not validated yet held only as
+//! configured, `startup hold`, and only while validation waits for data).
 
 use std::ffi::OsString;
 use std::fs::DirBuilder;
@@ -84,7 +89,7 @@ use std::time::{Duration, Instant};
 
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_config::{ConfigError, Pos};
-use bgpfc_rpki::{RpkiError, ValidationChange, ValidationSink};
+use bgpfc_rpki::{RpkiError, Startup, ValidationChange, ValidationSink};
 use bgpfc_rtr::Version;
 use bgpfc_rtr::client::{self, Backoff, Cache, Client, ConnectionCheck, Held, Status};
 use bgpfc_rtr::session;
@@ -94,6 +99,26 @@ use bgpfc_wire::types::RouterId;
 
 use crate::messages::{RibMsg, RpkiReport, SidecarReport};
 use crate::{owner, privileges};
+
+/// The startup setting the RIB applies while `rpki` is the block in
+/// effect ([`Rpki::in_effect`]): its own `startup` in a mode that
+/// validates, and `accept` with `mode disabled`.
+///
+/// The RIB holds every route used with state `disabled` under
+/// [`Startup::Hold`]. While a client waits for its first full set those
+/// are the routes not validated yet, which `hold` is meant for (RFC 6811
+/// §2: only routes "explicitly configured" to leave the decision process
+/// for their state do). With validation off they are every route, for
+/// good, as no data will come to release them: so `hold` applies with
+/// `mode external` and `mode sidecar` only, and a block that could not be
+/// started, which [`Rpki::in_effect`] gives as `mode disabled`, holds
+/// nothing either.
+pub(crate) fn startup(rpki: &ast::Rpki) -> Startup {
+    match rpki.mode {
+        RpkiMode::Disabled => Startup::Accept,
+        RpkiMode::External | RpkiMode::Sidecar => rpki.startup,
+    }
+}
 
 /// The checks of the `rpki` block that need more than the configuration
 /// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
@@ -442,6 +467,20 @@ fn start_sidecar(s: &ast::RpkiSidecar) -> Result<Sidecar, String> {
     Sidecar::start(sidecar_config(s)).map_err(|e| format!("rpki sidecar: {e}"))
 }
 
+/// The line logged when a client starts with no data to hold, so that the
+/// routes wait for its first full set: what becomes of them meanwhile,
+/// under `startup` (issue #71: the startup window is not silent).
+pub(crate) const fn waiting_line(startup: Startup) -> &'static str {
+    match startup {
+        Startup::Accept => {
+            "rpki: no validation data yet; routes are used unvalidated until the first full set"
+        }
+        Startup::Hold => {
+            "rpki: no validation data yet; routes are held until the first full set (startup hold)"
+        }
+    }
+}
+
 /// Where the client publishes: the RIB thread's bounded channel. A send
 /// waits while the channel is full, and fails once the RIB thread is
 /// gone, which stops the client. The first change ends the wait for
@@ -567,29 +606,37 @@ impl Rpki {
 
     /// Note that the routes wait for the first full set, from now unless
     /// they waited already, and say so (issue #71). Until it arrives every
-    /// route is `disabled`, used as received: RFC 6811 §2 lets no route
-    /// leave route selection for its state without configuration, and the
-    /// import-policy term `match rpki disabled; action reject;` is that
-    /// configuration for those who want routes held instead (m14 design
-    /// §3.2). With the sidecar the wait is Routinator's first validation
-    /// run, minutes from a cold repository, so it is a warning; an
-    /// external cache answers within a moment, which is no news.
+    /// route is `disabled`: used as received under `startup accept`, the
+    /// default, since RFC 6811 §2 lets no route leave route selection for
+    /// its state without configuration, and held under `startup hold`,
+    /// which is that configuration ([`waiting_line`]). With the sidecar the
+    /// wait is Routinator's first validation run, minutes from a cold
+    /// repository, so it is a warning; an external cache answers within a
+    /// moment, which is no news, unless the routes are held meanwhile.
     fn wait_for_data(&self, config: &ast::Rpki) {
-        const WAITING: &str =
-            "rpki: no validation data yet; routes are used unvalidated until the first full set";
+        let line = waiting_line(config.startup);
         lock(&self.waiting).get_or_insert_with(Instant::now);
         if config.mode == RpkiMode::Sidecar {
             bgpfc_log::warn!(
-                WAITING,
+                line,
                 mode = config.mode,
                 enforcement = config.enforcement,
+                startup = config.startup,
                 hint = "Routinator serves RTR once its first validation run ends: minutes from a cold cache"
+            );
+        } else if config.startup == Startup::Hold {
+            bgpfc_log::warn!(
+                line,
+                mode = config.mode,
+                enforcement = config.enforcement,
+                startup = config.startup
             );
         } else {
             bgpfc_log::info!(
-                WAITING,
+                line,
                 mode = config.mode,
-                enforcement = config.enforcement
+                enforcement = config.enforcement,
+                startup = config.startup
             );
         }
     }
@@ -725,12 +772,18 @@ impl Rpki {
         }
     }
 
-    /// Turn validation off in the RIB: every route `disabled`, and no
-    /// longer waiting for data.
+    /// Turn validation off in the RIB: every route `disabled`, used, and
+    /// no longer waiting for data.
+    ///
+    /// The hold of `startup hold` goes first ([`startup`]): the RIB holds
+    /// every `disabled` route under it, and no data would come to release
+    /// them. On the same channel, so the RIB applies the two in this
+    /// order, and no route that was used is withdrawn on the way.
     fn disable(&self) {
         *lock(&self.waiting) = None;
         bgpfc_log::info!("rpki: validation disabled; every route is disabled again");
         // A RIB thread that is gone has no routes to tell.
+        let _ = self.rib.send(RibMsg::SetStartup(Startup::Accept));
         let _ = self
             .rib
             .send(RibMsg::Validation(ValidationChange::disabled()));
@@ -841,6 +894,19 @@ mod tests {
             Ok(RibMsg::Validation(change)) => change,
             other => panic!("expected a validation change, got {other:?}"),
         }
+    }
+
+    /// What turning validation off sends the RIB: the hold of `startup
+    /// hold` off first, then no source for every route, which with the
+    /// hold still on would hold every route.
+    fn next_disabled(rx: &Receiver<RibMsg>) -> ValidationChange {
+        match rx.recv_timeout(WAIT) {
+            Ok(RibMsg::SetStartup(Startup::Accept)) => {}
+            other => panic!("expected the startup hold off first, got {other:?}"),
+        }
+        let change = next_change(rx);
+        assert_eq!(change.affected, AffectedPrefixes::All);
+        change
     }
 
     fn eventually(what: &str, mut done: impl FnMut() -> bool) {
@@ -1376,9 +1442,9 @@ mod tests {
         );
         assert!(rpki.status().is_none());
         assert!(closed(&mut conn));
-        // ValidationChange::disabled: no source, for every route.
-        let change = next_change(&rx);
-        assert_eq!(change.affected, AffectedPrefixes::All);
+        // ValidationChange::disabled: no source, for every route, after
+        // the hold of `startup hold` is off.
+        let change = next_disabled(&rx);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
         assert!(rx.try_recv().is_err());
         // From disabled to disabled nothing is sent; back to external
@@ -1618,6 +1684,40 @@ mod tests {
     /// Issue #71, m14 design §3.3: a client that starts with no data
     /// leaves the routes waiting until its first full set; one that takes
     /// data over does not; disabling validation ends the wait.
+    /// RFC 6811 §2: the hold applies while a mode that validates waits
+    /// for its data, never with validation off, where nothing would
+    /// release the routes.
+    #[test]
+    fn the_startup_in_effect_holds_only_where_data_will_come() {
+        for (block, startup) in [
+            ("", Startup::Accept),
+            ("rpki { mode disabled; startup hold; }", Startup::Accept),
+            ("rpki { mode external; cache 192.0.2.10; }", Startup::Accept),
+            (
+                "rpki { mode external; startup hold; cache 192.0.2.10; }",
+                Startup::Hold,
+            ),
+            ("rpki { mode sidecar; startup hold; }", Startup::Hold),
+            ("rpki { mode sidecar; startup accept; }", Startup::Accept),
+        ] {
+            assert_eq!(super::startup(&config(block).rpki), startup, "{block}");
+        }
+        // A block a reload could not start is in effect as `mode disabled`
+        // (`Rpki::in_effect`).
+        let off = ast::Rpki::defaults(RpkiMode::Disabled);
+        assert_eq!(super::startup(&off), Startup::Accept);
+        // The line of a client that starts with nothing says what becomes
+        // of the routes meanwhile.
+        assert_eq!(
+            waiting_line(Startup::Accept),
+            "rpki: no validation data yet; routes are used unvalidated until the first full set"
+        );
+        assert_eq!(
+            waiting_line(Startup::Hold),
+            "rpki: no validation data yet; routes are held until the first full set (startup hold)"
+        );
+    }
+
     #[test]
     fn validation_waits_for_the_first_full_set() {
         let first = StubCache::new();
@@ -1656,7 +1756,7 @@ mod tests {
             Ok("rpki: validation disabled")
         );
         assert!(closed(&mut taken_over));
-        next_change(&rx);
+        next_disabled(&rx);
         assert_eq!(
             rpki.reconfigure(&off.rpki, &moved.rpki),
             Ok("rpki: rtr client started")
@@ -2186,8 +2286,7 @@ mod tests {
         assert!(closed(&mut r.conn));
         assert!(!alive(r.pid));
         assert!(r.rpki.sidecar.is_none() && r.rpki.status().is_none());
-        let change = next_change(&r.rx);
-        assert_eq!(change.affected, AffectedPrefixes::All);
+        let change = next_disabled(&r.rx);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
 
         let mut r = Running::new("to-external");
@@ -2363,7 +2462,7 @@ mod tests {
         assert!(closed(&mut r.conn));
         assert!(!alive(r.pid));
         assert!(r.rpki.sidecar.is_none() && r.rpki.status().is_none());
-        let change = next_change(&r.rx);
+        let change = next_disabled(&r.rx);
         assert_eq!(rov(&change, "192.0.2.0/24", 64_496), RovState::Disabled);
         // What is in effect now is `mode disabled`, which a reload compares
         // the file with: one of the same file checks the block again, and

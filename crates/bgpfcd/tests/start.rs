@@ -102,16 +102,18 @@ fn a_cache_that_cannot_be_found_stops_the_start() {
 }
 
 #[test]
-fn the_start_line_names_the_rpki_enforcement() {
+fn the_start_line_names_the_rpki_enforcement_and_startup() {
     // Design §D1.3: the operator sees the configured action next to the
-    // mode, `drop-invalid` unless another is written (issue #61). The
-    // cache that cannot be found ends the start right after the line.
+    // mode, `drop-invalid` unless another is written (issue #61), and
+    // what becomes of the routes until the first data, `accept` unless
+    // another is written (RFC 6811 §2). The cache that cannot be found
+    // ends the start right after the line.
     let dir = scratch("enforcement");
     let config = dir.join("bgpfcd.conf");
     for (statement, shown) in [
-        ("", "drop-invalid"),
-        ("enforcement prefer-valid;", "prefer-valid"),
-        ("enforcement off;", "off"),
+        ("", "drop-invalid startup=accept"),
+        ("enforcement prefer-valid;", "prefer-valid startup=accept"),
+        ("enforcement off; startup hold;", "off startup=hold"),
     ] {
         fs::write(
             &config,

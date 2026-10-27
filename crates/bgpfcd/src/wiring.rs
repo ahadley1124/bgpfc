@@ -10,6 +10,7 @@ use bgpfc_wire::types::{Afi, Asn, RouterId};
 
 use crate::messages::{Intervals, PrefixLimits, RibSettings};
 use crate::peer::PeerConfig;
+use crate::rpki;
 
 /// The per-peer configuration for `n`.
 pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> PeerConfig {
@@ -91,12 +92,15 @@ pub(crate) fn rib_settings(config: &bgpfc_config::Config) -> RibSettings {
 
 /// The RIB the RIB thread starts with: `policies`, a jitter seed for the
 /// advertisement intervals (RFC 4271 §10: they are jittered too), and the
-/// `rpki` block's `enforcement`. RFC 6811 §2: a route leaves the decision
-/// process for its validation state only when "explicitly configured to
-/// do so", and §5 names "rejecting all "invalid" routes" among the
-/// policies; the mode is set before any route arrives, so that every
-/// route is judged under it from the first. `Rib` itself starts with
-/// `off` and acts on nothing until told.
+/// `rpki` block's `enforcement` and `startup`. RFC 6811 §2: a route leaves
+/// the decision process for its validation state only when "explicitly
+/// configured to do so", and §5 names "rejecting all "invalid" routes"
+/// among the policies; both are set before any route arrives, so that
+/// every route is judged under them from the first. The startup setting
+/// is the one in effect ([`rpki::startup`]): the block's with a mode that
+/// validates, whose client starts before any neighbor, `accept` with
+/// `mode disabled`. `Rib` itself starts with `off` and `accept`, and acts
+/// on nothing until told.
 pub(crate) fn rib(config: &bgpfc_config::Config, policies: Box<dyn Policies>) -> Rib {
     let mut rib = Rib::with_policies(config.local_as, policies);
     rib.set_jitter_seed(jitter_seed(&"rib"));
@@ -104,10 +108,13 @@ pub(crate) fn rib(config: &bgpfc_config::Config, policies: Box<dyn Policies>) ->
     // so is dropped, as the start line already names the mode.
     let mut report = Vec::new();
     rib.set_enforcement(config.rpki.enforcement, Instant::now(), &mut report);
+    rib.set_startup(rpki::startup(&config.rpki), Instant::now(), &mut report);
     debug_assert!(
-        report
-            .iter()
-            .all(|o| matches!(o, Output::Enforcement(r) if r.routes == 0)),
+        report.iter().all(|o| match o {
+            Output::Enforcement(r) => r.routes == 0,
+            Output::Startup(r) => r.routes == 0,
+            _ => false,
+        }),
         "{report:?}"
     );
     rib
@@ -267,6 +274,35 @@ mod tests {
             assert_eq!(rib.enforcement(), mode, "{block}");
             assert_eq!(rib.local_as(), Asn(65_000));
             assert_eq!(rib.peers().count(), 0);
+        }
+    }
+
+    #[test]
+    fn the_rib_starts_with_the_rpki_blocks_startup_while_it_validates() {
+        use bgpfc_rib::{AcceptAll, Startup};
+        let with = |block: &str| {
+            bgpfc_config::parse_str(
+                "t",
+                &format!("router-id 192.0.2.1; local-as 65000; {block}"),
+            )
+            .unwrap()
+        };
+        // RFC 6811 §2: held only where the file says so, and only in a
+        // mode that will bring the data that releases the routes.
+        for (block, startup) in [
+            ("", Startup::Accept),
+            ("rpki { mode disabled; startup hold; }", Startup::Accept),
+            ("rpki { mode external; cache 192.0.2.10; }", Startup::Accept),
+            (
+                "rpki { mode external; startup hold; cache 192.0.2.10; }",
+                Startup::Hold,
+            ),
+            ("rpki { mode sidecar; startup hold; }", Startup::Hold),
+            ("rpki { mode sidecar; startup accept; }", Startup::Accept),
+        ] {
+            let cfg = with(block);
+            let rib = rib(&cfg, Box::new(AcceptAll));
+            assert_eq!(rib.startup(), startup, "{block}");
         }
     }
 

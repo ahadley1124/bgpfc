@@ -237,6 +237,10 @@ fn handle(
             bgpfc_log::debug!("rib: rpki enforcement", mode = mode);
             rib.set_enforcement(mode, now, out);
         }
+        RibMsg::SetStartup(startup) => {
+            bgpfc_log::debug!("rib: rpki startup", startup = startup);
+            rib.set_startup(startup, now, out);
+        }
         // The changes of earlier messages went to the FIB first: the loop
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
@@ -1853,10 +1857,10 @@ mod tests {
     }
 
     #[test]
-    fn a_startup_change_is_one_info_line() {
+    fn a_startup_message_is_one_info_line() {
         // RFC 6811 §2: with no validation data yet, every route is
-        // `disabled`; `startup hold` holds both, and `accept` uses them
-        // again, each change in one line.
+        // `disabled`; `startup hold` through the channel holds both, and
+        // `accept` uses them again, each change in one line.
         use bgpfc_rib::Startup;
         let now = Instant::now();
         let mut rib = Rib::new(Asn(65_000));
@@ -1869,8 +1873,12 @@ mod tests {
         );
         let msg = routes("192.0.2.1", 65_001, &["198.51.100.0/24", "203.0.113.0/24"]);
         handle(&mut rib, &mut settings, msg, now);
-        let mut out = Vec::new();
-        rib.set_startup(Startup::Hold, now, &mut out);
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::SetStartup(Startup::Hold),
+            now,
+        );
         let Some(Output::Startup(r)) = out.first() else {
             panic!("{out:?}");
         };
@@ -1891,8 +1899,15 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(states(&rib), []);
-        let mut out = Vec::new();
-        rib.set_startup(Startup::Accept, now, &mut out);
+        // The same setting again: nothing to do, nothing logged.
+        let again = RibMsg::SetStartup(Startup::Hold);
+        assert_eq!(handle(&mut rib, &mut settings, again, now), vec![]);
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            RibMsg::SetStartup(Startup::Accept),
+            now,
+        );
         let Some(Output::Startup(r)) = out.first() else {
             panic!("{out:?}");
         };

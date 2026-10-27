@@ -1060,7 +1060,8 @@ fn with_mode_disabled_no_cache_is_asked() {
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
         ok && out
-            == "mode disabled\nenforcement off\nvalidation off\ncache 127.0.0.1:3323 preference 0\n",
+            == "mode disabled\nenforcement off\nstartup accept\nvalidation off\n\
+                   cache 127.0.0.1:3323 preference 0\n",
         "{out}"
     );
     let body = s.http("/v1/rpki");
@@ -1385,7 +1386,7 @@ fn invalid_routes_are_held_and_not_used_by_default() {
     );
     let start = s.last_line("bgpfcd starting");
     assert!(
-        start.ends_with(" rpki=external enforcement=drop-invalid"),
+        start.ends_with(" rpki=external enforcement=drop-invalid startup=accept"),
         "{start}"
     );
 }

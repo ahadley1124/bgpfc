@@ -389,6 +389,13 @@ pub(crate) enum RibMsg {
     /// every route again under it (RFC 6811 §5), holding or releasing
     /// routes and choosing again, with no UPDATE and no ROUTE-REFRESH.
     SetEnforcement(bgpfc_rpki::Enforcement),
+    /// The startup setting in effect (`rpki::startup`), after a reload or
+    /// before validation is turned off: judge again every route not
+    /// validated yet, `disabled`, holding it under `hold` and releasing it
+    /// under `accept` (RFC 6811 §2: only "explicitly configured" routes
+    /// leave the decision process for their state), with no UPDATE and no
+    /// ROUTE-REFRESH. The same setting again changes nothing.
+    SetStartup(bgpfc_rpki::Startup),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.
