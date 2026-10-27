@@ -70,6 +70,10 @@ pub enum NetlinkError {
     },
     /// A route message payload shorter than `struct rtmsg`.
     ShortRoute,
+    /// An interface message payload shorter than `struct ifinfomsg`.
+    ShortLink,
+    /// An address message payload shorter than `struct ifaddrmsg`.
+    ShortAddress,
 }
 
 impl fmt::Display for NetlinkError {
@@ -78,6 +82,10 @@ impl fmt::Display for NetlinkError {
             NetlinkError::Truncated { at } => write!(f, "truncated netlink message at offset {at}"),
             NetlinkError::BadAttribute { at } => write!(f, "bad netlink attribute at offset {at}"),
             NetlinkError::ShortRoute => f.write_str("route message shorter than struct rtmsg"),
+            NetlinkError::ShortLink => f.write_str("link message shorter than struct ifinfomsg"),
+            NetlinkError::ShortAddress => {
+                f.write_str("address message shorter than struct ifaddrmsg")
+            }
         }
     }
 }
@@ -242,6 +250,14 @@ mod tests {
         assert_eq!(
             NetlinkError::ShortRoute.to_string(),
             "route message shorter than struct rtmsg"
+        );
+        assert_eq!(
+            NetlinkError::ShortLink.to_string(),
+            "link message shorter than struct ifinfomsg"
+        );
+        assert_eq!(
+            NetlinkError::ShortAddress.to_string(),
+            "address message shorter than struct ifaddrmsg"
         );
     }
 }

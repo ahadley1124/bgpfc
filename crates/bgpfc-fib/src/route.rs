@@ -28,25 +28,25 @@ pub const RT_TABLE_MAIN: u32 = 254;
 /// table id above 255.
 const RT_TABLE_UNSPEC: u8 = 0;
 /// `RTN_UNICAST`.
-const RTN_UNICAST: u8 = 1;
+pub(crate) const RTN_UNICAST: u8 = 1;
 /// `RT_SCOPE_UNIVERSE`.
 const RT_SCOPE_UNIVERSE: u8 = 0;
 /// `RT_SCOPE_NOWHERE`: what `ip route del` sends.
 const RT_SCOPE_NOWHERE: u8 = 255;
 /// `RTM_F_CLONED`: routes the kernel made itself; never ours.
-const RTM_F_CLONED: u32 = 0x200;
+pub(crate) const RTM_F_CLONED: u32 = 0x200;
 
 // enum rtattr_type_t
-const RTA_DST: u16 = 1;
-const RTA_OIF: u16 = 4;
-const RTA_GATEWAY: u16 = 5;
-const RTA_PRIORITY: u16 = 6;
-const RTA_TABLE: u16 = 15;
-const RTA_VIA: u16 = 18;
+pub(crate) const RTA_DST: u16 = 1;
+pub(crate) const RTA_OIF: u16 = 4;
+pub(crate) const RTA_GATEWAY: u16 = 5;
+pub(crate) const RTA_PRIORITY: u16 = 6;
+pub(crate) const RTA_TABLE: u16 = 15;
+pub(crate) const RTA_VIA: u16 = 18;
 
 // <bits/socket.h>
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
+pub(crate) const AF_INET: u8 = 2;
+pub(crate) const AF_INET6: u8 = 10;
 
 /// `offsetof(struct rtvia, rtvia_addr)`: `<linux/rtnetlink.h>` declares
 /// `struct rtvia { __kernel_sa_family_t rtvia_family; __u8 rtvia_addr[]; }`,
@@ -55,7 +55,7 @@ const AF_INET6: u8 = 10;
 const RTVIA_ADDR_OFFSET: usize = 2;
 
 /// `sizeof(struct rtmsg)`.
-const RTMSG_LEN: usize = 12;
+pub(crate) const RTMSG_LEN: usize = 12;
 
 /// The metric every route we install gets, as BIRD and FRR do for
 /// external BGP routes (`RTA_PRIORITY`).
@@ -281,7 +281,7 @@ fn encode_via(gw: IpAddr) -> Vec<u8> {
 /// The gateway in an `RTA_VIA` value (`struct rtvia`, `<linux/rtnetlink.h>`),
 /// or `None` for a family other than IPv4 and IPv6 (the kernel also uses
 /// it for MPLS) or an address of the wrong length.
-fn decode_via(value: &[u8]) -> Option<IpAddr> {
+pub(crate) fn decode_via(value: &[u8]) -> Option<IpAddr> {
     let family = <[u8; RTVIA_ADDR_OFFSET]>::try_from(value.get(..RTVIA_ADDR_OFFSET)?).ok()?;
     let family = u16::from_ne_bytes(family);
     let addr = value.get(RTVIA_ADDR_OFFSET..)?;
@@ -301,7 +301,7 @@ fn addr_bytes(a: IpAddr) -> Vec<u8> {
     }
 }
 
-fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
+pub(crate) fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
     match afi {
         Afi::Ipv4 => <[u8; 4]>::try_from(value).ok().map(IpAddr::from),
         Afi::Ipv6 => <[u8; 16]>::try_from(value).ok().map(IpAddr::from),
@@ -309,7 +309,7 @@ fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
     }
 }
 
-fn parse_u32(value: &[u8]) -> Option<u32> {
+pub(crate) fn parse_u32(value: &[u8]) -> Option<u32> {
     <[u8; 4]>::try_from(value).ok().map(u32::from_ne_bytes)
 }
 

@@ -10,8 +10,14 @@
 //! Implements: `rtnetlink(7)` `RTM_NEWROUTE` / `RTM_DELROUTE` /
 //! `RTM_GETROUTE`; RFC 8950 §3 (IPv6 next hop for IPv4 routes via
 //! `RTA_VIA`).
+//!
+//! It also reads, without writing, what the kernel's main table holds
+//! and how it changes ([`kernel`]: route, interface and address
+//! notifications, decoded and filtered), for the RIB to resolve next hops
+//! against (RFC 4271 §9.1.2, §9.1.2.1).
 #![forbid(unsafe_code)]
 
+pub mod kernel;
 pub mod netlink;
 pub mod reconcile;
 pub mod route;
