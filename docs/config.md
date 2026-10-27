@@ -309,9 +309,16 @@ comes up, and it shows:
   the same error repeats. The hint comes with that error, with `Network
   is unreachable` and with a timeout. bgpfcd retries every
   `connect-retry-time`, as after any failed connection.
-- A connection the neighbor opens is accepted, but bgpfcd's OPEN never
-  reaches it: the session waits in OpenSent until its hold timer of four
-  minutes (RFC 4271 §8.2.2) ends it, with a warning `msg="connection
+- A connection the neighbor opens is accepted only while bgpfcd is not
+  Idle (RFC 4271 §8.2.2: Idle refuses connections). As its own
+  connections fail at once and each failure puts it in Idle, in practice
+  that takes `passive yes`; without it bgpfcd closes the neighbor's
+  connections, with a line at debug, `msg="connection while idle,
+  closing"`. An accepted connection brings the neighbor's OPEN, which the
+  neighbor sends with its own TTL, and bgpfcd moves to OpenConfirm; but
+  its OPEN and KEEPALIVE die at the first router, so the session ends
+  when the negotiated hold time expires (`hold-time`, 90 seconds by
+  default, or the neighbor's if lower), with a warning `msg="connection
   closed with a socket error"` that has the same error as
   `socket_error=`, and the same hint.
 - `bgpfcctl show neighbor` says `ttl 1`, and the error as `last error`

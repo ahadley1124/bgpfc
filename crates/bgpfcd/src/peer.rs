@@ -743,8 +743,9 @@ impl Peer {
         if let Some(c) = self.conn.take() {
             // An ICMP error for what we sent leaves a soft error on the
             // socket and nothing else: with TTL 1 to a neighbor two hops
-            // away, an accepted connection's OPEN dies at the router and
-            // the session waits in OpenSent for its hold timer.
+            // away, an accepted connection's OPEN and KEEPALIVE die at the
+            // router, while the neighbor's OPEN arrives, so the session
+            // waits in OpenConfirm for the negotiated hold time.
             if !c.up
                 && let Ok(Some(e)) = c.stream.take_error()
             {
