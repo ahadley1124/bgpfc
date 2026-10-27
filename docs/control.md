@@ -318,7 +318,14 @@ mixes the modes, and at shutdown, so that every operation is counted on
 some line. The lines' counts add up to every operation done.
 
 Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
-applied`, with `op`, `prefix` and `gateway`), written as it is done. A
+applied`, with `op`, `prefix`, `gateway` and `oif`), written as it is
+done. A route goes through the hop its next hop resolves to (see [Next
+hops](#next-hops)): `gateway` is the next hop itself on a connected
+network, else the gateway of the kernel route that resolves it, and `oif`
+the index of the interface it is reached on. A delete the kernel answers
+`ESRCH`, having removed the route itself, as IPv4 does with the routes
+through an interface that goes down, is done all the same: its line says
+`fib: already gone`, and it counts as a `delete`, not a failure. A
 failed operation has one at error (`fib: failed`, with the kernel's
 `error`), at once, the first three of a change, and three at most between
 two `fib: changes` lines, whatever the number of changes; the others at

@@ -192,8 +192,8 @@ pub(crate) const PAGE: usize = 4096;
 pub(crate) struct FibReport {
     /// The mode.
     pub(crate) mode: bgpfc_fib::Mode,
-    /// Routes believed installed: a page.
-    pub(crate) installed: Vec<(Prefix, IpAddr)>,
+    /// Routes believed installed, each with its hop: a page.
+    pub(crate) installed: Vec<(Prefix, bgpfc_fib::Hop)>,
 }
 
 /// A question for the RIB thread.
@@ -216,8 +216,8 @@ pub(crate) enum RibQuery {
         /// between two destinations.
         held: bool,
     },
-    /// The next hop of the destinations after `after`, as the FIB is to
-    /// install them: a page.
+    /// The hop of the destinations after `after`, gateway and interface,
+    /// as the FIB is to install them: a page.
     FibRoutes {
         /// The last route of the page before, if any.
         after: Option<Prefix>,
@@ -256,7 +256,7 @@ pub(crate) enum RibReply {
     /// Answer to [`RibQuery::Routes`].
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
-    FibRoutes(Vec<(Prefix, IpAddr)>),
+    FibRoutes(Vec<(Prefix, bgpfc_fib::Hop)>),
     /// Answer to [`RibQuery::Transitions`].
     Transitions(TransitionsReport),
 }

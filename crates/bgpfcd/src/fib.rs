@@ -36,9 +36,11 @@
 //!   shutdown.
 //!
 //! Each operation also has a line of its own at debug (`fib: dry-run` or
-//! `fib: applied`, with the prefix and gateway; `fib: already gone` for a
-//! delete of a route the kernel had removed itself, which counts as a
-//! delete), written as it is done. A
+//! `fib: applied`, with the prefix, the gateway and the interface it is
+//! reached on; `fib: already gone` for a delete the kernel answered
+//! `ESRCH`, having removed the route itself, as IPv4 does with the routes
+//! through an interface that goes down, which counts as a delete), written
+//! as it is done. A
 //! failed one has a line at error (`fib: failed`) instead, at once, for
 //! the first [`FAILURES_LOGGED`] of a change, and for no more than
 //! [`FAILURES_LOGGED`] in all between two `fib: changes` lines, and at
@@ -236,11 +238,7 @@ fn serve(
             FibMsg::Query { after, reply } => {
                 let _ = reply.send(FibReport {
                     mode: fib.mode(),
-                    installed: fib
-                        .installed_after(after, PAGE)
-                        .into_iter()
-                        .map(|(prefix, hop)| (prefix, hop.gateway))
-                        .collect(),
+                    installed: fib.installed_after(after, PAGE),
                 });
             }
             FibMsg::Shutdown(done) => {
@@ -360,18 +358,22 @@ impl Fold {
     }
 }
 
-/// The line of one operation: its kind, prefix and gateway, and the
-/// kernel's error if it failed.
+/// The line of one operation: its kind, prefix, gateway and, when known,
+/// the index of the interface the gateway is reached on (`oif`, the
+/// kernel's `RTA_OIF`), and the kernel's error if it failed.
 fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
-    let (op, prefix, gateway) = match &a.op {
-        Op::Set { prefix, hop } => ("install", prefix, hop.gateway),
-        Op::Delete { prefix, hop } => ("delete", prefix, hop.gateway),
+    let (op, prefix, hop) = match &a.op {
+        Op::Set { prefix, hop } => ("install", prefix, hop),
+        Op::Delete { prefix, hop } => ("delete", prefix, hop),
     };
     let mut fields = vec![
         ("op", op.to_owned()),
         ("prefix", prefix.to_string()),
-        ("gateway", gateway.to_string()),
+        ("gateway", hop.gateway.to_string()),
     ];
+    if let Some(oif) = hop.oif {
+        fields.push(("oif", oif.to_string()));
+    }
     if let Err(e) = &a.result {
         fields.push(("error", e.to_string()));
     }
@@ -493,11 +495,20 @@ mod tests {
         }
     }
 
+    /// The hop of [`set`] and [`delete`]: through 192.0.2.1 on interface
+    /// 2.
+    fn hop() -> Hop {
+        Hop {
+            oif: Some(2),
+            ..gw("192.0.2.1")
+        }
+    }
+
     fn set(prefix: &str, dry_run: bool) -> Applied {
         Applied {
             op: Op::Set {
                 prefix: p(prefix),
-                hop: gw("192.0.2.1"),
+                hop: hop(),
             },
             result: Ok(()),
             dry_run,
@@ -509,7 +520,7 @@ mod tests {
         Applied {
             op: Op::Delete {
                 prefix: p(prefix),
-                hop: gw("192.0.2.1"),
+                hop: hop(),
             },
             result: Ok(()),
             dry_run,
@@ -601,7 +612,7 @@ mod tests {
     }
 
     /// At debug every operation has a line of its own too, as it is done,
-    /// with its prefix and gateway.
+    /// with its prefix, gateway and interface, when known.
     #[test]
     fn each_operation_has_a_line_at_debug() {
         let lines = change_lines(
@@ -615,9 +626,9 @@ mod tests {
             written(&lines),
             [
                 "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: dry-run\" op=install \
-                 prefix=192.0.2.0/24 gateway=192.0.2.1\n",
+                 prefix=192.0.2.0/24 gateway=192.0.2.1 oif=2\n",
                 "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: dry-run\" op=delete \
-                 prefix=198.51.100.0/24 gateway=192.0.2.1\n",
+                 prefix=198.51.100.0/24 gateway=192.0.2.1 oif=2\n",
                 "1970-01-01T00:00:00.000Z INFO  msg=\"fib: changes\" mode=dry-run install=1 \
                  delete=1 failed=0 prefixes=192.0.2.0/24,198.51.100.0/24\n",
             ]
@@ -625,6 +636,20 @@ mod tests {
         let lines = change_lines(&[&[set("192.0.2.0/24", false)]], true);
         assert_eq!(lines[0].msg, "fib: applied");
         assert_eq!(lines[1].fields[0], ("mode", "install".to_owned()));
+        // A hop with no interface known has no `oif`.
+        let mut op = set("192.0.2.0/24", false);
+        op.op = Op::Set {
+            prefix: p("192.0.2.0/24"),
+            hop: gw("192.0.2.1"),
+        };
+        let lines = change_lines(&[&[op]], true);
+        assert_eq!(
+            written(&lines[..1]),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: applied\" op=install \
+              prefix=192.0.2.0/24 gateway=192.0.2.1\n"
+            ]
+        );
     }
 
     /// A delete the kernel answered `ESRCH` had nothing left to remove:
@@ -641,7 +666,7 @@ mod tests {
             written(&lines),
             [
                 "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: already gone\" op=delete \
-                 prefix=198.51.100.0/24 gateway=192.0.2.1\n",
+                 prefix=198.51.100.0/24 gateway=192.0.2.1 oif=2\n",
                 "1970-01-01T00:00:00.000Z INFO  msg=\"fib: changes\" mode=install install=0 \
                  delete=1 failed=0 prefixes=198.51.100.0/24\n",
             ]
@@ -668,7 +693,7 @@ mod tests {
             written(&lines[..1]),
             [
                 "1970-01-01T00:00:00.000Z ERROR msg=\"fib: failed\" op=install \
-              prefix=10.0.0.0/24 gateway=192.0.2.1 \
+              prefix=10.0.0.0/24 gateway=192.0.2.1 oif=2 \
               error=\"kernel refused: Operation not permitted (os error 1)\"\n"
             ]
         );

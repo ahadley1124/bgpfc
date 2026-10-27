@@ -34,7 +34,7 @@ use bgpfc_config::ast::{RpkiCache, RpkiMode};
 use bgpfc_control::http;
 use bgpfc_control::json::Json;
 use bgpfc_control::proto;
-use bgpfc_fib::Mode;
+use bgpfc_fib::{Hop, Mode};
 use bgpfc_rib::{Held, RouteStatus};
 use bgpfc_rpki::{RouteOrigin, RovState, Startup, Vrp, VrpSet};
 use bgpfc_sidecar::SidecarState;
@@ -1493,7 +1493,7 @@ fn rib_routes(
 }
 
 /// A page of the routes the RIB wants in the FIB.
-fn rib_fib_routes(ctx: &Ctx, after: Option<Prefix>) -> Result<Vec<(Prefix, IpAddr)>, String> {
+fn rib_fib_routes(ctx: &Ctx, after: Option<Prefix>) -> Result<Vec<(Prefix, Hop)>, String> {
     let (tx, rx) = sync_channel(1);
     ctx.rib
         .send(RibMsg::Query(RibQuery::FibRoutes { after }, tx))
@@ -1583,19 +1583,19 @@ impl<'a, T> Pages<'a, T> {
 pub(crate) enum Listing<'a> {
     Routes(Pages<'a, RouteReport>),
     /// The routes the RIB wants merged with those installed, in prefix
-    /// order: each wanted route is installed or pending, and an installed
-    /// route not wanted is stale.
+    /// order: each wanted route is installed, through the hop wanted, or
+    /// pending, and an installed route not wanted is stale.
     Fib {
         mode: Mode,
-        desired: Pages<'a, (Prefix, IpAddr)>,
-        installed: Pages<'a, (Prefix, IpAddr)>,
+        desired: Pages<'a, (Prefix, Hop)>,
+        installed: Pages<'a, (Prefix, Hop)>,
     },
 }
 
 /// One `show fib` row.
 struct FibRow {
     prefix: Prefix,
-    gateway: IpAddr,
+    hop: Hop,
     installed: bool,
     stale: bool,
 }
@@ -1616,7 +1616,7 @@ impl<'a> Listing<'a> {
         let installed = Pages::starting(
             first.installed,
             move |after| fib_report(ctx, after).map(|r| r.installed),
-            |r: &(Prefix, IpAddr)| r.0,
+            |r: &(Prefix, Hop)| r.0,
         );
         let desired = Pages::open(move |after| rib_fib_routes(ctx, after), |r| r.0)?;
         Ok(Listing::Fib {
@@ -1628,14 +1628,14 @@ impl<'a> Listing<'a> {
 
     /// The next `show fib` row.
     fn next_fib_row(
-        desired: &mut Pages<'_, (Prefix, IpAddr)>,
-        installed: &mut Pages<'_, (Prefix, IpAddr)>,
+        desired: &mut Pages<'_, (Prefix, Hop)>,
+        installed: &mut Pages<'_, (Prefix, Hop)>,
     ) -> Result<Option<FibRow>, String> {
         let d = desired.peek()?.copied();
         let i = installed.peek()?.copied();
-        let wanted = |(prefix, gateway): (Prefix, IpAddr), installed| FibRow {
+        let wanted = |(prefix, hop): (Prefix, Hop), installed| FibRow {
             prefix,
-            gateway,
+            hop,
             installed,
             stale: false,
         };
@@ -1654,7 +1654,7 @@ impl<'a> Listing<'a> {
                 installed.take()?;
                 Some(FibRow {
                     prefix: i.0,
-                    gateway: i.1,
+                    hop: i.1,
                     installed: true,
                     stale: true,
                 })
@@ -1690,7 +1690,7 @@ impl<'a> Listing<'a> {
                     // `Prefix` writes itself without the padding a width
                     // asks for.
                     let prefix = r.prefix.to_string();
-                    out.line(&format!("{prefix:<44} via {:<40} {state}", r.gateway))
+                    out.line(&format!("{prefix:<44} via {:<40} {state}", r.hop.gateway))
                         .map_err(io)?;
                 }
             }
@@ -1732,7 +1732,7 @@ impl<'a> Listing<'a> {
                     let mut j = Json::new();
                     j.begin_object()
                         .field_display("prefix", r.prefix)
-                        .field_display("gateway", r.gateway)
+                        .field_display("gateway", r.hop.gateway)
                         .field_bool("installed", r.installed);
                     if r.stale {
                         j.field_bool("stale", true);
@@ -1916,17 +1916,31 @@ mod tests {
         s.split_whitespace().map(str::to_owned).collect()
     }
 
-    fn fib_route(prefix: &str, gateway: &str) -> (Prefix, IpAddr) {
-        (prefix.parse().unwrap(), gateway.parse().unwrap())
+    /// A route to `prefix` through `gateway`, on no interface known.
+    fn fib_route(prefix: &str, gateway: &str) -> (Prefix, Hop) {
+        fib_route_on(prefix, gateway, None)
     }
 
+    /// A route to `prefix` through `gateway` on interface `oif`.
+    fn fib_route_on(prefix: &str, gateway: &str, oif: Option<u32>) -> (Prefix, Hop) {
+        let hop = Hop {
+            gateway: gateway.parse().unwrap(),
+            oif,
+        };
+        (prefix.parse().unwrap(), hop)
+    }
+
+    /// A wanted route is installed when the FIB has it through the hop
+    /// wanted, gateway and interface; pending otherwise. One the FIB has
+    /// and the RIB does not want is stale.
     #[test]
     fn fib_rows_merge_wanted_and_installed_in_prefix_order() {
         let none = |_| Ok(Vec::new());
         let mut desired = Pages::starting(
             vec![
-                fib_route("10.0.0.0/8", "192.0.2.1"),
+                fib_route_on("10.0.0.0/8", "192.0.2.1", Some(2)),
                 fib_route("10.2.0.0/16", "192.0.2.2"),
+                fib_route_on("10.3.0.0/16", "192.0.2.1", Some(3)),
                 fib_route("2001:db8::/32", "fe80::1"),
             ],
             none,
@@ -1934,9 +1948,12 @@ mod tests {
         );
         let mut installed = Pages::starting(
             vec![
-                fib_route("10.0.0.0/8", "192.0.2.1"),
+                fib_route_on("10.0.0.0/8", "192.0.2.1", Some(2)),
                 fib_route("10.1.0.0/16", "192.0.2.9"),
                 fib_route("10.2.0.0/16", "192.0.2.3"),
+                // The gateway wanted, on another interface: the next hop
+                // came back through it.
+                fib_route_on("10.3.0.0/16", "192.0.2.1", Some(2)),
             ],
             none,
             |r| r.0,
@@ -1952,6 +1969,7 @@ mod tests {
                 row("10.0.0.0/8", true, false),
                 row("10.1.0.0/16", true, true),
                 row("10.2.0.0/16", false, false),
+                row("10.3.0.0/16", false, false),
                 row("2001:db8::/32", false, false),
             ]
         );

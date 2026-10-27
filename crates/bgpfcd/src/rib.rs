@@ -1118,7 +1118,7 @@ fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
         RibQuery::FibRoutes { after } => RibReply::FibRoutes(
             rib.fib_routes_after(*after)
                 .take(PAGE)
-                .map(|(prefix, hop)| (prefix, hop.gateway))
+                .map(|(prefix, hop)| (prefix, crate::fib::fib_hop(hop)))
                 .collect(),
         ),
     }
@@ -2263,6 +2263,69 @@ mod tests {
                 Output::Fib(c) if c.next_hop == Some(hop) && c.previous.is_none()
             )),
             "{out:?}"
+        );
+    }
+
+    /// A switch to install mode reconciles the FIB against the RIB's
+    /// routes through the hops they resolve to, interface included, as
+    /// `show fib` lists what the RIB wants.
+    #[test]
+    fn the_reconcile_and_show_fib_carry_the_interface() {
+        use bgpfc_rib::nexthop::{KernelRoute, Via};
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let table = KernelUpdate::Table {
+            routes: vec![KernelRoute {
+                prefix: "192.0.2.0/24".parse().unwrap(),
+                metric: 0,
+                via: Via::Unicast {
+                    gateway: None,
+                    oif: 7,
+                },
+            }],
+            links: vec![(7, "v7".to_owned())],
+        };
+        handle(&mut rib, &mut settings, RibMsg::Kernel(table), now);
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        let want = vec![(
+            "198.51.100.0/24".parse().unwrap(),
+            bgpfc_fib::Hop {
+                gateway: ip("192.0.2.1"),
+                oif: Some(7),
+            },
+        )];
+        let (fib, fib_rx) = sync_channel(8);
+        let (reply, _) = sync_channel(1);
+        fib_mode(&rib, &fib, bgpfc_fib::Mode::Install, reply);
+        let msgs: Vec<FibMsg> = fib_rx.try_iter().collect();
+        assert!(
+            matches!(&msgs[..], [
+                FibMsg::SetMode(bgpfc_fib::Mode::Install),
+                FibMsg::Reconcile(routes),
+                FibMsg::ReconcileEnd(_),
+            ] if *routes == want),
+            "{msgs:?}"
+        );
+        let answer = answer(
+            &rib,
+            &Transitions::default(),
+            &RibQuery::FibRoutes { after: None },
+        );
+        assert!(
+            matches!(&answer, RibReply::FibRoutes(routes) if *routes == want),
+            "{answer:?}"
         );
     }
 
