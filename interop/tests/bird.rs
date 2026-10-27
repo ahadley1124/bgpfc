@@ -25,6 +25,7 @@ fn bird_opts(lab: &Lab, passive: bool, statics: &[&str]) -> BirdOpts {
         statics: statics.iter().map(|s| (*s).to_owned()).collect(),
         channel: String::new(),
         protocol: String::new(),
+        export: String::new(),
     }
 }
 
@@ -205,6 +206,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             statics: Vec::new(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     // The scenario re-announces the statics seconds after the first
@@ -323,6 +325,7 @@ fn export_policy_filters_and_sets() {
             statics: Vec::new(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
@@ -832,6 +835,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             statics: vec!["203.0.113.0/24".to_owned()],
             channel: "extended next hop on;".to_owned(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     let socket = lab.dir.join("ctl.sock");

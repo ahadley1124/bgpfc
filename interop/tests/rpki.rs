@@ -713,6 +713,7 @@ fn start_relay(lab: &mut Lab, statics: &[&str]) -> Bird {
             statics: statics.iter().map(|&p| p.to_owned()).collect(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     )
 }
@@ -739,6 +740,7 @@ fn start_bird(lab: &Lab, held_back: bool) -> Bird {
             } else {
                 String::new()
             },
+            export: String::new(),
         },
     )
 }

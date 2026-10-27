@@ -173,6 +173,116 @@ impl Lab {
         c
     }
 
+    /// Make A a router between B and C, which are then two hops apart
+    /// over loopback addresses, the lab of multihop sessions
+    /// (`interop/tests/multihop.rs`; `S` is the lab's subnet):
+    ///
+    /// ```text
+    ///  C                        A                           B
+    ///  lo 10.255.S.3/32         10.98.S.1 -- 10.98.S.2 (C)   lo 10.255.S.2/32
+    ///  lo 10.255.S.30/32        10.99.S.1 -- 10.99.S.2 (B)   10.255.S.3/32 via 10.99.S.1 proto static
+    ///  10.255.S.2/32 and        ip_forward=1                 10.255.S.30/32 via 10.99.S.1 proto static
+    ///  10.99.S.0/24 via         10.255.S.{2,3,30}/32 routes
+    ///    10.98.S.1
+    /// ```
+    ///
+    /// C's second loopback is a next hop apart from the session's
+    /// address, so that its route can go while the session stays. C also
+    /// reaches the link between A and B, so that it answers a connection
+    /// from B's address there, as a router's neighbors would.
+    ///
+    /// # Panics
+    /// If [`Lab::add_c`] was not called first, or `ip` fails.
+    #[must_use]
+    pub fn route_through_a(&self) -> Loopbacks {
+        let c = self
+            .c
+            .as_deref()
+            .expect("route_through_a needs add_c first");
+        let subnet = self.a_addr.octets()[2];
+        let lo = |host| Ipv4Addr::new(10, 255, subnet, host);
+        let loopbacks = Loopbacks {
+            b: lo(2),
+            c: lo(3),
+            c_next_hop: lo(30),
+        };
+        let host = |a: Ipv4Addr| format!("{a}/32");
+        let (b_lo, c_los) = (loopbacks.b, [loopbacks.c, loopbacks.c_next_hop]);
+        sh(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.a,
+                "sysctl",
+                "-qw",
+                "net.ipv4.ip_forward=1",
+            ],
+        );
+        sh(
+            "ip",
+            &["-n", &self.b, "addr", "add", &host(b_lo), "dev", "lo"],
+        );
+        for a in c_los {
+            sh("ip", &["-n", c, "addr", "add", &host(a), "dev", "lo"]);
+            // B reaches C's loopbacks by static routes through A.
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    &self.b,
+                    "route",
+                    "add",
+                    &host(a),
+                    "via",
+                    &self.a_addr.to_string(),
+                    "proto",
+                    "static",
+                ],
+            );
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    &self.a,
+                    "route",
+                    "add",
+                    &host(a),
+                    "via",
+                    &self.c_addr.to_string(),
+                ],
+            );
+        }
+        let [x, y, z, _] = self.b_addr.octets();
+        for to in [host(b_lo), format!("{}/24", Ipv4Addr::new(x, y, z, 0))] {
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    c,
+                    "route",
+                    "add",
+                    &to,
+                    "via",
+                    &self.a2_addr.to_string(),
+                ],
+            );
+        }
+        sh(
+            "ip",
+            &[
+                "-n",
+                &self.a,
+                "route",
+                "add",
+                &host(b_lo),
+                "via",
+                &self.b_addr.to_string(),
+            ],
+        );
+        loopbacks
+    }
+
     /// An address on the link between A and B where what A sends goes
     /// nowhere: A has a permanent neighbour entry for it with a MAC address
     /// nobody has, and B drops frames for that address. A connection to
@@ -226,6 +336,18 @@ impl Drop for Lab {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// The loopback addresses of a lab routed through A
+/// ([`Lab::route_through_a`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loopbacks {
+    /// B's, `10.255.S.2`: bgpfcd's session address.
+    pub b: Ipv4Addr,
+    /// C's, `10.255.S.3`: its speaker's session address.
+    pub c: Ipv4Addr,
+    /// C's second, `10.255.S.30`: a next hop other than the session's.
+    pub c_next_hop: Ipv4Addr,
 }
 
 /// A running process whose stderr goes to a file; killed on drop.
@@ -570,6 +692,9 @@ pub struct BirdOpts {
     /// More options for the BGP protocol itself, such as
     /// `error wait time 1, 2;`.
     pub protocol: String,
+    /// What the `ipv4` channel exports: a filter, such as `filter {
+    /// bgp_next_hop = 192.0.2.30; accept; }`; empty is `all`.
+    pub export: String,
 }
 
 impl Bird {
@@ -604,7 +729,7 @@ impl Bird {
                  \x20   hold time {hold};\n\
                  {passive}\
                  \x20   {protocol}\n\
-                 \x20   ipv4 {{ import all; export all; {channel} }};\n\
+                 \x20   ipv4 {{ import all; export {export}; {channel} }};\n\
                  }}\n",
                 local = opts.local,
                 local_port = opts.local_port,
@@ -615,6 +740,11 @@ impl Bird {
                 hold = opts.hold_time,
                 channel = opts.channel,
                 protocol = opts.protocol,
+                export = if opts.export.is_empty() {
+                    "all"
+                } else {
+                    &opts.export
+                },
             ),
         )
         .expect("bird config");

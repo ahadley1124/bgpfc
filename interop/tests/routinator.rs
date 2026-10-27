@@ -117,6 +117,7 @@ fn start_bird(lab: &Lab) -> Bird {
             statics: ROUTES.map(str::to_owned).to_vec(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     )
 }
