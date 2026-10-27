@@ -22,7 +22,11 @@ fn connected(prefix: &str, oif: u32) -> KernelRoute {
     KernelRoute {
         prefix: p(prefix),
         metric: 0,
-        via: Via::Unicast { gateway: None, oif },
+        via: Via::Unicast {
+            gateway: None,
+            oif,
+            onlink: false,
+        },
     }
 }
 
@@ -33,6 +37,7 @@ fn via(prefix: &str, gateway: &str, oif: u32, metric: u32) -> KernelRoute {
         via: Via::Unicast {
             gateway: Some(ip(gateway)),
             oif,
+            onlink: false,
         },
     }
 }
@@ -57,6 +62,7 @@ fn hop(gateway: &str, oif: Option<u32>) -> Hop {
     Hop {
         gateway: ip(gateway),
         oif,
+        onlink: false,
     }
 }
 
@@ -461,6 +467,54 @@ fn install_goes_through_the_immediate_gateway_and_interface() {
             .map(|(p, _)| p)
             .collect::<Vec<_>>(),
         vec![p("198.51.101.0/24"), p("2001:db8:1::/48")]
+    );
+}
+
+#[test]
+fn an_onlink_gateway_is_installed_onlink() {
+    // An IGP's route over an unnumbered link: its gateway is on the link
+    // though no route covers it (`onlink`), and the kernel takes a route
+    // through such a gateway only so marked. A next hop the route covers
+    // itself, as a device route's, is on the link by that route.
+    let mut rib = Rib::new(LOCAL_AS);
+    let onlink = |prefix: &str, gateway: Option<&str>| KernelRoute {
+        prefix: p(prefix),
+        metric: 20,
+        via: Via::Unicast {
+            gateway: gateway.map(ip),
+            oif: 3,
+            onlink: true,
+        },
+    };
+    kernel(
+        &mut rib,
+        table(&[
+            onlink("10.255.0.30/32", Some("192.168.77.1")),
+            onlink("10.0.0.0/24", None),
+        ]),
+    );
+    let (e1, _) = two_peers(&mut rib);
+    send(&mut rib, &e1, &["203.0.113.0/24"], &[65_001], "10.255.0.30");
+    send(&mut rib, &e1, &["198.51.100.0/24"], &[65_001], "10.0.0.1");
+    let through = Hop {
+        onlink: true,
+        ..hop("192.168.77.1", Some(3))
+    };
+    assert_eq!(
+        rib.fib_routes().collect::<Vec<_>>(),
+        vec![
+            (p("198.51.100.0/24"), hop("10.0.0.1", Some(3))),
+            (p("203.0.113.0/24"), through),
+        ]
+    );
+    let report = rib
+        .next_hops()
+        .into_iter()
+        .find(|n| n.addr == ip("10.255.0.30"))
+        .unwrap();
+    assert_eq!(
+        report.to_string(),
+        "10.255.0.30 via 192.168.77.1 dev eth1 onlink"
     );
 }
 
@@ -965,6 +1019,7 @@ fn kernel_route() -> impl Strategy<Value = KernelRoute> {
                 Some(g) => Via::Unicast {
                     gateway: Some(IpAddr::from([10, 9, 0, u8::try_from(g).unwrap()])),
                     oif: g + 2,
+                    onlink: false,
                 },
                 None => Via::Unreachable,
             },

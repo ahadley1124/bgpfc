@@ -24,7 +24,7 @@ use bgpfc_wire::types::Afi;
 use crate::netlink::{self, Attr, Message, NetlinkError};
 use crate::route::{
     self, AF_INET, AF_INET6, RT_TABLE_MAIN, RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY, RTA_TABLE,
-    RTA_VIA, RTM_DELROUTE, RTM_F_CLONED, RTM_NEWROUTE, RTMSG_LEN, RTN_UNICAST,
+    RTA_VIA, RTM_DELROUTE, RTM_F_CLONED, RTM_NEWROUTE, RTMSG_LEN, RTN_UNICAST, RTNH_F_ONLINK,
 };
 
 /// `RTM_NEWLINK`: an interface appeared or changed.
@@ -103,6 +103,9 @@ pub enum Via {
         gateway: Option<IpAddr>,
         /// The interface index.
         oif: u32,
+        /// `RTNH_F_ONLINK`: the gateway is on the link of `oif` though no
+        /// route covers it, so a route through it must say so too.
+        onlink: bool,
     },
     /// Dropped (blackhole, unreachable, prohibit, throw), or a route
     /// whose next hops are all dead or held in a nexthop object the
@@ -174,8 +177,15 @@ impl fmt::Display for Via {
             Via::Unicast {
                 gateway: Some(g),
                 oif,
-            } => write!(f, "via {g} oif {oif}"),
-            Via::Unicast { gateway: None, oif } => write!(f, "oif {oif}"),
+                onlink,
+            } => write!(
+                f,
+                "via {g} oif {oif}{}",
+                if *onlink { " onlink" } else { "" }
+            ),
+            Via::Unicast {
+                gateway: None, oif, ..
+            } => write!(f, "oif {oif}"),
             Via::Unreachable => f.write_str("unreachable"),
         }
     }
@@ -225,7 +235,9 @@ pub fn relevant(route: &Route, protocol: u8) -> bool {
 /// or that names a nexthop object (`RTA_NH_ID`) without the next hop
 /// expanded (`net.ipv4.nexthop_compat_mode` 0), has none: it is
 /// [`Via::Unreachable`]. `RTNH_F_LINKDOWN` next hops count, as the kernel
-/// uses them unless `ignore_routes_with_linkdown` is set.
+/// uses them unless `ignore_routes_with_linkdown` is set. `RTNH_F_ONLINK`
+/// (in `rtm_flags` for one next hop, `rtnh_flags` for several) is kept: a
+/// route through such a gateway needs it.
 ///
 /// # Errors
 /// [`NetlinkError`] on malformed bytes.
@@ -285,7 +297,11 @@ pub fn decode_route(payload: &[u8]) -> Result<Option<Route>, NetlinkError> {
         first_live(afi, nexthops)?
     } else {
         match oif {
-            Some(oif) if flags & u32::from(RTNH_F_DEAD) == 0 => Via::Unicast { gateway, oif },
+            Some(oif) if flags & u32::from(RTNH_F_DEAD) == 0 => Via::Unicast {
+                gateway,
+                oif,
+                onlink: flags & u32::from(RTNH_F_ONLINK) != 0,
+            },
             _ => Via::Unreachable,
         }
     };
@@ -325,7 +341,11 @@ fn first_live(afi: Afi, mut nexthops: &[u8]) -> Result<Via, NetlinkError> {
                     _ => {}
                 }
             }
-            return Ok(Via::Unicast { gateway, oif });
+            return Ok(Via::Unicast {
+                gateway,
+                oif,
+                onlink: flags & RTNH_F_ONLINK != 0,
+            });
         }
         let next = netlink::align(len);
         nexthops = nexthops.get(next..).unwrap_or_default();
@@ -532,7 +552,8 @@ mod tests {
                 metric: 5,
                 via: Via::Unicast {
                     gateway: Some(ip("10.1.0.2")),
-                    oif: 2
+                    oif: 2,
+                    onlink: false,
                 },
             }
         );
@@ -546,7 +567,8 @@ mod tests {
             r.via,
             Via::Unicast {
                 gateway: Some(ip("10.1.0.2")),
-                oif: 2
+                oif: 2,
+                onlink: false,
             }
         );
         // A device route and the connected route: no gateway.
@@ -559,7 +581,8 @@ mod tests {
                 r.via,
                 Via::Unicast {
                     gateway: None,
-                    oif: 2
+                    oif: 2,
+                    onlink: false,
                 }
             );
         }
@@ -707,7 +730,8 @@ mod tests {
             r.via,
             Via::Unicast {
                 gateway: Some(ll),
-                oif: 3
+                oif: 3,
+                onlink: false,
             }
         );
         assert!(relevant(&r, 186));
@@ -727,7 +751,8 @@ mod tests {
             via_of(&m),
             Via::Unicast {
                 gateway: Some(ll),
-                oif: 3
+                oif: 3,
+                onlink: false,
             }
         );
         // A nexthop object not expanded: nothing to forward through.
@@ -757,7 +782,8 @@ mod tests {
             via_of(&m),
             Via::Unicast {
                 gateway: None,
-                oif: 3
+                oif: 3,
+                onlink: false,
             }
         );
         // A single next hop marked dead.
@@ -770,6 +796,37 @@ mod tests {
             &[(RTA_DST, &dst4), (RTA_OIF, &oif3)],
         );
         assert_eq!(via_of(&m), Via::Unreachable);
+    }
+
+    /// `ip route add 10.255.0.30/32 via 192.168.77.1 dev v0 onlink`:
+    /// `RTNH_F_ONLINK` in `rtm_flags`, which a route through the gateway
+    /// needs too.
+    #[test]
+    fn onlink_gateways_are_kept() {
+        let oif3 = 3u32.to_ne_bytes();
+        let gw = [192, 168, 77, 1];
+        let m = rtmsg(
+            AF_INET,
+            32,
+            0,
+            RTN_UNICAST,
+            u32::from(RTNH_F_ONLINK),
+            &[
+                (RTA_DST, &[10, 255, 0, 30]),
+                (RTA_GATEWAY, &gw),
+                (RTA_OIF, &oif3),
+            ],
+        );
+        let onlink = via_of(&m);
+        assert_eq!(
+            onlink,
+            Via::Unicast {
+                gateway: Some(ip("192.168.77.1")),
+                oif: 3,
+                onlink: true,
+            }
+        );
+        assert_eq!(onlink.to_string(), "via 192.168.77.1 oif 3 onlink");
     }
 
     #[test]
@@ -793,7 +850,8 @@ mod tests {
             via_of(&m),
             Via::Unicast {
                 gateway: Some(ip("10.1.0.4")),
-                oif: 5
+                oif: 5,
+                onlink: false,
             }
         );
         let all_dead = [dead.clone(), dead].concat();
@@ -806,6 +864,24 @@ mod tests {
             &[(RTA_DST, &dst4), (RTA_MULTIPATH, &all_dead)],
         );
         assert_eq!(via_of(&m), Via::Unreachable);
+        // RTNH_F_ONLINK in the next hop's own flags.
+        let onlink = rtnexthop(RTNH_F_ONLINK, 7, &[(RTA_GATEWAY, &g4)]);
+        let m = rtmsg(
+            AF_INET,
+            24,
+            0,
+            RTN_UNICAST,
+            0,
+            &[(RTA_DST, &dst4), (RTA_MULTIPATH, &onlink)],
+        );
+        assert_eq!(
+            via_of(&m),
+            Via::Unicast {
+                gateway: Some(ip("10.1.0.4")),
+                oif: 7,
+                onlink: true,
+            }
+        );
         // A next hop without a gateway: a device next hop.
         let dev = rtnexthop(0, 6, &[]);
         let m = rtmsg(
@@ -820,7 +896,8 @@ mod tests {
             via_of(&m),
             Via::Unicast {
                 gateway: None,
-                oif: 6
+                oif: 6,
+                onlink: false,
             }
         );
         // A struct rtnexthop longer than the attribute: an error.

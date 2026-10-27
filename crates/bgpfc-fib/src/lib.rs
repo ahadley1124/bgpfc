@@ -241,6 +241,7 @@ impl Fib {
                         Hop {
                             gateway,
                             oif: r.oif,
+                            onlink: r.onlink(),
                         },
                     );
                 }
@@ -562,6 +563,7 @@ mod tests {
         Hop {
             gateway: ip(gateway),
             oif: None,
+            onlink: false,
         }
     }
 
@@ -644,6 +646,7 @@ mod tests {
         let ll = Hop {
             gateway: ip("fe80::1"),
             oif: Some(2),
+            onlink: false,
         };
         fib.reconcile(&mut merge, &[(p("2001:db8::/32"), ll)], &mut out);
         fib.reconcile_end(merge, &mut out);

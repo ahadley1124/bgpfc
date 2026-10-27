@@ -2132,6 +2132,7 @@ mod tests {
                 hop: Hop {
                     gateway: ip("10.99.7.1"),
                     oif: Some(4),
+                    onlink: false,
                 },
                 through: Some("10.255.7.30/32".parse().unwrap()),
             },
@@ -2179,6 +2180,29 @@ mod tests {
         );
     }
 
+    /// 192.0.2.0/24 connected on interface 2.
+    fn connected_on_eth0() -> bgpfc_rib::nexthop::KernelRoute {
+        use bgpfc_rib::nexthop::{KernelRoute, Via};
+        KernelRoute {
+            prefix: "192.0.2.0/24".parse().unwrap(),
+            metric: 0,
+            via: Via::Unicast {
+                gateway: None,
+                oif: 2,
+                onlink: false,
+            },
+        }
+    }
+
+    /// A next hop on that network, as it resolves: itself on interface 2.
+    fn connected_hop(next_hop: &str) -> bgpfc_rib::nexthop::Hop {
+        bgpfc_rib::nexthop::Hop {
+            gateway: ip(next_hop),
+            oif: Some(2),
+            onlink: false,
+        }
+    }
+
     /// The kernel thread's table and changes go to the RIB as they come
     /// (RFC 4271 §9.1.2): a route whose next hop the table resolves goes
     /// to the FIB through the interface it is reached on; when the
@@ -2186,18 +2210,10 @@ mod tests {
     /// and leaves the FIB; when it comes back, so does the route.
     #[test]
     fn the_kernels_table_resolves_and_holds_routes() {
-        use bgpfc_rib::nexthop::{Hop, KernelRoute, Via};
         let now = Instant::now();
         let mut rib = Rib::new(Asn(65_000));
         let mut settings = RibSettings::default();
-        let connected = KernelRoute {
-            prefix: "192.0.2.0/24".parse().unwrap(),
-            metric: 0,
-            via: Via::Unicast {
-                gateway: None,
-                oif: 2,
-            },
-        };
+        let connected = connected_on_eth0();
         let table = KernelUpdate::Table {
             routes: vec![connected],
             links: vec![(2, "eth0".to_owned())],
@@ -2220,10 +2236,7 @@ mod tests {
             routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
             now,
         );
-        let hop = Hop {
-            gateway: ip("192.0.2.1"),
-            oif: Some(2),
-        };
+        let hop = connected_hop("192.0.2.1");
         assert!(
             out.iter()
                 .any(|o| matches!(o, Output::Fib(c) if c.next_hop == Some(hop))),
@@ -2305,6 +2318,7 @@ mod tests {
                 via: Via::Unicast {
                     gateway: None,
                     oif: 7,
+                    onlink: false,
                 },
             }],
             links: vec![(7, "v7".to_owned())],
@@ -2327,6 +2341,7 @@ mod tests {
             bgpfc_fib::Hop {
                 gateway: ip("192.0.2.1"),
                 oif: Some(7),
+                onlink: false,
             },
         )];
         let (fib, fib_rx) = sync_channel(8);
@@ -2365,6 +2380,7 @@ mod tests {
                 next_hop: Some(bgpfc_rib::nexthop::Hop {
                     gateway: ip("192.0.2.1"),
                     oif: None,
+                    onlink: false,
                 }),
                 previous: None,
             })

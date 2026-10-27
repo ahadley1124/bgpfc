@@ -496,10 +496,15 @@ fn nexthops(c: &mut Criterion, routes: u32) {
     let net = |a: u8, b: u8, c: u8, len: u8| {
         Prefix::new(IpAddr::V4(Ipv4Addr::new(a, b, c, 0)), len).unwrap()
     };
+    let unicast = |gateway: Option<IpAddr>, oif: u32| Via::Unicast {
+        gateway,
+        oif,
+        onlink: false,
+    };
     let connected = |prefix: Prefix, oif: u32| KernelRoute {
         prefix,
         metric: 0,
-        via: Via::Unicast { gateway: None, oif },
+        via: unicast(None, oif),
     };
     let lan = net(192, 0, 2, 24);
     let other = net(198, 51, 100, 24);
@@ -568,10 +573,7 @@ fn nexthops(c: &mut Criterion, routes: u32) {
     let through = change(vec![KernelChange::Route(KernelRoute {
         prefix: lan,
         metric: 0,
-        via: Via::Unicast {
-            gateway: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            oif: 3,
-        },
+        via: unicast(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), 3),
     })]);
     let mut moved = false;
     group.bench_function(format!("next_hop_moved_{routes}"), |b| {

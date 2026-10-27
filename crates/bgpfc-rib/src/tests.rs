@@ -67,6 +67,7 @@ fn gw(gateway: &str) -> Hop {
     Hop {
         gateway: ip(gateway),
         oif: None,
+        onlink: false,
     }
 }
 

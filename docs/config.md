@@ -1072,7 +1072,10 @@ connected route that covers it, or else the gateway and interface of the
 kernel route that resolves it, the immediate next hop, as BIRD's
 `gateway recursive` and FRR do. The interface is always given, so that a
 next hop that comes back through another interface is installed again
-through it. Dry-run mode resolves the same way and installs nothing.
+through it. A gateway that kernel route has `onlink`, on the interface's
+link though no route covers it, as an IGP's route over an unnumbered link
+has, goes in `onlink` too: the kernel refuses such a gateway otherwise.
+Dry-run mode resolves the same way and installs nothing.
 
 A change of the kernel's table decides again only the destinations with a
 route through a next hop whose resolution it changed, however large the

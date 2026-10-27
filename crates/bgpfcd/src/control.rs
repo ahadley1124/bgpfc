@@ -1392,6 +1392,16 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
 /// the kernel route it resolves through and how many routes use it; then
 /// how many routes the RIB's copy of the kernel's table holds. In JSON an
 /// object with the same, `null` where the text has `-`.
+/// A gateway as the listings write it: ` onlink` after one on the
+/// interface's link that no route covers (`RTNH_F_ONLINK`).
+fn gateway_text(gateway: std::net::IpAddr, onlink: bool) -> String {
+    if onlink {
+        format!("{gateway} onlink")
+    } else {
+        gateway.to_string()
+    }
+}
+
 fn render_next_hops(r: &NextHopsReport) -> Reply {
     let mut lines = vec![format!(
         "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
@@ -1414,6 +1424,7 @@ fn render_next_hops(r: &NextHopsReport) -> Reply {
             .clone()
             .or_else(|| hop.and_then(|h| h.oif).map(|i| i.to_string()));
         let dash = |s: Option<String>| s.unwrap_or_else(|| "-".to_owned());
+        let onlink = hop.is_some_and(|h| h.onlink);
         lines.push(format!(
             "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
             n.addr.to_string(),
@@ -1422,7 +1433,7 @@ fn render_next_hops(r: &NextHopsReport) -> Reply {
             } else {
                 "unresolved"
             },
-            dash(hop.map(|h| h.gateway.to_string())),
+            dash(hop.map(|h| gateway_text(h.gateway, h.onlink))),
             dash(interface),
             dash(through.map(|p| p.to_string())),
             n.routes
@@ -1434,8 +1445,13 @@ fn render_next_hops(r: &NextHopsReport) -> Reply {
             .field_opt_num("oif", hop.and_then(|h| h.oif))
             .field_opt("interface", n.interface.as_deref())
             .field_opt("through", through)
-            .field_num("routes", num(n.routes))
-            .end_object();
+            .field_num("routes", num(n.routes));
+        // Only where the gateway is on the interface's link though no
+        // route covers it, as `stale` in `show fib`.
+        if onlink {
+            j.field_bool("onlink", true);
+        }
+        j.end_object();
     }
     j.end_array().end_object();
     lines.push(match r.kernel_routes {
@@ -1780,7 +1796,7 @@ impl<'a> Listing<'a> {
                     let oif = r.hop.oif.map_or("-".to_owned(), |i| i.to_string());
                     out.line(&format!(
                         "{prefix:<44} via {:<40} oif {oif:<10} {state}",
-                        r.hop.gateway
+                        gateway_text(r.hop.gateway, r.hop.onlink)
                     ))
                     .map_err(io)?;
                 }
@@ -1826,6 +1842,9 @@ impl<'a> Listing<'a> {
                         .field_display("gateway", r.hop.gateway)
                         .field_opt_num("oif", r.hop.oif)
                         .field_bool("installed", r.installed);
+                    if r.hop.onlink {
+                        j.field_bool("onlink", true);
+                    }
                     if r.stale {
                         j.field_bool("stale", true);
                     }
@@ -2018,6 +2037,7 @@ mod tests {
         let hop = Hop {
             gateway: gateway.parse().unwrap(),
             oif,
+            onlink: false,
         };
         (prefix.parse().unwrap(), hop)
     }
@@ -2428,20 +2448,32 @@ mod tests {
     }
 
     /// `show fib` names the interface each route goes out of, desired and
-    /// installed alike, in text and JSON.
+    /// installed alike, in text and JSON, and says `onlink` of a gateway
+    /// on its interface's link that no route covers.
     #[test]
     fn fib_rows_show_the_interface() {
         let none = |_| Ok(Vec::new());
+        let onlink = || {
+            let (prefix, hop) = fib_route_on("198.51.100.0/24", "192.168.77.1", Some(3));
+            (
+                prefix,
+                Hop {
+                    onlink: true,
+                    ..hop
+                },
+            )
+        };
         let listing = || Listing::Fib {
             mode: Mode::Install,
             desired: Pages::starting(
-                vec![fib_route_on("192.0.2.0/24", "10.99.7.1", Some(4))],
+                vec![fib_route_on("192.0.2.0/24", "10.99.7.1", Some(4)), onlink()],
                 none,
                 |r| r.0,
             ),
             installed: Pages::starting(
                 vec![
                     fib_route_on("192.0.2.0/24", "10.99.7.1", Some(4)),
+                    onlink(),
                     fib_route("203.0.113.0/24", "10.99.7.1"),
                 ],
                 none,
@@ -2454,11 +2486,15 @@ mod tests {
         let text = String::from_utf8(text).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            lines[2..4],
+            lines[2..5],
             [
                 format!(
                     "{:<44} via {:<40} oif {:<10} installed",
                     "192.0.2.0/24", "10.99.7.1", "4"
+                ),
+                format!(
+                    "{:<44} via {:<40} oif {:<10} installed",
+                    "198.51.100.0/24", "192.168.77.1 onlink", "3"
                 ),
                 format!(
                     "{:<44} via {:<40} oif {:<10} stale",
@@ -2473,6 +2509,8 @@ mod tests {
             concat!(
                 r#"{"mode":"install","routes":["#,
                 r#"{"prefix":"192.0.2.0/24","gateway":"10.99.7.1","oif":4,"installed":true},"#,
+                r#"{"prefix":"198.51.100.0/24","gateway":"192.168.77.1","oif":3,"#,
+                r#""installed":true,"onlink":true},"#,
                 r#"{"prefix":"203.0.113.0/24","gateway":"10.99.7.1","oif":null,"#,
                 r#""installed":true,"stale":true}]}"#
             )
@@ -2493,6 +2531,7 @@ mod tests {
                         hop: Hop {
                             gateway: "10.99.7.1".parse().unwrap(),
                             oif: Some(3),
+                            onlink: false,
                         },
                         through: Some("10.255.7.30/32".parse().unwrap()),
                     },
@@ -2505,6 +2544,7 @@ mod tests {
                         hop: Hop {
                             gateway: "10.99.7.1".parse().unwrap(),
                             oif: Some(5),
+                            onlink: false,
                         },
                         through: Some("10.99.7.0/24".parse().unwrap()),
                     },
@@ -2567,6 +2607,45 @@ mod tests {
             ["no kernel table: every next hop resolves to itself"]
         );
         assert_eq!(r.json, r#"{"kernel_routes":null,"next_hops":[]}"#);
+    }
+
+    /// `show nexthops` says `onlink` of a gateway on its interface's link
+    /// that no route covers, in text and JSON.
+    #[test]
+    fn an_onlink_gateway_says_so() {
+        use bgpfc_rib::nexthop::{Hop, NextHopReport};
+        let report = NextHopsReport {
+            next_hops: vec![NextHopReport {
+                addr: "10.255.0.30".parse().unwrap(),
+                resolution: Resolution::Resolved {
+                    hop: Hop {
+                        gateway: "192.168.77.1".parse().unwrap(),
+                        oif: Some(3),
+                        onlink: true,
+                    },
+                    through: Some("10.255.0.30/32".parse().unwrap()),
+                },
+                interface: Some("v12b".to_owned()),
+                routes: 4,
+            }],
+            kernel_routes: Some(1),
+        };
+        let r = render_next_hops(&report);
+        assert_eq!(
+            r.lines[1],
+            format!(
+                "{:<39} {:<10} {:<39} {:<15} {:<43} {:>8}",
+                "10.255.0.30", "resolved", "192.168.77.1 onlink", "v12b", "10.255.0.30/32", 4
+            )
+        );
+        assert_eq!(
+            r.json,
+            concat!(
+                r#"{"kernel_routes":1,"next_hops":["#,
+                r#"{"next_hop":"10.255.0.30","resolved":true,"gateway":"192.168.77.1","oif":3,"#,
+                r#""interface":"v12b","through":"10.255.0.30/32","routes":4,"onlink":true}]}"#
+            )
+        );
     }
 
     /// RFC 4271 §9.1.2: a route whose next hop does not resolve is listed

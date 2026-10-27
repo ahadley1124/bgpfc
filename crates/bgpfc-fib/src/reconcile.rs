@@ -24,15 +24,24 @@ pub struct Hop {
     pub gateway: IpAddr,
     /// The interface index (`RTA_OIF`); `None` leaves it to the kernel.
     pub oif: Option<u32>,
+    /// Whether the gateway is on the interface's link though no route
+    /// covers it (`RTNH_F_ONLINK`), as the kernel route that resolves the
+    /// next hop says, such as an IGP's route over an unnumbered link: the
+    /// kernel refuses such a gateway without it.
+    pub onlink: bool,
 }
 
 impl fmt::Display for Hop {
-    /// `GATEWAY`, or `GATEWAY dev OIF`.
+    /// `GATEWAY`, or `GATEWAY dev OIF`, then ` onlink` if so.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.oif {
-            Some(oif) => write!(f, "{} dev {oif}", self.gateway),
-            None => write!(f, "{}", self.gateway),
+            Some(oif) => write!(f, "{} dev {oif}", self.gateway)?,
+            None => write!(f, "{}", self.gateway)?,
         }
+        if self.onlink {
+            f.write_str(" onlink")?;
+        }
+        Ok(())
     }
 }
 
@@ -367,6 +376,7 @@ mod tests {
         Hop {
             gateway: gateway.parse().unwrap(),
             oif: None,
+            onlink: false,
         }
     }
 

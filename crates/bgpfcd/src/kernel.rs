@@ -234,7 +234,15 @@ pub(crate) fn kernel_route(r: &kernel::Route) -> KernelRoute {
         prefix: r.dst,
         metric: r.metric,
         via: match r.via {
-            kernel::Via::Unicast { gateway, oif } => Via::Unicast { gateway, oif },
+            kernel::Via::Unicast {
+                gateway,
+                oif,
+                onlink,
+            } => Via::Unicast {
+                gateway,
+                oif,
+                onlink,
+            },
             kernel::Via::Unreachable => Via::Unreachable,
         },
     }
@@ -385,6 +393,7 @@ mod tests {
         let via = kernel::Via::Unicast {
             gateway: Some(ip("10.1.0.2")),
             oif: 2,
+            onlink: false,
         };
         assert_eq!(
             kernel_route(&route("192.0.2.128/25", 5, via)),
@@ -394,18 +403,21 @@ mod tests {
                 via: Via::Unicast {
                     gateway: Some(ip("10.1.0.2")),
                     oif: 2,
+                    onlink: false,
                 },
             }
         );
         let dev = kernel::Via::Unicast {
             gateway: None,
             oif: 3,
+            onlink: false,
         };
         assert_eq!(
             kernel_route(&route("2001:db8::/64", 256, dev)).via,
             Via::Unicast {
                 gateway: None,
-                oif: 3
+                oif: 3,
+                onlink: false,
             }
         );
         assert_eq!(
@@ -421,6 +433,7 @@ mod tests {
         let via = kernel::Via::Unicast {
             gateway: None,
             oif: 2,
+            onlink: false,
         };
         let snapshot = Snapshot {
             routes: vec![route("10.1.0.0/24", 0, via)],
@@ -446,7 +459,8 @@ mod tests {
                     metric: 0,
                     via: Via::Unicast {
                         gateway: None,
-                        oif: 2
+                        oif: 2,
+                        onlink: false,
                     },
                 }],
                 links: vec![(1, "lo".to_owned()), (2, "ar".to_owned())],
@@ -469,6 +483,7 @@ mod tests {
         let gw = kernel::Via::Unicast {
             gateway: Some(ip("10.1.0.2")),
             oif: 2,
+            onlink: false,
         };
         // Routes, in order; a known interface that stays as it was is
         // nothing.
@@ -493,7 +508,8 @@ mod tests {
                     metric: 5,
                     via: Via::Unicast {
                         gateway: Some(ip("10.1.0.2")),
-                        oif: 2
+                        oif: 2,
+                        onlink: false,
                     },
                 }),
                 KernelChange::Gone {

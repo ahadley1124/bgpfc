@@ -127,13 +127,15 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
 }
 
 /// The RIB's hop of a route as the FIB takes it: the gateway, and the
-/// interface of the kernel route that resolves the next hop; none while
-/// the RIB has no kernel table, and the kernel chooses (the two crates
-/// are siblings, AGENTS.md §2, so their types meet here).
+/// interface of the kernel route that resolves the next hop, with its
+/// `onlink`; none while the RIB has no kernel table, and the kernel
+/// chooses (the two crates are siblings, AGENTS.md §2, so their types
+/// meet here).
 pub(crate) fn fib_hop(hop: bgpfc_rib::nexthop::Hop) -> Hop {
     Hop {
         gateway: hop.gateway,
         oif: hop.oif,
+        onlink: hop.onlink,
     }
 }
 
@@ -360,7 +362,8 @@ impl Fold {
 
 /// The line of one operation: its kind, prefix, gateway and, when known,
 /// the index of the interface the gateway is reached on (`oif`, the
-/// kernel's `RTA_OIF`), and the kernel's error if it failed.
+/// kernel's `RTA_OIF`), `onlink=yes` for a gateway on that interface's
+/// link that no route covers, and the kernel's error if it failed.
 fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
     let (op, prefix, hop) = match &a.op {
         Op::Set { prefix, hop } => ("install", prefix, hop),
@@ -373,6 +376,9 @@ fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
     ];
     if let Some(oif) = hop.oif {
         fields.push(("oif", oif.to_string()));
+    }
+    if hop.onlink {
+        fields.push(("onlink", "yes".to_owned()));
     }
     if let Err(e) = &a.result {
         fields.push(("error", e.to_string()));
@@ -492,6 +498,7 @@ mod tests {
         Hop {
             gateway: ip(gateway),
             oif: None,
+            onlink: false,
         }
     }
 
@@ -882,28 +889,56 @@ mod tests {
                 next_hop: Some(bgpfc_rib::nexthop::Hop {
                     gateway: ip("192.0.2.1"),
                     oif: None,
+                    onlink: false,
                 }),
                 previous: None,
             })
             .collect()
     }
 
-    /// The RIB's hop reaches the FIB as it is: gateway and interface.
+    /// The RIB's hop reaches the FIB as it is: gateway, interface and
+    /// `onlink`; the line of its operation says `onlink=yes` of such a
+    /// gateway.
     #[test]
     fn rib_hops_reach_the_fib_with_their_interface() {
-        for oif in [None, Some(3)] {
+        for (oif, onlink) in [(None, false), (Some(3), false), (Some(3), true)] {
             let rib = bgpfc_rib::nexthop::Hop {
                 gateway: ip("fe80::1"),
                 oif,
+                onlink,
             };
             assert_eq!(
                 fib_hop(rib),
                 Hop {
                     gateway: ip("fe80::1"),
-                    oif
+                    oif,
+                    onlink,
                 }
             );
         }
+        let applied = Applied {
+            op: Op::Set {
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                hop: Hop {
+                    gateway: ip("192.168.77.1"),
+                    oif: Some(3),
+                    onlink: true,
+                },
+            },
+            result: Ok(()),
+            dry_run: false,
+            already_gone: false,
+        };
+        assert_eq!(
+            op_line(&applied, Level::Debug, "fib: applied").fields,
+            [
+                ("op", "install".to_owned()),
+                ("prefix", "203.0.113.0/24".to_owned()),
+                ("gateway", "192.168.77.1".to_owned()),
+                ("oif", "3".to_owned()),
+                ("onlink", "yes".to_owned()),
+            ]
+        );
     }
 
     fn changes(range: std::ops::Range<usize>, more: bool) -> Step {

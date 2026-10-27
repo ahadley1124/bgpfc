@@ -25,9 +25,15 @@ fn gateway() -> impl Strategy<Value = IpAddr> {
 }
 
 /// A hop: a gateway, on one of two interfaces or none, so that a route
-/// also moves between interfaces with one gateway.
+/// also moves between interfaces with one gateway, and `onlink` or not.
 fn hop() -> impl Strategy<Value = Hop> {
-    (gateway(), proptest::option::of(2u32..4)).prop_map(|(gateway, oif)| Hop { gateway, oif })
+    (gateway(), proptest::option::of(2u32..4), any::<bool>()).prop_map(|(gateway, oif, onlink)| {
+        Hop {
+            gateway,
+            oif,
+            onlink,
+        }
+    })
 }
 
 fn table() -> impl Strategy<Value = Table> {
@@ -72,10 +78,11 @@ proptest! {
             any::<u128>().prop_map(|a| IpAddr::V6(Ipv6Addr::from(a))),
         ],
         oif in proptest::option::of(any::<u32>()),
+        onlink in any::<bool>(),
         table in prop_oneof![Just(RT_TABLE_MAIN), 1u32..=u32::MAX],
     ) {
         let dst = Prefix::new(IpAddr::V4(Ipv4Addr::from(addr)), len).unwrap();
-        let r = RouteMsg::unicast(dst, Hop { gateway: gw, oif }, table, RTPROT_BGP);
+        let r = RouteMsg::unicast(dst, Hop { gateway: gw, oif, onlink }, table, RTPROT_BGP);
         let m = r.encode_set(7);
         prop_assert_eq!(RouteMsg::decode(&m[HEADER_LEN..]).unwrap(), Some(r));
     }

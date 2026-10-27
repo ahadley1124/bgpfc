@@ -500,7 +500,8 @@ fn held_routes_follow_the_candidates() {
             next_hop: None,
             previous: Some(Hop {
                 gateway: e[1].addr,
-                oif: None
+                oif: None,
+                onlink: false,
             }),
         }]
     );

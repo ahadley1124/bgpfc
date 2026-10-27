@@ -57,6 +57,9 @@ pub enum Via {
         gateway: Option<IpAddr>,
         /// The interface index.
         oif: u32,
+        /// Whether the gateway is on the link of `oif` though no route
+        /// covers it (`RTNH_F_ONLINK`): a route through it needs it too.
+        onlink: bool,
     },
     /// Nowhere: a blackhole, unreachable, prohibit or throw route, or one
     /// with no usable next hop. Nothing resolves through it, and a more
@@ -111,6 +114,11 @@ pub struct Hop {
     pub gateway: IpAddr,
     /// The interface index; `None` without a kernel table.
     pub oif: Option<u32>,
+    /// Whether the gateway is on the interface's link though no route
+    /// covers it, as the kernel route that resolves the next hop says
+    /// (`onlink`, such as an IGP's route over an unnumbered link): the
+    /// kernel takes a route through it only so marked.
+    pub onlink: bool,
 }
 
 /// What a next hop resolves to.
@@ -161,17 +169,22 @@ pub struct NextHopReport {
 
 impl fmt::Display for NextHopReport {
     /// `ADDR unresolved`, or `ADDR via GATEWAY dev NAME` (`dev` with the
-    /// index when the name is unknown, nothing without an interface).
+    /// index when the name is unknown, nothing without an interface), then
+    /// ` onlink` when the gateway is.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.resolution {
             Resolution::Unresolved => write!(f, "{} unresolved", self.addr),
             Resolution::Resolved { hop, .. } => {
                 write!(f, "{} via {}", self.addr, hop.gateway)?;
                 match (&self.interface, hop.oif) {
-                    (Some(name), _) => write!(f, " dev {name}"),
-                    (None, Some(oif)) => write!(f, " dev {oif}"),
-                    (None, None) => Ok(()),
+                    (Some(name), _) => write!(f, " dev {name}")?,
+                    (None, Some(oif)) => write!(f, " dev {oif}")?,
+                    (None, None) => {}
                 }
+                if hop.onlink {
+                    f.write_str(" onlink")?;
+                }
+                Ok(())
             }
         }
     }
@@ -324,13 +337,23 @@ impl Kernel {
     /// the immediate next hop, or `addr` itself for a connected or device
     /// route, on the route's interface. An IPv6 route's link-local
     /// gateway comes with the interface it is on, which is what makes it
-    /// usable.
+    /// usable; a gateway the route has `onlink` goes on with it, which the
+    /// kernel needs of a gateway no route covers. The next hop itself, on
+    /// a connected or device route, is covered by that route.
     pub(crate) fn resolve(&self, addr: IpAddr) -> Resolution {
         match self.lookup(addr) {
-            Some((through, Via::Unicast { gateway, oif })) => Resolution::Resolved {
+            Some((
+                through,
+                Via::Unicast {
+                    gateway,
+                    oif,
+                    onlink,
+                },
+            )) => Resolution::Resolved {
                 hop: Hop {
                     gateway: gateway.unwrap_or(addr),
                     oif: Some(oif),
+                    onlink: onlink && gateway.is_some(),
                 },
                 through: Some(through),
             },
@@ -531,6 +554,7 @@ impl NextHops {
                 hop: Hop {
                     gateway: addr,
                     oif: None,
+                    onlink: false,
                 },
                 through: None,
             },

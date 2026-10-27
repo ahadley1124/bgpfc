@@ -369,6 +369,7 @@ mod tests {
             via: Via::Unicast {
                 gateway: Some(IpAddr::from([10, 1, 0, 2])),
                 oif: 2,
+                onlink: false,
             },
         }
     }
@@ -558,7 +559,8 @@ mod root_tests {
                 route.via,
                 Via::Unicast {
                     gateway: Some(IpAddr::from([10, 1, 0, 2])),
-                    oif
+                    oif,
+                    onlink: false,
                 }
             );
             // Ours is never reported.
@@ -619,6 +621,7 @@ mod root_tests {
                         hop: Some(crate::Hop {
                             gateway: IpAddr::from([192, 0, 2, 1]),
                             oif: None,
+                            onlink: false,
                         }),
                         previous: None,
                     }
