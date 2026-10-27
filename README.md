@@ -459,7 +459,10 @@ sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
 ```
 
 Without it bgpfcd stops with `cannot join network namespace` and
-`setns(2) needs CAP_SYS_ADMIN`. A bgpfcd started inside the namespace
+`setns(2) needs CAP_SYS_ADMIN`; with it, `setns(2) refused although
+CAP_SYS_ADMIN is effective` means the namespace belongs to another user
+namespace, or a seccomp filter, such as systemd's
+`RestrictNamespaces=yes`, blocks the call. A bgpfcd started inside the namespace
 already needs no capability for it. Under systemd,
 `NetworkNamespacePath=/run/netns/blue` has systemd put bgpfcd there
 instead, with no capability at all; `contrib/bgpfcd.service` shows both

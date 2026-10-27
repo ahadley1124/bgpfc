@@ -61,7 +61,9 @@ pub enum NetNsError {
     /// The path opened, but it is not a network namespace: another kind
     /// of namespace, or not one at all.
     NotNetwork,
-    /// `setns(2)` failed: `EPERM` without `CAP_SYS_ADMIN`.
+    /// `setns(2)` failed: `EPERM` without `CAP_SYS_ADMIN` in the
+    /// calling thread's user namespace and in the one that owns the
+    /// network namespace, or when a seccomp filter refuses the call.
     Join(io::Error),
     /// `setns(2)` succeeded but the thread is not in the namespace after
     /// it.
@@ -78,9 +80,15 @@ impl fmt::Display for NetNsError {
         match self {
             NetNsError::Open(e) => write!(f, "cannot open: {e}"),
             NetNsError::NotNetwork => f.write_str("not a network namespace"),
-            NetNsError::Join(e) if e.raw_os_error() == Some(ffi::EPERM) => {
-                write!(f, "setns(2) needs CAP_SYS_ADMIN: {e}")
-            }
+            // setns(2): EPERM means "the caller did not have the required
+            // capability", CAP_SYS_ADMIN, which the owner of a network
+            // namespace's user namespace must grant too; a seccomp filter,
+            // such as systemd's RestrictNamespaces=, answers EPERM as well.
+            NetNsError::Join(e) if e.raw_os_error() == Some(ffi::EPERM) => write!(
+                f,
+                "setns(2) refused: it needs CAP_SYS_ADMIN, also in the user namespace that \
+                 owns the network namespace, and no seccomp filter that blocks it: {e}"
+            ),
             NetNsError::Join(e) => write!(f, "setns(2): {e}"),
             NetNsError::NotEntered { now, want } => write!(
                 f,
@@ -166,8 +174,10 @@ impl NetNs {
     ///
     /// # Errors
     /// [`NetNsError::Join`] if `setns(2)` fails, with `EPERM` without
-    /// `CAP_SYS_ADMIN`; [`NetNsError::NotEntered`] if the thread is not in
-    /// the namespace afterwards.
+    /// `CAP_SYS_ADMIN`, for a namespace another user namespace owns, or
+    /// under a seccomp filter that refuses the call;
+    /// [`NetNsError::NotEntered`] if the thread is not in the namespace
+    /// afterwards.
     #[allow(unsafe_code, reason = "setns(2) on a borrowed descriptor")]
     pub fn enter(&self) -> Result<(), NetNsError> {
         // SAFETY: the descriptor belongs to `self.file`, which stays open
@@ -231,16 +241,19 @@ mod tests {
         assert_eq!(parse_threads("Threads:\tmany\n"), None);
     }
 
-    /// The messages name what is wrong, and `CAP_SYS_ADMIN` when that is
-    /// why `setns(2)` failed.
+    /// The messages name what is wrong; for `EPERM` from `setns(2)`, every
+    /// cause it has, as the library cannot tell them apart.
     #[test]
     fn errors_say_why() {
         let eperm = NetNsError::Join(io::Error::from_raw_os_error(ffi::EPERM));
-        assert!(
-            eperm
-                .to_string()
-                .starts_with("setns(2) needs CAP_SYS_ADMIN: "),
-            "{eperm}"
+        // The text of the OS error follows; Miri words it its own way.
+        assert_eq!(
+            eperm.to_string(),
+            format!(
+                "setns(2) refused: it needs CAP_SYS_ADMIN, also in the user namespace that \
+                 owns the network namespace, and no seccomp filter that blocks it: {}",
+                io::Error::from_raw_os_error(ffi::EPERM)
+            )
         );
         let einval = NetNsError::Join(io::Error::from_raw_os_error(ffi::EINVAL));
         assert!(!einval.to_string().contains("CAP_SYS_ADMIN"), "{einval}");

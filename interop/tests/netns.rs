@@ -6,8 +6,8 @@
 //! exec`, while `bgpfcctl` reaches its control socket from the host.
 //!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`,
-//! `curl`, `stayrtr` and `setpriv` on `PATH`, and a built `bgpfcd`. CI runs
-//! them with `--include-ignored` under sudo.
+//! `curl`, `stayrtr`, `setpriv` and `unshare` on `PATH`, and a built
+//! `bgpfcd`. CI runs them with `--include-ignored` under sudo.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -345,7 +345,8 @@ fn bgpfcd_for_nobody(lab: &Lab) -> PathBuf {
 }
 
 /// `--check` opens the namespace, which needs no privilege, and joins
-/// nothing; the start joins it only with `CAP_SYS_ADMIN`, and an
+/// nothing; the start joins it only with `CAP_SYS_ADMIN`, which a user
+/// namespace of bgpfcd's own does not give over the lab's, and an
 /// unprivileged user that has it, with the two capabilities bgpfcd needs
 /// besides (README, "Run", Option A), joins, comes up, and keeps those
 /// two after it gave up `CAP_SYS_ADMIN`.
@@ -389,6 +390,31 @@ fn check_and_capabilities_stop_a_start_that_cannot_join() {
     );
     assert!(
         log.contains("msg=\"cannot join network namespace\"") && log.contains("CAP_SYS_ADMIN"),
+        "{log}"
+    );
+
+    // In a user namespace of its own, CAP_SYS_ADMIN is effective, but
+    // over that user namespace only, not over the lab's network namespace,
+    // which the host's owns: setns(2) refuses, and the error says why,
+    // not that the capability is missing.
+    let mut unshare = Command::new("unshare");
+    unshare
+        .args(["--user", "--map-root-user"])
+        .arg(&binary)
+        .arg("-c")
+        .arg(&file)
+        .args(["--netns", &ns_b]);
+    let mut userns = Daemon::start(unshare, lab.dir.join("bgpfcd-userns.log"));
+    let status = userns.wait(Duration::from_secs(10));
+    let log = userns.log_text();
+    assert!(
+        status.is_some_and(|s| s.code() == Some(1)),
+        "{status:?}\n{log}"
+    );
+    assert!(
+        log.contains("msg=\"cannot join network namespace\"")
+            && log.contains("setns(2) refused although CAP_SYS_ADMIN is effective")
+            && log.contains("another user namespace"),
         "{log}"
     );
 

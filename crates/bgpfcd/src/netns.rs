@@ -13,7 +13,10 @@
 
 use std::path::Path;
 
-use bgpfc_sys::{Capability, Effective, NetNs, NsId};
+use bgpfc_sys::{Capability, Effective, NetNs, NetNsError, NsId};
+
+/// `EPERM`, `<asm-generic/errno-base.h>`.
+const EPERM: i32 = 1;
 
 /// What the main thread does about the namespace it is to run in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +79,7 @@ fn try_join(path: &Path) -> Result<(), String> {
             id = ns.id()
         ),
         Join::Enter => {
-            ns.enter().map_err(|e| e.to_string())?;
+            ns.enter().map_err(|e| refused(&e))?;
             bgpfc_log::info!(
                 "network namespace joined",
                 netns = path.display(),
@@ -94,6 +97,20 @@ fn try_join(path: &Path) -> Result<(), String> {
     }
     bgpfc_log::info!("capability dropped", capability = Capability::SysAdmin);
     Ok(())
+}
+
+/// Why `setns(2)` failed, once [`plan`] has seen `CAP_SYS_ADMIN`
+/// effective: `EPERM` then has a cause other than the capability's
+/// absence, which the operator is told rather than to add it.
+fn refused(e: &NetNsError) -> String {
+    match e {
+        NetNsError::Join(io) if io.raw_os_error() == Some(EPERM) => format!(
+            "setns(2) refused although CAP_SYS_ADMIN is effective: the namespace belongs to \
+             another user namespace than bgpfcd's, or a seccomp filter blocks setns(2), as \
+             systemd's RestrictNamespaces=yes does (RestrictNamespaces=net allows it): {io}"
+        ),
+        e => e.to_string(),
+    }
 }
 
 /// The effective capabilities of the main thread, the one that joins.
@@ -129,6 +146,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `EPERM` from the join, with `CAP_SYS_ADMIN` effective as the plan
+    /// checked: the causes it has then, not the capability; other errors
+    /// as they are.
+    #[test]
+    fn a_refused_join_names_the_other_causes() {
+        let eperm = NetNsError::Join(std::io::Error::from_raw_os_error(EPERM));
+        assert_eq!(
+            refused(&eperm),
+            format!(
+                "setns(2) refused although CAP_SYS_ADMIN is effective: the namespace belongs \
+                 to another user namespace than bgpfcd's, or a seccomp filter blocks setns(2), \
+                 as systemd's RestrictNamespaces=yes does (RestrictNamespaces=net allows it): \
+                 {}",
+                std::io::Error::from_raw_os_error(EPERM)
+            )
+        );
+        let einval = NetNsError::Join(std::io::Error::from_raw_os_error(22));
+        assert_eq!(refused(&einval), einval.to_string());
+        let (now, want) = (HERE, THERE);
+        let other = NetNsError::NotEntered { now, want };
+        assert_eq!(refused(&other), other.to_string());
     }
 
     /// The real count: a process with a second thread refuses, before it

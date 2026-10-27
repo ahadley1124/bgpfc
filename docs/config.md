@@ -1109,7 +1109,13 @@ namespace changes the network, not the file system.
 Joining needs `CAP_SYS_ADMIN` (`setns(2)`): root has it, and a bgpfcd run
 as an unprivileged user needs it besides the others (README, "Run").
 bgpfcd checks for it before the join, and stops with `cannot join network
-namespace` and `setns(2) needs CAP_SYS_ADMIN` without it. It gives the
+namespace` and `setns(2) needs CAP_SYS_ADMIN` without it. With the
+capability effective, `setns(2)` still refuses a namespace that another
+user namespace than bgpfcd's owns, such as one made by `unshare -U`, and
+a seccomp filter can refuse the call, as systemd's
+`RestrictNamespaces=yes` does; the error then says `setns(2) refused
+although CAP_SYS_ADMIN is effective` and names both causes
+(`RestrictNamespaces=net` lets bgpfcd join). It gives the
 capability up right after the join, as root and as a user alike, so that
 nothing it runs later holds it; the log says `network namespace joined`,
 with the namespace's identity (`dev:inode` of its file), then
