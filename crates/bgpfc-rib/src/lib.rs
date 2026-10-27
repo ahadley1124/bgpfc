@@ -1380,7 +1380,7 @@ impl Rib {
                 let hop = match last {
                     Some((k, hop)) if k == key => hop,
                     _ => {
-                        let hop = self.s.nexthops.hop(key);
+                        let hop = self.s.nexthops.current_hop(key);
                         last = Some((key, hop));
                         hop
                     }
@@ -1456,9 +1456,7 @@ impl Rib {
     /// a next hop that does.
     #[cfg(test)]
     pub(crate) fn check_next_hops(&self) {
-        use std::collections::BTreeSet;
-        type Uses = (u32, BTreeSet<Ipv4Key>, BTreeSet<Prefix>);
-        let mut want: HashMap<IpAddr, Uses> = HashMap::new();
+        let mut want: HashMap<IpAddr, nexthop::Uses> = HashMap::new();
         for (_, table) in self.tables.iter() {
             for (prefix, dest) in table.iter() {
                 for r in dest.routes() {
@@ -1698,7 +1696,9 @@ impl Sessions {
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
-        self.nexthops.unlink(removed.next_hop(), prefix, dest);
+        let key = removed.next_hop();
+        self.nexthops
+            .unlink(key, prefix, !dest.has_next_hop(key, None));
         self.decide().run(dest);
         self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
         drop(old);
@@ -2157,7 +2157,8 @@ fn drop_routes(
         if let Some(i) = dest.position(id) {
             let old = dest.best().cloned();
             let removed = dest.remove(i);
-            nexthops.unlink(removed.next_hop(), prefix, dest);
+            let key = removed.next_hop();
+            nexthops.unlink(key, prefix, !dest.has_next_hop(key, None));
             scratch.note_removed(family, &removed);
             scratch.released.push(removed.attrs);
             scratch.released.extend(removed.received);
@@ -2226,7 +2227,8 @@ fn withdraw_in<K: Ord>(
     };
     let old = dest.best().cloned();
     let removed = dest.remove(i);
-    nexthops.unlink(removed.next_hop(), prefix, dest);
+    let key = removed.next_hop();
+    nexthops.unlink(key, prefix, !dest.has_next_hop(key, None));
     scratch.note_removed(family, &removed);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
@@ -2276,7 +2278,7 @@ fn announce_in<K: Ord>(
             // A new destination: its one route is the best, unless it is
             // held.
             let new = route.held.is_none().then(|| route.clone());
-            nexthops.link(route.next_hop(), prefix);
+            nexthops.link(route.next_hop(), prefix, true);
             scratch.note_added(family, &route);
             slot.insert(Destination::One(route));
             (None, new)
@@ -2296,17 +2298,20 @@ fn announce_in<K: Ord>(
                     return;
                 }
                 scratch.note_added(family, &route);
-                let key = route.next_hop();
-                let replaced = dest.replace(i, route);
-                if replaced.next_hop() != key {
-                    nexthops.link(key, prefix);
-                    nexthops.unlink(replaced.next_hop(), prefix, dest);
+                let (key, was) = (route.next_hop(), r.next_hop());
+                if key != was {
+                    // The other routes decide whether the destination
+                    // gains the one and keeps the other.
+                    nexthops.link(key, prefix, !dest.has_next_hop(key, Some(i)));
+                    nexthops.unlink(was, prefix, !dest.has_next_hop(was, Some(i)));
                 }
+                let replaced = dest.replace(i, route);
                 scratch.note_removed(family, &replaced);
                 scratch.released.push(replaced.attrs);
                 scratch.released.extend(replaced.received);
             } else {
-                nexthops.link(route.next_hop(), prefix);
+                let key = route.next_hop();
+                nexthops.link(key, prefix, !dest.has_next_hop(key, None));
                 scratch.note_added(family, &route);
                 dest.push(route);
             }

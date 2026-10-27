@@ -134,6 +134,14 @@ impl Destination {
         self.routes().is_empty()
     }
 
+    /// Whether a route here, but the one at `except`, has next hop `addr`.
+    pub(crate) fn has_next_hop(&self, addr: IpAddr, except: Option<usize>) -> bool {
+        self.routes()
+            .iter()
+            .enumerate()
+            .any(|(i, r)| Some(i) != except && r.next_hop() == addr)
+    }
+
     /// The index of `peer`'s route.
     pub(crate) fn position(&self, peer: PeerId) -> Option<usize> {
         self.routes().iter().position(|r| r.peer == peer)

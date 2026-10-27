@@ -27,7 +27,7 @@
 //! `NullSource` is, every next hop resolves to itself with no interface:
 //! every route is a candidate, as before resolution existed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -344,6 +344,116 @@ impl Kernel {
     }
 }
 
+/// A set of destinations kept as a sorted base and logs of what was added
+/// and removed since: adding or removing one costs a push, where a B-tree
+/// insert would cost a descent of a tree as large as the table, cache
+/// misses included, for every route that comes. The set is read only when
+/// its next hop's resolution changes, rarely, and is sorted then; the logs
+/// are folded in, at the end of an input, once they are a quarter of the
+/// set, which bounds the memory they take.
+///
+/// The callers add a destination only when it is not a member and remove
+/// it only when it is: they know from the destination's routes. So a
+/// destination's count, in the base plus added minus removed, is 0 or 1.
+#[derive(Clone, Debug)]
+struct Members<K> {
+    /// The members when the logs were last folded in, sorted, each once.
+    base: Vec<K>,
+    /// Added since, in order.
+    added: Vec<K>,
+    /// Removed since, in order.
+    removed: Vec<K>,
+}
+
+impl<K> Default for Members<K> {
+    fn default() -> Self {
+        Members {
+            base: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+}
+
+impl<K: Ord + Copy> Members<K> {
+    fn insert(&mut self, k: K) {
+        self.added.push(k);
+    }
+
+    fn remove(&mut self, k: K) {
+        self.removed.push(k);
+    }
+
+    /// Whether the logs are a quarter of the set or more, and worth
+    /// folding in.
+    fn untidy(&self) -> bool {
+        self.added.len() + self.removed.len() > self.base.len() / 4 + 64
+    }
+
+    /// Fold the logs into the base: the members and those added since,
+    /// merged in place from the back, less one of each pair a removal
+    /// cancels. The base grows by exactly what was added and nothing else
+    /// is allocated: a sort's scratch space for a table's members would be
+    /// the largest allocation the index makes.
+    fn compact(&mut self) {
+        if self.added.is_empty() && self.removed.is_empty() {
+            return;
+        }
+        self.added.sort_unstable();
+        let (mut i, mut j) = (self.base.len(), self.added.len());
+        self.base.reserve_exact(j);
+        // Room at the end, overwritten by the merge.
+        self.base.extend_from_slice(&self.added);
+        while j > 0 {
+            let k = i + j - 1;
+            if i > 0 && self.base[i - 1] > self.added[j - 1] {
+                self.base[k] = self.base[i - 1];
+                i -= 1;
+            } else {
+                self.base[k] = self.added[j - 1];
+                j -= 1;
+            }
+        }
+        if !self.removed.is_empty() {
+            self.removed.sort_unstable();
+            let mut removed = self.removed.iter().peekable();
+            self.base.retain(|k| removed.next_if_eq(&k).is_none());
+        }
+        // The callers' discipline: a member is added only when it is not
+        // one, and removed only when it is.
+        debug_assert!(self.base.windows(2).all(|w| w[0] < w[1]), "a member twice");
+        if self.base.capacity() > 2 * self.base.len() {
+            self.base.shrink_to_fit();
+        }
+        // Their room goes too: a table's load would otherwise keep it.
+        self.added = Vec::new();
+        self.removed = Vec::new();
+    }
+
+    /// The members, in order, each once.
+    fn members(&mut self) -> &[K] {
+        self.compact();
+        &self.base
+    }
+
+    /// The members, in order, without folding the logs in.
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<K> {
+        let mut copy = self.clone();
+        copy.compact();
+        copy.base
+    }
+}
+
+/// What the tests' check counts for a next hop: its routes and the IPv4
+/// and IPv6 destinations they are routes to.
+#[cfg(test)]
+pub(crate) type Uses = (
+    u32,
+    std::collections::BTreeSet<Ipv4Key>,
+    std::collections::BTreeSet<Prefix>,
+);
+
 /// One next hop in use.
 #[derive(Debug)]
 struct Tracked {
@@ -352,9 +462,27 @@ struct Tracked {
     /// Routes in the Adj-RIBs-In with it, held ones included.
     routes: u32,
     /// The IPv4 destinations with such a route.
-    v4: BTreeSet<Ipv4Key>,
+    v4: Members<Ipv4Key>,
     /// The IPv6 destinations with such a route.
-    v6: BTreeSet<Prefix>,
+    v6: Members<Prefix>,
+}
+
+impl Tracked {
+    /// `prefix` becomes a destination with a route through the next hop.
+    fn join(&mut self, prefix: Prefix) {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.insert(k),
+            None => self.v6.insert(prefix),
+        }
+    }
+
+    /// `prefix` is no longer one.
+    fn leave(&mut self, prefix: Prefix) {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.v4.remove(k),
+            None => self.v6.remove(prefix),
+        }
+    }
 }
 
 /// The next hops the RIB's routes use, each with its resolution and the
@@ -409,27 +537,31 @@ impl NextHops {
         }
     }
 
+    /// The slot of `addr`, if it is tracked: the one used last, which the
+    /// routes of an UPDATE and the FIB changes they make share, without
+    /// hashing.
+    fn find(&self, addr: IpAddr) -> Option<u32> {
+        match self.last {
+            Some(s) if self.slots[at(s)].as_ref().is_some_and(|t| t.addr == addr) => Some(s),
+            _ => self.index.get(&addr).copied(),
+        }
+    }
+
     fn tracked(&self, addr: IpAddr) -> Option<&Tracked> {
-        let slot = *self.index.get(&addr)?;
-        self.slots[at(slot)].as_ref()
+        self.slots[at(self.find(addr)?)].as_ref()
     }
 
     /// The slot of `addr`, tracked from now on, resolved when first seen.
     fn slot(&mut self, addr: IpAddr) -> u32 {
-        if let Some(s) = self.last
-            && self.slots[at(s)].as_ref().is_some_and(|t| t.addr == addr)
-        {
-            return s;
-        }
-        let s = if let Some(&s) = self.index.get(&addr) {
+        let s = if let Some(s) = self.find(addr) {
             s
         } else {
             let tracked = Tracked {
                 addr,
                 resolution: self.resolve(addr),
                 routes: 0,
-                v4: BTreeSet::new(),
-                v6: BTreeSet::new(),
+                v4: Members::default(),
+                v6: Members::default(),
             };
             let s = if let Some(s) = self.free.pop() {
                 self.slots[at(s)] = Some(tracked);
@@ -462,47 +594,113 @@ impl NextHops {
         self.get_mut(s).resolution.is_resolved()
     }
 
-    /// A route with next hop `addr` came to `prefix`.
-    pub(crate) fn link(&mut self, addr: IpAddr, prefix: Prefix) {
+    /// A route with next hop `addr` came to `prefix`, `first` there with
+    /// it: then the destination becomes one of the next hop's.
+    pub(crate) fn link(&mut self, addr: IpAddr, prefix: Prefix, first: bool) {
         let s = self.slot(addr);
         let t = self.get_mut(s);
         t.routes += 1;
-        match Ipv4Key::new(prefix) {
-            Some(k) => t.v4.insert(k),
-            None => t.v6.insert(prefix),
-        };
+        if first {
+            t.join(prefix);
+        }
     }
 
-    /// A route with next hop `addr` left `prefix`, whose routes are now
-    /// `dest`'s: the destination stays listed while another of them has
-    /// `addr`, as two peers that pass on one next hop do.
-    pub(crate) fn unlink(&mut self, addr: IpAddr, prefix: Prefix, dest: &Destination) {
-        let s = match self.last {
-            Some(s) if self.slots[at(s)].as_ref().is_some_and(|t| t.addr == addr) => s,
-            _ => match self.index.get(&addr) {
-                Some(&s) => s,
-                None => return,
-            },
+    /// A route with next hop `addr` left `prefix`, the `last` there with
+    /// it: then the destination stops being one of the next hop's. While
+    /// another route there has it, as when two peers pass on one next hop,
+    /// it stays.
+    pub(crate) fn unlink(&mut self, addr: IpAddr, prefix: Prefix, last: bool) {
+        let Some(s) = self.find(addr) else {
+            return;
         };
         self.last = Some(s);
-        let still = dest.routes().iter().any(|r| r.next_hop() == addr);
         let t = self.get_mut(s);
         t.routes = t.routes.saturating_sub(1);
-        if !still {
-            match Ipv4Key::new(prefix) {
-                Some(k) => t.v4.remove(&k),
-                None => t.v6.remove(&prefix),
-            };
+        if last {
+            t.leave(prefix);
         }
         if t.routes == 0 {
             self.zeroed.push(s);
         }
     }
 
+    /// One route more, or fewer, with next hop `addr`.
+    pub(crate) fn count(&mut self, addr: IpAddr, more: bool) {
+        let s = if more {
+            self.slot(addr)
+        } else {
+            let Some(s) = self.find(addr) else {
+                return;
+            };
+            self.last = Some(s);
+            s
+        };
+        let t = self.get_mut(s);
+        if more {
+            t.routes += 1;
+        } else {
+            t.routes = t.routes.saturating_sub(1);
+            if t.routes == 0 {
+                self.zeroed.push(s);
+            }
+        }
+    }
+
+    /// `prefix` becomes, or stops being, a destination with a route through
+    /// `addr`.
+    fn mark(&mut self, addr: IpAddr, prefix: Prefix, member: bool) {
+        let s = if member {
+            self.slot(addr)
+        } else {
+            let Some(s) = self.find(addr) else {
+                return;
+            };
+            s
+        };
+        let t = self.get_mut(s);
+        if member {
+            t.join(prefix);
+        } else {
+            t.leave(prefix);
+        }
+    }
+
+    /// The routes of `prefix` were judged again, and some changed next hop
+    /// (counted with [`NextHops::count`]): `before` are the next hops they
+    /// had, one per route, and `dest` has the routes now. A destination is
+    /// a next hop's while one of its routes has it.
+    pub(crate) fn remark(&mut self, prefix: Prefix, before: &[IpAddr], dest: &Destination) {
+        let routes = dest.routes();
+        for (i, r) in routes.iter().enumerate() {
+            let k = r.next_hop();
+            if !routes[..i].iter().any(|o| o.next_hop() == k) && !before.contains(&k) {
+                self.mark(k, prefix, true);
+            }
+        }
+        for (i, &k) in before.iter().enumerate() {
+            if !before[..i].contains(&k) && !dest.has_next_hop(k, None) {
+                self.mark(k, prefix, false);
+            }
+        }
+    }
+
     /// The hop of `addr` now, if it resolves.
-    pub(crate) fn hop(&self, addr: IpAddr) -> Option<Hop> {
+    pub(crate) fn current_hop(&self, addr: IpAddr) -> Option<Hop> {
         match self.tracked(addr) {
             Some(t) => t.resolution.hop(),
+            None => self.resolve(addr).hop(),
+        }
+    }
+
+    /// [`NextHops::current_hop`], remembering the next hop as the one
+    /// used last: the FIB changes of an input come a destination after
+    /// another, most of them through one next hop.
+    pub(crate) fn hop(&mut self, addr: IpAddr) -> Option<Hop> {
+        match self.find(addr) {
+            Some(s) => {
+                self.last = Some(s);
+                self.slots[at(s)].as_ref().and_then(|t| t.resolution.hop())
+            }
             None => self.resolve(addr).hop(),
         }
     }
@@ -510,7 +708,7 @@ impl NextHops {
     /// The hop of `addr` before the input being handled changed its
     /// resolution, else now: what the FIB was last given for a route with
     /// it, which a change must name as the one it replaces.
-    pub(crate) fn hop_before(&self, addr: IpAddr) -> Option<Hop> {
+    pub(crate) fn hop_before(&mut self, addr: IpAddr) -> Option<Hop> {
         match self.before.iter().find(|(a, _)| *a == addr) {
             Some((_, r)) => r.hop(),
             None => self.hop(addr),
@@ -521,6 +719,14 @@ impl NextHops {
     /// next hops no route uses any more.
     pub(crate) fn settle(&mut self) {
         self.before.clear();
+        for t in self.slots.iter_mut().flatten() {
+            if t.v4.untidy() {
+                t.v4.compact();
+            }
+            if t.v6.untidy() {
+                t.v6.compact();
+            }
+        }
         for s in self.zeroed.drain(..) {
             let Some(t) = &self.slots[at(s)] else {
                 continue;
@@ -619,15 +825,23 @@ impl NextHops {
 
     /// The destinations with a route through any of `shifts`' next hops,
     /// in prefix order, each once.
-    pub(crate) fn destinations(&self, shifts: &[(IpAddr, Shift)]) -> (Vec<Ipv4Key>, Vec<Prefix>) {
-        let sets: Vec<&Tracked> = shifts
-            .iter()
-            .filter_map(|(a, _)| self.tracked(*a))
-            .collect();
-        let mut v4: Vec<Ipv4Key> = sets.iter().flat_map(|t| t.v4.iter().copied()).collect();
-        let mut v6: Vec<Prefix> = sets.iter().flat_map(|t| t.v6.iter().copied()).collect();
+    pub(crate) fn destinations(
+        &mut self,
+        shifts: &[(IpAddr, Shift)],
+    ) -> (Vec<Ipv4Key>, Vec<Prefix>) {
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        let mut sets = 0;
+        for (addr, _) in shifts {
+            let Some(s) = self.find(*addr) else {
+                continue;
+            };
+            let t = self.get_mut(s);
+            v4.extend_from_slice(t.v4.members());
+            v6.extend_from_slice(t.v6.members());
+            sets += 1;
+        }
         // One next hop's set is in order already; several are merged.
-        if sets.len() > 1 {
+        if sets > 1 {
             v4.sort_unstable();
             v4.dedup();
             v6.sort_unstable();
@@ -673,7 +887,8 @@ impl NextHops {
     /// for `Rib::check_next_hops`; and that each resolution is what the
     /// copy gives now, and nothing is left of an input.
     #[cfg(test)]
-    pub(crate) fn check(&self, want: &HashMap<IpAddr, (u32, BTreeSet<Ipv4Key>, BTreeSet<Prefix>)>) {
+    pub(crate) fn check(&self, want: &HashMap<IpAddr, Uses>) {
+        use std::collections::BTreeSet;
         assert!(self.before.is_empty(), "before: {:?}", self.before);
         assert!(self.zeroed.is_empty(), "zeroed: {:?}", self.zeroed);
         let mut have = HashMap::new();
@@ -685,7 +900,9 @@ impl NextHops {
                 Some(Some(t.addr))
             );
             assert_eq!(t.resolution, self.resolve(t.addr), "{}", t.addr);
-            have.insert(t.addr, (t.routes, t.v4.clone(), t.v6.clone()));
+            let v4: BTreeSet<Ipv4Key> = t.v4.snapshot().into_iter().collect();
+            let v6: BTreeSet<Prefix> = t.v6.snapshot().into_iter().collect();
+            have.insert(t.addr, (t.routes, v4, v6));
         }
         assert_eq!(self.index.len(), have.len());
         assert_eq!(&have, want);
@@ -696,5 +913,68 @@ impl NextHops {
     pub(crate) fn resolution(&self, addr: IpAddr) -> Resolution {
         self.tracked(addr)
             .map_or_else(|| self.resolve(addr), |t| t.resolution)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        /// Whatever members come and go, and whenever the logs are folded
+        /// in, the set is the one a B-tree set would hold.
+        #[test]
+        fn members_are_the_set_a_btree_holds(
+            ops in proptest::collection::vec((0u8..24, 0u8..8), 0..300),
+        ) {
+            let mut m: Members<u8> = Members::default();
+            let mut model = BTreeSet::new();
+            for (k, op) in ops {
+                match op {
+                    // Folded in now and then, as an input ends or a next
+                    // hop's resolution changes.
+                    0 => {
+                        prop_assert_eq!(m.members(), &model.iter().copied().collect::<Vec<_>>()[..]);
+                    }
+                    1 if m.untidy() => m.compact(),
+                    // Added when not a member, removed when one: what the
+                    // destination's routes tell the callers.
+                    _ if model.insert(k) => m.insert(k),
+                    _ => {
+                        model.remove(&k);
+                        m.remove(k);
+                    }
+                }
+                prop_assert_eq!(m.snapshot(), model.iter().copied().collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn logs_are_folded_in_once_they_are_a_quarter_of_the_set() {
+        let mut m: Members<u32> = Members::default();
+        for k in 0..64 {
+            m.insert(k);
+        }
+        assert!(!m.untidy());
+        m.insert(64);
+        assert!(m.untidy());
+        m.compact();
+        assert_eq!(m.base.len(), 65);
+        assert!(m.added.is_empty() && m.removed.is_empty());
+        // Removals count too: 81 changes of a set of 65 are untidy.
+        for k in 0..65 {
+            m.remove(k);
+        }
+        assert!(!m.untidy());
+        for k in 100..116 {
+            m.insert(k);
+        }
+        assert!(m.untidy());
+        assert_eq!(m.members(), (100..116).collect::<Vec<_>>());
     }
 }

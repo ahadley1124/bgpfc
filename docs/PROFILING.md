@@ -454,6 +454,64 @@ time: the RIB's UPDATEs to it went through its input queue, full of its
 own. With that fixed and the Adj-RIB-Out still a hash map per peer, the
 synthetic million peaked at 201 MB.
 
+## Next-hop changes
+
+RFC 4271 §9.1.2: the RIB resolves every next hop its routes use against a
+copy of the kernel's routing table, and keeps for each next hop the
+destinations with a route through it, so that a change of the kernel's
+table decides again only the destinations of the next hops whose
+resolution it changed. Measured in another 4-CPU container, about 1.7
+times slower than the one above (36451f0 loaded the synthetic million in
+3.0 s there): compare the columns, not the hosts.
+
+The index against e4ff055, the commit before it, interleaved, one round
+of each at a time, three rounds; each cell is the lowest and highest of
+the three rounds' medians. The benches, the insert ones here and the
+next-hop ones below:
+
+```sh
+BGPFC_BENCH_ROUTES=1000000 cargo bench -p bgpfc-rib --bench rib -- 'insert_|next_hop_'
+```
+
+and the rest `bgp_bench --scenario load --runs 5`, as in "Baseline".
+
+| | e4ff055 | with the index |
+|---|---|---|
+| `insert_1000000_from_one_peer_to_one_peer` | 398–410 ms | 451–481 ms (+16 %) |
+| `insert_1000000_from_two_peers_to_one_peer` | 772–832 ms | 876–906 ms (+11 %) |
+| table load (`load_us`) | 2.84–2.95 s | 3.00–3.06 s (+4 %) |
+| bytes per prefix | 57 | 62 |
+| peak live / peak RSS | 57.4 MB / 67.1 MB | 63.0 MB / 73.5 MB |
+
+The million IPv4 destinations of one next hop cost 5.5 MB: 5 octets each
+(`Ipv4Key`) in a sorted vector, and the logs of the destinations that
+came and went since it was last sorted. Adding or removing one is a push
+onto a log; the logs are folded in, merged in place, at the end of an
+input once they are a quarter of the set, and when the next hop's
+destinations are read, which only a change of its resolution does. The
+`BTreeSet`s the design started from were measured first, against
+36451f0 on the same host: inserts 627 ms and 1.34 s (+59 %), load 3.95 s
+(+31 %), 68 octets a prefix, 68.5 MB live, 78.4 MB RSS. A B-tree insert
+per route descends a tree as large as the table, cache misses included:
+about 450 instructions a route under callgrind, and 0.23 µs a route on
+the one-peer insert, where the design had counted 0.1 µs.
+
+The stalls: one peer's million routes through
+192.0.2.1, on a network the kernel's table has as connected, and a second
+peer up to export to.
+
+| bench | the change | time |
+|---|---|---|
+| `next_hop_unresolved_1000000` | 192.0.2.0/24 goes: 1M routes held, 1M FIB deletes, 1M withdrawals queued | 544 ms |
+| `next_hop_resolved_again_1000000` | it comes back | 573 ms |
+| `next_hop_moved_1000000` | it goes through 10.0.0.1 on another interface: 1M FIB changes, no decision, no UPDATE | 337 ms |
+| `next_hop_flip_1000_of_1000000` | a second next hop with 1000 routes stops resolving, or resolves again | 0.39 ms |
+
+`withdraw_1000000_on_peer_down` takes 440 ms on the same host: losing the
+next hop of a full table stalls the RIB about as long as losing the peer
+that sent it, and a next hop with a thousand routes costs what a thousand
+routes do, however large the table.
+
 ## Caveats
 
 - `bytes_per_prefix` counts everything allocated during the load in every

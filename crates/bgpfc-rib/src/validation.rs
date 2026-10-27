@@ -388,7 +388,7 @@ impl Rib {
         // Empty destinations to remove once a table's walk is done.
         let mut empty: Vec<Prefix> = Vec::new();
         let mut moves: Vec<Move> = Vec::new();
-        let mut unlinks: Vec<IpAddr> = Vec::new();
+        let mut keys: Vec<IpAddr> = Vec::new();
         // IPv4 before IPv6, whichever table came first, for the order of
         // the sample and the transitions.
         let mut tables: Vec<(AddressFamily, &mut Table)> = self.tables.iter_mut().collect();
@@ -409,7 +409,8 @@ impl Rib {
                 scratch: &mut *scratch,
                 empty: &mut empty,
                 moves: &mut moves,
-                unlinks: &mut unlinks,
+                keys: &mut keys,
+                relinked: false,
             };
             match ranges {
                 None => {
@@ -466,7 +467,7 @@ impl Rib {
         scratch: &mut Scratch,
     ) -> Tally {
         let mut tally = Tally::default();
-        let (mut empty, mut moves, mut unlinks) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut empty, mut moves, mut keys) = (Vec::new(), Vec::new(), Vec::new());
         let mut tables: Vec<(AddressFamily, &mut Table)> = self.tables.iter_mut().collect();
         tables.sort_by_key(|(family, _)| *family);
         for (family, table) in tables {
@@ -485,7 +486,8 @@ impl Rib {
                 scratch: &mut *scratch,
                 empty: &mut empty,
                 moves: &mut moves,
-                unlinks: &mut unlinks,
+                keys: &mut keys,
+                relinked: false,
             };
             let size = table.v4.len() + table.v6.len();
             let dense = (v4.len() + v6.len()).saturating_mul(DENSE) >= size;
@@ -563,9 +565,11 @@ struct Pass<'a> {
     /// The routes of the destination being validated again whose state
     /// moved among valid, invalid and not-found.
     moves: &'a mut Vec<Move>,
-    /// The next hops the destination's routes no longer have, to take it
-    /// off once all of them are judged.
-    unlinks: &'a mut Vec<IpAddr>,
+    /// The next hops the destination's routes had before they were
+    /// judged again, for the next-hop index.
+    keys: &'a mut Vec<IpAddr>,
+    /// Whether a route of the destination changed next hop, or went.
+    relinked: bool,
 }
 
 /// A route whose state moved among valid, invalid and not-found, until
@@ -599,6 +603,9 @@ impl Pass<'_> {
     /// route, changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let old = dest.best().cloned();
+        self.keys.clear();
+        self.keys.extend(dest.routes().iter().map(Route::next_hop));
+        self.relinked = false;
         let mut done = Redone::default();
         // The routes no state admits any more.
         let mut dropped: Vec<PeerId> = Vec::new();
@@ -619,10 +626,10 @@ impl Pass<'_> {
                 self.scratch.released.extend(r.received);
             }
         }
-        // After the loop: a next hop leaves the destination only if no
-        // route left there has it.
-        for key in self.unlinks.drain(..) {
-            self.nexthops.unlink(key, prefix, dest);
+        // After the loop and the drops: which next hops the destination
+        // has a route through now.
+        if self.relinked {
+            self.nexthops.remark(prefix, self.keys, dest);
         }
         if done.restated {
             self.tally.destinations += 1;
@@ -809,7 +816,7 @@ impl Pass<'_> {
         }
         let replaced = std::mem::replace(&mut route.attrs, attrs);
         let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
-        self.relink(prefix, replaced.next_hop_addr(), route.next_hop(), gone);
+        self.relink(replaced.next_hop_addr(), route.next_hop(), gone);
         if gone || !unchanged || was != (rov_set, held) {
             self.tally.changed += 1;
         }
@@ -826,17 +833,17 @@ impl Pass<'_> {
 }
 
 impl Pass<'_> {
-    /// Keep the next-hop index up to date for a route to `prefix` judged
-    /// again, whose next hop went from `was` to `now`, or that is `gone`:
-    /// the next hop it gains is linked now, the one it loses once the
-    /// destination's routes are all judged, a dropped route's as the
-    /// destination removes it.
-    fn relink(&mut self, prefix: Prefix, was: IpAddr, now: IpAddr, gone: bool) {
-        if gone {
-            self.unlinks.push(was);
-        } else if was != now {
-            self.nexthops.link(now, prefix);
-            self.unlinks.push(was);
+    /// Count a route judged again whose next hop went from `was` to
+    /// `now`, or that is `gone`, in the next-hop index; which next hops the
+    /// destination has a route through is worked out once all its routes
+    /// are judged ([`NextHops::remark`]).
+    fn relink(&mut self, was: IpAddr, now: IpAddr, gone: bool) {
+        if gone || was != now {
+            self.nexthops.count(was, false);
+            if !gone {
+                self.nexthops.count(now, true);
+            }
+            self.relinked = true;
         }
     }
 
