@@ -47,11 +47,15 @@ pub(crate) const SOCK_CLOEXEC: c_int = 0o2_000_000;
 pub(crate) const SOCK_NONBLOCK: c_int = 0o4_000;
 // <linux/netlink.h>
 pub(crate) const NETLINK_ROUTE: c_int = 0;
+pub(crate) const NETLINK_ADD_MEMBERSHIP: c_int = 1;
+// <linux/socket.h>
+pub(crate) const SOL_NETLINK: c_int = 270;
 // <asm-generic/socket.h>
 pub(crate) const SOL_SOCKET: c_int = 1;
 pub(crate) const SO_ERROR: c_int = 4;
 pub(crate) const SO_KEEPALIVE: c_int = 9;
 pub(crate) const SO_RCVBUF: c_int = 8;
+pub(crate) const SO_RCVBUFFORCE: c_int = 33;
 // <linux/in.h>
 pub(crate) const IPPROTO_IP: c_int = 0;
 pub(crate) const IPPROTO_TCP: c_int = 6;

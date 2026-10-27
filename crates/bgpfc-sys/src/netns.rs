@@ -328,18 +328,19 @@ mod proc_tests {
 /// sudo -E "$(command -v cargo)" test -p bgpfc-sys -- --ignored netns
 /// ```
 #[cfg(all(test, not(miri)))]
-mod root_tests {
+pub(crate) mod root_tests {
     use super::*;
 
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// `unshare --net sleep 30`, killed on drop: a process in a network
-    /// namespace of its own with nothing but `lo` in it.
-    struct Sleeper(Child);
+    /// namespace of its own with nothing but `lo` in it. The netlink
+    /// tests join it too.
+    pub(crate) struct Sleeper(Child);
 
     impl Sleeper {
-        fn start() -> Sleeper {
+        pub(crate) fn start() -> Sleeper {
             let child = Command::new("unshare")
                 .args(["--net", "sleep", "30"])
                 .stdin(Stdio::null())
@@ -355,6 +356,11 @@ mod root_tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             sleeper
+        }
+
+        /// Its namespace, opened.
+        pub(crate) fn namespace(&self) -> NetNs {
+            NetNs::open(Path::new(&format!("/proc/{}/ns/net", self.0.id()))).unwrap()
         }
     }
 

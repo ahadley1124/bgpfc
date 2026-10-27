@@ -6,7 +6,8 @@
 //! descriptors never cross its boundary. Every entry point is declared by
 //! hand in `ffi.rs` with the header it comes from (AGENTS.md §1.4).
 //!
-//! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`; the
+//! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`, with the
+//! `rtnetlink(7)` multicast groups it follows the kernel's routes by; the
 //! self-pipe signal handler of AGENTS.md §3; the two privilege modes of
 //! the README; with the `profiling` feature, the counting allocator of
 //! `docs/PROFILING.md`.
