@@ -200,6 +200,11 @@ impl fmt::Display for Via {
 ///   are not.
 #[must_use]
 pub fn relevant(route: &Route, protocol: u8) -> bool {
+    // NOTE(interop): RFC 4271 §9.1.2.1 1) lets a next hop resolve through
+    // any route of the Routing Table that does not itself resolve through
+    // the BGP route. As FRR does by default (no `resolve-via-default`),
+    // bgpfc resolves neither through a BGP route, its own, nor through a
+    // default route, through which every next hop would resolve.
     route.table == RT_TABLE_MAIN
         && route.protocol != protocol
         && route.dst.prefix_len() > 0
