@@ -56,16 +56,22 @@ pub enum GlobalChange {
     /// starts, stops or restarts, and with `mode sidecar` the sidecar too
     /// when its own settings changed. A block that only spells something
     /// differently, such as a default written out, a cache's host or a
-    /// moved `sidecar` block, is no change, and nor is its `enforcement`,
-    /// which neither uses (see
-    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); that is
-    /// [`GlobalChange::RpkiEnforcement`].
+    /// moved `sidecar` block, is no change, and nor are its `enforcement`
+    /// and its `startup`, which neither uses (see
+    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); those are
+    /// [`GlobalChange::RpkiEnforcement`] and [`GlobalChange::RpkiStartup`].
     Rpki,
     /// The `rpki` block's `enforcement`, an absent block or statement
     /// counting as the default: every route is judged again under the new
     /// mode (RFC 6811 §5), with no restart of the RTR client. It may come
     /// with [`GlobalChange::Rpki`] in one reload.
     RpkiEnforcement,
+    /// The `rpki` block's `startup`, an absent block or statement counting
+    /// as the default: the routes not validated yet are held or used as
+    /// it now says (RFC 6811 §2), with no restart of the RTR client. It
+    /// acts only while validation waits for its first full set, and never
+    /// with `mode disabled`. It may come with the other two in one reload.
+    RpkiStartup,
 }
 
 impl ConfigDiff {
@@ -84,6 +90,10 @@ impl ConfigDiff {
             (
                 old.rpki.enforcement != new.rpki.enforcement,
                 GlobalChange::RpkiEnforcement,
+            ),
+            (
+                old.rpki.startup != new.rpki.startup,
+                GlobalChange::RpkiStartup,
             ),
         ] {
             if changed {
@@ -577,6 +587,42 @@ mod tests {
         let written = with("rpki { mode sidecar; backoff 1 600; }");
         assert_eq!(written.rpki.backoff_max, Duration::from_secs(600));
         assert!(!sidecar.rpki.same_as(&written.rpki));
+    }
+
+    #[test]
+    fn a_startup_change_is_not_an_rpki_client_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        for mode in [
+            "mode external; cache 192.0.2.10;",
+            "mode sidecar;",
+            "mode disabled;",
+        ] {
+            let implied = with(&format!("rpki {{ {mode} }}"));
+            let accept = with(&format!("rpki {{ {mode} startup accept; }}"));
+            let hold = with(&format!("rpki {{ {mode} startup hold; }}"));
+            // The default written out is no change at all.
+            assert_eq!(implied.rpki, accept.rpki, "{mode}");
+            assert!(ConfigDiff::between(&implied, &accept).is_empty(), "{mode}");
+            // The client keeps its sessions and its VRPs; the routes not
+            // validated yet are held or used, and no neighbor is touched.
+            for (a, b) in [(&accept, &hold), (&hold, &accept)] {
+                assert!(a.rpki.same_as(&b.rpki), "{mode}");
+                let d = ConfigDiff::between(a, b);
+                assert_eq!(d.global, vec![GlobalChange::RpkiStartup], "{mode}");
+                assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+            }
+        }
+        // With the other changes of the block, each is named.
+        let a = with("rpki { mode external; cache 192.0.2.10; }");
+        let b = with("rpki { mode external; enforcement off; startup hold; cache 192.0.2.11; }");
+        assert_eq!(
+            ConfigDiff::between(&a, &b).global,
+            vec![
+                GlobalChange::Rpki,
+                GlobalChange::RpkiEnforcement,
+                GlobalChange::RpkiStartup
+            ]
+        );
     }
 
     #[test]

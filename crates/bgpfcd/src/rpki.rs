@@ -120,6 +120,19 @@ pub(crate) fn startup(rpki: &ast::Rpki) -> Startup {
     }
 }
 
+/// The reload summary's note on a changed `startup`: the new setting, and
+/// that it holds nothing with validation off ([`startup`]).
+pub(crate) fn startup_note(rpki: &ast::Rpki) -> String {
+    if rpki.mode == RpkiMode::Disabled {
+        format!(
+            "rpki startup {} (holds nothing with mode disabled)",
+            rpki.startup
+        )
+    } else {
+        format!("rpki startup {}", rpki.startup)
+    }
+}
+
 /// The checks of the `rpki` block that need more than the configuration
 /// crate knows, as the hook of [`bgpfc_config::parse_file_with`]: their
 /// errors are reported with the file's own, at their positions in it, by
@@ -1706,6 +1719,14 @@ mod tests {
         // (`Rpki::in_effect`).
         let off = ast::Rpki::defaults(RpkiMode::Disabled);
         assert_eq!(super::startup(&off), Startup::Accept);
+        // A reload that changes it says so, and when it holds nothing.
+        let hold = config("rpki { mode sidecar; startup hold; }");
+        assert_eq!(startup_note(&hold.rpki), "rpki startup hold");
+        let off = config("rpki { mode disabled; startup hold; }");
+        assert_eq!(
+            startup_note(&off.rpki),
+            "rpki startup hold (holds nothing with mode disabled)"
+        );
         // The line of a client that starts with nothing says what becomes
         // of the routes meanwhile.
         assert_eq!(

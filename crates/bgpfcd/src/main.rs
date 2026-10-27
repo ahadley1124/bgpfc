@@ -383,6 +383,8 @@ impl Coordinator<'_> {
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
                 }
+                // So is the startup setting in effect, whatever changed.
+                GlobalChange::RpkiStartup => notes.push(rpki::startup_note(&new.rpki)),
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
                 GlobalChange::Fib => {
                     if new.fib.table != self.config.fib.table

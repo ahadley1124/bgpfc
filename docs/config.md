@@ -965,8 +965,16 @@ route again at once under the new mode, with the new import policies: the
 routes it rules out are held, those it admits again are used, and route
 selection runs for every destination, so that what changes is installed
 and advertised, or withdrawn, with no UPDATE or route refresh (RFC 6811
-§5). The reload summary then says `rpki enforcement MODE`. A new cache
-whose name does not resolve fails the reload as it fails the start.
+§5). The reload summary then says `rpki enforcement MODE`. A changed
+`startup` leaves the client alone as well: it acts on the routes not
+validated yet, so while they wait for the first full set it holds them, or
+uses them, at once, and otherwise it changes nothing until validation
+waits again (RFC 6811 §2); the summary says `rpki startup SETTING`. A
+reload that turns validation on with `startup hold` holds every route
+until the first set (see **Startup window**), and one that turns it off
+lets the held routes go before every route becomes `disabled`, so that no
+route in use is withdrawn on the way. A new cache whose name does not
+resolve fails the reload as it fails the start.
 
 With `mode sidecar`, a reload restarts only what changed, since every
 start of Routinator costs a validation run before it listens again:
