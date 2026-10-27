@@ -144,6 +144,8 @@ neighbor-item
              | "extended-next-hop" yes-no ";"        (* default no *)
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
+             | "multihop" [ u8 ] ";"                 (* 1-255, bare 255; default 1 external, the system's internal *)
+             | "local-address" ip ";"                (* the neighbor's family; default the kernel's choice *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -270,6 +272,75 @@ seconds for an external neighbor, 5 for an internal one. `0` sends every
 change at once. `allow-as-set yes` accepts `AS_SET` in received
 UPDATEs against RFC 9774 §3. `collision-detect-established yes` lets a new
 connection replace an Established session per RFC 4271 §6.8.
+
+`multihop` sets the TTL (IPv4) or hop limit (IPv6) of every segment
+bgpfcd sends the neighbor, the SYN of its own connections included:
+
+| Neighbor | `multihop` | TTL sent |
+|---|---|---|
+| external (`remote-as` is not `local-as`) | none | 1 |
+| external | `multihop;` | 255 |
+| external | `multihop N;` | N, from 1 to 255 |
+| internal | none | the system's (`net.ipv4.ip_default_ttl`, 64 by default; IPv6 `hop_limit`) |
+| internal | `multihop;` or `multihop N;` | 255 or N |
+
+As with FRR and BIRD, an external neighbor is taken to be directly
+connected: TTL 1 reaches the next router and no further. One more than a
+hop away, such as one peered over loopback addresses, needs `multihop N`
+with N at least the number of hops to it, or a bare `multihop` for 255. An internal
+neighbor needs no `multihop`, since it keeps the system's TTL, as BIRD's
+and FRR's internal sessions do; `multihop N` there sets N all the same.
+`multihop` sets only what bgpfcd sends and checks nothing of what it
+receives: checking the TTL of arriving packets is the Generalized TTL
+Security Mechanism (GTSM, RFC 5082), which bgpfcd does not implement.
+
+A connection the neighbor opens gets the neighbor's TTL as soon as bgpfcd
+accepts it, so from bgpfcd's first segment on it, its OPEN. The SYN-ACK
+that answered the neighbor's SYN has left by then with the listener's TTL,
+the system's: one listener serves every neighbor.
+
+An external neighbor more than one hop away without `multihop` never
+comes up, and it shows:
+
+- bgpfcd's own connections fail at once, as the first router answers the
+  SYN with an ICMP Time Exceeded: a warning `msg="connect failed"
+  peer=P error="No route to host (os error 113)" ttl=1 hint="external
+  neighbor: more than one hop away needs multihop"`, again at debug while
+  the same error repeats. The hint comes with that error, with `Network
+  is unreachable` and with a timeout. bgpfcd retries every
+  `connect-retry-time`, as after any failed connection.
+- A connection the neighbor opens is accepted, but bgpfcd's OPEN never
+  reaches it: the session waits in OpenSent until its hold timer of four
+  minutes (RFC 4271 §8.2.2) ends it, with a warning `msg="connection
+  closed with a socket error"` that has the same error as
+  `socket_error=`, and the same hint.
+- `bgpfcctl show neighbor` says `ttl 1`, and the error as `last error`
+  with how long ago it was.
+- The neighbor sees connections that never bring an OPEN, which its own
+  timers end (BIRD logs them as `Connection lost` or a hold timer
+  expiry).
+
+`local-address 192.0.2.1;` runs the session from that address. bgpfcd
+binds its own connections to it before connecting, and closes a
+connection the neighbor opens to any other of its addresses, with an info
+line `msg="connection to another local address, closing"` that names
+both. Either way it is the session's local address, which bgpfcd
+advertises as the next hop to an external neighbor and for `set next-hop
+self` (RFC 4271 §5.1.3). Its use is peering from a loopback address, so
+that the session survives the loss of an interface. Refusing the other
+addresses keeps it there, as BIRD's `local` address does: a session
+accepted on an interface address would end with that interface, and
+advertise that address as its next hop, with nothing to tell the
+operator why. The neighbor must then reach the address, through a route
+to it, and bgpfcd must listen on it (`listen`), or on the wildcard
+address, its default, to accept the neighbor's connections. Its family
+is the neighbor's, and it is not unspecified (`0.0.0.0`, `::`),
+multicast, the neighbor's own address or an IPv6 link-local address,
+which a socket can only be bound to with an interface that bgpfcd has
+no way to be given. An address the host does not have fails every
+connect with `Cannot assign requested address`. Without
+`local-address` the kernel picks the source address by route, and a
+connection the neighbor opens is accepted on any local address.
 
 `extended-next-hop yes` advertises the Extended Next Hop Encoding
 capability of RFC 8950 for IPv4 unicast, which must then be in `families`.
@@ -1008,7 +1079,9 @@ has `remote-as`, `import` and `export`; no neighbor's `export` policy has
 `set rpki`; the HTTP listen address is a loopback address; `netns` is a
 name or an absolute path (above); timer
 constraints above; `extended-next-hop` only with `ipv4-unicast` in
-`families`; `maximum-prefix` only for a family in `families`; an `rpki`
+`families`; `maximum-prefix` only for a family in `families`; `multihop`
+from 1 to 255; a `local-address` of the neighbor's family that is not
+unspecified, multicast, the neighbor's own address or IPv6 link-local; an `rpki`
 block has a `mode`, at least one `cache` with `mode external`, no cache
 twice, `connect-timeout` ≤ `response-timeout` ≤ `reply-timeout`,
 `max-vrps` at least 1, a `backoff` MAX no lower than its MIN, no `cache`
@@ -1026,8 +1099,9 @@ it fails, the running configuration stays and the errors are logged.
 Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
-`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
-reset with Cease / Other Configuration Change and start again, and
+`advertisement-interval` and `maximum-prefix`; `restart-limit`,
+`multihop` and `local-address` included) reset with Cease / Other
+Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset. A changed `import` policy applies at
 once to the routes the neighbor sent, from those bgpfcd kept (RFC 4271

@@ -5,6 +5,7 @@
 //! plain data so that reload diffing can compare values.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -880,6 +881,18 @@ pub struct Neighbor {
     /// exceeding it ends the session with Cease / Maximum Number of
     /// Prefixes Reached (RFC 4486 §4). Empty by default: no limit.
     pub maximum_prefix: Vec<(AddressFamily, u32)>,
+    /// `multihop`: the TTL (IPv4) or hop limit (IPv6) of every segment
+    /// sent to the neighbor, as written, 255 for the bare keyword. `None`
+    /// sends an external neighbor TTL 1, so that it must be directly
+    /// connected, and an internal one the system's TTL, as FRR and BIRD
+    /// do. Only what is sent: the TTL of what arrives is not checked
+    /// (that would be GTSM, RFC 5082).
+    pub multihop: Option<NonZeroU8>,
+    /// `local-address`: the address the session runs from. bgpfcd binds
+    /// its own connections to it, and refuses one the neighbor opens to
+    /// another of its addresses. `None` lets the kernel choose the source
+    /// by route, and accepts a connection on any local address.
+    pub local_address: Option<IpAddr>,
 }
 
 /// The `restart-limit` of a neighbor that sets none: the same figure as
@@ -891,7 +904,9 @@ impl Neighbor {
     /// the session reset, are the same. Description, policies, the
     /// advertisement interval and the prefix limits are not session
     /// parameters: the interval paces what the RIB sends and the limits
-    /// bound what it keeps, and both change without a reset.
+    /// bound what it keeps, and both change without a reset. `multihop`
+    /// and `local-address` are: the local address of a connection cannot
+    /// change, and one rule serves both.
     #[must_use]
     pub fn same_session(&self, other: &Neighbor) -> bool {
         self.addr == other.addr
@@ -907,6 +922,8 @@ impl Neighbor {
             && self.collision_detect_established == other.collision_detect_established
             && self.extended_next_hop == other.extended_next_hop
             && self.restart_limit == other.restart_limit
+            && self.multihop == other.multihop
+            && self.local_address == other.local_address
     }
 }
 

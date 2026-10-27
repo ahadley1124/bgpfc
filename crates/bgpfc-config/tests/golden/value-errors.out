@@ -286,3 +286,24 @@ value-errors.conf:82:1: `netns` is given more than once
 value-errors.conf:82:7: `netns` takes a name in /run/netns or an absolute path, not an empty string
   netns "";
         ^
+value-errors.conf:85:14: `multihop` takes 1-255
+      multihop 0;
+               ^
+value-errors.conf:86:5: `multihop` is given more than once
+      multihop 256;
+      ^
+value-errors.conf:86:14: `256` is not a TTL (1-255)
+      multihop 256;
+               ^
+value-errors.conf:87:5: `multihop` takes no argument or one, found 2
+      multihop 1 2;
+      ^
+value-errors.conf:87:5: `multihop` is given more than once
+      multihop 1 2;
+      ^
+value-errors.conf:88:19: `nowhere` is not an IP address
+      local-address nowhere;
+                    ^
+value-errors.conf:89:5: `local-address` is given more than once
+      local-address 192.0.2.1;
+      ^

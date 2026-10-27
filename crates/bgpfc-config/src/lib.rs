@@ -264,6 +264,42 @@ neighbor 192.0.2.3 { remote-as 65002; import ANY; export ANY; }
     }
 
     /// iproute2's names, and absolute paths as they are; nothing else.
+    /// `multihop` as written, 255 bare, on an internal neighbor as on an
+    /// external one; `local-address` as written; neither by default.
+    #[test]
+    fn multihop_and_local_address_are_read_as_written() {
+        use std::net::IpAddr;
+        use std::num::NonZeroU8;
+        let cfg = parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; multihop; }
+             neighbor 192.0.2.4 {
+                 remote-as 65000; import A; export A; multihop 2; local-address 192.0.2.1;
+             }
+             neighbor 2001:db8::5 {
+                 remote-as 65000; import A; export A; local-address 2001:db8::1;
+             }",
+        )
+        .unwrap();
+        let read: Vec<(Option<u8>, Option<IpAddr>)> = cfg
+            .neighbors
+            .iter()
+            .map(|n| (n.multihop.map(NonZeroU8::get), n.local_address))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (None, None),
+                (Some(255), None),
+                (Some(2), Some("192.0.2.1".parse().unwrap())),
+                (None, Some("2001:db8::1".parse().unwrap())),
+            ]
+        );
+    }
+
     #[test]
     fn netns_names_and_paths() {
         for (value, path) in [

@@ -207,6 +207,8 @@ Config {
                 10,
             ),
             maximum_prefix: [],
+            multihop: None,
+            local_address: None,
         },
     ],
 }

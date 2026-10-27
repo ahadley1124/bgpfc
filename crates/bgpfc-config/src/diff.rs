@@ -272,6 +272,33 @@ mod tests {
         assert!(ConfigDiff::between(&a, &explicit).is_empty());
     }
 
+    /// The TTL and the local address a session runs from are session
+    /// parameters: a live connection cannot change its local address, and
+    /// one rule serves both.
+    #[test]
+    fn multihop_and_local_address_reset_the_session() {
+        let a = cfg(BASE);
+        let n3 = addr("192.0.2.3");
+        let with = |extra: &str| {
+            cfg(&BASE.replace("remote-as 65002;", &format!("remote-as 65002; {extra}")))
+        };
+        for (from, to) in [
+            ("", "multihop;"),
+            ("multihop;", "multihop 2;"),
+            ("multihop 2;", ""),
+            ("", "local-address 192.0.2.1;"),
+            ("local-address 192.0.2.1;", "local-address 192.0.2.4;"),
+            ("multihop 2; local-address 192.0.2.1;", "multihop 2;"),
+        ] {
+            let d = ConfigDiff::between(&with(from), &with(to));
+            assert_eq!(d.reset, vec![n3], "{from:?} -> {to:?}");
+            assert!(d.policy_changed.is_empty(), "{d:?}");
+        }
+        // `multihop` alone is `multihop 255`.
+        assert!(ConfigDiff::between(&with("multihop;"), &with("multihop 255;")).is_empty());
+        assert!(ConfigDiff::between(&a, &with("")).is_empty());
+    }
+
     #[test]
     fn policy_and_prefix_list_edits_are_policy_changes() {
         let base = cfg(BASE);
