@@ -236,7 +236,14 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    fn start(mut cmd: Command, log: PathBuf) -> Daemon {
+    /// Spawn `cmd` with no standard input or output and its standard
+    /// error in the file `log`.
+    ///
+    /// # Panics
+    /// If the log file cannot be created or the process cannot be
+    /// spawned.
+    #[must_use]
+    pub fn start(mut cmd: Command, log: PathBuf) -> Daemon {
         let file = fs::File::create(&log).expect("log file");
         let child = cmd
             .stdin(Stdio::null())
@@ -292,8 +299,8 @@ impl Daemon {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// The process ID. `ip netns exec` executes the program in its own
-    /// place, so this is the daemon's, not `ip`'s.
+    /// The process ID. `ip netns exec` and `setpriv` execute the program
+    /// in their own place, so this is the daemon's, not theirs.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -445,6 +452,10 @@ pub struct BgpfcdOpts {
     pub extra: String,
     /// Further command-line arguments, such as `--user nobody`.
     pub args: Vec<String>,
+    /// Start the binary in the host's namespace, not through
+    /// `ip netns exec`: for a daemon that joins a namespace itself
+    /// (`--netns`).
+    pub from_host: bool,
 }
 
 impl BgpfcdOpts {
@@ -458,20 +469,21 @@ impl BgpfcdOpts {
             neighbors: vec![neighbor],
             extra: String::new(),
             args: Vec::new(),
+            from_host: false,
         }
     }
 }
 
-/// Write a configuration and start `bgpfcd` in namespace `ns` with debug
-/// logging and the further arguments of `opts`. Both families are
-/// offered, and an accept-all policy is used in both directions. The file
-/// is readable by every user, as a bgpfcd started with `--user` reads it
-/// again at a reload.
+/// Write the configuration of a `bgpfcd` for namespace `ns`,
+/// `bgpfcd-<ns>.conf` in the lab's directory, with debug logging. Both
+/// families are offered, and an accept-all policy is used in both
+/// directions. The file is readable by every user, as a bgpfcd started
+/// with `--user` reads it again at a reload. Its path is returned.
 ///
 /// # Panics
-/// If the config cannot be written or the process cannot be spawned.
+/// If the file cannot be written.
 #[must_use]
-pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+pub fn bgpfcd_config(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> PathBuf {
     use std::fmt::Write as _;
     let cfg = lab.dir.join(format!("bgpfcd-{ns}.conf"));
     let mut text = format!(
@@ -502,7 +514,23 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
     }
     fs::write(&cfg, text).expect("bgpfcd config");
     fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).expect("bgpfcd config mode");
-    let mut cmd = lab.exec(ns, bgpfcd_path().to_str().expect("path"));
+    cfg
+}
+
+/// Write a configuration ([`bgpfcd_config`]) and start `bgpfcd` in
+/// namespace `ns`, or, with `opts.from_host`, in the host's namespace,
+/// with the further arguments of `opts`. Its log is `bgpfcd-<ns>.log`.
+///
+/// # Panics
+/// If the config cannot be written or the process cannot be spawned.
+#[must_use]
+pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+    let cfg = bgpfcd_config(lab, ns, opts);
+    let mut cmd = if opts.from_host {
+        Command::new(bgpfcd_path())
+    } else {
+        lab.exec(ns, bgpfcd_path().to_str().expect("path"))
+    };
     cmd.args(["-c", cfg.to_str().expect("path")]);
     cmd.args(&opts.args);
     Daemon::start(cmd, lab.dir.join(format!("bgpfcd-{ns}.log")))

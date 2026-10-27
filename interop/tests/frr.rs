@@ -63,6 +63,7 @@ fn frr_session_prefixes_both_ways_withdraw_and_refresh() {
             ],
             extra: String::new(),
             args: Vec::new(),
+            from_host: false,
         },
     );
     let ok = wait_for(ESTABLISH, || {

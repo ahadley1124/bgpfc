@@ -218,12 +218,9 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
         &lab,
         &lab.a.clone(),
         &BgpfcdOpts {
-            local_as: BGPFC_AS,
-            router_id: lab.a_addr,
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
             neighbors: vec![NeighborOpts::new(lab.b_addr, BIRD_AS), to_bird2],
-            extra: String::new(),
-            args: Vec::new(),
+            ..bgpfcd_opts(&lab, false)
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -350,6 +347,7 @@ fn export_policy_filters_and_sets() {
                     }"
             .to_owned(),
             args: Vec::new(),
+            from_host: false,
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -857,6 +855,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             neighbors: vec![to_b, to_c],
             extra: format!("control {{ socket {}; }}", socket.display()),
             args: Vec::new(),
+            from_host: false,
         },
     );
     (bird_b, bird_c, bgpfcd, socket)
