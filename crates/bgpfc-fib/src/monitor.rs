@@ -13,6 +13,10 @@
 //! is as the dump read it. The notifications after the snapshot follow
 //! from [`Monitor::next_events`].
 //!
+//! The routes go into a [`Mirror`]: the kernel may hold several routes
+//! with one destination and metric, and a notification says where among
+//! them its route went.
+//!
 //! What breaks that: the kernel drops notifications that do not fit the
 //! socket's receive buffer and reports it once, as `ENOBUFS`
 //! (`<asm-generic/errno.h>`, 105). The reader then takes a new snapshot.
@@ -24,11 +28,11 @@
 use std::collections::BTreeMap;
 
 use bgpfc_sys::NetlinkSocket;
-use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
 use crate::FibError;
-use crate::kernel::{self, Event, Link, Route};
+use crate::kernel::{self, Event, Link};
+use crate::mirror::{Mirror, Unclear};
 use crate::netlink;
 use crate::route::{RTM_NEWROUTE, RouteMsg};
 
@@ -41,15 +45,16 @@ const BUF: usize = 64 << 10;
 
 /// How many times a snapshot is taken in a row while something it cannot
 /// follow happens during it (lost notifications, an interface going down
-/// or away, an address going); the last is used as it is.
+/// or away, an address going, a change of routes the copy cannot place);
+/// the last is used as it is.
 const TRIES: usize = 3;
 
 /// The kernel's routes that [`kernel::relevant`] keeps, and its
 /// interfaces.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// The routes, by destination, then metric.
-    pub routes: Vec<Route>,
+    /// The routes, as the kernel holds them.
+    pub mirror: Mirror,
     /// The interfaces, by index.
     pub links: Vec<Link>,
 }
@@ -67,7 +72,11 @@ pub struct Monitor {
 /// What one dump of a snapshot collects.
 #[derive(Default)]
 struct Dumps {
-    routes: BTreeMap<(Prefix, u32), Route>,
+    /// The family of the routes the dump under way asks for: a kernel
+    /// without IPv6 (`ipv6.disable=1`) answers a dump of IPv6 routes with
+    /// those of every family, IPv4's again (`rtnl_dump_all`).
+    afi: Option<Afi>,
+    mirror: Mirror,
     links: BTreeMap<u32, Link>,
     /// Notifications that came during the dumps, in order.
     events: Vec<Event>,
@@ -100,7 +109,8 @@ impl Monitor {
     /// notifications that came meanwhile applied after them. When
     /// notifications were lost, or an interface went down or away, or an
     /// address went, during the dumps, the snapshot is taken again, up to
-    /// three times; the last is used as it is.
+    /// three times; so it is when a change of routes came that the copy
+    /// cannot place ([`Unclear`]). The last is used as it is.
     ///
     /// # Errors
     /// The socket's, a dump the kernel refuses, or a malformed reply.
@@ -108,20 +118,25 @@ impl Monitor {
         let mut tries = 0;
         loop {
             tries += 1;
-            let mut d = Dumps::default();
+            let mut d = Dumps {
+                mirror: Mirror::new(self.protocol),
+                ..Dumps::default()
+            };
             let links = self.next_seq();
             self.dump(&kernel::encode_link_dump(links), links, &mut d)?;
             for afi in [Afi::Ipv4, Afi::Ipv6] {
                 let seq = self.next_seq();
+                d.afi = Some(afi);
                 self.dump(&RouteMsg::encode_dump(afi, seq), seq, &mut d)?;
             }
-            let again = d.lost || disturbed(&d);
+            d.mirror.listed_all();
+            let mut again = d.lost || disturbed(&d);
             for e in std::mem::take(&mut d.events) {
-                apply(&mut d, e);
+                again |= apply(&mut d, &e).is_err();
             }
             if !again || tries == TRIES {
                 return Ok(Snapshot {
-                    routes: d.routes.into_values().collect(),
+                    mirror: d.mirror,
                     links: d.links.into_values().collect(),
                 });
             }
@@ -214,9 +229,9 @@ impl Dumps {
                 }
                 RTM_NEWROUTE => {
                     if let Some(r) = kernel::decode_route(m.payload)?
-                        && kernel::relevant(&r, protocol)
+                        && Some(r.dst.afi()) == self.afi
                     {
-                        self.routes.insert((r.dst, r.metric), r);
+                        self.mirror.listed(&r);
                     }
                 }
                 kernel::RTM_NEWLINK => {
@@ -255,27 +270,28 @@ fn disturbed(d: &Dumps) -> bool {
             was && !l.up
         }
         Event::LinkGone(_) | Event::AddressGone(_) => true,
-        Event::Route(_) | Event::RouteGone { .. } => false,
+        Event::Route { .. } | Event::RouteGone(_) | Event::Own { .. } => false,
     })
 }
 
 /// Apply a notification to what the dumps listed.
-fn apply(d: &mut Dumps, e: Event) {
+///
+/// # Errors
+/// [`Unclear`] when the copy cannot place a change of routes.
+fn apply(d: &mut Dumps, e: &Event) -> Result<(), Unclear> {
     match e {
-        Event::Route(r) => {
-            d.routes.insert((r.dst, r.metric), r);
-        }
-        Event::RouteGone { dst, metric } => {
-            d.routes.remove(&(dst, metric));
+        Event::Route { .. } | Event::RouteGone(_) | Event::Own { .. } => {
+            d.mirror.apply(e)?;
         }
         Event::Link(l) => {
-            d.links.insert(l.index, l);
+            d.links.insert(l.index, l.clone());
         }
         Event::LinkGone(index) => {
-            d.links.remove(&index);
+            d.links.remove(index);
         }
         Event::AddressGone(_) => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -283,7 +299,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::kernel::Via;
+    use crate::kernel::{NextHop, Route};
     use crate::route::{RT_TABLE_MAIN, RTPROT_BGP};
 
     /// An unprivileged process may read the routing table: the snapshot
@@ -295,11 +311,10 @@ mod tests {
         let s = m.snapshot().expect("snapshot");
         assert!(s.links.iter().any(|l| l.name == "lo"), "{:?}", s.links);
         assert!(s.links.is_sorted_by_key(|l| l.index));
-        for r in &s.routes {
-            assert!(kernel::relevant(r, RTPROT_BGP), "{r:?}");
-            assert_eq!(r.table, RT_TABLE_MAIN);
-        }
-        assert!(s.routes.is_sorted_by_key(|r| (r.dst, r.metric)));
+        let routes: Vec<_> = s.mirror.routes().collect();
+        assert!(routes.iter().all(|(dst, _, _)| dst.prefix_len() > 0));
+        assert!(routes.is_sorted_by_key(|(dst, metric, _)| (*dst, *metric)));
+        assert!(routes.len() <= s.mirror.len());
         // A second one on the same socket reads the same table, give or
         // take what changed in between, and a quiet host changes nothing.
         let again = m.snapshot().expect("second snapshot");
@@ -317,6 +332,30 @@ mod tests {
         let one = |b: &[u8]| is_reply(&netlink::parse(b).unwrap()[0]);
         assert!(one(&part) && one(&done) && one(&error));
         assert!(!one(&note));
+    }
+
+    /// A kernel without IPv6 answers a dump of IPv6 routes with those of
+    /// every family: the IPv4 routes it lists again are not listed twice.
+    #[test]
+    fn a_dump_keeps_the_family_it_asks_for() {
+        let hop = crate::Hop {
+            gateway: IpAddr::from([10, 1, 0, 2]),
+            oif: Some(2),
+            onlink: false,
+        };
+        let mut part =
+            RouteMsg::unicast("192.0.2.0/24".parse().unwrap(), hop, RT_TABLE_MAIN, 4).encode_set(3);
+        part[6..8].copy_from_slice(&netlink::NLM_F_MULTI.to_ne_bytes());
+        let part = netlink::parse(&part).unwrap();
+        let mut d = Dumps {
+            afi: Some(Afi::Ipv4),
+            mirror: Mirror::new(RTPROT_BGP),
+            ..Dumps::default()
+        };
+        assert!(matches!(d.take(&part[0], 3, RTPROT_BGP), Ok(false)));
+        d.afi = Some(Afi::Ipv6);
+        assert!(matches!(d.take(&part[0], 3, RTPROT_BGP), Ok(false)));
+        assert_eq!(d.mirror.len(), 1);
     }
 
     /// A dump ends with its `NLMSG_DONE`; one that carries an error, such
@@ -358,6 +397,11 @@ mod tests {
     }
 
     fn route(dst: &str, metric: u32) -> Route {
+        let next_hops = vec![NextHop {
+            gateway: Some(IpAddr::from([10, 1, 0, 2])),
+            oif: 2,
+            flags: 0,
+        }];
         Route {
             dst: dst.parse().unwrap(),
             table: RT_TABLE_MAIN,
@@ -366,13 +410,14 @@ mod tests {
             tos: 0,
             flags: 0,
             metric,
-            via: Via::Unicast {
-                gateway: Some(IpAddr::from([10, 1, 0, 2])),
-                oif: 2,
-                onlink: false,
-            },
+            via: kernel::via_of(1, &next_hops),
+            next_hops,
         }
     }
+
+    /// `ip route add`: the kernel had no route with the destination and
+    /// metric.
+    const ADD: u16 = netlink::NLM_F_CREATE | netlink::NLM_F_EXCL;
 
     fn link(index: u32, up: bool) -> Link {
         Link {
@@ -387,28 +432,33 @@ mod tests {
     /// away, or an address going, asks for the snapshot again.
     #[test]
     fn notifications_apply_over_the_dumps_in_order() {
-        let mut d = Dumps::default();
-        d.routes
-            .insert((route("192.0.2.0/24", 5).dst, 5), route("192.0.2.0/24", 5));
+        let mut d = Dumps {
+            mirror: Mirror::new(RTPROT_BGP),
+            ..Dumps::default()
+        };
+        d.mirror.listed(&route("192.0.2.0/24", 5));
         d.links.insert(2, link(2, true));
         let dst = route("198.51.100.0/24", 0).dst;
+        let add = |r: Route| Event::Route {
+            route: r,
+            flags: ADD,
+        };
         d.events = vec![
-            Event::Route(route("198.51.100.0/24", 0)),
-            Event::RouteGone { dst, metric: 0 },
-            Event::Route(route("198.51.100.0/24", 0)),
-            Event::RouteGone {
-                dst: route("192.0.2.0/24", 5).dst,
-                metric: 5,
-            },
+            add(route("198.51.100.0/24", 0)),
+            Event::RouteGone(route("198.51.100.0/24", 0)),
+            add(route("198.51.100.0/24", 0)),
+            Event::RouteGone(route("192.0.2.0/24", 5)),
             Event::Link(link(3, true)),
         ];
         assert!(!disturbed(&d));
         for e in std::mem::take(&mut d.events) {
-            apply(&mut d, e);
+            assert_eq!(apply(&mut d, &e), Ok(()));
         }
-        assert_eq!(d.routes.len(), 1);
-        assert!(d.routes.contains_key(&(dst, 0)));
+        let keys: Vec<_> = d.mirror.routes().map(|(p, m, _)| (p, m)).collect();
+        assert_eq!(keys, [(dst, 0)]);
         assert_eq!(d.links.len(), 2);
+        // A removal of a route the dumps did not list cannot be placed.
+        assert!(apply(&mut d, &Event::RouteGone(route("192.0.2.0/24", 5))).is_err());
         for trigger in [
             Event::Link(link(2, false)),
             Event::LinkGone(2),
@@ -444,6 +494,8 @@ mod root_tests {
     use std::time::{Duration, Instant};
 
     use bgpfc_sys::NetNs;
+
+    use bgpfc_wire::prefix::Prefix;
 
     use super::*;
     use crate::kernel::Via;
@@ -539,7 +591,7 @@ mod root_tests {
         in_namespace(|| {
             let mut monitor = Monitor::open(RTPROT_BGP).unwrap();
             let first = monitor.snapshot().unwrap();
-            assert_eq!(first.routes, vec![], "a new namespace has no route");
+            assert!(first.mirror.is_empty(), "a new namespace has no route");
             assert!(first.links.iter().any(|l| l.name == "lo"));
             ip("link add mo0 type veth peer name mo1");
             ip("addr add 10.1.0.1/24 dev mo0");
@@ -550,9 +602,9 @@ mod root_tests {
             let oif = index_of("mo0");
             let added = wait_for(
                 &mut monitor,
-                |e| matches!(e, Event::Route(r) if r.dst == dst),
+                |e| matches!(e, Event::Route { route: r, .. } if r.dst == dst),
             );
-            let Event::Route(route) = added else {
+            let Event::Route { route, .. } = added else {
                 unreachable!()
             };
             assert_eq!(route.metric, 7);
@@ -564,17 +616,26 @@ mod root_tests {
                     onlink: false,
                 }
             );
-            // Ours is never reported.
+            // Ours only by destination and metric.
             ip("route add 198.51.100.0/24 via 10.1.0.2 proto 186");
             ip("route del 192.0.2.0/24 via 10.1.0.2 metric 7");
             let mut seen = Vec::new();
-            while !seen.contains(&Event::RouteGone { dst, metric: 7 }) {
+            while !seen
+                .iter()
+                .any(|e| matches!(e, Event::RouteGone(r) if r.dst == dst && r.metric == 7))
+            {
                 seen.extend(monitor.next_events().unwrap());
             }
             assert!(
-                !seen
-                    .iter()
-                    .any(|e| matches!(e, Event::Route(r) if r.protocol == RTPROT_BGP)),
+                !seen.iter().any(
+                    |e| matches!(e, Event::Route { route: r, .. } if r.protocol == RTPROT_BGP)
+                ),
+                "{seen:?}"
+            );
+            let ours: Prefix = "198.51.100.0/24".parse().unwrap();
+            assert!(
+                seen.iter()
+                    .any(|e| matches!(e, Event::Own { dst, gone: false, .. } if *dst == ours)),
                 "{seen:?}"
             );
             ip("link set mo0 down");
@@ -593,7 +654,7 @@ mod root_tests {
             // IPv4 removed the connected route and 198.51.100.0/24, the
             // latter with no notification: a snapshot has neither.
             let after = monitor.snapshot().unwrap();
-            assert_eq!(after.routes, vec![]);
+            assert!(after.mirror.is_empty(), "{after:?}");
             assert!(after.links.iter().any(|l| l.index == oif && !l.up));
         });
     }
@@ -640,7 +701,10 @@ mod root_tests {
             let after = monitor.snapshot().unwrap();
             assert_eq!(after, before);
             let other: Prefix = "198.51.100.0/24".parse().unwrap();
-            assert!(after.routes.iter().any(|r| r.dst == other), "{after:?}");
+            assert!(
+                after.mirror.routes().any(|(dst, _, _)| dst == other),
+                "{after:?}"
+            );
             assert!(fib.clear().iter().all(|a| a.result.is_ok()));
         });
     }
@@ -708,6 +772,76 @@ mod root_tests {
                 "{listed}"
             );
             assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+        });
+    }
+
+    /// Routes that share a destination and metric, as `ip route append`
+    /// and `prepend` make them, one of them removed, and one of bgpfcd's
+    /// put in place of the first: the copy kept from the notifications,
+    /// with the flags the kernel really sends, is the copy a snapshot
+    /// reads afterwards, and a change there once bgpfcd's sits among them
+    /// cannot be placed.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN and CAP_NET_ADMIN: joins a network namespace and changes it"]
+    fn netns_the_copy_follows_routes_that_share_a_destination() {
+        in_namespace(|| {
+            ip("link set lo up");
+            ip("link add sh0 type veth peer name sh1");
+            ip("addr add 10.1.0.1/24 dev sh0");
+            ip("link set sh0 up");
+            ip("link set sh1 up");
+            let mut monitor = Monitor::open(RTPROT_BGP).unwrap();
+            let mut copy = monitor.snapshot().unwrap().mirror;
+            let key = ("10.255.0.30/32".parse::<Prefix>().unwrap(), 20);
+            let at = |gateway: u8| {
+                Some(Via::Unicast {
+                    gateway: Some(IpAddr::from([10, 1, 0, gateway])),
+                    oif: index_of("sh0"),
+                    onlink: false,
+                })
+            };
+            let follow = |copy: &mut Mirror, monitor: &mut Monitor, marker: &str| {
+                ip(&format!("route add {marker} via 10.1.0.2"));
+                let marker: Prefix = marker.parse().unwrap();
+                let mut unclear = false;
+                loop {
+                    for e in monitor.next_events().unwrap() {
+                        unclear |= copy.apply(&e).is_err();
+                        if matches!(&e, Event::Route { route, .. } if route.dst == marker) {
+                            return unclear;
+                        }
+                    }
+                }
+            };
+            ip("route add 10.255.0.30/32 proto static metric 20 via 10.1.0.2");
+            ip("route append 10.255.0.30/32 proto static metric 20 via 10.1.0.3");
+            ip("route prepend 10.255.0.30/32 proto static metric 20 via 10.1.0.4");
+            assert!(!follow(&mut copy, &mut monitor, "192.0.2.1/32"));
+            assert_eq!(copy.via(&key), at(4));
+            assert_eq!(copy.len(), 5, "three at the key, the network, the marker");
+            // The prepended one goes: the first of the others is used.
+            ip("route del 10.255.0.30/32 proto static metric 20 via 10.1.0.4");
+            assert!(!follow(&mut copy, &mut monitor, "192.0.2.2/32"));
+            assert_eq!(copy.via(&key), at(2));
+            let read = monitor.snapshot().unwrap().mirror;
+            assert_eq!(
+                copy.routes().collect::<Vec<_>>(),
+                read.routes().collect::<Vec<_>>()
+            );
+            assert_eq!(copy.len(), read.len());
+            // bgpfcd's own in place of the first: that one is gone.
+            ip("route replace 10.255.0.30/32 proto 186 metric 20 via 10.1.0.5");
+            assert!(!follow(&mut copy, &mut monitor, "192.0.2.3/32"));
+            assert_eq!(copy.via(&key), at(3));
+            let read = monitor.snapshot().unwrap().mirror;
+            assert_eq!(
+                copy.routes().collect::<Vec<_>>(),
+                read.routes().collect::<Vec<_>>()
+            );
+            // With bgpfcd's first there, another's replace there is
+            // unclear: whose route it replaced, the kernel does not say.
+            ip("route replace 10.255.0.30/32 proto static metric 20 via 10.1.0.6");
+            assert!(follow(&mut copy, &mut monitor, "192.0.2.4/32"));
         });
     }
 }

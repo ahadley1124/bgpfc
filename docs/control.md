@@ -392,11 +392,14 @@ A kernel thread follows that table: it reads it whole at startup, before
 the RIB judges any route, and then the kernel's notifications of the
 routes of both families, of the interfaces and of the addresses removed.
 It keeps the routes a next hop may resolve through: neither bgpfcd's own
-nor a default route. It reads the table whole again when the kernel drops
-notifications, and when an interface goes down or away or an address is
-removed, since IPv4 then removes the routes through it without a
-notification of their own; the RIB keeps its copy until the new one
-arrives whole. The thread never writes to the kernel, in dry-run and
+nor a default route, each route where the kernel holds several with one
+prefix and metric, and hands the RIB the one the kernel uses there. It
+reads the table whole again when the kernel drops notifications, when an
+interface goes down or away or an address is removed, since IPv4 then
+removes the routes through it without a notification of their own, and
+when a change comes that it cannot place for sure, as where a route of
+bgpfcd's sits beside another program's at one prefix and metric; the RIB
+keeps its copy until the new one arrives whole. The thread never writes to the kernel, in dry-run and
 install mode alike.
 
 ```
@@ -407,8 +410,8 @@ install mode alike.
 at startup and after the thread opened a new socket (`reopened`, after
 an error of the old one, which is logged at error); at `debug` for the
 reads an interface going down (`link-down`) or away (`link-gone`), an
-address removed (`address-removed`) or lost notifications (`lost-events`)
-ask for. Lost notifications also have a line at warn, at once and then
+address removed (`address-removed`), lost notifications (`lost-events`)
+or a change it cannot place (`unclear`) ask for. Lost notifications also have a line at warn, at once and then
 at most one a minute, `times` counting those since the line before:
 
 ```

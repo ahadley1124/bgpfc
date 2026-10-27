@@ -166,10 +166,16 @@ runtime and no hand-rolled epoll.
   without one; the thread then forwards the changes to the RIB thread
   (`RibMsg::Kernel`), keeping only the routes a next hop may resolve
   through: neither bgpfcd's own (its protocol number) nor a default route.
-  It reads the table whole again when notifications were lost (`ENOBUFS`)
-  and when an interface goes down or away or an address is removed, since
-  IPv4 then drops routes without a notification each. It never writes to
-  the kernel, in dry-run and install mode alike.
+  It keeps them as the kernel holds them (`bgpfc_fib::mirror`), every
+  route at a destination and metric in the kernel's order, placed by the
+  notifications' `nlmsg_flags`, and hands the RIB, which keeps one a
+  destination and metric, the one the kernel uses there when it changes.
+  It reads the table whole again when notifications were lost (`ENOBUFS`),
+  when an interface goes down or away or an address is removed, since IPv4
+  then drops routes without a notification each, and when a change cannot
+  be placed for sure (a route of bgpfcd's among others' at one destination
+  and metric). It never writes to the kernel, in dry-run and install mode
+  alike.
 - **Control thread(s)**: the Unix-socket server and the HTTP server. They
   query the RIB and coordinator through request/response channels, for
   example `(Query, mpsc::Sender<Reply>)`. They never read shared state

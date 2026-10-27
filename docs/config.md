@@ -1044,7 +1044,11 @@ the kernel's notifications (`docs/control.md`, "Next hops"):
 - It resolves through the longest matching route ("only the longest
   matching route SHOULD be considered", RFC 4271 §9.1.2.1), and among
   routes to the same prefix through the one of lowest metric, as the
-  kernel does.
+  kernel does. Where the kernel holds several routes with one prefix and
+  metric (`ip route append` and `prepend`, or the gateways of one metric
+  that IPv6 makes the next hops of one route), bgpfcd keeps each in the
+  kernel's order and resolves through the first that forwards, as the
+  kernel does; one of them removed leaves the others.
 - Never through a route of bgpfcd's own, those that carry the `fib {
   protocol }` number, so never through another BGP route, and never
   through a default route (`0.0.0.0/0`, `::/0`): FRR's defaults, as
@@ -1096,7 +1100,10 @@ and sends no neighbor anything, since nothing a neighbor sees changed.
 IPv4 removes the routes through an interface that goes down, or that loses
 its address, without a notification each, so bgpfcd then reads the table
 whole again: a route through an interface counts only while the interface
-is up (RFC 4271 §9.1.2.1 2)). Until a new reading is whole the RIB keeps
+is up (RFC 4271 §9.1.2.1 2)). So it does when a change comes that it
+cannot place for sure: where a route of bgpfcd's sits beside another
+program's at one prefix and metric, the kernel's notification does not
+say whose route a replacement replaced. Until a new reading is whole the RIB keeps
 the one it has, so neither at startup nor after lost notifications does a
 next hop look unresolvable, or resolvable, for want of a table.
 

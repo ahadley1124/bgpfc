@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod kernel;
+pub mod mirror;
 #[cfg(not(miri))]
 pub mod monitor;
 pub mod netlink;

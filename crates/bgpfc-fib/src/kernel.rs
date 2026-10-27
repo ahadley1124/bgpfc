@@ -134,6 +134,25 @@ pub struct Route {
     pub metric: u32,
     /// Where it sends what it matches.
     pub via: Via,
+    /// Its next hops as the kernel lists them, dead ones included: one,
+    /// or several from `RTA_MULTIPATH`; none for a route that drops what
+    /// it matches. A removal names the next hops it removes, so that the
+    /// copy can tell which of several routes at a destination and metric
+    /// went ([`crate::mirror`]).
+    pub next_hops: Vec<NextHop>,
+}
+
+/// One next hop of a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NextHop {
+    /// The gateway (`RTA_GATEWAY`, or `RTA_VIA` for one of the other
+    /// family), if any.
+    pub gateway: Option<IpAddr>,
+    /// The interface index.
+    pub oif: u32,
+    /// `rtnh_flags`, or the low octet of `rtm_flags` for a route with one
+    /// next hop: `RTNH_F_DEAD`, `RTNH_F_ONLINK`, `RTNH_F_LINKDOWN`, ...
+    pub flags: u8,
 }
 
 /// An interface.
@@ -151,14 +170,32 @@ pub struct Link {
 /// resolve through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A route that [`relevant`] keeps was added or replaced.
-    Route(Route),
-    /// Such a route was removed.
-    RouteGone {
+    /// A route that [`relevant`] keeps was added, or put in place of the
+    /// first with its destination and metric. `flags` are the
+    /// notification's `nlmsg_flags`, which say where it went among the
+    /// routes there ([`crate::mirror`]).
+    Route {
+        /// The route.
+        route: Route,
+        /// `NLM_F_REPLACE`, `NLM_F_EXCL`, `NLM_F_CREATE`, `NLM_F_APPEND`.
+        flags: u16,
+    },
+    /// Such a route was removed: the route, with the next hops removed.
+    RouteGone(Route),
+    /// One of bgpfcd's own routes in the main table (those with its
+    /// protocol number) was added, put in place of the first route with
+    /// its destination and metric (`flags`, as for `Route`), or removed
+    /// (`gone`). Nothing resolves through it, but it may have replaced, or
+    /// sit among, routes that something does.
+    Own {
         /// Its destination.
         dst: Prefix,
         /// Its metric.
         metric: u32,
+        /// The notification's `nlmsg_flags`.
+        flags: u16,
+        /// Whether it was removed.
+        gone: bool,
     },
     /// An interface appeared or changed.
     Link(Link),
@@ -191,6 +228,18 @@ impl fmt::Display for Via {
     }
 }
 
+impl Event {
+    /// The destination and metric of a route's notification.
+    #[must_use]
+    pub fn key(&self) -> Option<(Prefix, u32)> {
+        match self {
+            Event::Route { route, .. } | Event::RouteGone(route) => Some((route.dst, route.metric)),
+            Event::Own { dst, metric, .. } => Some((*dst, *metric)),
+            Event::Link(_) | Event::LinkGone(_) | Event::AddressGone(_) => None,
+        }
+    }
+}
+
 /// Whether a next hop may resolve through `route`, the filter of the
 /// kernel's table bgpfc keeps a copy of, for routes installed by someone
 /// else than the bgpfcd whose routes carry `protocol`:
@@ -215,8 +264,16 @@ pub fn relevant(route: &Route, protocol: u8) -> bool {
     // the BGP route. As FRR does by default (no `resolve-via-default`),
     // bgpfc resolves neither through a BGP route, its own, nor through a
     // default route, through which every next hop would resolve.
+    route.protocol != protocol && candidate(route)
+}
+
+/// [`relevant`] but for who installed the route: a route of the main
+/// table, not a default route, `rtm_tos` 0, not cloned, unicast or one
+/// that drops. Of bgpfcd's own routes, these are the ones that compete
+/// with the routes next hops resolve through for a destination and metric.
+#[must_use]
+pub fn candidate(route: &Route) -> bool {
     route.table == RT_TABLE_MAIN
-        && route.protocol != protocol
         && route.dst.prefix_len() > 0
         && route.tos == 0
         && route.flags & RTM_F_CLONED == 0
@@ -291,19 +348,17 @@ pub fn decode_route(payload: &[u8]) -> Result<Option<Route>, NetlinkError> {
     let Some(dst) = dst else {
         return Ok(None);
     };
-    let via = if kind != RTN_UNICAST {
-        Via::Unreachable
-    } else if let Some(nexthops) = multipath {
-        first_live(afi, nexthops)?
-    } else {
-        match oif {
-            Some(oif) if flags & u32::from(RTNH_F_DEAD) == 0 => Via::Unicast {
+    let next_hops = match multipath {
+        Some(nexthops) => multipath_hops(afi, nexthops)?,
+        // The next hop's own flags are the low octet of `rtm_flags`.
+        None => oif
+            .map(|oif| NextHop {
                 gateway,
                 oif,
-                onlink: flags & u32::from(RTNH_F_ONLINK) != 0,
-            },
-            _ => Via::Unreachable,
-        }
+                flags: u8::try_from(flags & 0xff).unwrap_or(0),
+            })
+            .into_iter()
+            .collect(),
     };
     Ok(Some(Route {
         dst,
@@ -313,12 +368,36 @@ pub fn decode_route(payload: &[u8]) -> Result<Option<Route>, NetlinkError> {
         tos,
         flags,
         metric,
-        via,
+        via: via_of(kind, &next_hops),
+        next_hops,
     }))
 }
 
-/// The first next hop of an `RTA_MULTIPATH` value without `RTNH_F_DEAD`.
-fn first_live(afi: Afi, mut nexthops: &[u8]) -> Result<Via, NetlinkError> {
+/// Where a route of type `kind` with `next_hops` sends what it matches:
+/// nowhere for a type that drops; else through the first next hop
+/// without `RTNH_F_DEAD`, with its `RTNH_F_ONLINK`; nowhere when every
+/// one is dead, or there is none, as for a route that names a nexthop
+/// object the message does not expand.
+#[must_use]
+pub fn via_of(kind: u8, next_hops: &[NextHop]) -> Via {
+    if kind != RTN_UNICAST {
+        return Via::Unreachable;
+    }
+    next_hops
+        .iter()
+        .find(|h| h.flags & RTNH_F_DEAD == 0)
+        .map_or(Via::Unreachable, |h| Via::Unicast {
+            gateway: h.gateway,
+            oif: h.oif,
+            onlink: h.flags & RTNH_F_ONLINK != 0,
+        })
+}
+
+/// Every next hop of an `RTA_MULTIPATH` value, a run of `struct
+/// rtnexthop` each followed by its attributes, in order; one with an
+/// interface index that is no interface's is passed over.
+fn multipath_hops(afi: Afi, mut nexthops: &[u8]) -> Result<Vec<NextHop>, NetlinkError> {
+    let mut hops = Vec::new();
     let mut at = 0;
     while !nexthops.is_empty() {
         let Some((head, _)) = nexthops.split_first_chunk::<RTNEXTHOP_LEN>() else {
@@ -329,10 +408,7 @@ fn first_live(afi: Afi, mut nexthops: &[u8]) -> Result<Via, NetlinkError> {
         let Some(attrs) = nexthops.get(RTNEXTHOP_LEN..len) else {
             return Err(NetlinkError::BadAttribute { at });
         };
-        let index = u32::try_from(i32::from_ne_bytes([i0, i1, i2, i3])).ok();
-        if flags & RTNH_F_DEAD == 0
-            && let Some(oif) = index
-        {
+        if let Ok(oif) = u32::try_from(i32::from_ne_bytes([i0, i1, i2, i3])) {
             let mut gateway = None;
             for Attr { ty, value } in netlink::parse_attrs(attrs)? {
                 match ty {
@@ -341,17 +417,17 @@ fn first_live(afi: Afi, mut nexthops: &[u8]) -> Result<Via, NetlinkError> {
                     _ => {}
                 }
             }
-            return Ok(Via::Unicast {
+            hops.push(NextHop {
                 gateway,
                 oif,
-                onlink: flags & RTNH_F_ONLINK != 0,
+                flags,
             });
         }
         let next = netlink::align(len);
         nexthops = nexthops.get(next..).unwrap_or_default();
         at += next;
     }
-    Ok(Via::Unreachable)
+    Ok(hops)
 }
 
 /// Decode the payload of an `RTM_NEWLINK` or `RTM_DELLINK`. `None` for an
@@ -396,21 +472,32 @@ pub fn decode_address_index(payload: &[u8]) -> Result<u32, NetlinkError> {
 
 /// What a notification says, if anything a reader of the routes bgpfcd
 /// may resolve through needs: routes [`relevant`] keeps for `protocol`,
-/// interfaces, and removed addresses. `None` for anything else.
+/// with the notification's flags; bgpfcd's own routes that compete with
+/// them ([`candidate`]), by destination and metric; interfaces; and
+/// removed addresses. `None` for anything else.
 ///
 /// # Errors
 /// [`NetlinkError`] on a malformed message.
 pub fn event(message: &Message<'_>, protocol: u8) -> Result<Option<Event>, NetlinkError> {
-    Ok(match message.header.ty {
-        RTM_NEWROUTE => decode_route(message.payload)?
-            .filter(|r| relevant(r, protocol))
-            .map(Event::Route),
-        RTM_DELROUTE => decode_route(message.payload)?
-            .filter(|r| relevant(r, protocol))
-            .map(|r| Event::RouteGone {
+    let route = |gone: bool| -> Result<Option<Event>, NetlinkError> {
+        let Some(r) = decode_route(message.payload)?.filter(candidate) else {
+            return Ok(None);
+        };
+        let flags = message.header.flags;
+        Ok(Some(match (r.protocol == protocol, gone) {
+            (true, gone) => Event::Own {
                 dst: r.dst,
                 metric: r.metric,
-            }),
+                flags,
+                gone,
+            },
+            (false, false) => Event::Route { route: r, flags },
+            (false, true) => Event::RouteGone(r),
+        }))
+    };
+    Ok(match message.header.ty {
+        RTM_NEWROUTE => route(false)?,
+        RTM_DELROUTE => route(true)?,
         RTM_NEWLINK => decode_link(message.payload)?.map(Event::Link),
         RTM_DELLINK => decode_link(message.payload)?.map(|l| Event::LinkGone(l.index)),
         RTM_DELADDR => Some(Event::AddressGone(decode_address_index(message.payload)?)),
@@ -537,7 +624,7 @@ mod tests {
 
     #[test]
     fn routes_through_a_gateway_a_device_and_several_next_hops() {
-        let Some(Event::Route(r)) = event_of(STATIC) else {
+        let Some(Event::Route { route: r, .. }) = event_of(STATIC) else {
             panic!("{:?}", event_of(STATIC));
         };
         assert_eq!(
@@ -555,10 +642,26 @@ mod tests {
                     oif: 2,
                     onlink: false,
                 },
+                next_hops: vec![NextHop {
+                    gateway: Some(ip("10.1.0.2")),
+                    oif: 2,
+                    flags: 0,
+                }],
             }
         );
+        // `ip route add`: NLM_F_CREATE | NLM_F_EXCL, as no route had the
+        // destination and metric.
+        assert_eq!(
+            message(&hex(STATIC)).header.flags,
+            netlink::NLM_F_CREATE | netlink::NLM_F_EXCL
+        );
+        assert!(matches!(
+            event_of(STATIC),
+            Some(Event::Route { flags, .. })
+                if flags == netlink::NLM_F_CREATE | netlink::NLM_F_EXCL
+        ));
         // RTA_MULTIPATH: the first next hop; no metric given.
-        let Some(Event::Route(r)) = event_of(MULTIPATH) else {
+        let Some(Event::Route { route: r, .. }) = event_of(MULTIPATH) else {
             panic!("multipath");
         };
         assert_eq!(r.dst, p("198.18.0.0/24"));
@@ -571,9 +674,12 @@ mod tests {
                 onlink: false,
             }
         );
+        // Every next hop, for a removal of one of them to name.
+        let gateways: Vec<Option<IpAddr>> = r.next_hops.iter().map(|h| h.gateway).collect();
+        assert_eq!(gateways, [Some(ip("10.1.0.2")), Some(ip("10.1.0.4"))]);
         // A device route and the connected route: no gateway.
         for (s, dst) in [(DEV, "192.0.2.64/26"), (CONNECTED, "10.1.0.0/24")] {
-            let Some(Event::Route(r)) = event_of(s) else {
+            let Some(Event::Route { route: r, .. }) = event_of(s) else {
                 panic!("{dst}");
             };
             assert_eq!(r.dst, p(dst));
@@ -587,7 +693,7 @@ mod tests {
             );
         }
         // A blackhole forwards nothing, and is kept: it shadows.
-        let Some(Event::Route(r)) = event_of(BLACKHOLE) else {
+        let Some(Event::Route { route: r, .. }) = event_of(BLACKHOLE) else {
             panic!("blackhole");
         };
         assert_eq!(
@@ -598,10 +704,24 @@ mod tests {
 
     #[test]
     fn our_routes_and_other_tables_are_not_kept() {
-        assert_eq!(event_of(OURS), None);
+        // Ours only by destination and metric: nothing resolves through
+        // it, but it may stand where another's route stood.
+        assert_eq!(
+            event_of(OURS),
+            Some(Event::Own {
+                dst: p("198.51.100.0/24"),
+                metric: 20,
+                flags: netlink::NLM_F_CREATE | netlink::NLM_F_EXCL,
+                gone: false,
+            })
+        );
+        assert_eq!(
+            event_of(OURS).unwrap().key(),
+            Some((p("198.51.100.0/24"), 20))
+        );
         // Under another protocol number, the same route counts.
         let m = hex(OURS);
-        let Some(Event::Route(r)) = event(&message(&m), 4).unwrap() else {
+        let Some(Event::Route { route: r, .. }) = event(&message(&m), 4).unwrap() else {
             panic!("another daemon's route");
         };
         assert_eq!(r.protocol, 186);
@@ -613,18 +733,35 @@ mod tests {
     }
 
     #[test]
-    fn deletions_name_the_route_and_its_metric() {
+    fn deletions_name_the_route_and_its_next_hops() {
+        let Some(Event::RouteGone(r)) = event_of(DELETE) else {
+            panic!("{:?}", event_of(DELETE));
+        };
+        assert_eq!((r.dst, r.metric), (p("192.0.2.128/25"), 5));
         assert_eq!(
-            event_of(DELETE),
-            Some(Event::RouteGone {
-                dst: p("192.0.2.128/25"),
-                metric: 5
-            })
+            r.next_hops,
+            [NextHop {
+                gateway: Some(ip("10.1.0.2")),
+                oif: 2,
+                flags: 0,
+            }]
         );
-        // A deletion passes the same filter.
+        // A deletion of ours: by destination and metric.
         let mut ours = hex(OURS);
         ours[4..6].copy_from_slice(&RTM_DELROUTE.to_ne_bytes());
-        assert_eq!(event(&message(&ours), 186).unwrap(), None);
+        assert_eq!(
+            event(&message(&ours), 186).unwrap(),
+            Some(Event::Own {
+                dst: p("198.51.100.0/24"),
+                metric: 20,
+                flags: netlink::NLM_F_CREATE | netlink::NLM_F_EXCL,
+                gone: true,
+            })
+        );
+        // Of another table, nothing.
+        let mut local = hex(LOCAL_BROADCAST);
+        local[4..6].copy_from_slice(&RTM_DELROUTE.to_ne_bytes());
+        assert_eq!(event(&message(&local), 186).unwrap(), None);
     }
 
     #[test]
