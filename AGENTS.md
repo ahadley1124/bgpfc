@@ -297,7 +297,13 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
   lists (SSH, TLS, TCP-MD5, TCP-AO, IPsec) are out of scope. §9 requires a
   router and a cache on unprotected TCP to share a trusted, controlled
   network, so operators keep the cache on loopback or a trusted network.
-  `docs/config.md` says so next to the `rpki` block.
+  `docs/config.md` says so next to the `rpki` block. Every connection has
+  TCP keep-alive on (§9: routers "SHOULD enable keep-alives when
+  available"), with the `rpki` block's `tcp-keepalive` times. `bgpfc-rtr`
+  must not depend on `bgpfc-sys` (§2), so `bgpfcd` sets it through the
+  client's per-connection hook, `client::Config::check`, which runs on
+  each new connection before its first PDU, and again on the connection
+  in use (`Client::check_again`) when a reload changes the times.
 
 ## 5. Testing and verification
 
@@ -315,7 +321,7 @@ Ship `contrib/bgpfcd.service` with the ambient-capabilities setup.
 | `bgpfc-rpki` | Validation vectors from RFC 6811 §2 (the Route Origin ASN for each kind of final segment; Covered and Matched), the RFC 6483 §2 outcome table and §4 AS 0 ROAs, and the RFC 9319 §3 maxLength examples, covering NotFound, Valid, and Invalid by origin AS and by prefix length in both families. VRP bounds from RFC 8210 §5.1, §5.6 and §5.7. Proptests that check validation against the RFC 6811 §2.1 pseudo-code run over a plain list, VRP insert and remove against a set model, and that validating again only the routes `AffectedPrefixes` names, a merged backlog of changes included, gives the states validating every route gives. Miri, since the RTR decoder fills its VRP set. No fuzz target: the crate decodes no bytes. |
 | `bgpfc-rtr` | Unit tests with PDU byte vectors laid out as in the figures of RFC 8210 §5 and RFC 6810 §5, and from a capture of a real version 0 session. `proptest` round-trips of the codec, and framer properties: the same PDUs, and the same error, however the stream is cut. Fuzz targets for the PDU decoder and framer and for the client session. Miri. Table-driven session tests with injected time: every PDU type and every transport and timer event in every state, then the RFC 8210 §8 sequences, the §7 version fallback, the §6 timers and stale data. A proptest of the session against a simulated cache that updates, restarts, goes away and runs out of data: every commit is a whole set the cache held, and the session ends in sync with it. Client tests against an in-process cache served from a std `TcpListener`. |
 | `bgpfc-sidecar` | Supervisor state-machine tests with injected time (start, exit, restart backoff, shutdown). Process tests against stub executables that exit, hang, or ignore `SIGTERM`, never against a real Routinator. |
-| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`. What acts on the state: Invalid routes held by the default `drop-invalid` and kept from the kernel and a relay, ROAs created, changed and deleted moving installed routes with the per-route log lines and `show rpki transitions`, `prefer-valid` against a higher LOCAL_PREF, a reload of the `enforcement` that leaves the RTR client alone, `enforcement off`, and import policy that matches and sets the state; a stub cache of the crate's own stands in where StayRTR cannot. The Routinator sidecar, with `bgpfcd --user nobody` and a fake Routinator, a script that answers `--version`, records its arguments and `exec`s the stub cache (never a real Routinator): the arguments derived from the block, Routinator started after the privilege drop with no capabilities, RTR on loopback only, a server of another user on its port refused, a version mismatch, a missing binary and root without `--user` stopping the start, the stop order at `SIGTERM`, no restart when Routinator is signalled with bgpfcd, and no orphan after `SIGKILL` (Routinator's own child, which the fake leaves as `rsync` would, gone with its process group at a stop or restart, and left to the service manager after a `SIGKILL` of bgpfcd), a killed Routinator restarted with the data held, one that keeps failing backing off and raising the alarm, one a reload could not start raising its alarm until a reload starts it, a cold start that converges without hanging, the import-policy hold until the first set, and a reload walk across settings and modes. Uses network namespaces and needs root, so it runs in CI and on demand. |
+| `interop/` | Scenarios against BIRD, FRR, and GoBGP: session up, prefixes exchanged both ways, withdraw, route refresh, NOTIFICATION on bad input, 4-octet ASN with a 2-octet peer. A reload that changes import policy imports the kept routes again with no ROUTE-REFRESH, one that changes only export policy sends none, and one that accepts what import policy dropped asks for that family alone; the FIB reports what it did in `fib: changes` lines and, at debug, a line per route, never naming a route import policy rejected. Route origin validation with VRPs over RTR from StayRTR, an independent cache: each state of BIRD's routes, a VRP change that moves them without an UPDATE, a cache that goes away, restarts, fails over and comes back, or never answers, a reload, and `mode disabled`; TCP keep-alive on bgpfcd's connection to the cache, and a reload of `tcp-keepalive` that sets it on that connection with no new one; `startup hold` holding every route, through a reload to `accept` and back, until a late cache's first full set, then releasing all but the Invalid ones. What acts on the state: Invalid routes held by the default `drop-invalid` and kept from the kernel and a relay, ROAs created, changed and deleted moving installed routes with the per-route log lines and `show rpki transitions`, `prefer-valid` against a higher LOCAL_PREF, a reload of the `enforcement` that leaves the RTR client alone, `enforcement off`, and import policy that matches and sets the state; a stub cache of the crate's own stands in where StayRTR cannot. The Routinator sidecar, with `bgpfcd --user nobody` and a fake Routinator, a script that answers `--version`, records its arguments and `exec`s the stub cache: the arguments derived from the block, Routinator started after the privilege drop with no capabilities, RTR on loopback only, a server of another user on its port refused, a version mismatch, a missing binary and root without `--user` stopping the start, the stop order at `SIGTERM`, no restart when Routinator is signalled with bgpfcd, and no orphan after `SIGKILL` (Routinator's own child, which the fake leaves as `rsync` would, gone with its process group at a stop or restart, and left to the service manager after a `SIGKILL` of bgpfcd), a killed Routinator restarted with the data held, one that keeps failing backing off and raising the alarm, one a reload could not start raising its alarm until a reload starts it, a cold start that converges without hanging, the import-policy hold until the first set, a reload walk across settings and modes, and the warning of a weaker owner check, once, before Routinator starts. And the real Routinator 0.15 at `/usr/bin/routinator`, with no network: a repository the harness signs with `openssl` and serves with `rsync` on loopback (`LocalRpki`), a block that sets every option bgpfcd derives an argument from, all of them taken, the version check, Routinator as `nobody` on a loopback port only, the client in sync over RTR version 1 with keep-alive on, BIRD's routes validated, and a stop that leaves no process. Uses network namespaces and needs root, so it runs in CI and on demand. |
 | benches | `criterion` benches for UPDATE decode, RIB insert/withdraw at full-table scale (~1M IPv4 + ~250k IPv6), and policy evaluation; std-only micro-benchmarks in `bgpfc-bench`. Do not regress them without saying so in the PR. |
 | `bgpfc-prof`, `bgpfc-bench`, profiling | Histogram bucket and percentile math; allocator arithmetic on a private instance, under Miri; UPDATE packing against the size limit and round-tripped through the daemon's decoder; MRT parsing from hand-built records; the ignored loadgen-to-daemon test (`cargo test -p bgpfcd --features profiling -- --ignored`). `bgp_bench` keeps the time and memory history (`docs/PROFILING.md`); quote it when a change claims to be faster or smaller. |
 
@@ -433,8 +439,9 @@ Steps 0–9 are complete: they built v1. Their text stays as a record of what
 v1 covers. Steps 10 to 14 are complete as well, and their text stays as a
 record of what they added; step 11 also did the part of step 13 that
 re-evaluates only the prefixes a VRP delta affects (RFC 6811 §4), and step
-12 the part that adds the `rpki` config, external caches or disabled. There
-is no step after 14: ask the maintainer what comes next.
+12 the part that adds the `rpki` config, external caches or disabled. So
+are the post-14 follow-ups listed after step 14. There is no step after
+them: ask the maintainer what comes next.
 
 0. **Skeleton.**
    - Workspace, toolchain pin, lints, and the scripts in `scripts/`.
@@ -506,6 +513,28 @@ is no step after 14: ask the maintainer what comes next.
       from a thread that lives as long as the daemon.
     - Localhost RTR auto-wiring.
     - A unified config surface for external caches and the sidecar.
+
+**Post-14 follow-ups** (branch `followups-r1`, one PR): the maintainer's
+decisions after reviewing step 14, and the answers that followed.
+- RTR TCP keep-alive on every connection (RFC 8210 §9), set from `bgpfcd`
+  through the client's per-connection hook (§4, "RTR transport"), with
+  `tcp-keepalive idle|interval|count` in the `rpki` block (60, 10, 6 by
+  default; the kernel's bounds), applied at a reload to the connection in
+  use.
+- The FIB thread's log folded: a `fib: changes` line at info at most once a
+  second, counts by operation, sample prefixes and dry-run or install;
+  each route at debug, and at most three failure lines a change at error.
+- The sidecar's owner check is `partial` in COMPLIANCE.md (RFC 8210 §9,
+  §13), as it tells users apart and nothing finer; bgpfcd warns, and starts
+  all the same, when it runs as `nobody`, as the overflow user or in a user
+  namespace.
+- `rpki { startup accept | hold; }`: `hold` holds every route until the
+  first full set (RFC 6811 §2, "unless explicitly configured").
+- A changed import policy imports the routes the RIB kept again, with no
+  route refresh (RFC 4271 §3 (a)), which is sent only for the families
+  where import policy dropped routes (§3 (b)); an export change sends none.
+- Routinator 0.15.3 as the tested release, and an interop scenario that
+  runs the real one, offline, which CI installs from NLnet Labs' packages.
 
 **Out of scope until the maintainer says otherwise:** ASPA (planned for
 v1.1.0), BGPsec (RFC 8205), the protected RTR transports (RFC 8210 §9; see
