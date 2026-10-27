@@ -11,20 +11,20 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 6811. RFC 4271 has six
-> rows open. Two need the host's interfaces and routes, which bgpfc does not
-> track, so the kernel's verdict is logged instead: next-hop resolvability
-> (§9.1.2), and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is
-> partial: a received next hop is checked against our own address on that
-> session, not against every address of the host (§6.3 a). Two are deliberate
-> deviations: a NOTIFICATION received in OpenSent closes the connection without
-> an FSM error in reply, as BIRD and FRR do (§8.2.2), and the
-> MinRouteAdvertisementInterval timer paces announcements but never holds back
-> a withdrawal (§9.2.1.1). The sixth applies only under `enforcement
-> prefer-valid`: the validation state ranks routes before LOCAL_PREF, and that
-> rank is not passed on to internal neighbors (§9.1.1). RFC 2545 has one partial
-> row for the same lack of interfaces: bgpfc never sends a link-local next hop,
-> which §3 asks for where it shares a subnet with the next hop and the peer. RFC
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 6811. RFC 4271 has five
+> rows open. Next hops resolve in the kernel's routing table (§9.1.2), but
+> one check is not made yet: that a one-hop EBGP neighbor's next hop is on a
+> subnet shared with us (§6.3 b). One is partial: a received next hop is
+> checked against our own address on that session, not against every address
+> of the host (§6.3 a). Two are deliberate deviations: a NOTIFICATION received
+> in OpenSent closes the connection without an FSM error in reply, as BIRD and
+> FRR do (§8.2.2), and the MinRouteAdvertisementInterval timer paces
+> announcements but never holds back a withdrawal (§9.2.1.1). The fifth
+> applies only under `enforcement prefer-valid`: the validation state ranks
+> routes before LOCAL_PREF, and that rank is not passed on to internal
+> neighbors (§9.1.1). RFC 2545 has one partial row: bgpfc cannot tell when
+> it shares a subnet with the next hop and the peer, so it never sends the
+> link-local next hop §3 asks for there. RFC
 > 8481, which clarifies RFC 6811, has one deliberate deviation: turning
 > validation on with `mode external` or `mode sidecar` also holds Invalid
 > routes back unless `enforcement` says otherwise, the project's chosen default
@@ -48,6 +48,15 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 - Routes installed through rtnetlink under a dedicated protocol number, with
   dry-run as the default and a runtime toggle; privilege drop and a capability
   check; clean shutdown on `SIGTERM`.
+- Next hops resolved in the kernel's main routing table, which bgpfcd follows
+  over rtnetlink (RFC 4271 §9.1.2): a route whose next hop does not resolve is
+  held, neither installed nor advertised, until it does, and routes are
+  installed through the gateway and interface that resolve their next hop.
+  `bgpfcctl show nexthops` lists them.
+- Neighbors more than one hop away, such as over loopback addresses: external
+  sessions are sent with TTL 1 unless `multihop` says otherwise, as with BIRD
+  and FRR, and `local-address` runs a session from an address of the host.
+  bgpfcd also joins a network namespace by itself (`netns`, `--netns`).
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)); a changed
   import policy applies at once to the routes already received. Routes an
@@ -163,6 +172,22 @@ and shown ([`docs/config.md`](docs/config.md), "Startup window").
 either mode, and `show rpki` and the log say that the routes are held. An external validator
 (`mode external`) and no validation (`mode disabled`, or no `rpki` block)
 work as before, without Routinator on the host.
+
+### Multihop, next hops and network namespaces
+
+[`AGENTS.md`](AGENTS.md) §9 step 15 is done. External neighbors are sent
+TTL 1, and `multihop` raises it for neighbors further away, as BIRD and FRR
+do; `local-address` binds a session to an address of the host, typically a
+loopback, and a connection the neighbor opens to another address is
+refused. Next hops resolve in the kernel's main routing table, through
+connected, static and IGP routes but never through a default route or
+bgpfcd's own: a route whose next hop does not resolve is held, and comes
+back with no UPDATE when it resolves, and routes are installed through the
+immediate gateway and interface. `netns` or `--netns` names the network
+namespace bgpfcd joins at startup ("Network namespace" under "Run").
+Checking the TTL of what neighbors send (GTSM, RFC 5082), the RFC 4271
+§6.3 b subnet check and an interior cost from the kernel's metrics come
+later.
 
 ### Later
 
@@ -289,10 +314,49 @@ neighbor 198.51.100.1 {
     import UPSTREAM-IN;
     export UPSTREAM-OUT;
 }
+
+# A neighbor two hops away, peered between loopback addresses. bgpfcd
+# sends external neighbors TTL 1 unless `multihop` raises it, and runs
+# the session from `local-address`, on which it listens through `::`
+# above. Each end needs a route to the other's loopback, such as
+# `ip route add 192.0.2.30/32 via GATEWAY`, and the neighbor's next hops
+# must resolve in the kernel's main table (docs/config.md, "Neighbors"
+# and "Next hops").
+# neighbor 192.0.2.30 {
+#     remote-as 64512;
+#     multihop 2;                 # TTL 2; `multihop;` alone sends 255
+#     local-address 192.0.2.1;    # this host's loopback address
+#     import UPSTREAM-IN;
+#     export UPSTREAM-OUT;
+# }
 ```
 
 Every neighbor must name both an `import` and an `export` policy. A config
 without them is rejected.
+
+### Neighbors more than one hop away
+
+bgpfcd sends to an external neighbor with TTL 1, as BIRD and FRR do: a
+neighbor that is not directly connected, such as one peered between
+loopback addresses as in the commented example above, needs `multihop`
+(TTL 255, or `multihop N;`), and usually `local-address`. Internal
+neighbors keep the system's TTL. A route is used only if its next hop
+resolves in the kernel's main routing table, through a connected, static or
+IGP route, never through a default route or a route of bgpfcd's own, and it
+is installed through the gateway and interface of the route that resolves
+it ([`docs/config.md`](docs/config.md), "Next hops"). `bgpfcctl show
+nexthops` shows what each next hop resolves to.
+
+**Upgrading from an earlier bgpfcd**, which sent with the system's TTL and
+used every route whatever its next hop:
+
+- An external neighbor more than one hop away now needs `multihop`. Without
+  it the session no longer comes up: the log says `connect failed` with
+  `hint="external neighbor: more than one hop away needs multihop"`, and
+  `bgpfcctl show neighbor` shows `ttl 1` and the `last error`.
+- A route whose next hop the kernel's main table reaches only through a
+  default route, or not at all, is now held (`next hop unresolvable` in
+  `bgpfcctl show routes`): add a route to the next hop.
 
 ### FIB dry-run
 
