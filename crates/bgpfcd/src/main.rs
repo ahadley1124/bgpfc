@@ -71,6 +71,9 @@ fn main() {
             config.neighbors.len(),
             config.policies.len()
         );
+        if let Some(warning) = weaker_owner_check(&opts, &config) {
+            eprintln!("{warning}");
+        }
         return;
     }
     bgpfc_log::init(config.log_level);
@@ -94,6 +97,42 @@ fn main() {
         std::process::exit(1);
     }
     run(&opts, config, engine);
+}
+
+/// What `--check` warns of with `mode sidecar` when the owner check of
+/// Routinator's port is weaker where bgpfcd would run
+/// ([`owner::weaker_here`]): as the user `--user` names, or else as the
+/// user `--check` runs as, in this user namespace. It is a warning, at
+/// the `mode sidecar` statement or the `sidecar` block, and the file is
+/// still ok: bgpfcd starts all the same, and warns again then.
+fn weaker_owner_check(opts: &args::Args, config: &bgpfc_config::Config) -> Option<String> {
+    if config.rpki.mode != bgpfc_config::ast::RpkiMode::Sidecar {
+        return None;
+    }
+    let uid = match &opts.user {
+        Some(user) => {
+            let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+            // A user that is not there stops the start; nothing to judge.
+            Some(bgpfc_sys::lookup_user(&passwd, user)?.uid)
+        }
+        None => None,
+    };
+    let (uid, found) = owner::weaker_here(uid)?;
+    if found.is_empty() {
+        return None;
+    }
+    let at = config
+        .rpki
+        .sidecar
+        .pos
+        .map_or_else(String::new, |pos| format!("{pos}:"));
+    Some(format!(
+        "{}:{at} warning: rpki sidecar: the owner check of Routinator's port is weaker \
+         for bgpfcd as uid {uid}: {}; bgpfcd starts all the same (docs/config.md, \
+         \"Who serves the sidecar's port\")",
+        opts.config.display(),
+        owner::reasons(&found)
+    ))
 }
 
 /// Parse, validate and compile the configuration file, with the command

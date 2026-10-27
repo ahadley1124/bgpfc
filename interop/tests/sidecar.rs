@@ -579,6 +579,25 @@ fn the_sidecar_is_started_wired_and_validates() {
         )
         .unwrap_or_else(|| panic!("no arrival line:\n{}", s.report()));
     assert!(waiting < arrived, "{}", s.report());
+    // As nobody, as the lab runs it, the owner check of Routinator's port
+    // is weaker: bgpfcd says so once, before it starts Routinator, and
+    // starts it all the same (COMPLIANCE.md, RFC 8210 §9, §13).
+    let weaker = s
+        .first(
+            "WARN  msg=\"rpki sidecar: the owner check of Routinator's port is weaker here; \
+             starting anyway\" uid=",
+        )
+        .unwrap_or_else(|| panic!("no warning of the weaker check:\n{}", s.report()));
+    let starting = s
+        .first("msg=\"rpki: starting the routinator sidecar\"")
+        .unwrap_or_else(|| panic!("{}", s.report()));
+    assert!(weaker < starting, "{}", s.report());
+    assert_eq!(
+        s.count("the owner check of Routinator's port is weaker"),
+        1,
+        "{}",
+        s.report()
+    );
 
     s.stop_in_order(pid);
 }

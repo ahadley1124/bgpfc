@@ -698,10 +698,27 @@ not map as the overflow user (`/proc/sys/kernel/overflowuid`, 65534,
 `nobody`), so a bgpfcd that runs as that user there, or in a namespace
 with no user map at all, where it is that user itself, takes every
 process of an unmapped user, root's included, for its own: give it a
-mapped user of its own there too. Without `/proc` no connection to the sidecar is used. For
-these reasons COMPLIANCE.md marks the RFC 8210 §9, §13 requirement
-(cache and router on a trusted, controlled network) `partial` with `mode
-sidecar`.
+mapped user of its own there too. Without `/proc` no connection to the
+sidecar is used. For these reasons COMPLIANCE.md marks the RFC 8210 §9,
+§13 requirement (cache and router on a trusted, controlled network)
+`partial` with `mode sidecar`.
+
+bgpfcd says so where it applies. With `mode sidecar`, each time it starts
+Routinator, at startup and at a reload that starts it, it logs a warning,
+`rpki sidecar: the owner check of Routinator's port is weaker here;
+starting anyway`, with its `uid` and the `reasons`, when
+
+- it runs as the overflow user (`/proc/sys/kernel/overflowuid`, 65534
+  unless the kernel says otherwise),
+- it runs as the user called `nobody` in `/etc/passwd`, or
+- it runs in a user namespace, one whose `/proc/self/uid_map` is not the
+  identity map, `0 0 4294967295`.
+
+It starts Routinator all the same: the check still refuses every user it
+can tell apart from bgpfcd's own. `bgpfcd --check` prints the same
+warning on standard error, at the `mode sidecar` statement or the
+`sidecar` block, for the user `--user` names, or else the user it runs
+as, and still reports the file ok.
 
 **Startup window.** Until the RTR client's first full set arrives there
 are no VRPs, and every route is `disabled`: shown so, not as `not-found`.

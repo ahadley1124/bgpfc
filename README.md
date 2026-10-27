@@ -396,7 +396,9 @@ start rpki` naming both versions.
   Routinator does, so give bgpfcd a user of its own (`bgpfc`, not
   `nobody`), and in a user namespace one the namespace maps: there every
   unmapped user, root included, reads as `nobody` (`docs/config.md`, "Who
-  serves the sidecar's port").
+  serves the sidecar's port"). bgpfcd warns at the start of the sidecar,
+  and `bgpfcd --check` too, when it runs as `nobody`, as the overflow
+  user, or in a user namespace, and starts all the same.
 - **systemd**: `contrib/bgpfcd.service` has `KillMode=mixed`, so that
   `systemctl stop` signals bgpfcd alone, which stops its RTR client and
   then Routinator itself; with the default mode systemd would signal

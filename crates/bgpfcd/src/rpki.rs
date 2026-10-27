@@ -469,14 +469,18 @@ fn create_repository_dir(path: &Path) -> Result<(), String> {
         })
 }
 
-/// Start Routinator as `s` says: its repository directory, then
-/// [`Sidecar::start`], which checks the binary's version (issue #72: a
-/// mismatch is reported at startup), picks the RTR port if `s` leaves it
-/// to bgpfcd, and starts supervising.
+/// Start Routinator as `s` says: a warning if the owner check of its port
+/// is weaker where bgpfcd runs ([`owner::warn_if_weaker`]), its repository
+/// directory, then [`Sidecar::start`], which checks the binary's version
+/// (issue #72: a mismatch is reported at startup), picks the RTR port if
+/// `s` leaves it to bgpfcd, and starts supervising.
 ///
 /// # Errors
 /// What failed, for `cannot start rpki` or a reload's notes.
 fn start_sidecar(s: &ast::RpkiSidecar) -> Result<Sidecar, String> {
+    // RFC 8210 §9, §13: whether the client can tell Routinator from
+    // another server of its port as well here as COMPLIANCE.md says.
+    owner::warn_if_weaker();
     create_repository_dir(&s.repository_dir)?;
     bgpfc_log::info!(
         "rpki: starting the routinator sidecar",

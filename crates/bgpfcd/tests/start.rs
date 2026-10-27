@@ -4,8 +4,11 @@
 //! the file alone and looks nothing up (`docs/config.md`, "RPKI"); the
 //! start line names the `rpki` block's enforcement; `--check` reports
 //! what Routinator's rules refuse in a `sidecar` block at its position,
-//! without running the binary (issue #72); and a Routinator that cannot
-//! run stops the start (issue #60).
+//! without running the binary (issue #72); a Routinator that cannot run
+//! stops the start (issue #60); and, with `mode sidecar`, `--check` and
+//! the start warn when the owner check of Routinator's port is weaker,
+//! as for `nobody` or in a user namespace, and go on (COMPLIANCE.md, RFC
+//! 8210 §9, §13).
 
 use std::fs;
 use std::net::TcpListener;
@@ -260,5 +263,159 @@ fn a_missing_routinator_stops_the_start() {
     // The neighbors would start after it; none is configured, but the
     // repository directory shows how far the start got.
     assert!(dir.join("repo").is_dir(), "{stderr}");
+    // As nobody, the owner check of Routinator's port is weaker, which
+    // the start says before it goes on.
+    if root {
+        let warning = stderr
+            .lines()
+            .position(|l| l.contains(WEAKER_AT_START))
+            .unwrap_or_else(|| panic!("{stderr}"));
+        assert!(
+            stderr
+                .lines()
+                .nth(warning)
+                .unwrap()
+                .contains(" is nobody's, ")
+        );
+        let failed = stderr
+            .lines()
+            .position(|l| l.contains("msg=\"cannot start rpki\""));
+        assert!(failed > Some(warning), "{stderr}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The start's warning that the owner check of Routinator's port is
+/// weaker.
+const WEAKER_AT_START: &str =
+    "msg=\"rpki sidecar: the owner check of Routinator's port is weaker here; starting anyway\"";
+
+/// `--check`'s.
+const WEAKER_AT_CHECK: &str =
+    ": warning: rpki sidecar: the owner check of Routinator's port is weaker for bgpfcd as uid";
+
+/// With `mode sidecar`, `--check` warns, at the `mode sidecar` statement,
+/// when bgpfcd would run as `nobody` (`--user nobody`), and the file is
+/// still ok; with another mode, or as a user of its own, it says nothing.
+#[test]
+fn check_warns_when_the_owner_check_is_weaker_as_nobody() {
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    if !passwd.lines().any(|l| l.starts_with("nobody:")) {
+        eprintln!("skipped: no user nobody here");
+        return;
+    }
+    let dir = scratch("weaker-nobody");
+    let config = dir.join("bgpfcd.conf");
+    let run = |text: &str, user: Option<&str>| {
+        fs::write(&config, text).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bgpfcd"));
+        cmd.arg("-c").arg(&config).arg("--check");
+        if let Some(user) = user {
+            cmd.args(["--user", user]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).ends_with(": ok (0 neighbors, 0 policies)\n"));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let sidecar = "router-id 192.0.2.1;\nlocal-as 65000;\nrpki {\n    mode sidecar;\n}\n";
+    let stderr = run(sidecar, Some("nobody"));
+    assert!(
+        stderr.starts_with(&format!("{}:4:5{WEAKER_AT_CHECK}", config.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" is nobody's, "), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    // Only `mode sidecar` has the check.
+    let external = "router-id 192.0.2.1;\nlocal-as 65000;\n\
+                    rpki { mode external; cache 127.0.0.1; }\n";
+    assert_eq!(run(external, Some("nobody")), "");
+    // Root, as `--user root` would judge, in the initial namespace, is a
+    // user of its own.
+    let initial = fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|m| m.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]);
+    if initial {
+        assert_eq!(run(sidecar, Some("root")), "");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Whether this process may make a user namespace (`unshare -U`).
+fn user_namespaces_allowed() -> bool {
+    Command::new("unshare")
+        .args(["-U", "true"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// In a new user namespace with no map, `unshare -U`, bgpfcd is the
+/// overflow user itself, and every user outside reads as that user: both
+/// `--check` and the start say why the owner check is weaker there, and
+/// the start goes on to Routinator, which is missing here.
+#[test]
+fn a_user_namespace_weakens_the_owner_check() {
+    if !user_namespaces_allowed() {
+        eprintln!("skipped: unshare -U is not allowed here");
+        return;
+    }
+    let dir = scratch_for_nobody("weaker-userns");
+    let config = dir.join("bgpfcd.conf");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .unwrap()
+        .port();
+    fs::write(
+        &config,
+        format!(
+            "router-id 192.0.2.1;\nlocal-as 65000;\n\
+             listen {{ address 127.0.0.1; port {port}; }}\nfib {{ mode dry-run; }}\n\
+             rpki {{ mode sidecar; sidecar {{ binary \"{}\"; repository-dir \"{}\"; }} }}\n",
+            dir.join("routinator").display(),
+            dir.join("repo").display()
+        ),
+    )
+    .unwrap();
+    let bgpfcd = |check: bool| {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-U", env!("CARGO_BIN_EXE_bgpfcd"), "-c"])
+            .arg(&config);
+        if check {
+            cmd.arg("--check");
+        }
+        cmd.output().unwrap()
+    };
+    let reasons = [
+        "uid 65534 is the overflow uid, ",
+        "bgpfcd runs in a user namespace whose uid_map is not the identity, ",
+    ];
+    let out = bgpfcd(true);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    // At the `sidecar` block.
+    assert!(
+        stderr.starts_with(&format!(
+            "{}:5:22{WEAKER_AT_CHECK} 65534: ",
+            config.display()
+        )),
+        "{stderr}"
+    );
+    for reason in reasons {
+        assert!(stderr.contains(reason), "{reason}: {stderr}");
+    }
+    let out = bgpfcd(false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let warning = stderr
+        .lines()
+        .find(|l| l.contains(WEAKER_AT_START))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(warning.contains(" uid=65534 "), "{warning}");
+    for reason in reasons {
+        assert!(warning.contains(reason), "{reason}: {warning}");
+    }
+    assert!(
+        stderr.contains("msg=\"cannot start rpki\""),
+        "started on to Routinator: {stderr}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

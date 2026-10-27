@@ -27,7 +27,12 @@
 //! itself, passes a server of any unmapped user, root's included. That,
 //! and a user other processes share, such as `nobody`, is why
 //! COMPLIANCE.md has the RFC 8210 §9, §13 row `partial` with `mode
-//! sidecar` (`docs/config.md`, "Who serves the sidecar's port").
+//! sidecar` (`docs/config.md`, "Who serves the sidecar's port"). Where
+//! one of them applies ([`weaknesses`]: bgpfcd runs as the overflow user,
+//! as `nobody`, or in a user namespace that is not the initial one),
+//! bgpfcd warns at each start of Routinator ([`warn_if_weaker`]), and
+//! `bgpfcd --check` does too, and goes on: the check still refuses every
+//! user it can tell apart from bgpfcd's own.
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -188,6 +193,172 @@ pub(crate) fn same_user(stream: &TcpStream) -> io::Result<()> {
     ))
 }
 
+/// The overflow user of a kernel that does not say otherwise in
+/// `/proc/sys/kernel/overflowuid`: `DEFAULT_OVERFLOWUID` in the kernel's
+/// `include/linux/highuid.h`.
+const DEFAULT_OVERFLOW_UID: u32 = 65534;
+
+/// The kernel's overflow user, the user the socket tables give a socket
+/// whose user the reader's user namespace does not map.
+const OVERFLOW_UID: &str = "/proc/sys/kernel/overflowuid";
+
+/// The user map of this process's user namespace (`user_namespaces(7)`).
+const UID_MAP: &str = "/proc/self/uid_map";
+
+/// The map of the initial user namespace: every user to itself, one line
+/// `0 0 4294967295` (`user_namespaces(7)`).
+const IDENTITY_MAP: [u32; 3] = [0, 0, u32::MAX];
+
+/// Why [`same_user`] tells fewer servers apart where bgpfcd runs than
+/// where it runs as a user of its own in the initial user namespace: the
+/// reasons COMPLIANCE.md has the RFC 8210 §9, §13 row `partial` with
+/// `mode sidecar` (see the module documentation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Weakness {
+    /// bgpfcd runs as the overflow user, this uid, which the socket
+    /// tables give every user the user namespace does not map: a server
+    /// of any such user, root's included, passes for bgpfcd's own.
+    OverflowUser(u32),
+    /// bgpfcd runs as `nobody`, this uid, which other services share: a
+    /// server any of them starts on the port passes for Routinator.
+    Nobody(u32),
+    /// bgpfcd runs in a user namespace whose map is not the identity: the
+    /// tables show every user it does not map as the overflow user, so
+    /// the check cannot tell those users apart.
+    UserNamespace,
+}
+
+impl std::fmt::Display for Weakness {
+    /// Why, in a sentence that stands alone.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Weakness::OverflowUser(uid) => write!(
+                f,
+                "uid {uid} is the overflow uid, which the kernel's socket tables give every \
+                 user this user namespace does not map, so a server of any such user, root's \
+                 included, passes for bgpfcd's own"
+            ),
+            Weakness::Nobody(uid) => write!(
+                f,
+                "uid {uid} is nobody's, which other services share, so a server any of them \
+                 starts on the port passes for Routinator"
+            ),
+            Weakness::UserNamespace => f.write_str(
+                "bgpfcd runs in a user namespace whose uid_map is not the identity, where the \
+                 kernel's socket tables show every user it does not map as the overflow uid, \
+                 so the check cannot tell those users apart",
+            ),
+        }
+    }
+}
+
+/// What weakens [`same_user`] for a bgpfcd that runs as `uid`, given the
+/// kernel's overflow user, `overflow`, the uid `nobody` has in the user
+/// database, if it has one, and the text of `/proc/self/uid_map`, `None`
+/// for a kernel without user namespaces. Pure.
+pub(crate) fn weaknesses(
+    uid: u32,
+    overflow: u32,
+    nobody: Option<u32>,
+    uid_map: Option<&str>,
+) -> Vec<Weakness> {
+    let mut found = Vec::new();
+    if uid == overflow {
+        found.push(Weakness::OverflowUser(uid));
+    }
+    if nobody == Some(uid) {
+        found.push(Weakness::Nobody(uid));
+    }
+    if uid_map.is_some_and(|map| !is_identity_map(map)) {
+        found.push(Weakness::UserNamespace);
+    }
+    found
+}
+
+/// Whether `uid_map`, as `/proc/self/uid_map` gives it, maps every user
+/// to itself: one line, `0 0 4294967295`, however it is padded. An empty
+/// map, a namespace's before its map is written, maps no one.
+fn is_identity_map(uid_map: &str) -> bool {
+    let mut lines = uid_map.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().map(|line| {
+        line.split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+    });
+    matches!(first, Some(Ok(fields)) if fields == IDENTITY_MAP) && lines.next().is_none()
+}
+
+/// The effective uid in the text of `/proc/self/status` (`proc(5)`:
+/// `Uid:` real, effective, saved set, filesystem), as this process's user
+/// namespace sees it.
+pub(crate) fn effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// The overflow user in the text of `/proc/sys/kernel/overflowuid`, or
+/// the kernel's default without one.
+fn overflow_uid(text: Option<&str>) -> u32 {
+    text.and_then(|t| t.trim().parse().ok())
+        .unwrap_or(DEFAULT_OVERFLOW_UID)
+}
+
+/// What weakens [`same_user`] here for a bgpfcd that runs as `uid`, or,
+/// with `None`, as the user this process runs as now, from the kernel and
+/// the user database; and the uid judged. A file that cannot be read
+/// counts as saying nothing: no `uid_map` is the initial namespace, no
+/// `nobody` no such user.
+pub(crate) fn weaker_here(uid: Option<u32>) -> Option<(u32, Vec<Weakness>)> {
+    let read = |path: &str| fs::read_to_string(path).ok();
+    let uid = match uid {
+        Some(uid) => uid,
+        None => effective_uid(&read("/proc/self/status")?)?,
+    };
+    let passwd = read("/etc/passwd").unwrap_or_default();
+    let nobody = bgpfc_sys::lookup_user(&passwd, "nobody").map(|id| id.uid);
+    let found = weaknesses(
+        uid,
+        overflow_uid(read(OVERFLOW_UID).as_deref()),
+        nobody,
+        read(UID_MAP).as_deref(),
+    );
+    Some((uid, found))
+}
+
+/// The reasons the check is weaker, one sentence.
+pub(crate) fn reasons(found: &[Weakness]) -> String {
+    found
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// With `mode sidecar`, at each start of Routinator, a warning if the
+/// owner check of its port is weaker where bgpfcd runs ([`weaker_here`]);
+/// bgpfcd starts it all the same. Whether the check holds is the
+/// operator's to judge, which the warning helps with: running bgpfcd as a
+/// user of its own, in the initial user namespace, is the remedy.
+pub(crate) fn warn_if_weaker() {
+    let Some((uid, found)) = weaker_here(None) else {
+        return;
+    };
+    if found.is_empty() {
+        return;
+    }
+    bgpfc_log::warn!(
+        "rpki sidecar: the owner check of Routinator's port is weaker here; starting anyway",
+        uid = uid,
+        reasons = reasons(&found),
+        hint = "run bgpfcd as a user of its own in the initial user namespace (docs/config.md, \"Who serves the sidecar's port\")"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +516,132 @@ mod tests {
             let (_accepted, _) = listener.accept().unwrap();
             assert_eq!(same_user(&stream).map_err(|e| e.to_string()), Ok(()));
         }
+    }
+
+    /// The initial user namespace's map, however the kernel pads it, and
+    /// nothing else, maps every user to itself.
+    #[test]
+    fn only_the_initial_namespace_maps_every_user_to_itself() {
+        assert!(is_identity_map("         0          0 4294967295\n"));
+        assert!(is_identity_map("0 0 4294967295"));
+        for other in [
+            // A namespace whose map is not written yet, as `unshare -U`.
+            "",
+            "\n",
+            // A rootless container's, and one that maps a single user.
+            "         0     100000      65536\n",
+            "         0       1000          1\n",
+            "0 0 4294967295\n4294967295 1 1\n",
+            "0 0 4294967294\n",
+            "0 0\n",
+            "a b c\n",
+        ] {
+            assert!(!is_identity_map(other), "{other:?}");
+        }
+    }
+
+    /// `Uid:` real, effective, saved set, filesystem: the second.
+    #[test]
+    fn the_effective_uid_comes_from_the_status() {
+        use std::os::unix::fs::MetadataExt as _;
+        let status = "Name:\tbgpfcd\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t42\n\
+                      Uid:\t0\t65534\t65534\t65534\nGid:\t0\t65534\t65534\t65534\n";
+        assert_eq!(effective_uid(status), Some(65534));
+        assert_eq!(effective_uid("Name:\tx\n"), None);
+        assert_eq!(effective_uid("Uid:\t0\n"), None);
+        assert_eq!(effective_uid("Uid:\t0\tx\t0\t0\n"), None);
+        // This process's own, as the kernel writes it: the owner the
+        // kernel gives its `/proc/self`.
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        assert_eq!(
+            effective_uid(&status),
+            Some(fs::metadata("/proc/self").unwrap().uid())
+        );
+    }
+
+    /// The kernel's overflow user, its default 65534 when the file says
+    /// nothing usable.
+    #[test]
+    fn the_overflow_uid_is_the_kernel_s() {
+        assert_eq!(overflow_uid(Some("65534\n")), 65534);
+        assert_eq!(overflow_uid(Some("4000\n")), 4000);
+        assert_eq!(overflow_uid(None), 65534);
+        assert_eq!(overflow_uid(Some("")), 65534);
+        assert_eq!(overflow_uid(Some("-1\n")), 65534);
+    }
+
+    /// What weakens the check: being the overflow user, being `nobody`,
+    /// and a user namespace; each alone, together, or none of them.
+    #[test]
+    fn what_weakens_the_owner_check() {
+        use Weakness::{Nobody, OverflowUser, UserNamespace};
+        const IDENTITY: Option<&str> = Some("         0          0 4294967295\n");
+        // A user of its own in the initial namespace, root included.
+        assert_eq!(weaknesses(998, 65534, Some(65534), IDENTITY), []);
+        assert_eq!(weaknesses(0, 65534, Some(65534), IDENTITY), []);
+        // `nobody`, the overflow user on most systems: both.
+        assert_eq!(
+            weaknesses(65534, 65534, Some(65534), IDENTITY),
+            [OverflowUser(65534), Nobody(65534)]
+        );
+        // `nobody` that is not the overflow user, as uid 99 on older
+        // systems, and the overflow user with no `nobody`.
+        assert_eq!(weaknesses(99, 65534, Some(99), IDENTITY), [Nobody(99)]);
+        assert_eq!(weaknesses(4000, 4000, None, IDENTITY), [OverflowUser(4000)]);
+        // A rootless container's namespace, and one with no map at all,
+        // where bgpfcd is the overflow user itself.
+        assert_eq!(
+            weaknesses(998, 65534, Some(65534), Some("0 100000 65536\n")),
+            [UserNamespace]
+        );
+        assert_eq!(
+            weaknesses(65534, 65534, None, Some("")),
+            [OverflowUser(65534), UserNamespace]
+        );
+        // A kernel without user namespaces has only the initial one.
+        assert_eq!(weaknesses(998, 65534, None, None), []);
+    }
+
+    /// The warning says why, a reason after the other, each standing
+    /// alone.
+    #[test]
+    fn the_reasons_are_one_sentence() {
+        assert_eq!(reasons(&[]), "");
+        assert_eq!(
+            reasons(&[Weakness::Nobody(99), Weakness::UserNamespace]),
+            "uid 99 is nobody's, which other services share, so a server any of them starts \
+             on the port passes for Routinator; bgpfcd runs in a user namespace whose uid_map \
+             is not the identity, where the kernel's socket tables show every user it does not \
+             map as the overflow uid, so the check cannot tell those users apart"
+        );
+        assert!(
+            Weakness::OverflowUser(65534)
+                .to_string()
+                .starts_with("uid 65534 is the overflow uid, ")
+        );
+    }
+
+    /// Here, as the kernel and the user database have it: as `nobody` the
+    /// check is weaker wherever `nobody` exists; as this process's user,
+    /// the judgment is that of the files read now.
+    #[test]
+    fn the_judgment_here_reads_the_kernel() {
+        let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+        if let Some(nobody) = bgpfc_sys::lookup_user(&passwd, "nobody") {
+            let (uid, found) = weaker_here(Some(nobody.uid)).unwrap();
+            assert_eq!(uid, nobody.uid);
+            assert!(found.contains(&Weakness::Nobody(nobody.uid)), "{found:?}");
+        }
+        let (uid, found) = weaker_here(None).unwrap();
+        let overflow = overflow_uid(fs::read_to_string(OVERFLOW_UID).ok().as_deref());
+        assert_eq!(
+            found.contains(&Weakness::OverflowUser(uid)),
+            uid == overflow
+        );
+        let map = fs::read_to_string(UID_MAP).ok();
+        assert_eq!(
+            found.contains(&Weakness::UserNamespace),
+            map.is_some_and(|m| !is_identity_map(&m))
+        );
     }
 }
