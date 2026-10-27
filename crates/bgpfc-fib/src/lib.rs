@@ -62,6 +62,10 @@ pub enum FibError {
     Kernel(i32),
     /// The kernel's reply was malformed.
     Protocol(netlink::NetlinkError),
+    /// The kernel has another route with this destination and metric, in
+    /// this table (`EEXIST`, `<asm-generic/errno-base.h>`): another
+    /// program's, which bgpfcd leaves in place rather than replace it.
+    Occupied,
 }
 
 impl fmt::Display for FibError {
@@ -76,6 +80,10 @@ impl fmt::Display for FibError {
                 )
             }
             FibError::Protocol(e) => write!(f, "netlink reply: {e}"),
+            FibError::Occupied => f.write_str(
+                "another route has this destination and metric (File exists): \
+                 left in place, as bgpfcd replaces no route of another program",
+            ),
         }
     }
 }
@@ -126,14 +134,21 @@ pub struct Change {
 /// of a route it does not have.
 const ESRCH: i32 = 3;
 
+/// `EEXIST`, `<asm-generic/errno-base.h>`: what the kernel answers a route
+/// added with `NLM_F_EXCL` where one has its destination and metric.
+const EEXIST: i32 = 17;
+
 /// What the kernel's answer `errno` (0 for success) to `op` means: the
 /// result and whether the route was already gone. A delete answered
 /// `ESRCH` is done: the kernel removed the route itself, as IPv4 does
-/// with the routes through an interface that goes down.
+/// with the routes through an interface that goes down. A route added
+/// answered `EEXIST` found another program's route at its destination
+/// and metric, which stays ([`FibError::Occupied`]).
 fn outcome(op: &Op, errno: i32) -> (Result<(), FibError>, bool) {
     match (op, errno) {
         (_, 0) => (Ok(()), false),
         (Op::Delete { .. }, ESRCH) => (Ok(()), true),
+        (Op::Set { .. }, EEXIST) => (Err(FibError::Occupied), false),
         (_, e) => (Err(FibError::Kernel(e)), false),
     }
 }
@@ -419,9 +434,19 @@ impl Fib {
         for (seq, op) in (first..).zip(ops) {
             let ack = seq == last;
             self.buf.extend_from_slice(&match op {
-                Op::Set { prefix, hop } => {
+                // A route of ours whose hop changes replaces itself, with
+                // no moment without a route; one not installed yet goes in
+                // only where no route has its destination and metric, so
+                // that another program's is never replaced (AGENTS.md §3).
+                // A batch changes a prefix once at most, so what is
+                // installed is what the operation finds.
+                Op::Set { prefix, hop } if self.routes.installed(prefix).is_some() => {
                     RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
                         .encode_set_with(seq, ack)
+                }
+                Op::Set { prefix, hop } => {
+                    RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
+                        .encode_add_with(seq, ack)
                 }
                 Op::Delete { prefix, hop } => {
                     RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
@@ -809,6 +834,20 @@ mod tests {
         assert!(matches!(outcome(&delete, 0), (Ok(()), false)));
         assert!(matches!(outcome(&set, 0), (Ok(()), false)));
         assert!(matches!(outcome(&delete, ESRCH), (Ok(()), true)));
+        // Another program's route at the destination and metric: it stays.
+        assert!(matches!(
+            outcome(&set, EEXIST),
+            (Err(FibError::Occupied), false)
+        ));
+        assert!(
+            FibError::Occupied
+                .to_string()
+                .starts_with("another route has this destination and metric"),
+        );
+        assert!(matches!(
+            outcome(&delete, EEXIST),
+            (Err(FibError::Kernel(EEXIST)), false)
+        ));
         // Only a delete: a route that cannot be set is a failure.
         assert!(matches!(
             outcome(&set, ESRCH),

@@ -1346,3 +1346,42 @@ proptest! {
         prop_assert_eq!(&a, &b);
     }
 }
+
+#[test]
+fn a_destination_another_program_leaves_is_offered_again() {
+    // The FIB installs a route only where no route of another program has
+    // its destination and metric, and leaves it out while one has; when
+    // that route goes, the best route there is offered again, with the
+    // hop as new and previous both: installed if it was left out, nothing
+    // asked if it is in.
+    let mut rib = Rib::new(LOCAL_AS);
+    let igp = via("198.51.100.0/24", "10.0.0.9", 2, 20);
+    kernel(&mut rib, table(&[connected("10.0.0.0/24", 2), igp]));
+    let (e1, _) = two_peers(&mut rib);
+    send(&mut rib, &e1, &["198.51.100.0/24"], &[65_001], "10.0.0.1");
+    let out = change(
+        &mut rib,
+        &[
+            KernelChange::Gone {
+                prefix: igp.prefix,
+                metric: 20,
+            },
+            KernelChange::Gone {
+                prefix: p("203.0.113.0/24"),
+                metric: 20,
+            },
+        ],
+    );
+    let hop = hop("10.0.0.1", Some(2));
+    assert_eq!(
+        out,
+        [Output::Fib(FibChange {
+            family: V4,
+            prefix: igp.prefix,
+            next_hop: Some(hop),
+            previous: Some(hop),
+        })]
+    );
+    // A route that comes changes no place.
+    assert_eq!(change(&mut rib, &[KernelChange::Route(igp)]), []);
+}

@@ -1052,7 +1052,10 @@ the kernel's notifications (`docs/control.md`, "Next hops"):
   does not resolve. So no route resolves through itself or through
   another that resolves through it (the mutual recursion of RFC 4271
   §9.1.2.1), and installing a route never changes what a next hop
-  resolves to. A blackhole, unreachable, prohibit or throw route resolves
+  resolves to: bgpfcd installs a route only where no route of another
+  program has its destination and metric (see `fib` in the README,
+  "FIB dry-run"), so no route a next hop resolves through is replaced. A
+  blackhole, unreachable, prohibit or throw route resolves
   nothing, and hides a less specific route as in the kernel.
 - Only the main table counts, whatever `fib { table }` says: policy
   routing rules and VRFs are not looked at. A route of another program

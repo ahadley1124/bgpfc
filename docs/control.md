@@ -336,7 +336,15 @@ network, else the gateway of the kernel route that resolves it, and `oif`
 the index of the interface it is reached on. A delete the kernel answers
 `ESRCH`, having removed the route itself, as IPv4 does with the routes
 through an interface that goes down, is done all the same: its line says
-`fib: already gone`, and it counts as a `delete`, not a failure. A
+`fib: already gone`, and it counts as a `delete`, not a failure. A route
+bgpfcd installs for the first time goes in only where the kernel has no
+route with its destination and metric (20, as FRR's zebra gives its own):
+where another program's route is there, the kernel keeps that one and
+answers `EEXIST`, and the route's line is a failure, `error="another route
+has this destination and metric (File exists): left in place, as bgpfcd
+replaces no route of another program"`; `show fib` lists the route
+`pending`. When that route leaves the kernel's table, the RIB offers the
+route again, and it goes in. A
 failed operation has one at error (`fib: failed`, with the kernel's
 `error`), at once, the first three of a change, and three at most between
 two `fib: changes` lines, whatever the number of changes; the others at

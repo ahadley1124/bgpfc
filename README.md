@@ -371,7 +371,11 @@ before and naming the first few, and a line per route at debug
 
 In install mode, bgpfc only touches routes tagged with its own protocol number.
 At startup it flushes stale routes left by a previous run, and it never modifies
-routes it did not create.
+routes it did not create. Its routes have metric 20, as FRR's zebra gives its
+own: where another program's route has the destination and metric of one of
+bgpfc's, as zebra's IGP route to a prefix a neighbor also announces, the
+kernel keeps that route and bgpfc's is not installed, with an error line
+(`another route has this destination and metric`), until that route goes.
 
 ## Run
 

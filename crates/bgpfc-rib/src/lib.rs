@@ -83,7 +83,7 @@ pub use peer::PeerInfo;
 pub use reimport::Reimport;
 pub use validation::{Rejudged, Revalidation, RouteStatus, StartupChange, Transition};
 
-use nexthop::{Hop, KernelUpdate, NextHopReport, NextHops, NextHopsChanged, Shift};
+use nexthop::{Hop, KernelChange, KernelUpdate, NextHopReport, NextHops, NextHopsChanged, Shift};
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
 
@@ -1409,9 +1409,20 @@ impl Rib {
     /// to itself. Give it before any route comes, so that no route is
     /// judged against no table: it then moves nothing.
     pub fn kernel(&mut self, update: KernelUpdate, now: Instant, out: &mut impl Sink) {
+        let freed: Vec<Prefix> = match &update {
+            KernelUpdate::Changes(changes) => changes
+                .iter()
+                .filter_map(|c| match c {
+                    KernelChange::Gone { prefix, .. } => Some(*prefix),
+                    _ => None,
+                })
+                .collect(),
+            KernelUpdate::Table { .. } => Vec::new(),
+        };
         let shifts = self.s.nexthops.update(update);
         if shifts.is_empty() {
             self.s.nexthops.settle();
+            self.offer_again(&freed, out);
             return;
         }
         let (v4, v6) = self.s.nexthops.destinations(&shifts);
@@ -1432,6 +1443,40 @@ impl Rib {
         }));
         self.finish(&mut scratch, now, out);
         self.scratch = scratch;
+        self.offer_again(&freed, out);
+    }
+
+    /// Offer the FIB again the best route to each of `freed`, destinations
+    /// a route of the kernel's table left: the FIB installs a route only
+    /// where no route of another program has its destination and metric,
+    /// and leaves it out while one has (`bgpfc_fib`, `FibError::Occupied`),
+    /// so such a route may be waiting for that place. The change names the
+    /// hop as both new and previous: one the FIB has installed already
+    /// asks for nothing, nor does dry-run, which reports changes of the
+    /// RIB's routes alone.
+    fn offer_again(&mut self, freed: &[Prefix], out: &mut impl Sink) {
+        for &prefix in freed {
+            let family = match prefix {
+                Prefix::V4 { .. } => AddressFamily::IPV4_UNICAST,
+                Prefix::V6 { .. } => AddressFamily::IPV6_UNICAST,
+            };
+            let Some(best) = self
+                .tables
+                .get(family)
+                .and_then(|t| t.get(prefix))
+                .and_then(Destination::best)
+            else {
+                continue;
+            };
+            if let Some(hop) = self.s.nexthops.current_hop(best.next_hop()) {
+                out.put(Output::Fib(FibChange {
+                    family,
+                    prefix,
+                    next_hop: Some(hop),
+                    previous: Some(hop),
+                }));
+            }
+        }
     }
 
     /// Every next hop the routes in the Adj-RIBs-In use, in address order:

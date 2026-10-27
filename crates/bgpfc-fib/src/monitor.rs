@@ -427,8 +427,9 @@ mod tests {
     }
 }
 
-/// The monitor in a network namespace of its own, where routes and
-/// interfaces can be changed without touching the host's. Joining it needs
+/// The monitor, and the FIB beside it, in a network namespace of its own,
+/// where routes and interfaces can be changed without touching the
+/// host's. Joining it needs
 /// `CAP_SYS_ADMIN`, changing it `CAP_NET_ADMIN`. Run as root:
 ///
 /// ```sh
@@ -640,6 +641,72 @@ mod root_tests {
             assert_eq!(after, before);
             let other: Prefix = "198.51.100.0/24".parse().unwrap();
             assert!(after.routes.iter().any(|r| r.dst == other), "{after:?}");
+            assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+        });
+    }
+
+    /// The routes of the namespace's main table with `dst`, as `ip route`
+    /// lists them.
+    fn routes_to(dst: &str) -> String {
+        let out = Command::new("ip")
+            .args(["route", "show", dst])
+            .output()
+            .expect("ip(8)");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A static route with the destination and metric bgpfcd installs
+    /// with stays: bgpfcd's is not installed, and says why; once the
+    /// static route goes, it is, and a route of bgpfcd's whose hop
+    /// changes replaces itself.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN and CAP_NET_ADMIN: joins a network namespace and changes it"]
+    fn netns_routes_of_others_are_never_replaced() {
+        in_namespace(|| {
+            ip("link set lo up");
+            ip("link add fo0 type veth peer name fo1");
+            ip("addr add 10.1.0.1/24 dev fo0");
+            ip("link set fo0 up");
+            ip("link set fo1 up");
+            ip("route add 192.0.2.40/30 via 10.1.0.2 proto static metric 20");
+            let mut fib = Fib::new(Mode::Install, RT_TABLE_MAIN, RTPROT_BGP);
+            fib.open().unwrap();
+            let dst: Prefix = "192.0.2.40/30".parse().unwrap();
+            let hop = |last| crate::Hop {
+                gateway: IpAddr::from([10, 1, 0, last]),
+                oif: None,
+                onlink: false,
+            };
+            let set = |fib: &mut Fib, h, previous| {
+                fib.set(Change {
+                    prefix: dst,
+                    hop: Some(h),
+                    previous,
+                })
+                .unwrap()
+            };
+            let refused = set(&mut fib, hop(3), None);
+            assert!(
+                matches!(refused.result, Err(FibError::Occupied)),
+                "{refused:?}"
+            );
+            assert!(fib.installed().is_empty());
+            let listed = routes_to("192.0.2.40/30");
+            assert!(
+                listed.contains("via 10.1.0.2") && listed.contains("proto static"),
+                "{listed}"
+            );
+            assert!(!listed.contains("proto bgp"), "{listed}");
+            // The static route goes: bgpfcd's goes in, and then moves.
+            ip("route del 192.0.2.40/30 via 10.1.0.2 proto static metric 20");
+            assert!(set(&mut fib, hop(3), None).result.is_ok());
+            assert!(set(&mut fib, hop(4), Some(hop(3))).result.is_ok());
+            let listed = routes_to("192.0.2.40/30");
+            assert_eq!(listed.lines().count(), 1, "{listed}");
+            assert!(
+                listed.contains("via 10.1.0.4") && listed.contains("proto bgp"),
+                "{listed}"
+            );
             assert!(fib.clear().iter().all(|a| a.result.is_ok()));
         });
     }

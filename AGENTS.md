@@ -196,6 +196,12 @@ tests can drive time deterministically.
 - At startup, the FIB thread dumps the routes that carry our protocol number,
   diffs them against the (empty) desired set, and removes the stale ones.
   Never touch routes with another protocol number.
+- A route not installed yet goes in with `NLM_F_EXCL`, so that another
+  program's route with its destination and metric (20, zebra's too) stays:
+  the kernel answers `EEXIST` and the route waits, reported as a failure,
+  until the RIB offers it again once that route leaves the kernel's table.
+  A route of ours whose hop changes replaces itself (`NLM_F_REPLACE`), with
+  no moment without a route.
 - `mode dry-run | install` comes from config, can be overridden with a CLI
   flag, and can be toggled at runtime through the control channel. **The
   default is dry-run.** Switching from dry-run to install performs a full

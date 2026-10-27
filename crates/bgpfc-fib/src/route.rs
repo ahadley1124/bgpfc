@@ -64,8 +64,11 @@ const RTVIA_ADDR_OFFSET: usize = 2;
 /// `sizeof(struct rtmsg)`.
 pub(crate) const RTMSG_LEN: usize = 12;
 
-/// The metric every route we install gets, as BIRD and FRR do for
-/// external BGP routes (`RTA_PRIORITY`).
+/// The metric every route we install gets (`RTA_PRIORITY`), the one FRR's
+/// zebra gives every route it installs. The kernel keeps routes to one
+/// destination with different metrics apart and forwards through the
+/// lowest; one with the same metric would be replaced by ours, so ours
+/// goes in only where none has it ([`RouteMsg::encode_add_with`]).
 pub const METRIC: u32 = 20;
 
 /// A unicast route as this daemon installs or reads it.
@@ -166,10 +169,31 @@ impl RouteMsg {
         p
     }
 
-    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_REPLACE`: add or replace.
+    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_REPLACE`: add, or replace
+    /// the first route with this destination and metric, whoever's it is.
+    /// For a route of ours whose hop changes, which must not leave the
+    /// destination without a route in between.
     #[must_use]
     pub fn encode_set(&self, seq: u32) -> Vec<u8> {
         self.encode_set_with(seq, true)
+    }
+
+    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_EXCL`: add where no route
+    /// has this destination and metric, and only there. The kernel answers
+    /// `EEXIST` where one has: another program's route, which is not ours
+    /// to replace (AGENTS.md §3, "Never touch routes with another protocol
+    /// number"). With an acknowledgement only if `ack`.
+    #[must_use]
+    pub fn encode_add_with(&self, seq: u32, ack: bool) -> Vec<u8> {
+        netlink::encode(
+            RTM_NEWROUTE,
+            netlink::NLM_F_REQUEST
+                | if ack { netlink::NLM_F_ACK } else { 0 }
+                | netlink::NLM_F_CREATE
+                | netlink::NLM_F_EXCL,
+            seq,
+            &self.payload(RT_SCOPE_UNIVERSE, RTN_UNICAST),
+        )
     }
 
     /// As [`RouteMsg::encode_set`], asking for an acknowledgement only if
@@ -418,7 +442,23 @@ mod tests {
             normalise(t.encode_set(1)),
             framed(RTM_NEWROUTE, &TABLE300_PAYLOAD)
         );
-        // Flags we actually send.
+        // `ip route add` asks for NLM_F_EXCL, as a route of ours sent the
+        // first time does.
+        let add = r.encode_add_with(5, true);
+        assert_eq!(
+            u16::from_ne_bytes([add[6], add[7]]),
+            netlink::NLM_F_REQUEST
+                | netlink::NLM_F_ACK
+                | netlink::NLM_F_CREATE
+                | netlink::NLM_F_EXCL
+        );
+        assert_eq!(normalise(add), framed(RTM_NEWROUTE, &ADD4_PAYLOAD));
+        let quiet = r.encode_add_with(5, false);
+        assert_eq!(
+            u16::from_ne_bytes([quiet[6], quiet[7]]),
+            netlink::NLM_F_REQUEST | netlink::NLM_F_CREATE | netlink::NLM_F_EXCL
+        );
+        // Flags we send for a route of ours whose hop changes.
         let m = r.encode_set(9);
         assert_eq!(
             u16::from_ne_bytes([m[6], m[7]]),

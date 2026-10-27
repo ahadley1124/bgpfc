@@ -17,10 +17,17 @@ pub const NLM_F_MULTI: u16 = 0x02;
 pub const NLM_F_ACK: u16 = 0x04;
 /// `NLM_F_DUMP` = `NLM_F_ROOT | NLM_F_MATCH`.
 pub const NLM_F_DUMP: u16 = 0x300;
-/// `NLM_F_REPLACE`.
+/// `NLM_F_REPLACE`: replace the first route with the destination and
+/// metric of the new one, whoever's it is.
 pub const NLM_F_REPLACE: u16 = 0x100;
+/// `NLM_F_EXCL`: add only where no route has the destination and metric
+/// of the new one; the kernel answers `EEXIST` otherwise.
+pub const NLM_F_EXCL: u16 = 0x200;
 /// `NLM_F_CREATE`.
 pub const NLM_F_CREATE: u16 = 0x400;
+/// `NLM_F_APPEND`: add after the routes with the same destination and
+/// metric.
+pub const NLM_F_APPEND: u16 = 0x800;
 
 /// `sizeof(struct nlmsghdr)`.
 pub const HEADER_LEN: usize = 16;

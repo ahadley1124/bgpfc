@@ -402,6 +402,41 @@ impl Routed {
         }
     }
 
+    /// A static route with the destination and metric of C's route, there
+    /// before bgpfcd installs it, stays (AGENTS.md §3: never touch a route
+    /// of another protocol): bgpfcd's is left out, with a failure line,
+    /// and `show fib` lists it pending; once the static route goes, it is
+    /// installed.
+    fn assert_another_programs_route_stays(&self, e: &Expect) {
+        let a = self.lab.a_addr.to_string();
+        let next_hop = format!("{}/32", self.lo.c_next_hop);
+        self.ip_in_b(&["route", "del", &next_hop]);
+        let gone = wait_for(Duration::from_secs(10), || self.installed().is_empty());
+        assert!(gone, "{}", self.report());
+        let static_route = [C_ROUTE, "via", &a, "proto", "static", "metric", "20"];
+        self.ip_in_b(&[&["route", "add"][..], &static_route].concat());
+        let before = self.bgpfcd.log_text().len();
+        self.ip_in_b(&["route", "add", &next_hop, "via", &a, "proto", "static"]);
+        let refused = "another route has this destination and metric";
+        let ok = wait_for(Duration::from_secs(10), || {
+            self.bgpfcd.log_text()[before..].contains(refused)
+        });
+        assert!(ok, "{}", self.report());
+        let kernel = Daemon::ip_in(&self.lab, &self.lab.b, &["route", "show", C_ROUTE]);
+        assert!(
+            kernel.contains("proto static") && !kernel.contains("proto bgp"),
+            "{kernel}"
+        );
+        let fib = self.ctl(&["show", "fib"]).0;
+        assert!(
+            fib.lines()
+                .any(|l| l.starts_with(&format!("{C_ROUTE} ")) && l.ends_with(" pending")),
+            "{fib}"
+        );
+        self.ip_in_b(&[&["route", "del"][..], &static_route].concat());
+        self.assert_in_use(e);
+    }
+
     /// C's route is the best, installed through A, which has it from
     /// bgpfcd, and its next hop resolves through the static route.
     fn assert_in_use(&self, e: &Expect) {
@@ -537,6 +572,7 @@ fn routes_install_via_the_resolved_gateway_and_follow_it() {
     s.assert_in_use(&e);
     s.assert_held_when_the_next_hop_goes();
     s.assert_back_when_the_next_hop_returns(&e);
+    s.assert_another_programs_route_stays(&e);
 
     // The session with C was never touched: one session, still up.
     assert!(s.neighbor_c().contains("state Established"));
