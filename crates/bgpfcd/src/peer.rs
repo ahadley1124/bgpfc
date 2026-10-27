@@ -8,9 +8,17 @@
 //! (AFI/SAFI disable is reported to the RIB, the session kept); RFC 2918
 //! §4 (ROUTE-REFRESH for an unadvertised family is ignored); RFC 9003 §2
 //! (a received Shutdown Communication is logged).
+//!
+//! Its own connections go out with the neighbor's TTL and from its
+//! `local-address` (`bgpfc_sys::TcpConnect`); a connection that fails, or
+//! closes with a socket error before the session is up, is kept as the
+//! peer's last error, logged at warn when it differs from the one before,
+//! with a hint when TTL 1 is the likely cause (`docs/config.md`,
+//! "Neighbors").
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -18,6 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bgpfc_fsm::{Action, Event, Fsm, Session, State};
+use bgpfc_log::Level;
 use bgpfc_wire::error::{CeaseSubcode, DecodeError, ErrorCode, OpenSubcode};
 use bgpfc_wire::header::{MessageType, frame};
 use bgpfc_wire::keepalive::KEEPALIVE;
@@ -59,6 +68,16 @@ pub(crate) struct PeerConfig {
     pub(crate) fsm: bgpfc_fsm::Config,
     /// Accept `AS_SET` in UPDATEs (RFC 9774 §3 override).
     pub(crate) allow_as_set: bool,
+    /// The TTL every segment to the neighbor is sent with, on our
+    /// connections and on accepted ones; `None` keeps the system's.
+    pub(crate) ttl: Option<NonZeroU8>,
+    /// `local-address`: our connections are bound to it, and accepted
+    /// ones to another local address refused.
+    pub(crate) local: Option<IpAddr>,
+    /// An external neighbor without `multihop`, sent TTL 1: one that
+    /// cannot be reached may simply be more than one hop away, which the
+    /// log then says.
+    pub(crate) single_hop: bool,
 }
 
 /// How other threads reach a peer thread.
@@ -68,6 +87,12 @@ pub(crate) struct PeerHandle {
     pub(crate) addr: IpAddr,
     /// Its input queue.
     pub(crate) tx: SyncSender<PeerInput>,
+    /// The TTL the listener sets on a connection from the neighbor
+    /// ([`PeerConfig::ttl`]).
+    pub(crate) ttl: Option<NonZeroU8>,
+    /// The only local address the listener takes a connection from the
+    /// neighbor on ([`PeerConfig::local`]).
+    pub(crate) local: Option<IpAddr>,
     /// UPDATEs for the peer, from the RIB thread: see [`Outbox`].
     outbox: Sender<Vec<Vec<u8>>>,
     /// Shared with the peer thread.
@@ -118,6 +143,8 @@ impl PeerHandle {
         PeerHandle {
             addr,
             tx,
+            ttl: None,
+            local: None,
             outbox: channel().0,
             state: Arc::default(),
             prefix_limit: Arc::default(),
@@ -157,6 +184,9 @@ struct Conn {
     stream: TcpStream,
     extended: Arc<AtomicBool>,
     initiator: Initiator,
+    /// Whether the session came up on it: a socket error it closes with
+    /// before then is the peer's last error.
+    up: bool,
 }
 
 /// One neighbour's thread state.
@@ -181,6 +211,10 @@ pub(crate) struct Peer {
     refresh: Arc<Mutex<Vec<AddressFamily>>>,
     /// When the FSM last changed state.
     state_since: Instant,
+    /// The last connection error, and when it happened: a failed
+    /// connect, or a socket error a connection closed with before the
+    /// session came up on it. Cleared when a session comes up.
+    last_error: Option<(String, Instant)>,
     updates_in: u64,
     updates_out: u64,
     #[cfg(feature = "profiling")]
@@ -199,6 +233,8 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
+        ttl: cfg.ttl,
+        local: cfg.local,
         outbox: outbox_tx,
         state: Arc::clone(&state),
         prefix_limit: Arc::clone(&prefix_limit),
@@ -222,6 +258,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         prefix_limit,
         refresh,
         state_since: Instant::now(),
+        last_error: None,
         updates_in: 0,
         updates_out: 0,
         #[cfg(feature = "profiling")]
@@ -358,10 +395,12 @@ impl Peer {
                         hold = session.hold_time,
                         families = session.families.len()
                     );
-                    if let Some(c) = &self.conn {
+                    if let Some(c) = &mut self.conn {
                         c.extended
                             .store(session.extended_messages, Ordering::Relaxed);
+                        c.up = true;
                     }
+                    self.last_error = None;
                     self.session = Some(session.clone());
                     let local_addr = self
                         .conn
@@ -413,7 +452,7 @@ impl Peer {
                 match result {
                     Ok(stream) => self.accept_stream(stream, Initiator::Local, now),
                     Err(e) => {
-                        bgpfc_log::debug!("connect failed", peer = self.cfg.addr, error = e);
+                        self.connection_failed("connect failed", "error", &e, now);
                         if self.conn.is_none() {
                             self.event(Event::TcpConnectionFails, now);
                         }
@@ -470,6 +509,17 @@ impl Peer {
                     remote_as: self.cfg.fsm.remote_as,
                     state: self.fsm.state(),
                     since: now.saturating_duration_since(self.state_since),
+                    local_addr: self
+                        .conn
+                        .as_ref()
+                        .and_then(|c| c.stream.local_addr().ok())
+                        .map(|a| crate::coordinator::canonical(a.ip()))
+                        .or(self.cfg.local),
+                    ttl: self.cfg.ttl,
+                    last_error: self
+                        .last_error
+                        .as_ref()
+                        .map(|(e, at)| (e.clone(), now.saturating_duration_since(*at))),
                     session: self.session.clone(),
                     updates_in: self.updates_in,
                     updates_out: self.updates_out,
@@ -657,18 +707,26 @@ impl Peer {
             stream,
             extended: Arc::new(AtomicBool::new(false)),
             initiator,
+            up: false,
         }
     }
 
+    /// Connect with the neighbor's TTL, from its `local-address`, on a
+    /// thread of its own (one code path for every neighbor, with or
+    /// without them).
     fn start_connect(&mut self) {
         self.attempt += 1;
         let attempt = self.attempt;
         let target = SocketAddr::new(self.cfg.addr, self.cfg.port);
         let tx = self.tx.clone();
+        let connect = bgpfc_sys::TcpConnect {
+            ttl: self.cfg.ttl,
+            local: self.cfg.local,
+        };
         let spawned = thread::Builder::new()
             .name(format!("connect-{}", self.cfg.addr))
             .spawn(move || {
-                let result = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT);
+                let result = connect.connect(target, CONNECT_TIMEOUT);
                 let _ = tx.send(PeerInput::Connected { attempt, result });
             });
         if spawned.is_err() {
@@ -683,8 +741,39 @@ impl Peer {
         #[cfg(feature = "profiling")]
         self.open_timer.reset();
         if let Some(c) = self.conn.take() {
+            // An ICMP error for what we sent leaves a soft error on the
+            // socket and nothing else: with TTL 1 to a neighbor two hops
+            // away, an accepted connection's OPEN dies at the router and
+            // the session waits in OpenSent for its hold timer.
+            if !c.up
+                && let Ok(Some(e)) = c.stream.take_error()
+            {
+                self.connection_failed(
+                    "connection closed with a socket error",
+                    "socket_error",
+                    &e,
+                    Instant::now(),
+                );
+            }
             let _ = c.stream.shutdown(Shutdown::Both);
         }
+    }
+
+    /// Log a connection error, folded, and keep it as the last one.
+    fn connection_failed(&mut self, msg: &str, key: &'static str, error: &io::Error, now: Instant) {
+        let text = error.to_string();
+        let previous = self.last_error.as_ref().map(|(e, _)| e.as_str());
+        let (level, hint) = failure(previous, error, self.cfg.single_hop);
+        let mut fields = vec![
+            ("peer", self.cfg.addr.to_string()),
+            (key, text.clone()),
+            ("ttl", ttl_text(self.cfg.ttl)),
+        ];
+        if let Some(hint) = hint {
+            fields.push(("hint", hint.to_owned()));
+        }
+        crate::rib::log_line(level, msg, &fields);
+        self.last_error = Some((text, now));
     }
 
     /// Write the UPDATEs waiting in the outbox, or drop them outside
@@ -925,6 +1014,38 @@ impl Peer {
     }
 }
 
+/// What an external neighbor without `multihop` is told when it cannot be
+/// reached (`docs/config.md`, "Neighbors").
+pub(crate) const MULTIHOP_HINT: &str = "external neighbor: more than one hop away needs multihop";
+
+/// How a connection error is logged: at warn when it differs from the
+/// `previous` one, at debug when it repeats it, so that a neighbor that
+/// stays unreachable gives one warning and not one per retry; and with
+/// [`MULTIHOP_HINT`] when the neighbor is sent TTL 1 (`single_hop`) and the
+/// error is what an expired TTL gives: an ICMP Time Exceeded makes Linux
+/// fail a connect with `EHOSTUNREACH`, a router may answer
+/// `ENETUNREACH`, and one that answers nothing leaves a timeout.
+fn failure(
+    previous: Option<&str>,
+    error: &io::Error,
+    single_hop: bool,
+) -> (Level, Option<&'static str>) {
+    let repeated = previous.is_some_and(|p| p == error.to_string());
+    let level = if repeated { Level::Debug } else { Level::Warn };
+    let ttl_expired = matches!(
+        error.kind(),
+        io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::TimedOut
+    );
+    (level, (single_hop && ttl_expired).then_some(MULTIHOP_HINT))
+}
+
+/// A neighbor's TTL as the log and `show neighbor` write it.
+pub(crate) fn ttl_text(ttl: Option<NonZeroU8>) -> String {
+    ttl.map_or_else(|| "system default".to_owned(), |t| t.to_string())
+}
+
 /// What the FSM is fed for `bgpfcctl clear neighbor`: a `ManualStop` with
 /// RFC 4486 §4 Administrative Reset, carrying the RFC 9003 communication
 /// when one was given, then a `ManualStart`. The stop is the operator's,
@@ -1014,6 +1135,40 @@ mod tests {
     use super::*;
     use bgpfc_wire::capability::Capability;
     use bgpfc_wire::mp::{MpReach, MpUnreach, NextHop};
+
+    /// docs/config.md, "Neighbors": one warning per new error, with the
+    /// hint where TTL 1 is the likely cause, and debug while it repeats.
+    #[test]
+    fn connect_errors_are_folded_with_a_hint() {
+        let unreachable = io::Error::from_raw_os_error(113); // EHOSTUNREACH
+        let no_network = io::Error::from_raw_os_error(101); // ENETUNREACH
+        let refused = io::Error::from_raw_os_error(111); // ECONNREFUSED
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "connection timed out");
+        let hint = Some(MULTIHOP_HINT);
+        // The first of its kind: a warning, with the hint for a
+        // single-hop neighbor and the errors an expired TTL gives.
+        assert_eq!(failure(None, &unreachable, true), (Level::Warn, hint));
+        assert_eq!(failure(None, &no_network, true), (Level::Warn, hint));
+        assert_eq!(failure(None, &timed_out, true), (Level::Warn, hint));
+        assert_eq!(failure(None, &refused, true), (Level::Warn, None));
+        // With `multihop`, or an internal neighbor: no hint.
+        assert_eq!(failure(None, &unreachable, false), (Level::Warn, None));
+        // The same again: debug, hint and all.
+        let same = unreachable.to_string();
+        assert_eq!(
+            failure(Some(&same), &unreachable, true),
+            (Level::Debug, hint)
+        );
+        // Another error: a warning again.
+        assert_eq!(failure(Some(&same), &refused, true), (Level::Warn, None));
+        assert_eq!(
+            failure(Some(&refused.to_string()), &unreachable, true),
+            (Level::Warn, hint)
+        );
+        assert_eq!(ttl_text(NonZeroU8::new(1)), "1");
+        assert_eq!(ttl_text(Some(NonZeroU8::MAX)), "255");
+        assert_eq!(ttl_text(None), "system default");
+    }
 
     #[test]
     fn families_we_did_not_advertise_are_named_once() {

@@ -1,5 +1,6 @@
 //! From the validated configuration to what the threads need.
 
+use std::num::NonZeroU8;
 use std::time::{Duration, Instant};
 
 use bgpfc_config::ast::{self, Neighbor};
@@ -55,11 +56,29 @@ pub(crate) fn peer_config(local_as: Asn, router_id: RouterId, n: &Neighbor) -> P
     }
     // RFC 4271 §10: jitter from something that differs per process.
     fsm.jitter_seed = jitter_seed(&n.addr);
+    let (ttl, single_hop) = ttl(local_as, n);
     PeerConfig {
         addr: n.addr,
         port: n.port,
         fsm,
         allow_as_set: n.allow_as_set,
+        ttl,
+        local: n.local_address,
+        single_hop,
+    }
+}
+
+/// The TTL `n` is sent with, and whether it is an external neighbor held
+/// to one hop. As FRR and BIRD do: an external neighbor is taken to be
+/// directly connected, TTL 1, unless `multihop` says otherwise; an
+/// internal one keeps the system's TTL (`None`) unless `multihop` sets
+/// one (`docs/config.md`, "Neighbors").
+fn ttl(local_as: Asn, n: &Neighbor) -> (Option<NonZeroU8>, bool) {
+    let external = n.remote_as != local_as;
+    match n.multihop {
+        Some(ttl) => (Some(ttl), false),
+        None if external => (Some(NonZeroU8::MIN), true),
+        None => (None, false),
     }
 }
 
@@ -191,6 +210,48 @@ mod tests {
         assert_eq!(q.fsm.damping, Some(Damping::default()));
         assert_eq!(q.fsm.hold_time.secs(), 90);
         assert_eq!(q.fsm.capabilities.len(), 4);
+    }
+
+    /// docs/config.md, "Neighbors": TTL 1 to an external neighbor unless
+    /// `multihop`, the system's to an internal one unless `multihop`.
+    #[test]
+    fn external_neighbors_send_with_ttl_one_unless_multihop() {
+        let cfg = bgpfc_config::parse_str(
+            "t",
+            "router-id 192.0.2.1; local-as 65000;
+             policy A { term t { action accept; } }
+             neighbor 192.0.2.2 { remote-as 65001; import A; export A; }
+             neighbor 192.0.2.3 { remote-as 65001; import A; export A; multihop; }
+             neighbor 192.0.2.4 { remote-as 65001; import A; export A; multihop 2; }
+             neighbor 192.0.2.5 { remote-as 65000; import A; export A; }
+             neighbor 192.0.2.6 { remote-as 65000; import A; export A; multihop; }
+             neighbor 192.0.2.7 { remote-as 65000; import A; export A; multihop 3; }
+             neighbor 192.0.2.8 {
+                 remote-as 65001; import A; export A; local-address 192.0.2.1;
+             }",
+        )
+        .unwrap();
+        let sent: Vec<(Option<u8>, bool, Option<IpAddr>)> = cfg
+            .neighbors
+            .iter()
+            .map(|n| {
+                let p = peer_config(cfg.local_as, cfg.router_id, n);
+                (p.ttl.map(NonZeroU8::get), p.single_hop, p.local)
+            })
+            .collect();
+        let local: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            sent,
+            [
+                (Some(1), true, None),
+                (Some(255), false, None),
+                (Some(2), false, None),
+                (None, false, None),
+                (Some(255), false, None),
+                (Some(3), false, None),
+                (Some(1), true, Some(local)),
+            ]
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show neighbor ADDR` | the same in detail: the session's `local address` (the connection's, else the configured `local-address`, else `-`), the `ttl` bgpfcd sends the neighbor with (`1` for an external neighbor without `multihop`, the `multihop` value, or `system default`), and until a session comes up the `last error` of a connection, with how long ago it was (a failed connect, or a socket error a connection closed with, such as the `No route to host` of a neighbor TTL 1 does not reach: `docs/config.md`, "Neighbors"); routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
 | `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement`, `held by startup` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode and enforcement, whether validation is off, waiting for its first data or active, Routinator's state with `mode sidecar`, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
@@ -96,6 +96,7 @@ Example objects:
  "rpki":{"mode":"sidecar","validation":"active"},"alarms":["rpki-sidecar-failed"]}
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
+  "local_address":"198.51.100.2","ttl":1,"last_error":null,"last_error_seconds_ago":null,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
   "received":2,"held":1,"advertised":1,
   "prefixes":[{"family":"ipv4-unicast","received":2,"held":1,"advertised":1,"limit":1000},

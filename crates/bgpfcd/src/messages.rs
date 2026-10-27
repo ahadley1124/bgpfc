@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime};
@@ -119,6 +120,15 @@ pub(crate) struct PeerReport {
     pub(crate) state: bgpfc_fsm::State,
     /// How long the state has been held.
     pub(crate) since: Duration,
+    /// Our address on the connection the FSM runs on, else the configured
+    /// `local-address`, if any.
+    pub(crate) local_addr: Option<IpAddr>,
+    /// The TTL sent to the neighbor; `None` for the system's.
+    pub(crate) ttl: Option<NonZeroU8>,
+    /// The last connection error and how long ago it was, until a session
+    /// comes up: a failed connect, or a socket error a connection closed
+    /// with before its session was up (`docs/config.md`, "Neighbors").
+    pub(crate) last_error: Option<(String, Duration)>,
     /// Negotiated session, when Established.
     pub(crate) session: Option<Session>,
     /// UPDATEs received since the thread started.

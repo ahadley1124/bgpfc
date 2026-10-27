@@ -1359,6 +1359,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);
@@ -1425,6 +1428,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);
@@ -1659,6 +1665,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);

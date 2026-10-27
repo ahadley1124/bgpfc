@@ -21,6 +21,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::num::NonZeroU8;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -1198,6 +1199,13 @@ fn write_neighbor(
         .field_num("remote_as", r.remote_as.0)
         .field_display("state", r.state)
         .field_num("since_seconds", r.since.as_secs())
+        .field_opt("local_address", r.local_addr)
+        .field_opt_num("ttl", r.ttl.map(NonZeroU8::get))
+        .field_opt("last_error", r.last_error.as_ref().map(|(e, _)| e))
+        .field_opt_num(
+            "last_error_seconds_ago",
+            r.last_error.as_ref().map(|(_, ago)| ago.as_secs()),
+        )
         .field_bool("admin_down", r.admin_down)
         .field_bool("restart_limit_reached", r.restart_limit_reached)
         .field_num("updates_in", r.updates_in)
@@ -1291,12 +1299,24 @@ fn render_neighbor(r: &PeerReport, stats: &[(bgpfc_rib::PeerInfo, bgpfc_rib::Pee
         format!("neighbor {}", r.addr),
         format!("  remote-as {}", r.remote_as),
         format!("  state {} for {}s", r.state, r.since.as_secs()),
+        format!(
+            "  local address {}",
+            r.local_addr
+                .map_or_else(|| "-".to_owned(), |a| a.to_string())
+        ),
+        format!("  ttl {}", crate::peer::ttl_text(r.ttl)),
+    ];
+    // docs/config.md, "Neighbors": why the session does not come up.
+    if let Some((error, ago)) = &r.last_error {
+        lines.push(format!("  last error {error} ({}s ago)", ago.as_secs()));
+    }
+    lines.extend([
         format!("  updates in {} out {}", r.updates_in, r.updates_out),
         format!(
             "  routes received {} held {} advertised {}",
             all.received, all.held, all.advertised
         ),
-    ];
+    ]);
     for (family, c, limit) in per_family(stats, r.addr) {
         lines.push(format!(
             "    {family} received {} held {} advertised {}{}",
@@ -1988,6 +2008,9 @@ mod tests {
             remote_as: Asn(65_001),
             state: bgpfc_fsm::State::Established,
             since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
             session: Some(session.clone()),
             updates_in: 0,
             updates_out: 0,
@@ -2068,6 +2091,9 @@ mod tests {
             remote_as: Asn(65_001),
             state: bgpfc_fsm::State::Established,
             since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
             session: Some(bgpfc_fsm::Session {
                 peer_as: Asn(65_001),
                 peer_router_id: RouterId::new(2).unwrap(),
@@ -2112,6 +2138,76 @@ mod tests {
         assert!(r.json.contains(r#""prefixes":[]"#), "{}", r.json);
     }
 
+    /// docs/config.md, "Neighbors": the address the session runs from, its
+    /// TTL, and why it does not come up.
+    #[test]
+    fn neighbor_detail_shows_the_local_address_ttl_and_last_error() {
+        let mut report = PeerReport {
+            addr: "10.255.7.3".parse().unwrap(),
+            remote_as: Asn(65_003),
+            state: bgpfc_fsm::State::Active,
+            since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
+            session: None,
+            updates_in: 0,
+            updates_out: 0,
+            admin_down: false,
+            restart_limit_reached: false,
+        };
+        let r = render_neighbor(&report, &[]);
+        assert!(
+            r.lines.contains(&"  local address -".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.lines.contains(&"  ttl system default".to_owned()),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            !r.lines.iter().any(|l| l.contains("last error")),
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(
+                r#""local_address":null,"ttl":null,"last_error":null,"last_error_seconds_ago":null"#
+            ),
+            "{}",
+            r.json
+        );
+        report.local_addr = Some("10.255.7.2".parse().unwrap());
+        report.ttl = NonZeroU8::new(1);
+        report.last_error = Some((
+            "No route to host (os error 113)".to_owned(),
+            Duration::from_secs(12),
+        ));
+        let r = render_neighbor(&report, &[]);
+        assert_eq!(
+            r.lines[3..6],
+            [
+                "  local address 10.255.7.2".to_owned(),
+                "  ttl 1".to_owned(),
+                "  last error No route to host (os error 113) (12s ago)".to_owned(),
+            ],
+            "{:?}",
+            r.lines
+        );
+        assert!(
+            r.json.contains(
+                r#""local_address":"10.255.7.2","ttl":1,"last_error":"No route to host (os error 113)","last_error_seconds_ago":12"#
+            ),
+            "{}",
+            r.json
+        );
+        // The list of neighbors has it too.
+        let r = render_neighbors(std::slice::from_ref(&report), &[]);
+        assert!(r.json.contains(r#""ttl":1"#), "{}", r.json);
+    }
+
     #[test]
     fn neighbor_detail_says_when_the_restart_limit_stopped_it() {
         let mut report = PeerReport {
@@ -2119,6 +2215,9 @@ mod tests {
             remote_as: Asn(65_001),
             state: bgpfc_fsm::State::Idle,
             since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
             session: None,
             updates_in: 0,
             updates_out: 0,
@@ -2156,6 +2255,9 @@ mod tests {
             remote_as: Asn(65_001),
             state: bgpfc_fsm::State::Idle,
             since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
             session: None,
             updates_in: 0,
             updates_out: 0,
@@ -2419,6 +2521,9 @@ mod tests {
             remote_as: Asn(65_001),
             state: bgpfc_fsm::State::Established,
             since: Duration::from_secs(5),
+            local_addr: None,
+            ttl: None,
+            last_error: None,
             session: None,
             updates_in: 0,
             updates_out: 0,
