@@ -211,12 +211,63 @@ value-errors.conf:67:5: `backoff` takes 2 arguments, found 1
 value-errors.conf:67:5: `backoff` is given more than once
       backoff 1;
       ^
-value-errors.conf:68:5: unknown statement `frobnicate` in `rpki`
+value-errors.conf:68:5: `tcp-keepalive` needs at least one of `idle N`, `interval N` and `count N`
+      tcp-keepalive;
+      ^
+value-errors.conf:69:5: `tcp-keepalive` is given more than once
+      tcp-keepalive idle 0;
+      ^
+value-errors.conf:69:24: tcp-keepalive idle must be between 1 and 32767 seconds (the kernel's MAX_TCP_KEEPIDLE)
+      tcp-keepalive idle 0;
+                         ^
+value-errors.conf:70:5: `tcp-keepalive` is given more than once
+      tcp-keepalive interval 32768;
+      ^
+value-errors.conf:70:28: tcp-keepalive interval must be between 1 and 32767 seconds (the kernel's MAX_TCP_KEEPINTVL)
+      tcp-keepalive interval 32768;
+                             ^
+value-errors.conf:71:5: `tcp-keepalive` is given more than once
+      tcp-keepalive count 128;
+      ^
+value-errors.conf:71:25: tcp-keepalive count must be between 1 and 127 (the kernel's MAX_TCP_KEEPCNT)
+      tcp-keepalive count 128;
+                          ^
+value-errors.conf:72:5: `tcp-keepalive` is given more than once
+      tcp-keepalive count 0;
+      ^
+value-errors.conf:72:25: tcp-keepalive count must be between 1 and 127 (the kernel's MAX_TCP_KEEPCNT)
+      tcp-keepalive count 0;
+                          ^
+value-errors.conf:73:5: `tcp-keepalive` is given more than once
+      tcp-keepalive idle 60 idle 30;
+      ^
+value-errors.conf:73:27: `idle` is given more than once
+      tcp-keepalive idle 60 idle 30;
+                            ^
+value-errors.conf:74:5: `tcp-keepalive` is given more than once
+      tcp-keepalive idle;
+      ^
+value-errors.conf:74:19: `idle` needs a value
+      tcp-keepalive idle;
+                    ^
+value-errors.conf:75:5: `tcp-keepalive` is given more than once
+      tcp-keepalive probes 5;
+      ^
+value-errors.conf:75:19: expected `idle`, `interval` or `count`, found `probes`
+      tcp-keepalive probes 5;
+                    ^
+value-errors.conf:76:5: `tcp-keepalive` is given more than once
+      tcp-keepalive idle soon;
+      ^
+value-errors.conf:76:24: `soon` is not a number of seconds
+      tcp-keepalive idle soon;
+                         ^
+value-errors.conf:77:5: unknown statement `frobnicate` in `rpki`
       frobnicate yes;
       ^
-value-errors.conf:70:1: `rpki` needs a `mode` (`disabled`, `external` or `sidecar`)
+value-errors.conf:79:1: `rpki` needs a `mode` (`disabled`, `external` or `sidecar`)
   rpki { cache 192.0.2.9; }
   ^
-value-errors.conf:70:1: `rpki` is given more than once
+value-errors.conf:79:1: `rpki` is given more than once
   rpki { cache 192.0.2.9; }
   ^

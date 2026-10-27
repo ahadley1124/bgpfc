@@ -29,8 +29,8 @@ use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
 
 use crate::ast::{
     Action, CommunityOp, Config, Control, DEFAULT_RESTART_LIMIT, Fib, FibMode, Http, Match,
-    Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiMode, RpkiSidecar,
-    SendHoldTime, SetAction, Term,
+    Neighbor, Policy, PrefixEntry, PrefixList, Rpki, RpkiCache, RpkiKeepalive, RpkiMode,
+    RpkiSidecar, SendHoldTime, SetAction, Term,
 };
 use crate::error::{ConfigError, Pos};
 use crate::parser::{Arg, Statement};
@@ -679,6 +679,110 @@ impl Lowerer {
         })
     }
 
+    /// `tcp-keepalive [idle N] [interval N] [count N]`: each option at
+    /// most once, in any order, and at least one; one not given keeps its
+    /// default, as with the options of `cache`. Keywords rather than three
+    /// numbers in a row, as `backoff` has two, so that the two times cannot
+    /// be swapped unseen; named after the socket options they set
+    /// (`TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `tcp(7)`). The
+    /// bounds are the kernel's, which would refuse anything else with
+    /// `EINVAL` when bgpfcd sets them.
+    fn tcp_keepalive(&mut self, s: &Statement) -> Option<RpkiKeepalive> {
+        if s.block.is_some() {
+            self.err(s.pos, "`tcp-keepalive` does not take a block");
+            return None;
+        }
+        if s.args.is_empty() {
+            self.err(
+                s.pos,
+                "`tcp-keepalive` needs at least one of `idle N`, `interval N` and `count N`",
+            );
+            return None;
+        }
+        let mut idle = None;
+        let mut interval = None;
+        let mut count = None;
+        let mut rest = s.args.iter();
+        while let Some(kw) = rest.next() {
+            let given = match kw.value.as_str() {
+                "idle" => idle.is_some(),
+                "interval" => interval.is_some(),
+                "count" => count.is_some(),
+                other => {
+                    self.err(
+                        kw.pos,
+                        format!("expected `idle`, `interval` or `count`, found `{other}`"),
+                    );
+                    return None;
+                }
+            };
+            let Some(value) = rest.next() else {
+                self.err(kw.pos, format!("`{}` needs a value", kw.value));
+                return None;
+            };
+            if given {
+                self.err(kw.pos, format!("`{}` is given more than once", kw.value));
+                return None;
+            }
+            match kw.value.as_str() {
+                "idle" => {
+                    idle = Some(self.keepalive_secs(value, "idle", RpkiKeepalive::MAX_IDLE)?);
+                }
+                "interval" => {
+                    interval = Some(self.keepalive_secs(
+                        value,
+                        "interval",
+                        RpkiKeepalive::MAX_INTERVAL,
+                    )?);
+                }
+                _ => {
+                    let n: u32 = self.parse(value, "a number of probes")?;
+                    if !(1..=RpkiKeepalive::MAX_COUNT).contains(&n) {
+                        self.err(
+                            value.pos,
+                            format!(
+                                "tcp-keepalive count must be between 1 and {} (the kernel's \
+                                 MAX_TCP_KEEPCNT)",
+                                RpkiKeepalive::MAX_COUNT
+                            ),
+                        );
+                        return None;
+                    }
+                    count = Some(n);
+                }
+            }
+        }
+        let d = RpkiKeepalive::DEFAULT;
+        Some(RpkiKeepalive {
+            idle: idle.unwrap_or(d.idle),
+            interval: interval.unwrap_or(d.interval),
+            count: count.unwrap_or(d.count),
+        })
+    }
+
+    /// The seconds of a `tcp-keepalive` time `what`, from 1 to `max`.
+    fn keepalive_secs(&mut self, a: &Arg, what: &str, max: Duration) -> Option<Duration> {
+        let n: u32 = self.parse(a, "a number of seconds")?;
+        let d = Duration::from_secs(u64::from(n));
+        if d.is_zero() || d > max {
+            let constant = if what == "idle" {
+                "MAX_TCP_KEEPIDLE"
+            } else {
+                "MAX_TCP_KEEPINTVL"
+            };
+            self.err(
+                a.pos,
+                format!(
+                    "tcp-keepalive {what} must be between 1 and {} seconds (the kernel's \
+                     {constant})",
+                    max.as_secs()
+                ),
+            );
+            return None;
+        }
+        Some(d)
+    }
+
     /// `max-expire N` within the range RFC 8210 §6 gives the Expire
     /// Interval it caps.
     fn max_expire(&mut self, s: &Statement) -> Option<Duration> {
@@ -1207,6 +1311,7 @@ struct RpkiBuilder {
     max_expire: Once<Duration>,
     max_vrps: Once<u32>,
     backoff: Once<(Duration, Duration)>,
+    tcp_keepalive: Once<RpkiKeepalive>,
 }
 
 impl RpkiBuilder {
@@ -1227,6 +1332,7 @@ impl RpkiBuilder {
             max_expire: Once::new("max-expire"),
             max_vrps: Once::new("max-vrps"),
             backoff: Once::new("backoff"),
+            tcp_keepalive: Once::new("tcp-keepalive"),
         }
     }
 
@@ -1322,6 +1428,11 @@ impl RpkiBuilder {
                 let v = l.backoff(t);
                 self.backoff.set(l, t.pos, v);
             }
+            "tcp-keepalive" => {
+                // RFC 8210 §9: routers "SHOULD enable keep-alives".
+                let v = l.tcp_keepalive(t);
+                self.tcp_keepalive.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`rpki`"),
         }
     }
@@ -1390,6 +1501,7 @@ impl RpkiBuilder {
             max_vrps: self.max_vrps.value.unwrap_or(d.max_vrps),
             backoff_min,
             backoff_max,
+            tcp_keepalive: self.tcp_keepalive.value.unwrap_or(d.tcp_keepalive),
         };
         // The client would quietly cut the one to the other; say so instead.
         if rpki.connect_timeout > rpki.response_timeout {

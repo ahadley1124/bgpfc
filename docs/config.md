@@ -68,10 +68,17 @@ rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"   (* required 
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
              | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
-             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX;
+             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX;
                                                          default 1 600, with mode sidecar 1 30 *)
+             | "tcp-keepalive" keepalive-option { keepalive-option } ";" ;
+                                                      (* options once each; default
+                                                         idle 60 interval 10 count 6 *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
+keepalive-option
+             = "idle" u32                              (* 1-32767; default 60 *)
+             | "interval" u32                          (* 1-32767; default 10 *)
+             | "count" u32 ;                           (* 1-127; default 6 *)
 
 sidecar-item = "binary" path ";"                       (* absolute; default /usr/bin/routinator *)
              | "repository-dir" path ";"               (* absolute; default /var/lib/bgpfc/rpki *)
@@ -514,15 +521,26 @@ breaks one of them is dropped and the next one tried.
 Between queries a connection in sync is idle, an hour by default (the
 cache's Refresh Interval), so bgpfcd turns TCP keep-alive on for every
 connection to a cache, in both modes (RFC 8210 §9: routers "SHOULD enable
-keep-alives when available"): after 60 seconds without a segment the
-kernel probes the cache every 10 seconds, and drops the connection after
-6 unanswered probes. A cache that vanished without closing the connection,
-by a crash or a network that drops its packets, is then noticed within two
-minutes, and bgpfcd moves to the next cache or reconnects, rather than at
-the next query an hour on. The values are fixed: the first probe comes
-after the same minute as Routinator's on its end (`--rtr-tcp-keepalive`),
-and a minute of unanswered probes rides out a short loss on the trusted
-network RTR needs.
+keep-alives when available"). `tcp-keepalive` says how the kernel probes
+it (`tcp(7)`): after `idle` seconds without a segment it sends a probe,
+then one every `interval` seconds while none is answered, and drops the
+connection after `count` unanswered probes. A cache that vanished without
+closing the connection, by a crash or a network that drops its packets,
+is then noticed within `idle` + `interval` × `count` seconds, and bgpfcd
+moves to the next cache or reconnects, rather than at the next query an
+hour on. Each option may be given once, in any order; one left out keeps
+its default, and the defaults, `idle 60 interval 10 count 6`, notice a
+dead cache within two minutes: the first probe comes after the same
+minute as Routinator's on its end (`--rtr-tcp-keepalive`), and a minute of
+unanswered probes rides out a short loss on the trusted network RTR needs.
+`tcp-keepalive count 3;` gives up after half a minute of silence instead.
+The bounds are the kernel's, which refuses anything else: `idle` and
+`interval` from 1 to 32767 seconds, `count` from 1 to 127
+(`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL` and `MAX_TCP_KEEPCNT` in its
+`include/net/tcp.h`). Keep-alive acts only on an idle connection: while a
+query is unanswered, `response-timeout` finds a dead cache instead. Should
+the kernel still refuse the options, the connection is used without
+keep-alive, with a warning.
 
 `max-expire` is the longest bgpfcd keeps using VRPs it cannot refresh.
 The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
@@ -590,7 +608,7 @@ Routinator serves RTR on (issue #71), so `cache` is an error with this
 mode; and a `sidecar` block is an error with `mode external`, where it
 would never run. The other statements of the `rpki` block apply to that
 one session as they apply to an external cache: `enforcement`, `version`,
-the timeouts, `max-expire`, `max-vrps` and `backoff`. Routinator is a
+the timeouts, `max-expire`, `max-vrps`, `backoff` and `tcp-keepalive`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
 Routinator 0.15.x, and is tested with 0.15.2.
 

@@ -26,7 +26,7 @@ Config {
         sidecar: RpkiSidecar {
             pos: Some(
                 Pos {
-                    line: 11,
+                    line: 12,
                     col: 5,
                 },
             ),
@@ -68,6 +68,11 @@ Config {
         max_vrps: 4000000,
         backoff_min: 2s,
         backoff_max: 60s,
+        tcp_keepalive: RpkiKeepalive {
+            idle: 60s,
+            interval: 10s,
+            count: 3,
+        },
     },
     prefix_lists: [],
     policies: [],

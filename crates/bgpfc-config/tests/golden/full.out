@@ -77,6 +77,11 @@ Config {
         max_vrps: 1000000,
         backoff_min: 2s,
         backoff_max: 300s,
+        tcp_keepalive: RpkiKeepalive {
+            idle: 120s,
+            interval: 15s,
+            count: 4,
+        },
     },
     prefix_lists: [
         PrefixList {
