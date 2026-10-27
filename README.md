@@ -371,6 +371,41 @@ against the credentials of whoever opened the socket. The trade-off is that a
 reload cannot open new listen sockets or a new netlink socket. Changes like that
 need a restart.
 
+### Network namespace
+
+To run bgpfcd in a network namespace, such as the one `ip netns add blue`
+creates, name it with `netns blue;` in the configuration file or with
+`bgpfcd --netns blue`, which overrides the file: `/run/netns/blue`. An
+absolute path, such as `/proc/PID/ns/net`, names a namespace as well.
+bgpfcd joins it itself at startup, before it opens a socket or starts a
+thread, so its sessions, the routes it installs, the HTTP API, its RTR
+connections and Routinator are all in the namespace, as if it had been
+started with `ip netns exec blue`. `bgpfcctl` reaches the control socket
+from any namespace.
+
+Joining takes `CAP_SYS_ADMIN` (`setns(2)`), which bgpfcd gives up right
+after the join. Root has it (Option B); under Option A it is a third
+capability:
+
+```sh
+sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+     --inh-caps=+net_bind_service,+net_admin,+sys_admin \
+     --ambient-caps=+net_bind_service,+net_admin,+sys_admin \
+     ./target/release/bgpfcd -c bgpfc.conf --netns blue
+```
+
+Without it bgpfcd stops with `cannot join network namespace` and
+`setns(2) needs CAP_SYS_ADMIN`. A bgpfcd started inside the namespace
+already needs no capability for it. Under systemd,
+`NetworkNamespacePath=/run/netns/blue` has systemd put bgpfcd there
+instead, with no capability at all; `contrib/bgpfcd.service` shows both
+ways. `bgpfcd --check --netns blue` checks that the namespace is there,
+as any user. Unlike `ip netns exec`, bgpfcd does not put
+`/etc/netns/blue/` over `/etc`: the host names of RPKI caches are looked
+up with the host's `/etc/resolv.conf`, from inside the namespace, so give
+caches by address or use a resolver the namespace reaches
+(`docs/config.md`, "Network namespace").
+
 ### Routinator sidecar
 
 With `rpki { mode sidecar; }` bgpfcd runs Routinator, tested with 0.15.3;

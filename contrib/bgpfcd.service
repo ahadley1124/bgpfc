@@ -43,6 +43,23 @@ RestartSec=5
 # Routinator gets neither: bgpfcd clears its ambient set for the child.
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+
+# Network namespace (README, "Network namespace"). Either let systemd put
+# bgpfcd in it, which needs no capability:
+#NetworkNamespacePath=/run/netns/NAME
+# or have bgpfcd join it itself (`--netns NAME`, or `netns NAME;` in the
+# file), which needs CAP_SYS_ADMIN for setns(2), dropped right after the
+# join. The empty assignments drop the lines above; and set
+# RestrictNamespaces=net in place of the RestrictNamespaces=yes below,
+# which blocks setns(2).
+#ExecStartPre=
+#ExecStartPre=/usr/local/bin/bgpfcd -c /etc/bgpfc/bgpfc.conf --check --netns NAME
+#ExecStart=
+#ExecStart=/usr/local/bin/bgpfcd -c /etc/bgpfc/bgpfc.conf --netns NAME
+#AmbientCapabilities=
+#AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+#CapabilityBoundingSet=
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
 # Also makes a `user` or `group` in a Routinator config file fail loudly,
 # rather than switch users and lose the signal that ends Routinator when
 # bgpfcd dies.
@@ -66,6 +83,8 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 # Routinator fetches over AF_INET and AF_INET6: RRDP (HTTPS) and rsync.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+# `net` instead when bgpfcd joins a network namespace itself (above):
+# setns(2) into a network namespace, and no other namespace.
 RestrictNamespaces=yes
 LockPersonality=yes
 # Routinator does not need writable executable memory either.
