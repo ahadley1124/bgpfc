@@ -827,7 +827,8 @@ fn session_line(show_rpki: &str) -> String {
 /// UPDATE: `StayRTR` sends a Serial Notify, bgpfcd asks for the changes
 /// (RFC 8210 §8.2), and the routes they cover are validated again
 /// (RFC 6811 §4, issue #59). bgpfcd's connection to the cache has TCP
-/// keep-alive on (RFC 8210 §9), as `ss` shows.
+/// keep-alive on (RFC 8210 §9), as `ss` shows, and a reload that changes
+/// `tcp-keepalive` sets it on that connection, with no new one.
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
@@ -848,17 +849,7 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
     ] {
         assert!(ok && out.contains(line), "{line}:\n{out}");
     }
-    // RFC 8210 §9: the connection bgpfcd made to the cache probes with
-    // TCP keep-alive while idle in sync.
-    let mut sockets = String::new();
-    assert!(
-        wait_for(Duration::from_secs(5), || {
-            sockets = s.rtr_sockets();
-            sockets.lines().count() == 1 && sockets.contains("timer:(keepalive,")
-        }),
-        "{sockets}\n{}",
-        s.report()
-    );
+    s.keep_alive_follows_a_reload();
     let body = s.http("/v1/rpki");
     assert!(
         body.contains("\"mode\":\"external\"")
@@ -1568,6 +1559,72 @@ impl Setup {
         let old = format!(" enforcement {from};");
         assert!(text.contains(&old), "{text}");
         fs::write(&path, text.replace(&old, &format!(" enforcement {to};"))).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok, "{out}");
+        out
+    }
+
+    /// RFC 8210 §9: the connection bgpfcd made to the cache probes with
+    /// TCP keep-alive while idle in sync, and a reload that changes
+    /// `tcp-keepalive` sets it on that connection, with no new one.
+    fn keep_alive_follows_a_reload(&self) {
+        // RFC 8210 §9: the connection bgpfcd made to the cache probes with
+        // TCP keep-alive while idle in sync.
+        let mut sockets = String::new();
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sockets = self.rtr_sockets();
+                sockets.lines().count() == 1 && sockets.contains("timer:(keepalive,")
+            }),
+            "{sockets}\n{}",
+            self.report()
+        );
+        // The default first probe comes within a minute; once a reload sets
+        // `idle 3000`, the kernel restarts the timer of the same connection
+        // with it, less the time since the last segment, and `ss` counts it
+        // in minutes: `59sec`, `5.250ms`, `1min` before, `49min` after.
+        // Nothing reconnects.
+        let minutes = |sockets: &str| -> u32 {
+            sockets
+                .split("timer:(keepalive,")
+                .nth(1)
+                .and_then(|t| t.split(',').next())
+                .and_then(|t| t.split_once("min"))
+                .map_or(0, |(m, _)| m.parse().unwrap_or(0))
+        };
+        assert!(minutes(&sockets) <= 1, "{sockets}");
+        let starts = self.rtr_starts();
+        let out = self.reload_keepalive("idle 3000");
+        assert!(
+            out.contains("rpki tcp-keepalive idle 3000 interval 10 count 6"),
+            "{out}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sockets = self.rtr_sockets();
+                sockets.lines().count() == 1 && minutes(&sockets) >= 40
+            }),
+            "{sockets}\n{}",
+            self.report()
+        );
+        assert_eq!(
+            self.count("msg=\"rpki: tcp keep-alive changed;"),
+            1,
+            "{}",
+            self.report()
+        );
+        assert_eq!(self.rtr_starts(), starts, "{}", self.report());
+    }
+
+    /// Add `tcp-keepalive OPTIONS` to bgpfcd's `rpki` block and reload;
+    /// the reload's summary.
+    fn reload_keepalive(&self, options: &str) -> String {
+        let path = self.config_path();
+        let text = fs::read_to_string(&path).unwrap();
+        let old = " backoff 1 1;";
+        assert!(text.contains(old), "{text}");
+        let new = format!("{old} tcp-keepalive {options};");
+        fs::write(&path, text.replace(old, &new)).unwrap();
         let (out, ok) = self.ctl(&["reload"]);
         assert!(ok, "{out}");
         out

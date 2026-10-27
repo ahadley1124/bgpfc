@@ -468,7 +468,11 @@ again, and restarts Routinator only when its `sidecar` block changes; a changed 
 every route again under the new mode at once (the summary says `rpki
 enforcement MODE`, the log `rib: rpki enforcement changed`), and so does a
 changed `startup`, which judges again the routes not validated yet (the
-summary says `rpki startup SETTING`, the log `rib: rpki startup changed`).
+summary says `rpki startup SETTING`, the log `rib: rpki startup changed`);
+a changed `tcp-keepalive` leaves the client alone too, and reaches the
+connection in use at once as well as every later one (the summary says
+`rpki tcp-keepalive idle N interval N count N`, the log `rpki: tcp
+keep-alive changed`).
 `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.

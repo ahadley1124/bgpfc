@@ -38,10 +38,13 @@
 //! a new set validates again only the routes it judges differently. A
 //! change to `mode disabled` sends [`ValidationChange::disabled`] instead,
 //! so that every route is `disabled` again. A reload that leaves the block
-//! alone leaves the client alone. Routinator is restarted only when its
-//! own settings change, since each start costs a validation run before it
-//! listens again, and the held data covers that gap; it is started and
-//! stopped as the mode comes to `sidecar` and leaves it (m14 design §5.2).
+//! alone leaves the client alone, and so does one that changes only the
+//! `tcp-keepalive`, which [`Rpki::set_tcp_keepalive`] sets on the
+//! connection in use and every later one. Routinator is restarted only
+//! when its own settings change, since each start costs a validation run
+//! before it listens again, and the held data covers that gap; it is
+//! started and stopped as the mode comes to `sidecar` and leaves it (m14
+//! design §5.2).
 //! [`preflight`] checks before anything changes what a start of
 //! Routinator would refuse, so that a reload onto a binary that would not
 //! start fails and the running one goes on.
@@ -759,6 +762,46 @@ impl Rpki {
         }
     }
 
+    /// Apply `new`'s `tcp-keepalive`, which a reload changed, and return
+    /// the reload summary's note on it. Every later connection to a cache
+    /// gets it, and so does the one in use, at once
+    /// ([`Client::check_again`]): with no new connection, and no new
+    /// client, which would load the cache's data afresh for a socket
+    /// option (RFC 8210 §9). Without a client, the next one gets it.
+    ///
+    /// With `mode sidecar` the owner check runs again on the connection in
+    /// use too; should it fail now, the connection is closed, and the
+    /// client connects again.
+    pub(crate) fn set_tcp_keepalive(&self, new: &ast::Rpki) -> String {
+        self.keepalive.set(&new.tcp_keepalive);
+        let Some(client) = &self.client else {
+            return format!(
+                "rpki tcp-keepalive {} (no rtr client runs)",
+                new.tcp_keepalive
+            );
+        };
+        match client.check_again() {
+            Ok(()) => {
+                bgpfc_log::info!(
+                    "rpki: tcp keep-alive changed; the connection in use and every later one have it",
+                    tcp_keepalive = new.tcp_keepalive
+                );
+                format!("rpki tcp-keepalive {}", new.tcp_keepalive)
+            }
+            Err(e) => {
+                bgpfc_log::warn!(
+                    "rpki: tcp keep-alive changed; the connection in use no longer passes its check and is closed",
+                    tcp_keepalive = new.tcp_keepalive,
+                    error = e
+                );
+                format!(
+                    "rpki tcp-keepalive {} (connection in use closed: {e})",
+                    new.tcp_keepalive
+                )
+            }
+        }
+    }
+
     /// The block in effect, for a reload to compare the new one with:
     /// `config`, the running configuration's, while what it runs is
     /// running, and otherwise `mode disabled`, which is what then holds:
@@ -889,7 +932,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use bgpfc_config::Config;
+    use bgpfc_config::diff::GlobalChange;
+    use bgpfc_config::{Config, ConfigDiff};
     use bgpfc_rpki::{AffectedPrefixes, RouteOrigin, RovState, Vrp};
     use bgpfc_rtr::{Framer, Intervals, Pdu};
     use bgpfc_sidecar::{SidecarState, TESTED_VERSION};
@@ -1371,6 +1415,84 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(rpki.status().is_some_and(|s| s.connected));
         rpki.stop();
+    }
+
+    /// The time left on the keep-alive timer of this host's TCP socket at
+    /// `local`, from the kernel's socket table (`proc(5)`: `tr` 2 is the
+    /// socket's own timer, which an established connection uses for
+    /// keep-alive, and `tm->when` the clock ticks left), or `None` while
+    /// another timer, or none, runs.
+    fn keep_alive_ticks(local: SocketAddr) -> Option<u64> {
+        let table = fs::read_to_string("/proc/net/tcp").unwrap();
+        let ip = match local.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => panic!("an IPv4 test"),
+        };
+        let address = format!(
+            "{:08X}:{:04X}",
+            u32::from_ne_bytes(ip.octets()),
+            local.port()
+        );
+        let line = table
+            .lines()
+            .skip(1)
+            .find(|l| l.split_whitespace().nth(1) == Some(address.as_str()))?;
+        let (timer, when) = line.split_whitespace().nth(5)?.split_once(':')?;
+        (timer == "02").then(|| u64::from_str_radix(when, 16).ok())?
+    }
+
+    /// RFC 8210 §9: a reload's new `tcp-keepalive` reaches the connection
+    /// in use at once, with no new connection, no new client and nothing
+    /// published, as the kernel's keep-alive timer of the client's end
+    /// shows: no longer than 30 s before, about 3000 s after.
+    #[test]
+    fn a_new_keep_alive_reaches_the_connection_in_use() {
+        let cache = StubCache::new();
+        let block = |idle: u32| {
+            config(&format!(
+                "rpki {{ mode external; cache 127.0.0.1 port {}; tcp-keepalive idle {idle}; }}",
+                cache.port()
+            ))
+        };
+        let (old, new) = (block(30), block(3000));
+        let (tx, rx) = sync_channel(4);
+        let mut rpki = Rpki::start(&old.rpki, old.router_id, tx).unwrap();
+        let conn = cache.serve(&[vrp("192.0.2.0/24", 24, 64_496)]);
+        assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
+        let client = conn.peer_addr().unwrap();
+        let mut before = 0;
+        eventually("the keep-alive timer of the client's end", || {
+            keep_alive_ticks(client).is_some_and(|t| {
+                before = t;
+                t > 0
+            })
+        });
+
+        let diff = ConfigDiff::between(&old, &new);
+        assert_eq!(diff.global, [GlobalChange::RpkiKeepalive]);
+        assert_eq!(rpki.reconfigure(&old.rpki, &new.rpki), Ok("rpki unchanged"));
+        assert_eq!(
+            rpki.set_tcp_keepalive(&new.rpki),
+            "rpki tcp-keepalive idle 3000 interval 10 count 6"
+        );
+        // The kernel restarts the timer with the new idle time, less what
+        // has gone by: a hundred times as long, whatever the clock tick.
+        let after = keep_alive_ticks(client).expect("the keep-alive timer");
+        assert!(after > 50 * before, "{before} ticks before, {after} after");
+        assert_eq!(
+            cache.listener.accept().map_err(|e| e.kind()).err(),
+            Some(ErrorKind::WouldBlock),
+            "no new connection"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(rpki.status().is_some_and(|s| s.connected));
+        rpki.stop();
+        // No client: the next one gets it.
+        assert_eq!(
+            rpki.set_tcp_keepalive(&old.rpki),
+            "rpki tcp-keepalive idle 30 interval 10 count 6 (no rtr client runs)"
+        );
+        assert_eq!(rpki.keepalive.get().idle, Duration::from_secs(30));
     }
 
     #[test]

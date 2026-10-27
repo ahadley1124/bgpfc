@@ -377,8 +377,9 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
-                // Applied below, from the block in effect.
-                GlobalChange::Rpki => {}
+                // Applied below: the block from the one in effect, then the
+                // keep-alive, once the client the block runs is known.
+                GlobalChange::Rpki | GlobalChange::RpkiKeepalive => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
@@ -413,6 +414,11 @@ impl Coordinator<'_> {
         if !rpki.same_as(&new.rpki) {
             let done = self.rpki.reconfigure(&rpki, &new.rpki);
             notes.push(done.map_or_else(|e| e, str::to_owned));
+        }
+        // RFC 8210 §9: the new keep-alive reaches the connection in use,
+        // with no new connection; a client just restarted has it already.
+        if diff.global.contains(&GlobalChange::RpkiKeepalive) {
+            notes.push(self.rpki.set_tcp_keepalive(&new.rpki));
         }
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.

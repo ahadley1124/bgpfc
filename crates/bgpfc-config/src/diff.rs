@@ -65,10 +65,11 @@ pub enum GlobalChange {
     /// starts, stops or restarts, and with `mode sidecar` the sidecar too
     /// when its own settings changed. A block that only spells something
     /// differently, such as a default written out, a cache's host or a
-    /// moved `sidecar` block, is no change, and nor are its `enforcement`
-    /// and its `startup`, which neither uses (see
-    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); those are
-    /// [`GlobalChange::RpkiEnforcement`] and [`GlobalChange::RpkiStartup`].
+    /// moved `sidecar` block, is no change, and nor are its `enforcement`,
+    /// its `startup` and its `tcp-keepalive`, which neither uses as a
+    /// setting of its own (see [`Rpki::same_as`](crate::ast::Rpki::same_as));
+    /// those are [`GlobalChange::RpkiEnforcement`],
+    /// [`GlobalChange::RpkiStartup`] and [`GlobalChange::RpkiKeepalive`].
     Rpki,
     /// The `rpki` block's `enforcement`, an absent block or statement
     /// counting as the default: every route is judged again under the new
@@ -81,6 +82,12 @@ pub enum GlobalChange {
     /// acts only while validation waits for its first full set, and never
     /// with `mode disabled`. It may come with the other two in one reload.
     RpkiStartup,
+    /// The `rpki` block's `tcp-keepalive`, an absent block or statement
+    /// counting as the defaults: the RTR client's connection in use gets
+    /// the new values at once, and so does every later one, with no new
+    /// connection and no restart of the client (RFC 8210 §9). It may come
+    /// with the others in one reload.
+    RpkiKeepalive,
 }
 
 impl ConfigDiff {
@@ -103,6 +110,10 @@ impl ConfigDiff {
             (
                 old.rpki.startup != new.rpki.startup,
                 GlobalChange::RpkiStartup,
+            ),
+            (
+                old.rpki.tcp_keepalive != new.rpki.tcp_keepalive,
+                GlobalChange::RpkiKeepalive,
             ),
         ] {
             if changed {
@@ -703,6 +714,52 @@ mod tests {
                 GlobalChange::Rpki,
                 GlobalChange::RpkiEnforcement,
                 GlobalChange::RpkiStartup
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keepalive_change_is_not_an_rpki_client_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        for mode in [
+            "mode external; cache 192.0.2.10;",
+            "mode sidecar;",
+            "mode disabled;",
+        ] {
+            let implied = with(&format!("rpki {{ {mode} }}"));
+            let written = with(&format!(
+                "rpki {{ {mode} tcp-keepalive count 6 interval 10 idle 60; }}"
+            ));
+            let partly = with(&format!("rpki {{ {mode} tcp-keepalive idle 60; }}"));
+            // The defaults written out, whole or in part, are no change.
+            assert_eq!(implied.rpki, written.rpki, "{mode}");
+            assert!(ConfigDiff::between(&implied, &written).is_empty(), "{mode}");
+            assert!(ConfigDiff::between(&implied, &partly).is_empty(), "{mode}");
+            // Any one value is one, which keeps the client and touches no
+            // neighbor.
+            for other in ["idle 61", "interval 5", "count 3"] {
+                let changed = with(&format!("rpki {{ {mode} tcp-keepalive {other}; }}"));
+                for (a, b) in [(&implied, &changed), (&changed, &implied)] {
+                    assert!(a.rpki.same_as(&b.rpki), "{mode} {other}");
+                    let d = ConfigDiff::between(a, b);
+                    assert_eq!(d.global, vec![GlobalChange::RpkiKeepalive], "{mode}");
+                    assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+                }
+            }
+        }
+        // With the other changes of the block, each is named.
+        let a = with("rpki { mode external; cache 192.0.2.10; }");
+        let b = with(
+            "rpki { mode external; enforcement off; startup hold; cache 192.0.2.11;
+             tcp-keepalive count 3; }",
+        );
+        assert_eq!(
+            ConfigDiff::between(&a, &b).global,
+            vec![
+                GlobalChange::Rpki,
+                GlobalChange::RpkiEnforcement,
+                GlobalChange::RpkiStartup,
+                GlobalChange::RpkiKeepalive
             ]
         );
     }

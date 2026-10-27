@@ -1003,8 +1003,14 @@ waits again (RFC 6811 §2); the summary says `rpki startup SETTING`. A
 reload that turns validation on with `startup hold` holds every route
 until the first set (see **Startup window**), and one that turns it off
 lets the held routes go before every route becomes `disabled`, so that no
-route in use is withdrawn on the way. A new cache whose name does not
-resolve fails the reload as it fails the start.
+route in use is withdrawn on the way. A changed `tcp-keepalive` leaves the
+client alone as well, and applies to the connection in use at once, not
+only to the next: bgpfcd sets the new values on it, and the kernel
+restarts its keep-alive timer with them, with no new connection and no
+reload of the cache's data; every later connection gets them too. The
+summary says `rpki tcp-keepalive idle N interval N count N`, with `(no rtr
+client runs)` when there is no connection to set them on. A new cache
+whose name does not resolve fails the reload as it fails the start.
 
 With `mode sidecar`, a reload restarts only what changed, since every
 start of Routinator costs a validation run before it listens again:
@@ -1012,7 +1018,7 @@ start of Routinator costs a validation run before it listens again:
 - A change to the client's settings (`version`, the timeouts,
   `max-expire`, `max-vrps`, `backoff`) restarts the RTR client at the
   same address and leaves Routinator running (`rpki: rtr client
-  restarted`).
+  restarted`); `tcp-keepalive` restarts neither.
 - A change to the `sidecar` block stops Routinator and starts it with
   the new settings, which with `rtr-listen` port 0 picks a new port
   (`rpki: sidecar restarted`). The VRPs in use stay in use until the new
