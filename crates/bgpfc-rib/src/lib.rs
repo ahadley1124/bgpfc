@@ -16,7 +16,9 @@
 //! RFC 4760 §3, §5, §7, §8 (each NLRI field with its own next hop,
 //! per-family RIBs, family disable, routes taken of the families we
 //! advertised and sent of the negotiated ones); RFC 2918 §4 (route refresh
-//! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
+//! re-sends the Adj-RIB-Out); RFC 4271 §3 (a changed import policy is
+//! applied to the routes the Adj-RIBs-In kept, and the peer asked again
+//! only for those they did not, see [`Rib::reimport`]); RFC 8950 §3–§5 (IPv4 routes with an IPv6
 //! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
 //! that ends the session, see [`Output::PrefixLimitExceeded`]);
 //! RFC 6811 §2 (every route received gets its validation state from a
@@ -29,7 +31,9 @@
 //! validated again when the validation source changes, see
 //! [`Rib::validation_changed`]), §5 (enforcement: Invalid routes left out
 //! of the decision process, or Valid ones preferred before anything else,
-//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]).
+//! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]); and,
+//! RFC 6811 §2 again, routes not validated yet left out of it only when
+//! configured to ([`Rib::set_startup`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -47,6 +51,7 @@ pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod reimport;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -66,11 +71,12 @@ use bgpfc_wire::types::{AddressFamily, Asn};
 use bgpfc_wire::update::{DecodedUpdate, PeerKind};
 
 pub use attrs::{Interner, PathAttrs};
-pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState};
+pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState, Startup};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
-pub use validation::{Rejudged, Revalidation, RouteStatus, Transition};
+pub use reimport::Reimport;
+pub use validation::{Rejudged, Revalidation, RouteStatus, StartupChange, Transition};
 
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
@@ -114,16 +120,22 @@ pub enum Held {
     /// out the state it is used with (Invalid under `drop-invalid`, RFC
     /// 6811 §5: "rejecting all "invalid" routes").
     Enforcement,
+    /// Import policy accepted it, but it has not been validated yet: it is
+    /// used with state `disabled`, and the operator's [`Startup::Hold`]
+    /// holds such routes until validation data judges them (RFC 6811 §2,
+    /// "unless explicitly configured to do so").
+    Startup,
 }
 
 impl Held {
-    /// The name used in logs and control output: `policy` or
-    /// `enforcement`.
+    /// The name used in logs and control output: `policy`,
+    /// `enforcement` or `startup`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Held::Policy => "policy",
             Held::Enforcement => "enforcement",
+            Held::Startup => "startup",
         }
     }
 }
@@ -282,6 +294,28 @@ pub enum Output {
     /// it: one report, counted, followed by the FIB changes and UPDATEs
     /// that follow. The caller logs it.
     Enforcement(Rejudged),
+    /// The operator's startup setting changed (see [`Rib::set_startup`]),
+    /// and every route used with state `disabled` was judged again under
+    /// it: one report, counted, followed by the FIB changes and UPDATEs
+    /// that follow. The caller logs it.
+    Startup(StartupChange),
+    /// The routes of peers whose import policy changed were put through
+    /// it again, from the Adj-RIBs-In (see [`Rib::reimport`]): one report,
+    /// counted, followed by the FIB changes and UPDATEs that follow, then
+    /// an [`Output::RequestRoutes`] for each peer it names to ask. The
+    /// caller logs it.
+    Reimported(Reimport),
+    /// Ask `peer` for its routes of `families` again with ROUTE-REFRESH
+    /// (RFC 2918 §4): import policy dropped some of them earlier, which
+    /// the Adj-RIB-In does not keep, and the policy now in use may take
+    /// them. The peer advertised the capability and these families.
+    RequestRoutes {
+        /// The peer.
+        peer: IpAddr,
+        /// The families, in the order the policy first dropped a route of
+        /// each.
+        families: Vec<AddressFamily>,
+    },
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -353,6 +387,11 @@ struct PeerState {
     adj_in_held: FamilyMap<usize>,
     /// The RFC 4271 §9.2.1.1 pacing state per family.
     pacing: FamilyMap<Pacing>,
+    /// Families in which import policy dropped a route this session (see
+    /// `judge`): the Adj-RIB-In lacks it, and only the peer can send it
+    /// again (RFC 2918). [`Rib::reimport`] asks for a family and forgets
+    /// it; a route the policy then drops again notes it again.
+    filtered: Vec<AddressFamily>,
     /// The session is going down: its routes are being removed, and it is
     /// sent nothing more.
     leaving: bool,
@@ -440,6 +479,9 @@ struct Context {
     /// What the validation state does to a route's use beyond policy:
     /// [`Enforcement::Off`] until [`Rib::set_enforcement`] says otherwise.
     enforcement: Enforcement,
+    /// What a route not validated yet does: [`Startup::Accept`] until
+    /// [`Rib::set_startup`] says otherwise.
+    startup: Startup,
 }
 
 /// UPDATEs being built during one input, per peer and family. A short
@@ -490,6 +532,9 @@ struct Scratch {
     delta: FamilyMap<isize>,
     /// Held routes added minus held routes removed, per family.
     held_delta: FamilyMap<isize>,
+    /// Families in which import policy dropped a route of the UPDATE,
+    /// for the peer's [`PeerState::filtered`].
+    filtered: Vec<AddressFamily>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
     /// §6.3), reported before what the UPDATE changed.
     ignored: Vec<Output>,
@@ -513,9 +558,22 @@ impl Scratch {
         }
     }
 
+    /// Note that import policy dropped a route of `family`.
+    fn note_filtered(&mut self, family: AddressFamily) {
+        if !self.filtered.contains(&family) {
+            self.filtered.push(family);
+        }
+    }
+
     /// Add what the routes added and removed came to to `state`'s
-    /// counts, and start again from zero.
+    /// counts, and the families import policy dropped routes of to its
+    /// own, and start again from zero.
     fn count_into(&mut self, state: &mut PeerState) {
+        for family in self.filtered.drain(..) {
+            if !state.filtered.contains(&family) {
+                state.filtered.push(family);
+            }
+        }
         for (family, d) in self.delta.iter_mut() {
             let n = state.adj_in_count.or_default(family);
             *n = n.saturating_add_signed(*d);
@@ -558,8 +616,9 @@ impl Rib {
     /// An empty RIB for a speaker in `local_as` with the given policies.
     /// Validation is off ([`NullSource`]: every route `Disabled`) until
     /// [`Rib::validation_changed`] gives it a source, and nothing acts on
-    /// the state beyond policy ([`Enforcement::Off`]) until
-    /// [`Rib::set_enforcement`] says otherwise.
+    /// the state beyond policy ([`Enforcement::Off`], [`Startup::Accept`])
+    /// until [`Rib::set_enforcement`] and [`Rib::set_startup`] say
+    /// otherwise.
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
@@ -574,6 +633,10 @@ impl Rib {
                     // configuration, policy MUST NOT be applied"; the
                     // daemon sets the configured mode.
                     enforcement: Enforcement::Off,
+                    // RFC 6811 §2: no route leaves the decision process
+                    // for its state "unless explicitly configured to do
+                    // so"; the daemon sets the configured setting.
+                    startup: Startup::Accept,
                 },
                 peers: Vec::new(),
                 by_addr: HashMap::new(),
@@ -597,8 +660,9 @@ impl Rib {
     /// whose export policy changed) what that changes: announcements for
     /// routes new or changed, withdrawals for routes no longer exported,
     /// found by exporting every best route under the old policies and the
-    /// new, paced like any other change (RFC 4271 §9.2.1.1). Import
-    /// changes are the caller's to re-evaluate (route refresh).
+    /// new, paced like any other change (RFC 4271 §9.2.1.1). The routes
+    /// of the peers whose import policy changed meet it through
+    /// [`Rib::reimport`], called after this, or as they arrive again.
     pub fn set_policies(
         &mut self,
         policies: Box<dyn Policies>,
@@ -638,6 +702,7 @@ impl Rib {
             adj_in_count: FamilyMap::default(),
             adj_in_held: FamilyMap::default(),
             pacing: FamilyMap::default(),
+            filtered: Vec::new(),
             leaving: false,
         });
         for family in families {
@@ -1078,24 +1143,24 @@ impl Rib {
                 let rov = cx.validation.rov(prefix, origin);
                 let judged = judge(
                     &*cx.policies,
-                    cx.enforcement,
+                    (cx.enforcement, cx.startup),
                     &mut cx.interner,
                     info,
                     (family, prefix),
                     &attrs,
                     rov,
                 );
-                match judged.into_route(&attrs, id, rov, aspa) {
-                    Some(route) => {
-                        let table = self.tables.or_default(family);
-                        announce(decide, table, family, prefix, route, scratch);
-                    }
+                if let Some(route) = judged.into_route(&attrs, id, rov, aspa) {
+                    let table = self.tables.or_default(family);
+                    announce(decide, table, family, prefix, route, scratch);
+                } else {
                     // Not kept, and one the peer sent before for the prefix
-                    // goes too: the new announcement replaced it.
-                    None => {
-                        if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(decide, table, family, prefix, id, scratch);
-                        }
+                    // goes too: the new announcement replaced it. Noted, so
+                    // that a later import policy that may take it asks the
+                    // peer for it (RFC 2918, `Rib::reimport`).
+                    scratch.note_filtered(family);
+                    if let Some(table) = self.tables.get_mut(family) {
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 // RFC 4271 §6.7: "the number of address prefixes received
@@ -1251,6 +1316,12 @@ impl Rib {
     #[must_use]
     pub fn enforcement(&self) -> Enforcement {
         self.s.cx.enforcement
+    }
+
+    /// What a route not validated yet does: used, or held.
+    #[must_use]
+    pub fn startup(&self) -> Startup {
+        self.s.cx.startup
     }
 
     /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
@@ -2171,8 +2242,8 @@ impl Judged {
 /// RFC 4271 §9.1.1: import policy decides whether a route `info`'s peer
 /// sent for `prefix` of `family`, with `attrs` as received and validation
 /// state `rov`, is a candidate for Phase 2, with which attributes, and,
-/// RFC 6811 §3, with which validation state it is used; then
-/// `enforcement` decides whether that state may be a candidate.
+/// RFC 6811 §3, with which validation state it is used; then `startup`
+/// and `enforcement` decide whether that state may be a candidate.
 ///
 /// RFC 6811 §2: "An implementation MUST NOT exclude a route from the
 /// Adj-RIB-In ... as a side effect of its validation state, unless
@@ -2183,7 +2254,9 @@ impl Judged {
 /// without a ROUTE-REFRESH. A route policy rejects whatever its state is
 /// dropped, as rejected routes were before validation existed: no change
 /// of state can bring it back, and holding it would let a filtered peer
-/// fill memory, past any `maximum-prefix`, with routes nothing uses. A
+/// fill memory, past any `maximum-prefix`, with routes nothing uses. Only
+/// a change of import policy can, and [`Rib::reimport`] then asks the
+/// peer for it again (RFC 4271 §3 (b), RFC 2918). A
 /// policy that does not read the state ([`Policies::import_reads_rov`])
 /// rejects with every state what it rejects with one, so it is not asked
 /// again: a filtered table costs one question per route, not four.
@@ -2196,11 +2269,20 @@ impl Judged {
 /// 6811 §2 asks. Policy alone decides what is kept, so that costs no
 /// further question to policy.
 ///
+/// A route policy accepts that has not been validated yet, used with
+/// state `disabled`, is held likewise ([`Held::Startup`]) under
+/// [`Startup::Hold`], the operator's explicit configuration to use no
+/// route before validation data judges it (RFC 6811 §2). The state
+/// import policy sets is the one used, as for `enforcement`, so a route
+/// policy gives a state is not held; nor is one policy holds for its
+/// state, which stays [`Held::Policy`]. Its first lookup with data gives
+/// it a state, and judges it again (RFC 6811 §4).
+///
 /// Every route reaches the candidates through here, whatever made it
 /// worth deciding again.
 fn judge(
     policies: &dyn Policies,
-    enforcement: Enforcement,
+    (enforcement, startup): (Enforcement, Startup),
     interner: &mut Interner,
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
@@ -2232,15 +2314,16 @@ fn judge(
             };
         }
     };
-    if enforcement.admits(rov_set.unwrap_or(rov)) {
-        Judged::Accepted { attrs, rov_set }
+    let used = rov_set.unwrap_or(rov);
+    let by = if !startup.admits(used) {
+        Held::Startup
+    } else if !enforcement.admits(used) {
+        Held::Enforcement
     } else {
-        // Held as received, like any held route: the set policy made of
-        // it goes back to the interner.
-        interner.release(attrs);
-        Judged::Held {
-            by: Held::Enforcement,
-            rov_set,
-        }
-    }
+        return Judged::Accepted { attrs, rov_set };
+    };
+    // Held as received, like any held route: the set policy made of it
+    // goes back to the interner.
+    interner.release(attrs);
+    Judged::Held { by, rov_set }
 }

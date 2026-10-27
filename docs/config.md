@@ -59,6 +59,7 @@ control-item = "socket" path ";"
 
 rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"   (* required *)
              | "enforcement" ( "drop-invalid" | "prefer-valid" | "off" ) ";"   (* default drop-invalid *)
+             | "startup" ( "accept" | "hold" ) ";"     (* default accept *)
              | "cache" host { cache-option } ";"       (* repeatable; options once each; not with mode sidecar *)
              | "sidecar" "{" { sidecar-item } "}"      (* once; not with mode external *)
              | "version" ( "0" | "1" ) ";"             (* default 1 *)
@@ -67,10 +68,17 @@ rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"   (* required 
              | "reply-timeout" u32 ";"                (* default 1800 *)
              | "max-expire" u32 ";"                   (* 600-172800; default 172800 *)
              | "max-vrps" u32 ";"                     (* at least 1; default 4000000 *)
-             | "backoff" u32 u32 ";" ;                (* MIN MAX: 1-7200 each, MIN <= MAX;
+             | "backoff" u32 u32 ";"                  (* MIN MAX: 1-7200 each, MIN <= MAX;
                                                          default 1 600, with mode sidecar 1 30 *)
+             | "tcp-keepalive" keepalive-option { keepalive-option } ";" ;
+                                                      (* options once each; default
+                                                         idle 60 interval 10 count 6 *)
 cache-option = "port" u16                              (* default 323; not 0 *)
              | "preference" u32 ;                      (* default 0 *)
+keepalive-option
+             = "idle" u32                              (* 1-32767; default 60 *)
+             | "interval" u32                          (* 1-32767; default 10 *)
+             | "count" u32 ;                           (* 1-127; default 6 *)
 
 sidecar-item = "binary" path ";"                       (* absolute; default /usr/bin/routinator *)
              | "repository-dir" path ";"               (* absolute; default /var/lib/bgpfc/rpki *)
@@ -354,8 +362,9 @@ of its validation state, unless explicitly configured to do so." bgpfcd
 keeps every route in the Adj-RIB-In whatever its state, and takes one out
 of route selection for its state only where the file says so: by `mode
 external` or `mode sidecar`, whose meaning includes `enforcement
-drop-invalid` as above, by an `enforcement` statement, or by an import
-policy that matches or sets the state (`match rpki`, `set rpki`). Without
+drop-invalid` as above, by an `enforcement` statement, by `startup hold`,
+or by an import policy that matches or sets the state (`match rpki`, `set
+rpki`). Without
 an `rpki` block, or with `mode disabled`, no route is validated, and no
 `enforcement` holds a `disabled` route; only an import policy that matches
 or sets the state can, such as one that rejects on `match rpki not-found`
@@ -367,6 +376,23 @@ configuration, policy MUST NOT be applied." bgpfcd's default departs from
 it, as the project chose (issue #61); `enforcement off;` gives the RFC 8481
 §5 behaviour.
 
+`startup` says what becomes of the routes while validation waits for its
+first data, in the startup window (see **Startup window** below), when
+no route has a state yet and every one is `disabled`:
+
+- `accept`, the default. They are used as received, and `enforcement`
+  acts once the first full set of VRPs has given them a state.
+- `hold`. They are held as `drop-invalid` holds an Invalid route: kept
+  in the Adj-RIB-In, counted as received and held, and neither installed
+  nor advertised, until the first full set gives them a state; then
+  `enforcement` acts on it, and a route it admits is used without an
+  UPDATE or a route refresh.
+
+The names are bgpfc's own words for what becomes of a route: import
+policy's `accept` lets it be used, and a *held* route is what `show
+routes held` lists. `startup` applies with `mode external` and `mode
+sidecar`; with `mode disabled` no data will come, and it holds nothing.
+
 Each route goes through these steps in order:
 
 1. The checks that make a route unusable whatever the policy, such as an
@@ -377,21 +403,27 @@ Each route goes through these steps in order:
 3. The import policy accepts the route, possibly with other attributes,
    or rejects it. It may match the state, and set the state the route is
    used with from then on (`set rpki`).
-4. `enforcement` acts on the state the route is used with, the one import
-   policy set or else the one the lookup gave: `drop-invalid` holds an
-   Invalid route. So `set rpki valid` in an import policy wins over
+4. `startup hold` holds a route used with state `disabled` while
+   validation waits for its first data; otherwise `enforcement` acts on
+   the state the route is used with, the one import policy set or else the
+   one the lookup gave: `drop-invalid` holds an Invalid route. So `set rpki valid` in an import policy wins over
    `drop-invalid`, and `match rpki invalid; action reject;` rejects in
    every mode.
 5. The Adj-RIB-In keeps the routes the import policy accepted and the ones
-   held for their state: by `enforcement`, or because the import policy
-   rejects them only in their current state, which it would accept in
-   another. A route the import policy rejects whatever its state is not
-   kept.
+   held for their state: by `startup` or `enforcement`, or because the
+   import policy rejects them only in their current state, which it would
+   accept in another. A route the import policy rejects whatever its state
+   is not kept: a reload that changes the policy asks the neighbor for it
+   again (see **Reload**).
 6. Route selection among the routes not held, ranking by state first under
    `prefer-valid`.
 7. The export policy of each neighbor, which sees the state the route is
    used with, the rewriting of RFC 4271 §5.1, and the neighbor's
    `advertisement-interval`.
+
+A reload that changes a neighbor's import policy puts every route of the
+neighbor the Adj-RIB-In keeps, held or not, through steps 3 to 7 again,
+with the state it has (see **Reload**).
 
 When the VRPs change, the routes whose state they change go through steps
 3 to 7 again (RFC 6811 §4: "When a mapping is added or deleted, the
@@ -486,6 +518,30 @@ query, and between two PDUs of an answer; it must be at least
 its End of Data, and must be at least `response-timeout`. A cache that
 breaks one of them is dropped and the next one tried.
 
+Between queries a connection in sync is idle, an hour by default (the
+cache's Refresh Interval), so bgpfcd turns TCP keep-alive on for every
+connection to a cache, in both modes (RFC 8210 §9: routers "SHOULD enable
+keep-alives when available"). `tcp-keepalive` says how the kernel probes
+it (`tcp(7)`): after `idle` seconds without a segment it sends a probe,
+then one every `interval` seconds while none is answered, and drops the
+connection after `count` unanswered probes. A cache that vanished without
+closing the connection, by a crash or a network that drops its packets,
+is then noticed within `idle` + `interval` × `count` seconds, and bgpfcd
+moves to the next cache or reconnects, rather than at the next query an
+hour on. Each option may be given once, in any order; one left out keeps
+its default, and the defaults, `idle 60 interval 10 count 6`, notice a
+dead cache within two minutes: the first probe comes after the same
+minute as Routinator's on its end (`--rtr-tcp-keepalive`), and a minute of
+unanswered probes rides out a short loss on the trusted network RTR needs.
+`tcp-keepalive count 3;` gives up after half a minute of silence instead.
+The bounds are the kernel's, which refuses anything else: `idle` and
+`interval` from 1 to 32767 seconds, `count` from 1 to 127
+(`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL` and `MAX_TCP_KEEPCNT` in its
+`include/net/tcp.h`). Keep-alive acts only on an idle connection: while a
+query is unanswered, `response-timeout` finds a dead cache instead. Should
+the kernel still refuse the options, the connection is used without
+keep-alive, with a warning.
+
 `max-expire` is the longest bgpfcd keeps using VRPs it cannot refresh.
 The cache's Expire Interval applies when it is shorter (RFC 8210 §6: "The
 router MUST NOT retain the data past the time indicated by this
@@ -509,8 +565,9 @@ changes is followed. It starts before the neighbors, and every route is
 `disabled` until a cache has sent its VRPs; from then on the states follow
 the cache's data. A route that arrives before then is therefore used, as
 no `enforcement` holds a `disabled` route, and withdrawn once the VRPs
-make it Invalid; an import policy that rejects on `match rpki not-found`
-holds it instead until they give it a state it accepts. A
+make it Invalid; under `startup hold` it is held until they give it a
+state, and an import policy that rejects on `match rpki not-found` holds
+it until they give it a state it accepts. A
 cache on the router or near it answers well before a BGP session comes up,
 so this window is normally empty (see **Startup window** below); BIRD
 and FRR behave the same way. The
@@ -551,9 +608,9 @@ Routinator serves RTR on (issue #71), so `cache` is an error with this
 mode; and a `sidecar` block is an error with `mode external`, where it
 would never run. The other statements of the `rpki` block apply to that
 one session as they apply to an external cache: `enforcement`, `version`,
-the timeouts, `max-expire`, `max-vrps` and `backoff`. Routinator is a
+the timeouts, `max-expire`, `max-vrps`, `backoff` and `tcp-keepalive`. Routinator is a
 separate program that bgpfc neither bundles nor links; bgpfcd needs
-Routinator 0.15.x, and is tested with 0.15.2.
+Routinator 0.15.x, and is tested with 0.15.3.
 
 The smallest file that validates every route:
 
@@ -630,45 +687,99 @@ uid M as bgpfcd is: another process holds the port"`, the last of them in
 `show rpki`; its VRPs never reach the RIB, and the routes keep the states
 they had (`disabled`, while validation waits). Routinator, finding the
 port taken, fails to start, and its failures raise the alarm (issue #70).
-A process that runs as bgpfcd's own user is not told apart: it could
-change Routinator's repository and configuration anyway. Run bgpfcd as a
-user of its own, not as one other daemons share, such as `nobody`, and
-keep untrusted code off that user. Without `/proc` no connection to the
-sidecar is used.
+The check tells users apart and nothing finer, so it is only as strong
+as the user bgpfcd runs as. A process that runs as bgpfcd's own user is
+not told apart: it could change Routinator's repository and
+configuration anyway. Root, which can make a socket as any user, can
+pass it too. Run bgpfcd as a user of its own, not as one other daemons
+share, such as `nobody`, and keep untrusted code off that user. In a user
+namespace the kernel's socket tables show every user the namespace does
+not map as the overflow user (`/proc/sys/kernel/overflowuid`, 65534,
+`nobody`), so a bgpfcd that runs as that user there, or in a namespace
+with no user map at all, where it is that user itself, takes every
+process of an unmapped user, root's included, for its own: give it a
+mapped user of its own there too. Without `/proc` no connection to the
+sidecar is used. For these reasons COMPLIANCE.md marks the RFC 8210 §9,
+§13 requirement (cache and router on a trusted, controlled network)
+`partial` with `mode sidecar`.
+
+bgpfcd says so where it applies. With `mode sidecar`, each time it starts
+Routinator, at startup and at a reload that starts it, it logs a warning,
+`rpki sidecar: the owner check of Routinator's port is weaker here;
+starting anyway`, with its `uid` and the `reasons`, when
+
+- it runs as the overflow user (`/proc/sys/kernel/overflowuid`, 65534
+  unless the kernel says otherwise),
+- it runs as the user called `nobody` in `/etc/passwd`, or
+- it runs in a user namespace, one whose `/proc/self/uid_map` is not the
+  identity map, `0 0 4294967295`.
+
+It starts Routinator all the same: the check still refuses every user it
+can tell apart from bgpfcd's own. `bgpfcd --check` prints the same
+warning on standard error, at the `mode sidecar` statement or the
+`sidecar` block, for the user `--user` names, or else the user it runs
+as, and still reports the file ok.
 
 **Startup window.** Until the RTR client's first full set arrives there
-are no VRPs, and every route is `disabled`: shown so, not as `not-found`,
-and used as received, since no `enforcement` acts on `disabled`. With an
-external cache on the router or near it, the window is normally too short
-to matter. With the sidecar it is long: Routinator opens its RTR listener
-only once its first validation run has ended, minutes after it starts
-from a cold repository directory, less from a warm one. bgpfcd does not
-wait for it: the neighbors come up at once and their routes are used,
-unvalidated. When the first set arrives, every route is validated (RFC
-6811 §4) and `enforcement` acts on the result, so that under
-`drop-invalid` the Invalid routes are then held and withdrawn from the
-neighbors and the kernel. Holding every route until then without being
-told to is what RFC 6811 §2 forbids ("MUST NOT exclude a route from the
-Adj-RIB-In or from consideration in the decision process as a side effect
-of its validation state, unless explicitly configured to do so"), and on a
-transit router it would black-hole the whole table for the minutes of a
-cold start after every reboot; BIRD and FRR converge the same way. The
-window is not silent (issue #71). When a client starts with no data to
-hold, bgpfcd logs `rpki: no validation data yet; routes are used
-unvalidated until the first full set` with the mode and the
-`enforcement`: at warn with `mode sidecar`, with a hint about
-Routinator's first run, and at info with `mode external`, whose window is
-normally a moment. When the first set arrives it logs `rpki: validation
-data arrived; routes are validated from now on` with `waited=`, the
-seconds the routes waited; the RIB's `rib: validation states changed` line
-follows, with the routes held and released. Meanwhile `show rpki` says
-`validation waiting Ns for the first full set` (`docs/control.md`,
-"RPKI"), and `show status` `validation waiting`. A reload from `mode disabled` opens the window again. A reload
-that restarts the client does not, since the data in use stays in use
-until the new set arrives.
+are no VRPs, and every route is `disabled`: shown so, not as `not-found`.
+With an external cache on the router or near it, the window is normally
+too short to matter. With the sidecar it is long: Routinator opens its
+RTR listener only once its first validation run has ended, minutes after
+it starts from a cold repository directory, less from a warm one. bgpfcd
+does not wait for it to bring the neighbors up: they come up at once.
+What becomes of their routes meanwhile is the block's `startup`:
 
-To hold the routes until the first set instead, say so in each import
-policy, first:
+- `startup accept`, the default: the routes are used as received,
+  unvalidated, since no `enforcement` acts on `disabled`. When the first
+  set arrives, every route is validated (RFC 6811 §4) and `enforcement`
+  acts on the result, so that under `drop-invalid` the Invalid routes are
+  then held and withdrawn from the neighbors and the kernel. Holding every
+  route until then without being told to is what RFC 6811 §2 forbids
+  ("MUST NOT exclude a route from the Adj-RIB-In or from consideration in
+  the decision process as a side effect of its validation state, unless
+  explicitly configured to do so"), and on a transit router it would
+  black-hole the whole table for the minutes of a cold start after every
+  reboot; BIRD and FRR converge the same way.
+- `startup hold`: that explicit configuration. Every route is held until
+  the first set arrives, kept in the Adj-RIB-In and counted, but neither
+  installed nor advertised; `show routes held` lists each as `held by
+  startup`. When the set arrives every route is validated and judged
+  again, with no UPDATE or route refresh: under `drop-invalid` the Valid
+  and `not-found` routes are used and the Invalid ones stay held, now by
+  `enforcement`; under the other modes all of them are used. Routes that
+  arrive later are validated on arrival and never held for the startup,
+  and a route whose import policy sets a state with `set rpki` is used
+  with that state and not held either. It suits a router that must never
+  install or pass on a route that was not validated, and that can do
+  without its BGP routes for as long as the cache takes; with the sidecar
+  from a cold repository, that is minutes after every start.
+
+VRPs that expire give `not-found`, not `disabled`, so `hold` holds routes
+before the first set only, not after the data expires (see `max-expire`:
+validation then fails open). With validation off, `mode disabled` or
+after a reload that could not start Routinator or the client, no set will
+come, and `startup` holds nothing: every route is `disabled` and used.
+
+The window is not silent (issue #71). When a client starts with no data
+to hold, bgpfcd logs `rpki: no validation data yet; routes are used
+unvalidated until the first full set`, or under `startup hold` `rpki: no
+validation data yet; routes are held until the first full set (startup
+hold)`, with the mode, the `enforcement` and the `startup`: at warn with
+`mode sidecar`, with a hint about Routinator's first run, or with `startup
+hold`, and at info with `mode external` and `startup accept`, whose
+window is normally a moment. When the first set arrives it logs `rpki:
+validation data arrived; routes are validated from now on` with
+`waited=`, the seconds the routes waited; the RIB's `rib: validation
+states changed` line follows, with the routes held and released.
+Meanwhile `show rpki` says `validation waiting Ns for the first full set`
+with what becomes of the routes (`docs/control.md`, "RPKI"), and `show
+status` `validation waiting`. A reload from `mode disabled` opens the
+window again, and under `startup hold` holds every route until the first
+set. A reload that restarts the client does not, since the data in use
+stays in use until the new set arrives.
+
+An import policy can hold the routes of some neighbors only, in the same
+way, with a first term:
 
 ```
 policy UPSTREAM-IN {
@@ -677,12 +788,10 @@ policy UPSTREAM-IN {
 }
 ```
 
-During the window every route is then held by policy (`show routes
+During the window each such route is then held by policy (`show routes
 held`), and none is used. When the first set arrives they are judged
-again: under `drop-invalid`, the Valid and `not-found` routes are used and
-the Invalid ones stay held. VRPs that expire give `not-found`, not
-`disabled`, so this holds routes before the first set only, not after the
-data expires; with `mode disabled` it holds every route for good.
+again, as under `startup hold`. Unlike `startup hold`, such a term also
+holds every route for good with `mode disabled`.
 
 The `sidecar` block takes these statements, each at most once:
 
@@ -809,8 +918,9 @@ no routes from the kernel, so every next hop counts as resolvable, as
 every interior cost counts as equal in step 7. A route whose next hop is
 unreachable can therefore be chosen and advertised. With `fib { mode
 install; }` the kernel refuses to install a route whose gateway it cannot
-reach directly, and the failure is logged at error as `fib: failed`, but
-the route stays chosen.
+reach directly, and the failure is logged at error as `fib: failed` (the
+first three of a change, three a second at most, and every one counted on
+the `fib: changes` lines, `docs/control.md`), but the route stays chosen.
 
 Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
 first, as the most significant part of the degree of preference that RFC
@@ -871,10 +981,20 @@ parameters changed (anything but `description`, `import`, `export`,
 `advertisement-interval` and `maximum-prefix`; `restart-limit` included)
 reset with Cease / Other Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
-are re-evaluated without a reset, using route refresh where the peer
-supports it. A route held for its validation state (see **RPKI**) meets
-the new import policy the same way, when its neighbor sends it again, or
-at once when the same reload also changes `enforcement`. A changed
+are re-evaluated without a reset. A changed `import` policy applies at
+once to the routes the neighbor sent, from those bgpfcd kept (RFC 4271
+§3), held ones included (see **RPKI**): each goes through the new policy
+again, and what it changes is installed and advertised, or withdrawn,
+with no UPDATE and no route refresh. A route an import policy rejected
+whatever its validation state was not kept, so for a neighbor that had
+such routes the reload also asks for them again with a route refresh
+(RFC 2918), where the neighbor supports it, for the families concerned.
+The neighbor then sends the whole family again, as a route refresh names
+nothing finer, so with an import policy that rejects any route at all,
+every change of it costs one (`docs/control.md`, "Reload"). Without the
+capability they come back when the neighbor sends them again, or after
+`bgpfcctl clear neighbor`. A changed `export` policy sends each neighbor
+the difference, with no route refresh. A changed
 `advertisement-interval` applies to the running session at once, also
 without a reset. So does a changed `maximum-prefix`:
 a session that already holds more routes than its new limit ends as if it
@@ -895,7 +1015,21 @@ route again at once under the new mode, with the new import policies: the
 routes it rules out are held, those it admits again are used, and route
 selection runs for every destination, so that what changes is installed
 and advertised, or withdrawn, with no UPDATE or route refresh (RFC 6811
-§5). The reload summary then says `rpki enforcement MODE`. A new cache
+§5). The reload summary then says `rpki enforcement MODE`. A changed
+`startup` leaves the client alone as well: it acts on the routes not
+validated yet, so while they wait for the first full set it holds them, or
+uses them, at once, and otherwise it changes nothing until validation
+waits again (RFC 6811 §2); the summary says `rpki startup SETTING`. A
+reload that turns validation on with `startup hold` holds every route
+until the first set (see **Startup window**), and one that turns it off
+lets the held routes go before every route becomes `disabled`, so that no
+route in use is withdrawn on the way. A changed `tcp-keepalive` leaves the
+client alone as well, and applies to the connection in use at once, not
+only to the next: bgpfcd sets the new values on it, and the kernel
+restarts its keep-alive timer with them, with no new connection and no
+reload of the cache's data; every later connection gets them too. The
+summary says `rpki tcp-keepalive idle N interval N count N`, with `(no rtr
+client runs)` when there is no connection to set them on. A new cache
 whose name does not resolve fails the reload as it fails the start.
 
 With `mode sidecar`, a reload restarts only what changed, since every
@@ -904,7 +1038,7 @@ start of Routinator costs a validation run before it listens again:
 - A change to the client's settings (`version`, the timeouts,
   `max-expire`, `max-vrps`, `backoff`) restarts the RTR client at the
   same address and leaves Routinator running (`rpki: rtr client
-  restarted`).
+  restarted`); `tcp-keepalive` restarts neither.
 - A change to the `sidecar` block stops Routinator and starts it with
   the new settings, which with `rtr-listen` port 0 picks a new port
   (`rpki: sidecar restarted`). The VRPs in use stay in use until the new

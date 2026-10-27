@@ -3,11 +3,14 @@
 //! privilege drop, wires the RTR client to it on loopback, supervises it,
 //! and stops it, for routes from BIRD 2 (AGENTS.md §5, `interop/` row).
 //!
-//! Routinator itself never runs (AGENTS.md §5). A [`FakeRoutinator`]
-//! stands in for it: a shell script that answers `--version` as Routinator
-//! 0.15.2, records the arguments bgpfcd derives from the block, and then
-//! becomes this crate's `rtr-stub` on the `--rtr` address, serving the VRPs
-//! of `rpki.rs` under a new Session ID at each start, as a restarted
+//! Routinator itself never runs here (AGENTS.md §5): these scenarios need
+//! a Routinator that fails, hangs or changes its version on demand, and
+//! `routinator.rs` runs the real one. A [`FakeRoutinator`] stands in for
+//! it: a shell script that answers `--version` as Routinator 0.15.2, a
+//! patch release before the tested 0.15.3 that bgpfcd accepts as the same
+//! series, records the arguments bgpfcd derives from the block, and then
+//! becomes this crate's `rtr-stub` on the `--rtr` address, serving the
+//! VRPs of `rpki.rs` under a new Session ID at each start, as a restarted
 //! Routinator does (RFC 8210 §5.1, §8.3). bgpfcd runs as root with `--user
 //! nobody`, as README's Option B: it refuses to run Routinator as root, and
 //! Routinator is born as `nobody` with no capabilities.
@@ -545,7 +548,7 @@ fn the_sidecar_is_started_wired_and_validates() {
     let out = s.wait_for_rpki(
         Duration::ZERO,
         &[
-            "mode sidecar\nenforcement drop-invalid\nvalidation active\n",
+            "mode sidecar\nenforcement drop-invalid\nstartup accept\nvalidation active\n",
             &format!("sidecar running pid {pid} for "),
             &format!(", routinator 0.15.2 ({})\n", s.fake.binary.display()),
             &format!("sidecar rtr {rtr}, restarts 0, failures 0\n"),
@@ -571,7 +574,7 @@ fn the_sidecar_is_started_wired_and_validates() {
 
     // Issue #71: the wait for the first full set is said, then its end.
     let waiting = s
-        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\" mode=sidecar enforcement=drop-invalid hint=")
+        .first("WARN  msg=\"rpki: no validation data yet; routes are used unvalidated until the first full set\" mode=sidecar enforcement=drop-invalid startup=accept hint=")
         .unwrap_or_else(|| panic!("no waiting line:\n{}", s.report()));
     let arrived = s
         .first(
@@ -579,6 +582,25 @@ fn the_sidecar_is_started_wired_and_validates() {
         )
         .unwrap_or_else(|| panic!("no arrival line:\n{}", s.report()));
     assert!(waiting < arrived, "{}", s.report());
+    // As nobody, as the lab runs it, the owner check of Routinator's port
+    // is weaker: bgpfcd says so once, before it starts Routinator, and
+    // starts it all the same (COMPLIANCE.md, RFC 8210 §9, §13).
+    let weaker = s
+        .first(
+            "WARN  msg=\"rpki sidecar: the owner check of Routinator's port is weaker here; \
+             starting anyway\" uid=",
+        )
+        .unwrap_or_else(|| panic!("no warning of the weaker check:\n{}", s.report()));
+    let starting = s
+        .first("msg=\"rpki: starting the routinator sidecar\"")
+        .unwrap_or_else(|| panic!("{}", s.report()));
+    assert!(weaker < starting, "{}", s.report());
+    assert_eq!(
+        s.count("the owner check of Routinator's port is weaker"),
+        1,
+        "{}",
+        s.report()
+    );
 
     s.stop_in_order(pid);
 }
@@ -617,7 +639,7 @@ fn a_bad_sidecar_stops_the_start() {
     fake.set_version("Routinator 0.14.1");
     let log = run(&fake.block("", ""), true);
     assert!(
-        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: Routinator 0.14.1 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2\""),
+        log.contains("ERROR msg=\"cannot start rpki\" error=\"rpki sidecar: Routinator 0.14.1 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.3\""),
         "{log}"
     );
     assert_eq!(fake.version_checks(), 1);

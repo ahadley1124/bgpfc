@@ -9,7 +9,7 @@ use bgpfc_rpki::Enforcement::{self, DropInvalid, Off, PreferValid};
 use super::*;
 
 /// Two external peers: e1 sends, e2 receives.
-fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
+pub(super) fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
     let e1 = peer("10.0.0.1", 65_001, 1);
     let e2 = peer("10.0.0.2", 65_002, 2);
     outputs(|o| rib.peer_up(e1.clone(), now(), o));
@@ -19,23 +19,23 @@ fn two_peers(rib: &mut Rib) -> (PeerInfo, PeerInfo) {
 
 /// A ROA for 192.0.2.0/24 that makes e1's routes to it, from AS 64496,
 /// Invalid; e1's route to 198.51.100.0/24 is `NotFound`.
-fn other_origin() -> VrpSet {
+pub(super) fn other_origin() -> VrpSet {
     vrps(&[("192.0.2.0/24", 24, 64_497)])
 }
 
 /// The ROA that makes them Valid.
-fn their_origin() -> VrpSet {
+pub(super) fn their_origin() -> VrpSet {
     vrps(&[("192.0.2.0/24", 24, 64_496)])
 }
 
 /// e1's routes to `prefixes`, from AS 64496.
-fn send(rib: &mut Rib, e1: &PeerInfo, prefixes: &[&str]) -> Vec<Output> {
+pub(super) fn send(rib: &mut Rib, e1: &PeerInfo, prefixes: &[&str]) -> Vec<Output> {
     let a = attrs(&[65_001, 64_496], "10.0.0.1");
     outputs(|o| rib.update(e1.addr, &announce(prefixes, &a), now(), o))
 }
 
 /// The announcements and withdrawals sent to `to`: (NLRI, withdrawn).
-fn sent(out: &[Output], to: &PeerInfo) -> (Vec<Prefix>, Vec<Prefix>) {
+pub(super) fn sent(out: &[Output], to: &PeerInfo) -> (Vec<Prefix>, Vec<Prefix>) {
     let mut nlri = Vec::new();
     let mut withdrawn = Vec::new();
     for messages in sends(out, to.addr) {
@@ -63,7 +63,7 @@ fn rejudged(out: &[Output]) -> &Rejudged {
 
 /// The routes the RIB holds for `prefix` of IPv4: peer, looked-up state
 /// and why it is held.
-fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
+pub(super) fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
     rib.routes(V4, p(prefix))
         .iter()
         .map(|r| (r.peer, r.rov, r.held))
@@ -71,7 +71,7 @@ fn kept(rib: &Rib, prefix: &str) -> Vec<(IpAddr, RovState, Option<Held>)> {
 }
 
 /// What `peer_stats` counts for `addr` in IPv4: received, held.
-fn counted(rib: &Rib, addr: IpAddr) -> (usize, usize) {
+pub(super) fn counted(rib: &Rib, addr: IpAddr) -> (usize, usize) {
     let s = rib.peer_stats(addr).unwrap();
     (s.received[0].1, s.held[0].1)
 }
@@ -433,13 +433,14 @@ fn a_route_policy_rejects_by_state_is_held_by_policy_not_enforcement() {
 }
 
 #[test]
-fn an_import_policy_change_reaches_held_routes_through_their_updates() {
-    // `set_policies` judges no route again: a reload that changes an
-    // import policy asks the neighbor for its routes again (RFC 2918
-    // ROUTE-REFRESH), and a route held for policy is judged under the new
-    // policy when its UPDATE comes back. A change of `enforcement` in the
-    // same reload, which comes after the policies, judges every route at
-    // once under the new ones.
+fn an_import_policy_change_reaches_held_routes_at_once() {
+    // `set_policies` alone judges no route again: a route held for policy
+    // meets the new policy when its UPDATE comes again, or at once when
+    // the reload imports the neighbor's routes again from the Adj-RIB-In
+    // (`Rib::reimport`, RFC 4271 §3 (a)), held ones included, with no
+    // UPDATE and no ROUTE-REFRESH. A change of `enforcement` in the same
+    // reload, which comes after the policies, judges every route at once
+    // under the new ones too.
     let held_for_policy = |rib: &mut Rib| {
         let (e1, e2) = two_peers(rib);
         outputs(|o| rib.validation_changed(all(other_origin()), now(), o));
@@ -463,6 +464,29 @@ fn an_import_policy_change_reaches_held_routes_through_their_updates() {
     let out = send(&mut rib, &e1, &["192.0.2.0/24"]);
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(sent(&out, &e2), (vec![p("192.0.2.0/24")], vec![]));
+    assert_eq!(
+        kept(&rib, "192.0.2.0/24"),
+        vec![(e1.addr, RovState::Invalid, None)]
+    );
+    assert_eq!(counted(&rib, e1.addr), (1, 0));
+
+    // Imported again: at once, with no UPDATE and nothing asked of e1.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectInvalidTagValid));
+    let (e1, e2) = held_for_policy(&mut rib);
+    outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[], now(), o));
+    let out = outputs(|o| rib.reimport(&[e1.addr], now(), o));
+    let Some(Output::Reimported(r)) = out.first() else {
+        panic!("{out:?}");
+    };
+    assert_eq!((r.routes, r.released, r.best_changed), (1, 1, 1));
+    assert_eq!(r.refresh, vec![]);
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sent(&out, &e2), (vec![p("192.0.2.0/24")], vec![]));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Output::RequestRoutes { .. })),
+        "{out:?}"
+    );
     assert_eq!(
         kept(&rib, "192.0.2.0/24"),
         vec![(e1.addr, RovState::Invalid, None)]

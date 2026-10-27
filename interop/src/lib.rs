@@ -1,9 +1,12 @@
 //! Interoperability test harness. Drives BIRD, FRR and `GoBGP` in network
 //! namespaces and peers them with `bgpfcd`, and serves it VRPs over RTR
 //! from `StayRTR`, or from this crate's stub cache (`src/bin/rtr-stub.rs`)
-//! where `StayRTR` cannot be used. For `rpki { mode sidecar; }` it stands
-//! in a [`FakeRoutinator`] for Routinator, which is never run (AGENTS.md
-//! §5). Nothing in this crate is shipped (AGENTS.md §1.2).
+//! where `StayRTR` cannot be used. For `rpki { mode sidecar; }` most
+//! scenarios stand in a [`FakeRoutinator`] for Routinator, which can be
+//! made to fail, hang or change its version; one runs the real Routinator
+//! 0.15 at `/usr/bin/routinator`, with no network, on a [`LocalRpki`] of
+//! its own (AGENTS.md §5). Nothing in this crate is shipped (AGENTS.md
+//! §1.2).
 //!
 //! Needs root, `iproute2` and the daemon under test:
 //!
@@ -1050,7 +1053,9 @@ const CHILD_SECONDS: u32 = 300;
 /// what it does, and its own copy of `rtr-stub`, which a bgpfcd run as
 /// `nobody` can execute whatever the permissions of the checkout. The
 /// directory belongs to [`NOBODY`], so that the script can write its
-/// records, and bgpfcd the repository directory, there.
+/// records, and bgpfcd the repository directory, there. 0.15.2 is a patch
+/// release before the one bgpfcd is tested with, 0.15.3, and bgpfcd
+/// accepts it as the same series.
 pub struct FakeRoutinator {
     /// The directory of the script, its records and its controls.
     pub dir: PathBuf,
@@ -1240,6 +1245,568 @@ impl Drop for FakeRoutinator {
     }
 }
 
+/// Where a [`LocalRpki`] publishes: an rsync module on the loopback
+/// address of a lab namespace. Routinator refuses a host name that is an
+/// IP address unless it may use "dubious" ones (manual page,
+/// `--allow-dubious-hosts`).
+pub const LOCAL_RPKI_BASE: &str = "rsync://127.0.0.1/rpki";
+
+/// The certificate policy every resource certificate carries,
+/// id-cp-ipAddr-asNumber (RFC 6484 §1.2; RFC 6487 §4.8.9).
+const RPKI_POLICY: &str = "1.3.6.1.5.5.7.14.2";
+
+/// The eContentType of a ROA, id-ct-routeOriginAuthz (RFC 9582 §3).
+const CT_ROA: &str = "1.2.840.113549.1.9.16.1.24";
+
+/// The eContentType of a manifest, id-ct-rpkiManifest (RFC 9286 §4.1).
+const CT_MANIFEST: &str = "1.2.840.113549.1.9.16.1.26";
+
+/// id-sha256 (RFC 5754 §2.2), the hash a manifest lists its files with
+/// (RFC 7935 §2).
+const ID_SHA256: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 2, 1];
+
+/// How long every certificate and CRL of a [`LocalRpki`] is valid, in
+/// days: far beyond any test run.
+const LOCAL_RPKI_DAYS: &str = "36500";
+
+/// An RPKI repository of the test's own, for the real Routinator: one
+/// trust anchor that holds every address and AS number, and a ROA for each
+/// VRP a test asks for, signed with `openssl` when the test starts and
+/// published by an `rsync` daemon on `127.0.0.1:873` in a lab namespace.
+/// Routinator, given the trust anchor locator in [`LocalRpki::tals`] and
+/// allowed the loopback host name ([`LOCAL_RPKI_BASE`]), validates it
+/// without any network beyond that namespace.
+///
+/// The objects follow the profiles Routinator checks, in its `--strict`
+/// mode too:
+/// - the trust anchor certificate, self-signed, with the resources, key
+///   usage, policy and Subject Information Access of a CA (RFC 6487
+///   §4.8), the CRL it issues (RFC 6487 §5) and the trust anchor locator
+///   that names it (RFC 8630 §2.2);
+/// - a ROA for each VRP (RFC 9582), and a manifest of the CRL and the
+///   ROAs (RFC 9286), each a CMS signed object (RFC 6488) with a
+///   one-time-use EE certificate: the ROA's holds exactly its prefix
+///   (RFC 9582 §5), the manifest's inherits every resource and is valid
+///   from its thisUpdate to its nextUpdate (RFC 9286 §5.1);
+/// - names that are a `CommonName` in a `PrintableString` (RFC 6487 §4.4,
+///   §4.5), which `openssl` writes only when told to.
+///
+/// The repository lives in the lab's directory, `rpki/`: the published
+/// tree in `public/`, the TAL in `tals/`, keys and requests in `work/`.
+/// Every user may read all of it, since Routinator and the daemon run as
+/// `nobody`; the keys sign nothing but this test's objects.
+pub struct LocalRpki {
+    /// The directory of the trust anchor locator, for the
+    /// `extra-tals-dir` statement.
+    pub tals: PathBuf,
+    /// The `rsync` daemon that publishes the repository.
+    pub rsyncd: Daemon,
+}
+
+impl LocalRpki {
+    /// Build the repository with a ROA for each of `vrps`, (prefix, max
+    /// length, origin AS), and publish it in namespace `ns`.
+    ///
+    /// # Panics
+    /// If `openssl` or `rsync` is missing or fails, a prefix does not
+    /// parse, or a file cannot be written.
+    #[must_use]
+    pub fn publish(lab: &Lab, ns: &str, vrps: &[(&str, u8, u32)]) -> LocalRpki {
+        let root = lab.dir.join("rpki");
+        let public = root.join("public");
+        let point = public.join("repo");
+        let tals = root.join("tals");
+        let ca = Issuer {
+            work: root.join("work"),
+            serial: std::cell::Cell::new(1),
+        };
+        for dir in [&ca.work, &public.join("ta"), &point, &tals] {
+            fs::create_dir_all(dir).expect("local rpki dir");
+        }
+        ca.trust_anchor(&public.join("ta").join("ta.cer"), &tals);
+        ca.crl(&point.join("ta.crl"));
+        let mut files = vec!["ta.crl".to_owned()];
+        for (i, &(prefix, max_len, asn)) in vrps.iter().enumerate() {
+            let file = format!("roa-{i}.roa");
+            ca.roa(&point.join(&file), prefix, max_len, asn);
+            files.push(file);
+        }
+        ca.manifest(&point, &files);
+        // Whatever the umask: the daemon and Routinator run as nobody.
+        sh("chmod", &["-R", "a+rX", root.to_str().expect("path")]);
+        let rsyncd = serve_rsync(lab, ns, &root, &public);
+        LocalRpki { tals, rsyncd }
+    }
+}
+
+/// Start `rsync --daemon` in namespace `ns`, publishing `public` as the
+/// module of [`LOCAL_RPKI_BASE`] to [`NOBODY`]'s reading, and wait until
+/// it answers.
+fn serve_rsync(lab: &Lab, ns: &str, root: &Path, public: &Path) -> Daemon {
+    let config = root.join("rsyncd.conf");
+    fs::write(
+        &config,
+        format!(
+            "use chroot = no\nuid = {NOBODY}\ngid = {NOBODY}\n[rpki]\npath = {}\nread only = yes\n",
+            public.display()
+        ),
+    )
+    .expect("rsyncd.conf");
+    let mut cmd = lab.exec(ns, "rsync");
+    cmd.args([
+        "--daemon",
+        "--no-detach",
+        "--address=127.0.0.1",
+        "--port=873",
+    ])
+    .arg(format!("--config={}", config.display()))
+    .arg(format!(
+        "--log-file={}",
+        lab.dir
+            .join(format!("rsyncd-{ns}-connections.log"))
+            .display()
+    ));
+    let daemon = Daemon::start(cmd, lab.dir.join(format!("rsyncd-{ns}.log")));
+    let listing = format!("{LOCAL_RPKI_BASE}/repo/");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            let mut list = lab.exec(ns, "rsync");
+            list.arg(&listing)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }),
+        "rsync --daemon did not serve {listing}:\n{}",
+        daemon.log_text()
+    );
+    daemon
+}
+
+/// The trust anchor of a [`LocalRpki`], which signs everything in it,
+/// working in `work`.
+struct Issuer {
+    work: PathBuf,
+    /// The serial number the next certificate gets (RFC 6487 §4.2).
+    serial: std::cell::Cell<u32>,
+}
+
+impl Issuer {
+    /// Run `openssl` in the work directory; its standard output.
+    fn openssl(&self, args: &[&str]) -> Vec<u8> {
+        let out = Command::new("openssl")
+            .current_dir(&self.work)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("running openssl {}: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "openssl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn write(&self, name: &str, contents: impl AsRef<[u8]>) {
+        fs::write(self.work.join(name), contents).expect("local rpki work file");
+    }
+
+    fn next_serial(&self) -> String {
+        let serial = self.serial.get();
+        self.serial.set(serial + 1);
+        serial.to_string()
+    }
+
+    /// A key pair `NAME.key` and a request `NAME.csr` for the subject
+    /// `CN=bgpfc-interop-NAME`, in a `PrintableString` (RFC 6487 §4.5):
+    /// `string_mask = default` picks it, where `openssl`'s own setting
+    /// writes a `UTF8String`.
+    fn request(&self, name: &str) {
+        self.openssl(&["genrsa", "-out", &format!("{name}.key"), "2048"]);
+        self.write(
+            &format!("{name}.req"),
+            format!(
+                "[req]\ndistinguished_name = dn\nstring_mask = default\nprompt = no\n\
+                 [dn]\nCN = bgpfc-interop-{name}\n"
+            ),
+        );
+        self.openssl(&[
+            "req",
+            "-new",
+            "-key",
+            &format!("{name}.key"),
+            "-config",
+            &format!("{name}.req"),
+            "-out",
+            &format!("{name}.csr"),
+        ]);
+    }
+
+    /// The self-signed trust anchor certificate `ta.pem`, published as
+    /// `cer` in DER, and the trust anchor locator that names it, in
+    /// `tals/bgpfc-interop.tal` (RFC 8630 §2.2: its URI, an empty line,
+    /// and its subjectPublicKeyInfo in base64).
+    fn trust_anchor(&self, cer: &Path, tals: &Path) {
+        self.request("ta");
+        // RFC 6487 §4.8: the extensions of a CA certificate. A
+        // self-signed one MAY leave out the Authority Key Identifier
+        // (§4.8.3) and MUST leave out CRL Distribution Points and
+        // Authority Information Access (§4.8.6, §4.8.7). Every address and
+        // AS number, as an RIR's trust anchor holds them (§4.8.10,
+        // §4.8.11).
+        self.write(
+            "ta.ext",
+            format!(
+                "[ext]\n\
+                 basicConstraints = critical, CA:true\n\
+                 keyUsage = critical, keyCertSign, cRLSign\n\
+                 subjectKeyIdentifier = hash\n\
+                 subjectInfoAccess = caRepository;URI:{LOCAL_RPKI_BASE}/repo/, \
+                 rpkiManifest;URI:{LOCAL_RPKI_BASE}/repo/ta.mft\n\
+                 certificatePolicies = critical, {RPKI_POLICY}\n\
+                 sbgp-ipAddrBlock = critical, IPv4:0.0.0.0/0, IPv6:::/0\n\
+                 sbgp-autonomousSysNum = critical, AS:0-4294967295\n"
+            ),
+        );
+        let serial = self.next_serial();
+        self.openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "ta.csr",
+            "-signkey",
+            "ta.key",
+            "-set_serial",
+            &serial,
+            "-days",
+            LOCAL_RPKI_DAYS,
+            "-sha256",
+            "-extfile",
+            "ta.ext",
+            "-extensions",
+            "ext",
+            "-out",
+            "ta.pem",
+        ]);
+        let cer = cer.to_str().expect("path");
+        self.openssl(&["x509", "-in", "ta.pem", "-outform", "DER", "-out", cer]);
+        self.openssl(&[
+            "pkey", "-in", "ta.key", "-pubout", "-outform", "DER", "-out", "ta.spki",
+        ]);
+        let spki = self.openssl(&["base64", "-A", "-in", "ta.spki"]);
+        let spki = String::from_utf8(spki).expect("base64 is ASCII");
+        fs::write(
+            tals.join("bgpfc-interop.tal"),
+            format!("{LOCAL_RPKI_BASE}/ta/ta.cer\n\n{}\n", spki.trim()),
+        )
+        .expect("trust anchor locator");
+    }
+
+    /// The trust anchor's CRL, empty, in DER at `out` (RFC 6487 §5: a
+    /// version 2 CRL with the Authority Key Identifier and a CRL number).
+    fn crl(&self, out: &Path) {
+        let work = self.work.display();
+        self.write(
+            "ca.cnf",
+            format!(
+                "[ca]\ndefault_ca = ta\n[ta]\ndatabase = {work}/index.txt\n\
+                 crlnumber = {work}/crlnumber\ndefault_md = sha256\n\
+                 default_crl_days = {LOCAL_RPKI_DAYS}\ncrl_extensions = crl_ext\n\
+                 [crl_ext]\nauthorityKeyIdentifier = keyid:always\n"
+            ),
+        );
+        self.write("index.txt", "");
+        self.write("crlnumber", "01\n");
+        self.openssl(&[
+            "ca",
+            "-gencrl",
+            "-config",
+            "ca.cnf",
+            "-keyfile",
+            "ta.key",
+            "-cert",
+            "ta.pem",
+            "-out",
+            "ta.crl.pem",
+        ]);
+        let out = out.to_str().expect("path");
+        self.openssl(&["crl", "-in", "ta.crl.pem", "-outform", "DER", "-out", out]);
+    }
+
+    /// A one-time-use EE certificate `NAME.pem` for the signed object
+    /// published as `file`, with `resources` as its RFC 3779 extensions;
+    /// its validity, `(notBefore, notAfter)` as `GeneralizedTime`.
+    fn end_entity(&self, name: &str, file: &str, resources: &str) -> (String, String) {
+        self.request(name);
+        // RFC 6487 §4.8: the extensions of an EE certificate, which signs
+        // the one object its Subject Information Access names (§4.8.8.2).
+        self.write(
+            &format!("{name}.ext"),
+            format!(
+                "[ext]\n\
+                 keyUsage = critical, digitalSignature\n\
+                 subjectKeyIdentifier = hash\n\
+                 authorityKeyIdentifier = keyid:always\n\
+                 crlDistributionPoints = URI:{LOCAL_RPKI_BASE}/repo/ta.crl\n\
+                 authorityInfoAccess = caIssuers;URI:{LOCAL_RPKI_BASE}/ta/ta.cer\n\
+                 subjectInfoAccess = signedObject;URI:{LOCAL_RPKI_BASE}/repo/{file}\n\
+                 certificatePolicies = critical, {RPKI_POLICY}\n\
+                 {resources}"
+            ),
+        );
+        let serial = self.next_serial();
+        self.openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            &format!("{name}.csr"),
+            "-CA",
+            "ta.pem",
+            "-CAkey",
+            "ta.key",
+            "-set_serial",
+            &serial,
+            "-days",
+            LOCAL_RPKI_DAYS,
+            "-sha256",
+            "-extfile",
+            &format!("{name}.ext"),
+            "-extensions",
+            "ext",
+            "-out",
+            &format!("{name}.pem"),
+        ]);
+        let dates = self.openssl(&[
+            "x509",
+            "-in",
+            &format!("{name}.pem"),
+            "-noout",
+            "-startdate",
+            "-enddate",
+            "-dateopt",
+            "iso_8601",
+        ]);
+        let dates = String::from_utf8_lossy(&dates).into_owned();
+        let date = |field: &str| -> String {
+            let iso = dates
+                .lines()
+                .find_map(|l| l.strip_prefix(field))
+                .unwrap_or_else(|| panic!("no {field} in {dates}"));
+            // `2026-10-27 05:00:06Z` as `20261027050006Z`.
+            iso.chars().filter(|c| !"-: ".contains(*c)).collect()
+        };
+        (date("notBefore="), date("notAfter="))
+    }
+
+    /// Sign `content` with `NAME.pem` as a CMS signed object of
+    /// `content_type`, in DER at `out` (RFC 6488 §2): the EE certificate
+    /// included, the signer named by its Subject Key Identifier
+    /// (§2.1.6.2, `-keyid`), SHA-256, and no signed attribute beyond
+    /// content type, message digest and signing time (§2.1.6.4,
+    /// `-nosmimecap`).
+    fn sign(&self, name: &str, content_type: &str, content: &[u8], out: &Path) {
+        let econtent = format!("{name}.econtent");
+        self.write(&econtent, content);
+        self.openssl(&[
+            "cms",
+            "-sign",
+            "-binary",
+            "-nodetach",
+            "-in",
+            &econtent,
+            "-econtent_type",
+            content_type,
+            "-signer",
+            &format!("{name}.pem"),
+            "-inkey",
+            &format!("{name}.key"),
+            "-md",
+            "sha256",
+            "-keyid",
+            "-nosmimecap",
+            "-outform",
+            "DER",
+            "-out",
+            out.to_str().expect("path"),
+        ]);
+    }
+
+    /// A ROA at `out` for `asn` to originate `prefix` up to `max_len`
+    /// (RFC 9582). Its EE certificate holds exactly that prefix, neither
+    /// `inherit` nor AS numbers (RFC 9582 §5).
+    fn roa(&self, out: &Path, prefix: &str, max_len: u8, asn: u32) {
+        let (addr, len) = parse_prefix(prefix);
+        let family = if addr.is_ipv4() { "IPv4" } else { "IPv6" };
+        let name = out
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("roa file name");
+        let file = out
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("roa file name");
+        self.end_entity(
+            name,
+            file,
+            &format!("sbgp-ipAddrBlock = critical, {family}:{prefix}\n"),
+        );
+        self.sign(name, CT_ROA, &roa_econtent(asn, addr, len, max_len), out);
+    }
+
+    /// The manifest `ta.mft` in the publication point `point`, listing
+    /// `files` there with their SHA-256 hashes (RFC 9286 §4.2.1). Its EE
+    /// certificate inherits the trust anchor's resources, and its
+    /// validity is the manifest's thisUpdate to nextUpdate (RFC 9286
+    /// §5.1).
+    fn manifest(&self, point: &Path, files: &[String]) {
+        let (this_update, next_update) = self.end_entity(
+            "mft",
+            "ta.mft",
+            "sbgp-ipAddrBlock = critical, IPv4:inherit, IPv6:inherit\n\
+             sbgp-autonomousSysNum = critical, AS:inherit\n",
+        );
+        let hashes: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|file| {
+                let path = point.join(file);
+                let hash =
+                    self.openssl(&["dgst", "-sha256", "-binary", path.to_str().expect("path")]);
+                (file.clone(), hash)
+            })
+            .collect();
+        let content = manifest_econtent(1, &this_update, &next_update, &hashes);
+        self.sign("mft", CT_MANIFEST, &content, &point.join("ta.mft"));
+    }
+}
+
+/// `ADDRESS/LENGTH` as an address and a length.
+///
+/// # Panics
+/// If it does not parse.
+fn parse_prefix(prefix: &str) -> (IpAddr, u8) {
+    prefix
+        .split_once('/')
+        .and_then(|(addr, len)| Some((addr.parse().ok()?, len.parse().ok()?)))
+        .unwrap_or_else(|| panic!("{prefix} is not a prefix"))
+}
+
+/// The DER encoding (X.690 §8.1, §10.1) of a value: its tag, its length
+/// in the definite form, the shortest one, and its contents.
+fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = contents.len();
+    if len < 0x80 {
+        out.push(u8::try_from(len).expect("below 0x80"));
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        let count = u8::try_from(bytes.len() - skip).expect("at most 8 length octets");
+        out.push(0x80 | count);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    out.extend_from_slice(contents);
+    out
+}
+
+/// A SEQUENCE of `items`, each already encoded.
+fn der_sequence(items: &[Vec<u8>]) -> Vec<u8> {
+    der(0x30, &items.concat())
+}
+
+/// A non-negative INTEGER (X.690 §8.3): the fewest octets of two's
+/// complement, with a leading zero octet where the top bit is set.
+fn der_uint(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let skip = bytes.iter().take_while(|&&b| b == 0).count().min(7);
+    let mut contents = bytes[skip..].to_vec();
+    if contents[0] & 0x80 != 0 {
+        contents.insert(0, 0);
+    }
+    der(0x02, &contents)
+}
+
+/// An OBJECT IDENTIFIER (X.690 §8.19): the first two arcs in one
+/// subidentifier, each subidentifier in base 128, high bit set on all
+/// octets but its last.
+fn der_oid(arcs: &[u64]) -> Vec<u8> {
+    let mut contents = Vec::new();
+    let first = arcs[0] * 40 + arcs[1];
+    for arc in std::iter::once(first).chain(arcs[2..].iter().copied()) {
+        let mut septets = vec![u8::try_from(arc & 0x7f).expect("seven bits")];
+        let mut rest = arc >> 7;
+        while rest > 0 {
+            septets.push(0x80 | u8::try_from(rest & 0x7f).expect("seven bits"));
+            rest >>= 7;
+        }
+        contents.extend(septets.iter().rev());
+    }
+    der(0x06, &contents)
+}
+
+/// A BIT STRING of `bits`, the last `unused` bits of which are not part
+/// of it (X.690 §8.6).
+fn der_bits(unused: u8, bits: &[u8]) -> Vec<u8> {
+    let mut contents = vec![unused];
+    contents.extend_from_slice(bits);
+    der(0x03, &contents)
+}
+
+/// An IP prefix as RFC 3779 §2.1.1 encodes it: a BIT STRING of the
+/// constant most-significant bits, the unused ones zero.
+fn der_prefix(addr: IpAddr, len: u8) -> Vec<u8> {
+    let octets = match addr {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    };
+    let used = usize::from(len).div_ceil(8);
+    let unused = u8::try_from(used * 8 - usize::from(len)).expect("fewer than 8");
+    let mut bits = octets[..used].to_vec();
+    if let Some(last) = bits.last_mut() {
+        *last &= 0xff << unused;
+    }
+    der_bits(unused, &bits)
+}
+
+/// The eContent of a ROA (RFC 9582 §4) for `asn` to originate the prefix
+/// `addr/len` up to `max_len`.
+fn roa_econtent(asn: u32, addr: IpAddr, len: u8, max_len: u8) -> Vec<u8> {
+    // RFC 9582 §4.3.1: the AFI, 1 for IPv4 and 2 for IPv6.
+    let afi: &[u8] = if addr.is_ipv4() { &[0, 1] } else { &[0, 2] };
+    let mut address = vec![der_prefix(addr, len)];
+    // RFC 9582 §4.3.2.2: maxLength SHOULD NOT be encoded when it is the
+    // prefix length.
+    if max_len != len {
+        address.push(der_uint(u64::from(max_len)));
+    }
+    let family = der_sequence(&[der(0x04, afi), der_sequence(&[der_sequence(&address)])]);
+    // RFC 9582 §4.1: version 0, the DEFAULT, which DER leaves out
+    // (X.690 §11.5).
+    der_sequence(&[der_uint(u64::from(asn)), der_sequence(&[family])])
+}
+
+/// The eContent of a manifest (RFC 9286 §4.2): `number`, the two times as
+/// `GeneralizedTime`, SHA-256, and each file's name with its hash.
+fn manifest_econtent(
+    number: u64,
+    this_update: &str,
+    next_update: &str,
+    files: &[(String, Vec<u8>)],
+) -> Vec<u8> {
+    let list: Vec<Vec<u8>> = files
+        .iter()
+        .map(|(name, hash)| der_sequence(&[der(0x16, name.as_bytes()), der_bits(0, hash)]))
+        .collect();
+    // RFC 9286 §4.2.1: version 0, the DEFAULT, left out (X.690 §11.5).
+    der_sequence(&[
+        der_uint(number),
+        der(0x18, this_update.as_bytes()),
+        der(0x18, next_update.as_bytes()),
+        der_oid(&ID_SHA256),
+        der_sequence(&list),
+    ])
+}
+
 /// Path to `rtr-stub`. Cargo builds a package's binaries for its
 /// integration tests and puts them in `target/<profile>/`, beside the
 /// `deps/` directory the test binary runs from.
@@ -1375,5 +1942,115 @@ mod tests {
             .expect("bgpfcd --check");
         assert!(out.status.success(), "{out:?}");
         assert_eq!(fake.version_checks(), 6);
+    }
+
+    /// The DER a [`LocalRpki`] writes: RFC 3779 §2.1.1's prefixes, both
+    /// forms of length (X.690 §8.1.3), integers with and without a
+    /// leading zero (§8.3), `id-sha256` as certificates carry it, and a
+    /// ROA's eContent laid out as RFC 9582 §4 defines it.
+    #[test]
+    fn der_is_written_as_the_rfcs_lay_it_out() {
+        let prefix = |p: &str| {
+            let (addr, len) = parse_prefix(p);
+            der_prefix(addr, len)
+        };
+        assert_eq!(
+            prefix("10.5.0.4/32"),
+            [0x03, 0x05, 0x00, 0x0a, 0x05, 0x00, 0x04]
+        );
+        assert_eq!(prefix("10.5.0.0/23"), [0x03, 0x04, 0x01, 0x0a, 0x05, 0x00]);
+        assert_eq!(
+            prefix("2001:0:200:3::1/128"),
+            [
+                0x03, 0x11, 0x00, 0x20, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01
+            ]
+        );
+        assert_eq!(
+            prefix("2001:0:200::/39"),
+            [0x03, 0x06, 0x01, 0x20, 0x01, 0x00, 0x00, 0x02]
+        );
+        // Host bits past the length are left out, as DER wants them zero.
+        assert_eq!(prefix("10.5.1.255/23"), prefix("10.5.0.0/23"));
+        assert_eq!(prefix("0.0.0.0/0"), [0x03, 0x01, 0x00]);
+
+        assert_eq!(der(0x04, &[7; 3]), [0x04, 0x03, 7, 7, 7]);
+        assert_eq!(der(0x04, &[0; 127])[..2], [0x04, 0x7f]);
+        assert_eq!(der(0x04, &[0; 128])[..3], [0x04, 0x81, 0x80]);
+        assert_eq!(der(0x04, &[0; 300])[..4], [0x04, 0x82, 0x01, 0x2c]);
+
+        assert_eq!(der_uint(0), [0x02, 0x01, 0x00]);
+        assert_eq!(der_uint(127), [0x02, 0x01, 0x7f]);
+        assert_eq!(der_uint(128), [0x02, 0x02, 0x00, 0x80]);
+        assert_eq!(der_uint(65_001), [0x02, 0x03, 0x00, 0xfd, 0xe9]);
+        assert_eq!(
+            der_uint(u64::from(u32::MAX)),
+            [0x02, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff]
+        );
+
+        assert_eq!(
+            der_oid(&ID_SHA256),
+            [
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01
+            ]
+        );
+
+        let (addr, len) = parse_prefix("192.0.2.0/24");
+        let address = [0x30, 0x06, 0x03, 0x04, 0x00, 0xc0, 0x00, 0x02];
+        let addresses = [&[0x30, 0x08][..], &address].concat();
+        let family = [&[0x30, 0x0e, 0x04, 0x02, 0x00, 0x01][..], &addresses].concat();
+        let blocks = [&[0x30, 0x10][..], &family].concat();
+        let as_id = [0x02, 0x03, 0x00, 0xfd, 0xe9];
+        let roa = [&[0x30, 0x17][..], &as_id, &blocks].concat();
+        assert_eq!(roa_econtent(65_001, addr, len, 24), roa);
+        // A longer maxLength follows the address in its SEQUENCE.
+        let longer = roa_econtent(65_001, addr, len, 26);
+        assert_eq!(longer.len(), roa.len() + 3);
+        assert!(longer.windows(11).any(|w| w
+            == [
+                0x30, 0x09, 0x03, 0x04, 0x00, 0xc0, 0x00, 0x02, 0x02, 0x01, 26
+            ]));
+    }
+
+    /// The repository a [`LocalRpki`] publishes is valid to the real
+    /// Routinator, in its strict mode, from inside a lab namespace and
+    /// with no other network: `routinator vrps` gives back the VRPs it was
+    /// built from, IPv6 and a longer maxLength included.
+    #[test]
+    #[ignore = "needs root, iproute2, openssl, rsync and routinator 0.15"]
+    fn the_local_rpki_is_valid_to_routinator() {
+        let lab = Lab::new("lr", 38);
+        let vrps = [
+            ("192.0.2.0/24", 24, 65_001),
+            ("198.51.100.0/24", 26, 64_999),
+            ("2001:db8::/32", 48, 65_002),
+        ];
+        let rpki = LocalRpki::publish(&lab, &lab.a, &vrps);
+        let cache = lab.dir.join("routinator-cache");
+        let mut cmd = lab.exec(&lab.a, "timeout");
+        cmd.env("HOME", &lab.dir)
+            .args(["60", "/usr/bin/routinator", "--strict", "--no-rir-tals"])
+            .arg(format!("--repository-dir={}", cache.display()))
+            .arg(format!("--extra-tals-dir={}", rpki.tals.display()))
+            .args(["--allow-dubious-hosts", "vrps"]);
+        let out = cmd.output().expect("routinator vrps");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut got: Vec<&str> = stdout.lines().skip(1).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                "AS64999,198.51.100.0/24,26,bgpfc-interop",
+                "AS65001,192.0.2.0/24,24,bgpfc-interop",
+                "AS65002,2001:db8::/32,48,bgpfc-interop",
+            ],
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

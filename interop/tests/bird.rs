@@ -34,6 +34,34 @@ fn bgpfcd_opts(lab: &Lab, passive: bool) -> BgpfcdOpts {
     BgpfcdOpts::single(BGPFC_AS, lab.a_addr, n)
 }
 
+/// Whether bgpfcd logged a line for changes of the FIB (`fib: changes`,
+/// at info whatever the level, at most one a second) in `mode` with at
+/// least one `op` (`install` or `delete`) and `prefix` among the prefixes
+/// it names.
+fn fib_change(log: &str, mode: &str, op: &str, prefix: &str) -> bool {
+    let count = format!("{op}=");
+    log.lines()
+        .filter(|l| l.contains("msg=\"fib: changes\""))
+        .any(|l| {
+            let field = |key: &str| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix(key))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            field("mode=") == mode
+                && field(&count).parse::<u32>().is_ok_and(|n| n > 0)
+                && field("prefixes=").split(',').any(|p| p == prefix)
+        })
+}
+
+/// Whether any line of the FIB thread names `prefix`: neither the line of
+/// a change nor the debug line of a route.
+fn fib_names(log: &str, prefix: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("msg=\"fib: ") && l.split([' ', '=', ',']).any(|w| w == prefix))
+}
+
 /// Both sides report Established, and BIRD's statics reach bgpfcd's RIB.
 fn assert_established(lab: &Lab, bird: &Bird, bgpfcd: &interop::Daemon) {
     let ok = wait_for(ESTABLISH, || {
@@ -222,7 +250,12 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
         routes.contains(&format!("BGP.next_hop: {}", lab.a2_addr)),
         "{routes}"
     );
+    // Dry-run: the change is one line at info, the route one at debug.
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_change(&bgpfcd.log_text(), "dry-run", "install", "192.0.2.0/24")
+    });
     let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
     assert!(
         log.contains(&format!("prefix=192.0.2.0/24 gateway={}", lab.b_addr)),
         "{log}"
@@ -236,6 +269,10 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             .contains("192.0.2.0/24")
     });
     assert!(ok, "withdraw not relayed:\n{}", bgpfcd.log_text());
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_change(&bgpfcd.log_text(), "dry-run", "delete", "192.0.2.0/24")
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
     assert!(
         bgpfcd.log_text().contains("op=delete"),
         "{}",
@@ -332,13 +369,15 @@ fn export_policy_filters_and_sets() {
     });
     let routes = bird2.birdc(&lab, &["show", "route", "all"]);
     assert!(ok, "route not relayed:\n{routes}\n{}", bgpfcd.log_text());
-    // Rejected on import: never reaches BIRD 2, nor the FIB.
+    // Rejected on import: never reaches BIRD 2, nor the FIB, whose lines
+    // name the accepted route and never the rejected one.
     assert!(!routes.contains("198.51.100.0/24"), "{routes}");
-    assert!(
-        !bgpfcd.log_text().contains("prefix=198.51.100.0/24 gateway"),
-        "{}",
-        bgpfcd.log_text()
-    );
+    let ok = wait_for(Duration::from_secs(5), || {
+        fib_names(&bgpfcd.log_text(), "192.0.2.0/24")
+    });
+    let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
+    assert!(!fib_names(&log, "198.51.100.0/24"), "{log}");
     // Export set actions, then our AS prepended by the session rules.
     assert!(
         routes.contains("BGP.as_path: 65000 65000 65001"),
@@ -373,11 +412,16 @@ fn fib_install_and_clean_shutdown() {
     assert!(ok, "routes not installed:\n{r}\n{}", bgpfcd.log_text());
     assert!(r.contains(&format!("via {}", lab.b_addr)), "{r}");
     assert!(r.contains("metric 20"), "{r}");
-    assert!(
-        bgpfcd.log_text().contains("fib: applied"),
-        "{}",
-        bgpfcd.log_text()
-    );
+    // The lines of the two installs: at once, or for the second, should
+    // it come within a second of the first, a second after it.
+    let ok = wait_for(Duration::from_secs(5), || {
+        let log = bgpfcd.log_text();
+        fib_change(&log, "install", "install", "192.0.2.0/24")
+            && fib_change(&log, "install", "install", "198.51.100.0/24")
+    });
+    let log = bgpfcd.log_text();
+    assert!(ok, "{log}");
+    assert!(log.contains("msg=\"fib: applied\" op=install"), "{log}");
 
     // Withdraw one: only the other stays.
     let _ = bird.birdc(&lab, &["disable", "static1"]);
@@ -533,8 +577,19 @@ fn control_plane_commands() {
     assert!(ok && out.contains("installed"), "{out}");
 }
 
-/// Reload with a policy change, refusal of a broken file, and a hard
-/// reset carrying a shutdown communication.
+/// Import and export policies for `control_plane_reload_and_reset`.
+const IMPORT_ALL: &str = "policy IN { term all { action accept; } }";
+const IMPORT_DROP: &str = "policy IN { term drop { match prefix 198.51.100.0/24; action reject; } term all { action accept; } }";
+const EXPORT_ALL: &str = "policy OUT { term all { action accept; } }";
+const EXPORT_MED: &str = "policy OUT { term all { set med 5; action accept; } }";
+
+/// Reloads with policy changes, refusal of a broken file, and a hard
+/// reset carrying a shutdown communication. A new import policy applies at
+/// once to the routes bgpfcd kept, with no ROUTE-REFRESH (RFC 4271 §3);
+/// a new export policy needs none either; the next import change, after
+/// an import policy dropped a route, which bgpfcd did not keep, asks BIRD
+/// for the whole family again with ROUTE-REFRESH (RFC 2918 §4), and the
+/// route comes back.
 #[test]
 #[ignore = "needs root, bird and iproute2"]
 fn control_plane_reload_and_reset() {
@@ -547,8 +602,10 @@ fn control_plane_reload_and_reset() {
     );
     let socket = lab.dir.join("ctl.sock");
     let mut opts = bgpfcd_opts(&lab, false);
+    opts.neighbors[0].import = "IN".to_owned();
+    opts.neighbors[0].export = "OUT".to_owned();
     opts.extra = format!(
-        "control {{ socket {}; }} fib {{ mode install; }}",
+        "{IMPORT_ALL} {EXPORT_ALL} control {{ socket {}; }} fib {{ mode install; }}",
         socket.display()
     );
     // The hard reset below reconnects at once (RFC 4271 §8.2.2 Idle,
@@ -567,25 +624,9 @@ fn control_plane_reload_and_reset() {
     });
     assert!(ok, "{}", bgpfcd.log_text());
 
-    // Reload with an import policy that drops one prefix: it leaves the
-    // RIB and the kernel without a session reset.
-    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
-    let cfg = fs::read_to_string(&cfg_path).unwrap();
-    let cfg = cfg.replace(
-        "policy ANY { term all { action accept; } }",
-        "policy ANY { term drop { match prefix 198.51.100.0/24; action reject; } term all { action accept; } }",
-    );
-    fs::write(&cfg_path, cfg).unwrap();
-    let (out, ok) = ctl(&["reload"]);
-    assert!(ok && out.contains("policy 1"), "{out}");
-    let ok = wait_for(Duration::from_secs(10), || {
-        !ctl(&["show", "routes"]).0.contains("198.51.100.0/24")
-            && !interop::Daemon::ip_in(&lab, &ns_a, &["route", "show", "proto", "186"])
-                .contains("198.51.100.0/24")
-    });
-    assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
-    assert_eq!(bgpfcd.log_text().matches("session established").count(), 1);
+    policy_reloads(&lab, &socket, &bgpfcd);
     // A broken file is refused and the running configuration kept.
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
     fs::write(&cfg_path, "router-id 192.0.2.1;").unwrap();
     let (out, ok) = ctl(&["reload"]);
     assert!(!ok && out.contains("local-as"), "{out}");
@@ -603,6 +644,98 @@ fn control_plane_reload_and_reset() {
         bgpfcd.log_text().matches("session established").count() >= 2
     });
     assert!(ok, "no reconnect:\n{}", bgpfcd.log_text());
+}
+
+/// The policy reloads of `control_plane_reload_and_reset`, on the lab's
+/// bgpfcd with its control socket at `socket`, which takes BIRD's two
+/// routes under `IMPORT_ALL` and `EXPORT_ALL`.
+fn policy_reloads(lab: &Lab, socket: &std::path::Path, bgpfcd: &interop::Daemon) {
+    use std::fs;
+    let ctl = |args: &[&str]| interop::bgpfcctl(socket, args);
+    let ns_a = lab.a.clone();
+    // Rewrite one policy of the file and reload: one neighbor's policy
+    // changed, and nothing else.
+    let cfg_path = lab.dir.join(format!("bgpfcd-{}.conf", lab.a));
+    let reload = |from: &str, to: &str| {
+        let cfg = fs::read_to_string(&cfg_path).unwrap();
+        assert!(cfg.contains(from), "{cfg}");
+        fs::write(&cfg_path, cfg.replace(from, to)).unwrap();
+        let (out, ok) = ctl(&["reload"]);
+        assert!(ok && out.contains("reset 0 policy 1"), "{out}");
+    };
+    let in_kernel = |prefix: &str| {
+        interop::Daemon::ip_in(lab, &ns_a, &["route", "show", "proto", "186"]).contains(prefix)
+    };
+    let refreshes = || {
+        bgpfcd
+            .log_text()
+            .matches("msg=\"route refresh sent\"")
+            .count()
+    };
+    let reimports = || {
+        bgpfcd
+            .log_text()
+            .lines()
+            .filter(|l| l.contains("msg=\"rib: re-import\""))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    // An import policy that drops one prefix: it leaves the RIB and the
+    // kernel at once, from the routes bgpfcd kept, with no session reset
+    // and no ROUTE-REFRESH.
+    reload(IMPORT_ALL, IMPORT_DROP);
+    let ok = wait_for(Duration::from_secs(10), || {
+        !ctl(&["show", "routes"]).0.contains("198.51.100.0/24") && !in_kernel("198.51.100.0/24")
+    });
+    assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
+    let lines = reimports();
+    assert_eq!(lines.len(), 1, "{}", bgpfcd.log_text());
+    assert!(
+        lines[0].contains("routes=2 ") && lines[0].contains("dropped=1 "),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].ends_with("refresh=none"), "{}", lines[0]);
+    assert_eq!(refreshes(), 0, "{}", bgpfcd.log_text());
+    // Nor is anything exported again: the export policy is the same.
+    assert!(
+        !bgpfcd.log_text().contains("msg=\"rib: re-export\""),
+        "{}",
+        bgpfcd.log_text()
+    );
+
+    // An export policy alone: BIRD is sent the difference, nothing is
+    // imported again, and no ROUTE-REFRESH goes out.
+    reload(EXPORT_ALL, EXPORT_MED);
+    let ok = wait_for(Duration::from_secs(10), || {
+        bgpfcd.log_text().contains("msg=\"rib: re-export\"")
+    });
+    assert!(ok, "{}", bgpfcd.log_text());
+    assert_eq!(reimports().len(), 1, "{}", bgpfcd.log_text());
+    assert_eq!(refreshes(), 0, "{}", bgpfcd.log_text());
+
+    // Back to taking every route: the dropped one was not kept, so BIRD
+    // is asked for IPv4 again (RFC 2918 §4), and the route returns.
+    reload(IMPORT_DROP, IMPORT_ALL);
+    let ok = wait_for(Duration::from_secs(10), || {
+        ctl(&["show", "routes"]).0.contains("198.51.100.0/24") && in_kernel("198.51.100.0/24")
+    });
+    assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
+    let lines = reimports();
+    assert_eq!(lines.len(), 2, "{}", bgpfcd.log_text());
+    let asked = format!("refresh=ipv4-unicast@{}", lab.b_addr);
+    assert!(lines[1].ends_with(&asked), "{}", lines[1]);
+    assert_eq!(refreshes(), 1, "{}", bgpfcd.log_text());
+    assert!(
+        bgpfcd
+            .log_text()
+            .lines()
+            .any(|l| l.contains("msg=\"route refresh sent\"") && l.contains("family=ipv4-unicast")),
+        "{}",
+        bgpfcd.log_text()
+    );
+    assert_eq!(bgpfcd.log_text().matches("session established").count(), 1);
 }
 
 /// RFC 8950 with BIRD on both sides of bgpfcd, over IPv4 sessions. The

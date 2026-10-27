@@ -43,7 +43,14 @@ pub(crate) const SOCK_CLOEXEC: c_int = 0o2_000_000;
 pub(crate) const NETLINK_ROUTE: c_int = 0;
 // <asm-generic/socket.h>
 pub(crate) const SOL_SOCKET: c_int = 1;
+pub(crate) const SO_KEEPALIVE: c_int = 9;
 pub(crate) const SO_RCVBUF: c_int = 8;
+// <linux/in.h>
+pub(crate) const IPPROTO_TCP: c_int = 6;
+// <linux/tcp.h>
+pub(crate) const TCP_KEEPIDLE: c_int = 4;
+pub(crate) const TCP_KEEPINTVL: c_int = 5;
+pub(crate) const TCP_KEEPCNT: c_int = 6;
 // <asm-generic/signal.h>
 pub(crate) const SIGHUP: c_int = 1;
 pub(crate) const SIGINT: c_int = 2;
@@ -115,6 +122,13 @@ unsafe extern "C" {
         value: *const c_void,
         len: socklen_t,
     ) -> c_int;
+    pub(crate) fn getsockopt(
+        fd: c_int,
+        level: c_int,
+        name: c_int,
+        value: *mut c_void,
+        len: *mut socklen_t,
+    ) -> c_int; // getsockopt(2)
     // <unistd.h>
     pub(crate) fn pipe2(fds: *mut c_int, flags: c_int) -> c_int; // pipe(2)
     pub(crate) fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;

@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use crate::ast::{Config, Neighbor};
+use crate::ast::Config;
 
 /// The difference between an old and a new configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -18,9 +18,19 @@ pub struct ConfigDiff {
     /// (Cease / Other Configuration Change, RFC 4486 §4).
     pub reset: Vec<IpAddr>,
     /// Neighbors in both, not reset, whose import or export policy (or
-    /// anything those policies reference) changed: re-evaluate their
-    /// routes, with route refresh where the peer supports it.
+    /// anything those policies reference) changed: the union of
+    /// `import_changed` and `export_changed`, in file order.
     pub policy_changed: Vec<IpAddr>,
+    /// Those of `policy_changed` whose import policy changed: the routes
+    /// they sent are put through it again, from the Adj-RIB-In (RFC 4271
+    /// §3: "retain the current version of the routes advertised to it"),
+    /// with route refresh (RFC 2918) only for the families of what it did
+    /// not keep.
+    pub import_changed: Vec<IpAddr>,
+    /// Those of `policy_changed` whose export policy changed: what they
+    /// are sent is exported again from the Loc-RIB, with no route
+    /// refresh.
+    pub export_changed: Vec<IpAddr>,
     /// Neighbors in both, not reset, whose `advertisement-interval`
     /// changed: the RIB paces the running session with the new value
     /// (RFC 4271 §9.2.1.1), no reset needed. A neighbor may be here and
@@ -56,16 +66,29 @@ pub enum GlobalChange {
     /// starts, stops or restarts, and with `mode sidecar` the sidecar too
     /// when its own settings changed. A block that only spells something
     /// differently, such as a default written out, a cache's host or a
-    /// moved `sidecar` block, is no change, and nor is its `enforcement`,
-    /// which neither uses (see
-    /// [`Rpki::same_as`](crate::ast::Rpki::same_as)); that is
-    /// [`GlobalChange::RpkiEnforcement`].
+    /// moved `sidecar` block, is no change, and nor are its `enforcement`,
+    /// its `startup` and its `tcp-keepalive`, which neither uses as a
+    /// setting of its own (see [`Rpki::same_as`](crate::ast::Rpki::same_as));
+    /// those are [`GlobalChange::RpkiEnforcement`],
+    /// [`GlobalChange::RpkiStartup`] and [`GlobalChange::RpkiKeepalive`].
     Rpki,
     /// The `rpki` block's `enforcement`, an absent block or statement
     /// counting as the default: every route is judged again under the new
     /// mode (RFC 6811 §5), with no restart of the RTR client. It may come
     /// with [`GlobalChange::Rpki`] in one reload.
     RpkiEnforcement,
+    /// The `rpki` block's `startup`, an absent block or statement counting
+    /// as the default: the routes not validated yet are held or used as
+    /// it now says (RFC 6811 §2), with no restart of the RTR client. It
+    /// acts only while validation waits for its first full set, and never
+    /// with `mode disabled`. It may come with the other two in one reload.
+    RpkiStartup,
+    /// The `rpki` block's `tcp-keepalive`, an absent block or statement
+    /// counting as the defaults: the RTR client's connection in use gets
+    /// the new values at once, and so does every later one, with no new
+    /// connection and no restart of the client (RFC 8210 §9). It may come
+    /// with the others in one reload.
+    RpkiKeepalive,
 }
 
 impl ConfigDiff {
@@ -84,6 +107,14 @@ impl ConfigDiff {
             (
                 old.rpki.enforcement != new.rpki.enforcement,
                 GlobalChange::RpkiEnforcement,
+            ),
+            (
+                old.rpki.startup != new.rpki.startup,
+                GlobalChange::RpkiStartup,
+            ),
+            (
+                old.rpki.tcp_keepalive != new.rpki.tcp_keepalive,
+                GlobalChange::RpkiKeepalive,
             ),
         ] {
             if changed {
@@ -104,11 +135,19 @@ impl ConfigDiff {
                 d.reset.push(n.addr);
                 continue;
             }
-            let policy = policy_differs(old, o, new, n);
+            let import = policy_differs(old, &o.import, new, &n.import);
+            let export = policy_differs(old, &o.export, new, &n.export);
+            let policy = import || export;
             let interval = o.advertisement_interval != n.advertisement_interval;
             let limit = o.maximum_prefix != n.maximum_prefix;
             if policy {
                 d.policy_changed.push(n.addr);
+            }
+            if import {
+                d.import_changed.push(n.addr);
+            }
+            if export {
+                d.export_changed.push(n.addr);
             }
             if interval {
                 d.interval_changed.push(n.addr);
@@ -136,12 +175,11 @@ impl ConfigDiff {
     }
 }
 
-/// Whether the import or export policy of a neighbor, including the
-/// prefix lists they use, differs between the configurations.
-fn policy_differs(old: &Config, o: &Neighbor, new: &Config, n: &Neighbor) -> bool {
-    [(&o.import, &n.import), (&o.export, &n.export)]
-        .into_iter()
-        .any(|(a, b)| policy_fingerprint(old, a) != policy_fingerprint(new, b))
+/// Whether the policy a neighbor names `o` in `old` and `n` in `new`, its
+/// import or its export policy, differs between the configurations,
+/// prefix lists it uses included.
+fn policy_differs(old: &Config, o: &str, new: &Config, n: &str) -> bool {
+    policy_fingerprint(old, o) != policy_fingerprint(new, n)
 }
 
 /// The policy's terms and every prefix list they reference, with
@@ -240,6 +278,8 @@ mod tests {
         ));
         let d = ConfigDiff::between(a, &b);
         assert_eq!(d.policy_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.import_changed, vec![addr("192.0.2.3")]);
+        assert_eq!(d.export_changed, Vec::<IpAddr>::new());
         assert_eq!(d.unchanged, vec![addr("192.0.2.2")]);
         assert_eq!(d.reset, Vec::<IpAddr>::new());
         // A prefix list edit reaches every neighbor whose policy uses it.
@@ -275,6 +315,70 @@ mod tests {
             );
         }
         assert!(ConfigDiff::between(&valid, &rpki("invalid", "valid")).is_empty());
+    }
+
+    #[test]
+    fn import_and_export_changes_are_told_apart() {
+        // A reload imports again only for the neighbors whose import
+        // policy changed, and exports again only to those whose export
+        // policy changed (RFC 4271 §3, RFC 2918): a change of one is not
+        // a change of the other.
+        let a = cfg(BASE);
+        let both = |d: &ConfigDiff| {
+            (
+                d.policy_changed.clone(),
+                d.import_changed.clone(),
+                d.export_changed.clone(),
+            )
+        };
+        let none = Vec::<IpAddr>::new();
+        let n2 = addr("192.0.2.2");
+        let n3 = addr("192.0.2.3");
+        // The export policy's terms: every neighbor exports with it.
+        let export = cfg(&BASE.replace(
+            "policy OUT { term all { action accept; } }",
+            "policy OUT { term all { set med 5; action accept; } }",
+        ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &export)),
+            (vec![n2, n3], none.clone(), vec![n2, n3])
+        );
+        // The prefix list only the import policy uses.
+        let list = cfg(&BASE.replace("le 24", "le 32"));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &list)),
+            (vec![n2, n3], vec![n2, n3], none.clone())
+        );
+        // One neighbor's export policy named anew.
+        let renamed = cfg(&BASE.replace(
+            "remote-as 65002; import IN; export OUT;",
+            "remote-as 65002; import IN; export IN;",
+        ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &renamed)),
+            (vec![n3], none.clone(), vec![n3])
+        );
+        // A policy both use, for one neighbor: both change.
+        let shared = cfg(&BASE
+            .replace(
+                "remote-as 65002; import IN; export OUT;",
+                "remote-as 65002; import OUT; export OUT;",
+            )
+            .replace(
+                "policy OUT { term all { action accept; } }",
+                "policy OUT { term all { set med 5; action accept; } }",
+            ));
+        assert_eq!(
+            both(&ConfigDiff::between(&a, &shared)),
+            (vec![n2, n3], vec![n3], vec![n2, n3])
+        );
+        // A reset neighbor is in neither: its session starts again.
+        let reset = cfg(&BASE
+            .replace("le 24", "le 32")
+            .replace("remote-as 65002;", "remote-as 65002; hold-time 30;"));
+        let d = ConfigDiff::between(&a, &reset);
+        assert_eq!(d.reset, vec![n3]);
+        assert_eq!(both(&d), (vec![n2], vec![n2], none));
     }
 
     #[test]
@@ -577,6 +681,88 @@ mod tests {
         let written = with("rpki { mode sidecar; backoff 1 600; }");
         assert_eq!(written.rpki.backoff_max, Duration::from_secs(600));
         assert!(!sidecar.rpki.same_as(&written.rpki));
+    }
+
+    #[test]
+    fn a_startup_change_is_not_an_rpki_client_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        for mode in [
+            "mode external; cache 192.0.2.10;",
+            "mode sidecar;",
+            "mode disabled;",
+        ] {
+            let implied = with(&format!("rpki {{ {mode} }}"));
+            let accept = with(&format!("rpki {{ {mode} startup accept; }}"));
+            let hold = with(&format!("rpki {{ {mode} startup hold; }}"));
+            // The default written out is no change at all.
+            assert_eq!(implied.rpki, accept.rpki, "{mode}");
+            assert!(ConfigDiff::between(&implied, &accept).is_empty(), "{mode}");
+            // The client keeps its sessions and its VRPs; the routes not
+            // validated yet are held or used, and no neighbor is touched.
+            for (a, b) in [(&accept, &hold), (&hold, &accept)] {
+                assert!(a.rpki.same_as(&b.rpki), "{mode}");
+                let d = ConfigDiff::between(a, b);
+                assert_eq!(d.global, vec![GlobalChange::RpkiStartup], "{mode}");
+                assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+            }
+        }
+        // With the other changes of the block, each is named.
+        let a = with("rpki { mode external; cache 192.0.2.10; }");
+        let b = with("rpki { mode external; enforcement off; startup hold; cache 192.0.2.11; }");
+        assert_eq!(
+            ConfigDiff::between(&a, &b).global,
+            vec![
+                GlobalChange::Rpki,
+                GlobalChange::RpkiEnforcement,
+                GlobalChange::RpkiStartup
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keepalive_change_is_not_an_rpki_client_change() {
+        let with = |block: &str| cfg(&format!("{BASE} {block}"));
+        for mode in [
+            "mode external; cache 192.0.2.10;",
+            "mode sidecar;",
+            "mode disabled;",
+        ] {
+            let implied = with(&format!("rpki {{ {mode} }}"));
+            let written = with(&format!(
+                "rpki {{ {mode} tcp-keepalive count 6 interval 10 idle 60; }}"
+            ));
+            let partly = with(&format!("rpki {{ {mode} tcp-keepalive idle 60; }}"));
+            // The defaults written out, whole or in part, are no change.
+            assert_eq!(implied.rpki, written.rpki, "{mode}");
+            assert!(ConfigDiff::between(&implied, &written).is_empty(), "{mode}");
+            assert!(ConfigDiff::between(&implied, &partly).is_empty(), "{mode}");
+            // Any one value is one, which keeps the client and touches no
+            // neighbor.
+            for other in ["idle 61", "interval 5", "count 3"] {
+                let changed = with(&format!("rpki {{ {mode} tcp-keepalive {other}; }}"));
+                for (a, b) in [(&implied, &changed), (&changed, &implied)] {
+                    assert!(a.rpki.same_as(&b.rpki), "{mode} {other}");
+                    let d = ConfigDiff::between(a, b);
+                    assert_eq!(d.global, vec![GlobalChange::RpkiKeepalive], "{mode}");
+                    assert_eq!(d.unchanged, vec![addr("192.0.2.2"), addr("192.0.2.3")]);
+                }
+            }
+        }
+        // With the other changes of the block, each is named.
+        let a = with("rpki { mode external; cache 192.0.2.10; }");
+        let b = with(
+            "rpki { mode external; enforcement off; startup hold; cache 192.0.2.11;
+             tcp-keepalive count 3; }",
+        );
+        assert_eq!(
+            ConfigDiff::between(&a, &b).global,
+            vec![
+                GlobalChange::Rpki,
+                GlobalChange::RpkiEnforcement,
+                GlobalChange::RpkiStartup,
+                GlobalChange::RpkiKeepalive
+            ]
+        );
     }
 
     #[test]

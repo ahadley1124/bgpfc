@@ -16,7 +16,9 @@
 //! 0.5.1 does only when its Error Report wins a race with its own close
 //! (see `a_restarted_cache_brings_bgpfcd_back_in_sync`).
 //! Another lists a cache whose address swallows every packet, so that a
-//! connection attempt to it hangs until its timeout.
+//! connection attempt to it hangs until its timeout. And one starts the
+//! stub late, so that `startup hold` holds the routes until its first full
+//! set.
 //!
 //! Every test is `#[ignore]`: it needs root, `iproute2`, `bird`, `birdc`,
 //! `curl` and `stayrtr` on `PATH`, and a built `bgpfcd`. CI runs them with
@@ -124,6 +126,10 @@ enum Caches {
     StayRtr(usize),
     /// One `rtr-stub` at the first of the [`CACHES`], Session ID 1.
     Stub,
+    /// The first of the [`CACHES`] in the block, with nothing listening
+    /// there until the scenario starts an `rtr-stub` itself
+    /// ([`Setup::start_late_stub`]): a cache that is late.
+    LateStub,
 }
 
 /// What a scenario runs.
@@ -140,6 +146,9 @@ struct Opts {
     /// The `enforcement` of the `rpki` block; `None` writes none, which
     /// means `drop-invalid`.
     enforcement: Option<&'static str>,
+    /// The `startup` of the `rpki` block; `None` writes none, which means
+    /// `accept`.
+    startup: Option<&'static str>,
     /// The import policy for BIRD in B, `policy NAME { ... }`; `None`
     /// accepts everything.
     import: Option<&'static str>,
@@ -166,6 +175,7 @@ impl Opts {
             unanswered: false,
             mode: "external",
             enforcement: Some("off"),
+            startup: None,
             import: None,
             fib_install: false,
             relay: None,
@@ -230,6 +240,7 @@ impl Setup {
                 Some(RtrStub::start(&lab, &ns_a, CACHES[0], 1, vrps)),
                 &CACHES[..1],
             ),
+            Caches::LateStub => (Vec::new(), None, &CACHES[..1]),
         };
         let relay = opts.relay.map(|statics| start_relay(&mut lab, statics));
         let bird = start_bird(&lab, opts.routes_after_vrps);
@@ -251,6 +262,12 @@ impl Setup {
             s.enable_bird_after_vrps();
         }
         s
+    }
+
+    /// Start the cache of [`Caches::LateStub`], serving `vrps`.
+    fn start_late_stub(&mut self, vrps: &[(&str, u8, u32)]) {
+        let ns_a = self.lab.a.clone();
+        self.stub = Some(RtrStub::start(&self.lab, &ns_a, CACHES[0], 1, vrps));
     }
 
     /// Wait for bgpfcd to have the VRPs of a cache, then let BIRD in B
@@ -338,6 +355,26 @@ impl Setup {
             self.report()
         );
         assert_eq!(self.http_states(), want, "{}", self.http("/v1/routes"));
+    }
+
+    /// What `ss` says of bgpfcd's connections to the cache on port 3323,
+    /// a line each, with the kernel's timer on the socket:
+    /// `timer:(keepalive,...)` while TCP keep-alive is on and nothing is
+    /// in flight (RFC 8210 §9).
+    fn rtr_sockets(&self) -> String {
+        let mut cmd = self.lab.exec(&self.lab.a, "ss");
+        cmd.args([
+            "-tnoH",
+            "state",
+            "established",
+            "(",
+            "dport",
+            "=",
+            ":3323",
+            ")",
+        ]);
+        let out = cmd.output().expect("ss");
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     /// Wait up to `timeout` for bgpfcd to log `line`.
@@ -624,15 +661,10 @@ fn log_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// The `rpki` block for the caches at `binds`, in that order of
+/// The `rpki` block of `opts` for the caches at `binds`, in that order of
 /// preference, after the one at `unanswered` if there is one, with the
-/// `enforcement` given, or none.
-fn rpki_block(
-    mode: &str,
-    enforcement: Option<&str>,
-    binds: &[&str],
-    unanswered: Option<Ipv4Addr>,
-) -> String {
+/// `enforcement` and `startup` given, or none.
+fn rpki_block(opts: &Opts, binds: &[&str], unanswered: Option<Ipv4Addr>) -> String {
     let mut entries = String::new();
     if let Some(addr) = unanswered {
         let _ = write!(
@@ -648,10 +680,18 @@ fn rpki_block(
             " cache 127.0.0.1 port {port} preference {preference};"
         );
     }
-    let enforcement = enforcement.map_or(String::new(), |e| format!(" enforcement {e};"));
+    let enforcement = opts
+        .enforcement
+        .map_or(String::new(), |e| format!(" enforcement {e};"));
+    let startup = opts
+        .startup
+        .map_or(String::new(), |s| format!(" startup {s};"));
     // The shortest back-off, so that a cache that comes back is found
     // within a second or two.
-    format!("rpki {{ mode {mode};{enforcement}{entries} backoff 1 1; }}")
+    format!(
+        "rpki {{ mode {};{enforcement}{startup}{entries} backoff 1 1; }}",
+        opts.mode
+    )
 }
 
 /// The relay BIRD, in a new namespace C: it takes the routes bgpfcd
@@ -743,7 +783,7 @@ fn bgpfcd_opts(
         } else {
             ""
         },
-        rpki_block(opts.mode, opts.enforcement, binds, unanswered),
+        rpki_block(opts, binds, unanswered),
         opts.import.unwrap_or_default(),
     );
     bgpfcd_opts
@@ -786,7 +826,9 @@ fn session_line(show_rpki: &str) -> String {
 /// A new VRP file then changes the state of every route without any BGP
 /// UPDATE: `StayRTR` sends a Serial Notify, bgpfcd asks for the changes
 /// (RFC 8210 §8.2), and the routes they cover are validated again
-/// (RFC 6811 §4, issue #59).
+/// (RFC 6811 §4, issue #59). bgpfcd's connection to the cache has TCP
+/// keep-alive on (RFC 8210 §9), as `ss` shows, and a reload that changes
+/// `tcp-keepalive` sets it on that connection, with no new one.
 #[test]
 #[ignore = "needs root, bird, curl, stayrtr and iproute2"]
 fn routes_are_validated_relayed_and_follow_the_vrps() {
@@ -807,6 +849,7 @@ fn routes_are_validated_relayed_and_follow_the_vrps() {
     ] {
         assert!(ok && out.contains(line), "{line}:\n{out}");
     }
+    s.keep_alive_follows_a_reload();
     let body = s.http("/v1/rpki");
     assert!(
         body.contains("\"mode\":\"external\"")
@@ -1028,7 +1071,8 @@ fn with_mode_disabled_no_cache_is_asked() {
     let (out, ok) = s.ctl(&["show", "rpki"]);
     assert!(
         ok && out
-            == "mode disabled\nenforcement off\nvalidation off\ncache 127.0.0.1:3323 preference 0\n",
+            == "mode disabled\nenforcement off\nstartup accept\nvalidation off\n\
+                   cache 127.0.0.1:3323 preference 0\n",
         "{out}"
     );
     let body = s.http("/v1/rpki");
@@ -1353,7 +1397,7 @@ fn invalid_routes_are_held_and_not_used_by_default() {
     );
     let start = s.last_line("bgpfcd starting");
     assert!(
-        start.ends_with(" rpki=external enforcement=drop-invalid"),
+        start.ends_with(" rpki=external enforcement=drop-invalid startup=accept"),
         "{start}"
     );
 }
@@ -1515,6 +1559,72 @@ impl Setup {
         let old = format!(" enforcement {from};");
         assert!(text.contains(&old), "{text}");
         fs::write(&path, text.replace(&old, &format!(" enforcement {to};"))).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok, "{out}");
+        out
+    }
+
+    /// RFC 8210 §9: the connection bgpfcd made to the cache probes with
+    /// TCP keep-alive while idle in sync, and a reload that changes
+    /// `tcp-keepalive` sets it on that connection, with no new one.
+    fn keep_alive_follows_a_reload(&self) {
+        // RFC 8210 §9: the connection bgpfcd made to the cache probes with
+        // TCP keep-alive while idle in sync.
+        let mut sockets = String::new();
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sockets = self.rtr_sockets();
+                sockets.lines().count() == 1 && sockets.contains("timer:(keepalive,")
+            }),
+            "{sockets}\n{}",
+            self.report()
+        );
+        // The default first probe comes within a minute; once a reload sets
+        // `idle 3000`, the kernel restarts the timer of the same connection
+        // with it, less the time since the last segment, and `ss` counts it
+        // in minutes: `59sec`, `5.250ms`, `1min` before, `49min` after.
+        // Nothing reconnects.
+        let minutes = |sockets: &str| -> u32 {
+            sockets
+                .split("timer:(keepalive,")
+                .nth(1)
+                .and_then(|t| t.split(',').next())
+                .and_then(|t| t.split_once("min"))
+                .map_or(0, |(m, _)| m.parse().unwrap_or(0))
+        };
+        assert!(minutes(&sockets) <= 1, "{sockets}");
+        let starts = self.rtr_starts();
+        let out = self.reload_keepalive("idle 3000");
+        assert!(
+            out.contains("rpki tcp-keepalive idle 3000 interval 10 count 6"),
+            "{out}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sockets = self.rtr_sockets();
+                sockets.lines().count() == 1 && minutes(&sockets) >= 40
+            }),
+            "{sockets}\n{}",
+            self.report()
+        );
+        assert_eq!(
+            self.count("msg=\"rpki: tcp keep-alive changed;"),
+            1,
+            "{}",
+            self.report()
+        );
+        assert_eq!(self.rtr_starts(), starts, "{}", self.report());
+    }
+
+    /// Add `tcp-keepalive OPTIONS` to bgpfcd's `rpki` block and reload;
+    /// the reload's summary.
+    fn reload_keepalive(&self, options: &str) -> String {
+        let path = self.config_path();
+        let text = fs::read_to_string(&path).unwrap();
+        let old = " backoff 1 1;";
+        assert!(text.contains(old), "{text}");
+        let new = format!("{old} tcp-keepalive {options};");
+        fs::write(&path, text.replace(old, &new)).unwrap();
         let (out, ok) = self.ctl(&["reload"]);
         assert!(ok, "{out}");
         out
@@ -1793,4 +1903,163 @@ fn policy_matches_the_state_and_overrides_it() {
         s.report()
     );
     assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+}
+
+/// `startup hold`, the explicit configuration RFC 6811 §2 asks for before
+/// a route leaves the decision process for its state ("unless explicitly
+/// configured to do so"). The cache is late, so bgpfcd has no VRPs: every
+/// route BIRD sends is held, `disabled`, kept and counted but neither
+/// installed nor relayed, where the default `startup accept` would use it,
+/// and `show rpki`, its JSON and the log say that the routes are held
+/// waiting for the data. A reload to `accept` uses them at once, and one
+/// back to `hold` holds them again, neither restarting the RTR client.
+/// Once the cache starts, its first full set validates every route (RFC
+/// 6811 §4) and, with no UPDATE from BIRD, releases the Valid and
+/// `not-found` routes, installed and relayed, while the Invalid ones stay
+/// held, now by `drop-invalid`.
+#[test]
+#[ignore = "needs root, bird, curl and iproute2"]
+fn startup_hold_holds_every_route_until_the_first_full_set() {
+    let opts = Opts {
+        caches: Caches::LateStub,
+        startup: Some("hold"),
+        fib_install: true,
+        ..Opts::enforcing(None)
+    };
+    let mut s = Setup::start("u", 36, &opts, &FIRST);
+    s.wait_for_startup_hold(ESTABLISH);
+    // The relay is up and has none of them; nor has the kernel.
+    let mut status = String::new();
+    assert!(
+        wait_for(ESTABLISH, || {
+            status = s.ctl(&["show", "status"]).0;
+            status.contains("neighbors 2 established 2\n")
+        }),
+        "{status}\n{}",
+        s.report()
+    );
+    s.wait_for_used(Duration::ZERO, &[]);
+    // Said in `show rpki`, its JSON, and the log.
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.starts_with(
+            "mode external\nenforcement drop-invalid\nstartup hold\nvalidation waiting "
+        ) && out.contains(
+            "s for the first full set: every route is disabled and held (startup hold); \
+             enforcement acts once it arrives\n"
+        ),
+        "{out}"
+    );
+    let body = s.http("/v1/rpki");
+    assert!(
+        body.contains(
+            "\"enforcement\":\"drop-invalid\",\"startup\":\"hold\",\"validation\":\"waiting\""
+        ),
+        "{body}"
+    );
+    s.wait_for_log(
+        Duration::ZERO,
+        "WARN  msg=\"rpki: no validation data yet; routes are held until the first full set \
+         (startup hold)\" mode=external enforcement=drop-invalid startup=hold",
+    );
+    let start = s.last_line("bgpfcd starting");
+    assert!(
+        start.ends_with(" rpki=external enforcement=drop-invalid startup=hold"),
+        "{start}"
+    );
+
+    s.reload_startup_and_back();
+
+    // The cache arrives, and its first full set releases what
+    // `drop-invalid` admits, with no UPDATE from BIRD.
+    let updates = s.updates_from_bird();
+    s.start_late_stub(&FIRST);
+    let (used, invalid) = split_invalid(&VALIDATED);
+    s.wait_for_states(RECONNECT + CHANGE, &used);
+    assert_eq!(s.held(), held_by(&invalid, "enforcement"), "{}", s.report());
+    s.wait_for_used(CHANGE, &used);
+    s.wait_for_log(
+        Duration::ZERO,
+        "msg=\"rpki: validation data arrived; routes are validated from now on\"",
+    );
+    // From held for the startup to held for enforcement is no release.
+    let line = s.last_line("rib: validation states changed");
+    assert_eq!(
+        (log_value(&line, "held"), log_value(&line, "released")),
+        (Some("0"), Some("2")),
+        "{line}"
+    );
+    let b = s.lab.b_addr.to_string();
+    let (out, ok) = s.ctl(&["show", "neighbor", &b]);
+    assert!(
+        ok && out.contains("ipv4-unicast received 4 held 2 "),
+        "{out}"
+    );
+    let (out, ok) = s.ctl(&["show", "rpki"]);
+    assert!(
+        ok && out.contains("\nstartup hold\nvalidation active\n"),
+        "{out}"
+    );
+    assert_eq!(s.updates_from_bird(), updates, "{}", s.report());
+}
+
+impl Setup {
+    /// Wait up to `timeout` for every route of BIRD's to be held for the
+    /// startup, `disabled`, counted as received and held, and none used.
+    fn wait_for_startup_hold(&self, timeout: Duration) {
+        let all_held = held_by(&DISABLED, "startup");
+        assert!(
+            wait_for(timeout, || self.held() == all_held),
+            "{:?}\n{}",
+            self.held(),
+            self.report()
+        );
+        assert_eq!(self.states(), [], "{}", self.report());
+        let b = self.lab.b_addr.to_string();
+        let (out, ok) = self.ctl(&["show", "neighbor", &b]);
+        assert!(
+            ok && out.contains("ipv4-unicast received 4 held 4 "),
+            "{out}"
+        );
+    }
+
+    /// A reload from `startup hold` to `accept`, which uses the routes,
+    /// unvalidated, at once, and one back, which holds them again; neither
+    /// restarts the RTR client. Each change is one log line.
+    fn reload_startup_and_back(&self) {
+        let cfg_path = self.config_path();
+        let hold = fs::read_to_string(&cfg_path).unwrap();
+        fs::write(
+            &cfg_path,
+            hold.replace(" startup hold;", " startup accept;"),
+        )
+        .unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(
+            ok && out.contains("rpki startup accept") && !out.contains("rtr client"),
+            "{out}"
+        );
+        self.wait_for_states(CHANGE, &DISABLED);
+        assert_eq!(self.held(), [], "{}", self.report());
+        self.wait_for_used(CHANGE, &DISABLED);
+        self.wait_for_log(
+            Duration::ZERO,
+            "msg=\"rib: rpki startup changed\" from=hold to=accept routes=4 held=0 released=4 ",
+        );
+        fs::write(&cfg_path, &hold).unwrap();
+        let (out, ok) = self.ctl(&["reload"]);
+        assert!(ok && out.contains("rpki startup hold"), "{out}");
+        self.wait_for_startup_hold(CHANGE);
+        self.wait_for_used(CHANGE, &[]);
+        self.wait_for_log(
+            Duration::ZERO,
+            "msg=\"rib: rpki startup changed\" from=accept to=hold routes=4 held=4 released=0 ",
+        );
+        assert_eq!(
+            self.count("msg=\"rpki: starting the rtr client\""),
+            1,
+            "{}",
+            self.report()
+        );
+    }
 }

@@ -17,6 +17,9 @@
 //!
 //! It also keeps bgpfcd's ambient capabilities and file descriptors
 //! from the child.
+//!
+//! And it sets TCP keep-alive on a connection (`tcp(7)`), which std
+//! cannot, for the RTR client's connections to its caches (RFC 8210 §9).
 #![cfg(target_os = "linux")]
 
 #[cfg(feature = "profiling")]
@@ -28,6 +31,7 @@ mod netlink;
 mod privilege;
 mod process;
 mod signal;
+mod tcp;
 
 pub use caps::{Capability, Effective};
 pub use inherit::clear_ambient_capabilities;
@@ -38,3 +42,4 @@ pub use process::send_signal_to_group;
 pub use process::wait_for_exit;
 pub use process::{ChildSignal, send_signal, set_parent_death_signal};
 pub use signal::{Signal, Signals};
+pub use tcp::{TcpKeepalive, set_tcp_keepalive, tcp_keepalive};

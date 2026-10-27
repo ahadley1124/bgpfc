@@ -31,7 +31,7 @@ failure, 2 on a usage error.
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
 | `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement`, `held by startup` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
 | `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
 | `show rpki` | the `rpki` mode and enforcement, whether validation is off, waiting for its first data or active, Routinator's state with `mode sidecar`, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki transitions` | the latest routes whose origin validation state changed, oldest first, each with its time (see [Changes of state](#changes-of-state)) |
@@ -124,7 +124,7 @@ Example objects:
 {"mode":"sidecar","enforcement":"drop-invalid","validation":"active","waiting_seconds":null,
  "sidecar":{"state":"failed","alarm":true,"pid":null,"running_seconds":null,"retry_in_seconds":280,
             "restarts":6,"consecutive_failures":7,"last_exit":"exited with status 1",
-            "rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","version":"0.15.2"},
+            "rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","version":"0.15.3"},
  "caches":[{"host":"127.0.0.1","port":41234,"preference":0,"in_use":true,"current":true}],
  "running":true,"state":"connecting","connected":false,"version":1,"session_id":4242,
  "serial":17,"synced_seconds_ago":1250,"expires_in_seconds":5950,
@@ -159,7 +159,8 @@ from one that no VRP covers (issue #52). Every route is `disabled` until
 the `rpki` block (`docs/config.md`, "RPKI") gives bgpfcd the VRPs of an
 RPKI cache, external (`mode external`) or Routinator run by bgpfcd (`mode
 sidecar`), and that cache has sent its first full set (`show rpki` says
-`validation waiting` meanwhile); from then on the states follow the
+`validation waiting` meanwhile, and whether the routes are used or held
+until then, as `startup` says); from then on the states follow the
 cache's data.
 
 The state is judged on the route as the neighbor sent it, before import
@@ -168,7 +169,9 @@ What acts on it is the `rpki` block's `enforcement`, which `show rpki`
 prints, and the import policy (`docs/config.md`, "RPKI"): under
 `drop-invalid`, the default, an Invalid route is held; under
 `prefer-valid` route selection ranks Valid routes first; under `off`
-nothing acts on the state but policy.
+nothing acts on the state but policy. Before the first full set, the
+block's `startup` decides: `accept`, the default, uses the `disabled`
+routes, and `hold` holds them until that set gives them a state.
 
 When import policy sets the state a route is used with (`set rpki`, RFC
 6811 §3), `show routes` prints it after the looked-up one, as in
@@ -181,10 +184,11 @@ installed nor advertised (RFC 6811 §2: kept in the Adj-RIB-In, and out
 of the decision process only as configured). It is used again, with no
 UPDATE from its neighbor, once its state allows. `show routes PREFIX`
 lists it after the candidates, marked `!`, followed by `held by
-enforcement` (the `enforcement` rules out the state it is used with) or
-`held by policy` (the import policy rejects it in its state and would
-accept it in another); the JSON has `held` (`enforcement`, `policy` or
-`null`). A held route keeps the attributes its neighbor sent, and is shown
+enforcement` (the `enforcement` rules out the state it is used with),
+`held by startup` (`startup hold`: it is `disabled`, waiting for the first
+full set to give it a state) or `held by policy` (the import policy
+rejects it in its state and would accept it in another); the JSON has
+`held` (`enforcement`, `startup`, `policy` or `null`). A held route keeps the attributes its neighbor sent, and is shown
 with them: the import policy runs on them again when the route is used
 again, so what the policy sets, such as a `set local-pref`, shows only
 then. `show routes held` lists every held route of a family, and `show
@@ -238,6 +242,20 @@ too:
 2026-10-22T12:34:56.789Z INFO  msg="rib: rpki enforcement changed" from=off to=drop-invalid routes=1250000 held=5000 released=0 best_changed=4800
 ```
 
+So is a change of the startup setting the RIB applies (`rib: rpki
+startup changed`), which judges again only the routes not validated yet,
+`disabled`: a reload that changes `startup` while the routes wait for the
+first full set, one that turns validation on with `startup hold`, which
+holds them all, or one that turns it off, before which the hold goes.
+`routes` counts those routes, `held` and `released` what the change did
+to them. When the first full set arrives, the routes `startup hold` held
+are released, or held by `enforcement`, on the `rib: validation states
+changed` line, as `released` and `held`:
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: rpki startup changed" from=accept to=hold routes=1250000 held=1250000 released=0 best_changed=1100000
+```
+
 `show rpki transitions` and `GET /v1/rpki/transitions` give the latest
 routes that moved among `valid`, `invalid` and `not-found`, oldest first,
 each with the time of its log line, then how many are kept and how many
@@ -267,14 +285,49 @@ Nothing is uncounted: the first line counts every move per pair of
 states, and `show routes` gives every route's current state. A knob
 would change no outcome, only how much is written.
 
-The bounds are on the RIB's lines only. The FIB thread logs each route it
-installs or removes at info (`fib: dry-run` or `fib: applied`), whatever
-made the change, as it does for an UPDATE. So a change of state or of
-`enforcement` adds up to one such line for each destination it counts in
-`best_changed`: under `drop-invalid`, one for each destination whose only
-route it holds or releases. The example above, `best_changed=4800`, comes
-with about 4800 of them. At `log { level warn; }` the FIB thread writes
-only its failures.
+The FIB thread folds its lines too, by time. It writes a line at info
+(`fib: changes`) at most once a second while the routes keep changing,
+each counting what was done since the line before: the `mode` it ran in
+(`dry-run`, only reported, or `install`, sent to the kernel), the routes
+installed or replaced (`install`) and removed (`delete`), the operations
+that failed (`failed`), and the first eight prefixes, `...` marking the
+rest. A change of state or of `enforcement` takes at most one operation
+for each destination it counts in `best_changed`: a removal for one whose
+only route it held, an install for one whose best route has another next
+hop. The `enforcement` change above, `best_changed=4800`, comes with
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="fib: changes" mode=install install=1300 delete=3500 failed=0 prefixes=192.0.2.0/24,192.0.2.128/25,198.51.100.0/24,198.51.100.0/25,203.0.113.0/24,203.0.113.0/25,203.0.113.128/25,2001:db8::/32,...
+```
+
+For the FIB thread a change is what the RIB made of one of its inputs (an
+UPDATE, a session that went down, a change of the VRPs or of
+`enforcement`, a reload), a switch to install mode with its reconcile,
+the removal of stale routes at startup, or that of every route at
+shutdown. A change that comes a second or more after the last line gets
+its line at once, as soon as it is applied. Those that follow within the
+second are added up and written a second after that line: a table that
+loads from a peer, an UPDATE at a time, or a burst of VRP changes, costs
+one line a second however many changes it makes, never one per route or
+per UPDATE. A change that takes more than a second to apply, such as one
+that moves a whole table, has a line a second with the counts so far. The
+thread writes what it counted within a second of the last change even if
+nothing else happens, at once before a switch of mode, so that no line
+mixes the modes, and at shutdown, so that every operation is counted on
+some line. The lines' counts add up to every operation done.
+
+Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
+applied`, with `op`, `prefix` and `gateway`), written as it is done. A
+failed operation has one at error (`fib: failed`, with the kernel's
+`error`), at once, the first three of a change, and three at most between
+two `fib: changes` lines, whatever the number of changes; the others at
+`debug`. The `fib: changes` line that counts them is then at error too,
+with every failure in `failed`. A kernel that refuses one route, for want
+of `CAP_NET_ADMIN` or for a next hop it cannot reach directly, often
+refuses the whole table, and the first already names the reason; a table
+that loads from a peer, a change an UPDATE, so costs at most three error
+lines and one `fib: changes` line a second, not a line a route. At
+`log { level warn; }` the FIB thread writes only its failures.
 
 ## RPKI
 
@@ -293,8 +346,9 @@ at preference 0.
 ```
 mode sidecar
 enforcement drop-invalid
+startup accept
 validation active
-sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)
+sidecar running pid 4242 for 312s, routinator 0.15.3 (/usr/bin/routinator)
 sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, last exit: killed by signal 9 (SIGKILL)
 cache 127.0.0.1:41234 (sidecar) preference 0, in use, current
 state idle, connected, version 1
@@ -308,7 +362,8 @@ failures 0
 |---|---|---|
 | `mode` | `mode` | `disabled`, `external` or `sidecar` |
 | `enforcement` | `enforcement` | what acts on the validation state: `drop-invalid`, `prefer-valid` or `off` (see [Validation state](#validation-state)); written or the default, and shown in every mode |
-| `validation` | `validation` | `off`: no RTR client runs, so every route is `disabled`, as with `mode disabled` or after a reload that could not start the client or Routinator; `waiting` (`waiting Ns for the first full set: ...`): the client has had no full set yet, so every route is `disabled` and used as received, and `enforcement` acts once the set arrives (`docs/config.md`, "Startup window"); `active`: the RIB validates with a cache's VRPs, or with VRPs held from one until they expire |
+| `startup` | `startup` | what becomes of the routes while validation waits for the first full set: `accept` or `hold` (`docs/config.md`, "Startup window"); written or the default, and shown in every mode, although with `mode disabled` it holds nothing |
+| `validation` | `validation` | `off`: no RTR client runs, so every route is `disabled` and used, as with `mode disabled` or after a reload that could not start the client or Routinator; `waiting` (`waiting Ns for the first full set: ...`): the client has had no full set yet, so every route is `disabled`, and used as received (`every route is disabled and used unvalidated`) or, under `startup hold`, held (`every route is disabled and held (startup hold)`); `enforcement` acts once the set arrives (`docs/config.md`, "Startup window"); `active`: the RIB validates with a cache's VRPs, or with VRPs held from one until they expire |
 | `waiting_seconds` | `waiting Ns` | while `validation` is `waiting`, for how long; `null` otherwise |
 | `sidecar` | `sidecar` | Routinator, while bgpfcd runs it: see below. `null` without; with `mode sidecar` that means a reload could not start it, and the text says `sidecar not running` |
 | `caches` | `cache` | the configured caches, and with a sidecar the client's cache at Routinator's address, marked `(sidecar)` in the text: `host`, `port`, `preference`, `in_use` (`in use`: its VRPs are in use) and `current` (`current`: the client talks to it) |
@@ -324,8 +379,8 @@ failures 0
 | `last_error`, `last_error_seconds_ago` | `last error` | the last warning or error the client logged, with its fields as the log line has them, and how long ago; the text line escapes any control character (`\n`, `\u{001b}`), so that what a cache wrote stays on its line |
 
 Without a client, in `mode disabled`, every member but `mode`,
-`enforcement`, `validation` (`off`) and `caches` is `null`, `false` or 0,
-and the text lists only those four. The members are the same in every
+`enforcement`, `startup`, `validation` (`off`) and `caches` is `null`,
+`false` or 0, and the text lists only those five. The members are the same in every
 mode.
 
 The `sidecar` object and its two lines, `sidecar STATE, routinator VERSION
@@ -401,10 +456,12 @@ named with `-c`. A file that fails to parse, validate or compile leaves the
 running configuration untouched and reports the errors. Otherwise, per
 `docs/config.md`: new neighbors start; removed ones stop with Cease / Peer
 De-configured; neighbors whose session parameters changed stop with Cease /
-Other Configuration Change and start again; neighbors whose import or
-export policy changed get a ROUTE-REFRESH and a re-export of the
-difference; a changed `advertisement-interval` applies to the running
-session without a reset, and so does a changed `maximum-prefix` (a session
+Other Configuration Change and start again; neighbors whose import policy
+changed have the routes they sent imported again under it at once, from
+the routes bgpfcd kept, with no ROUTE-REFRESH (the log says `rib:
+re-import`, below), and those whose export policy changed are sent the
+difference (`rib: re-export`), with no ROUTE-REFRESH either; a changed
+`advertisement-interval` applies to the running session without a reset, and so does a changed `maximum-prefix` (a session
 already over its new limit ends with Cease / Maximum Number of Prefixes
 Reached); a changed `fib { mode }` is applied; a changed
 `log { level }` takes effect at once; a changed `rpki` block restarts the
@@ -412,7 +469,50 @@ RTR client, which keeps the VRPs it had until a cache of the new list has
 sent a full set, or stops it with `mode disabled`, every route `disabled`
 again, and restarts Routinator only when its `sidecar` block changes; a changed `enforcement` alone leaves the client alone and judges
 every route again under the new mode at once (the summary says `rpki
-enforcement MODE`, the log `rib: rpki enforcement changed`).
+enforcement MODE`, the log `rib: rpki enforcement changed`), and so does a
+changed `startup`, which judges again the routes not validated yet (the
+summary says `rpki startup SETTING`, the log `rib: rpki startup changed`);
+a changed `tcp-keepalive` leaves the client alone too, and reaches the
+connection in use at once as well as every later one (the summary says
+`rpki tcp-keepalive idle N interval N count N`, the log `rpki: tcp
+keep-alive changed`).
 `router-id` and `local-as` changes are refused, and `listen`,
 `control`, `fib { table }` and `fib { protocol }` changes are noted for the
 next restart.
+
+A route an import policy rejects whatever its validation state is not
+kept, so importing again cannot bring it back: when import policy has
+dropped a route of a neighbor since its session came up, or since it was
+last asked, a reload that changes the neighbor's import policy also sends
+it a ROUTE-REFRESH for the family (RFC 2918), if it advertised the
+capability and the family, and the routes it
+sends again meet the new policy as they come (`route refresh sent` in the
+log). A ROUTE-REFRESH names a family and nothing finer (RFC 2918 §3), so
+the neighbor sends every route of the family again, not only those
+dropped, and bgpfcd asks whether or not the new policy would take any of
+them, which only the routes could tell. So under an import policy that
+rejects any route at all, as one that filters bogons or too-specific
+prefixes usually does, every reload that changes that neighbor's import
+policy, even only a `set local-pref`, has it send the family again: as
+much work for both sides as before re-import existed, though the change
+itself applies at once, from the routes kept. Not keeping the routes
+import policy rejects is what bounds a filtered neighbor's memory by its
+`maximum-prefix`, which counts only the routes kept. A neighbor without
+the capability gets them back only when it sends them again or after
+`clear neighbor` (a warning, `rib: re-import cannot ask the peer for the
+routes import policy dropped`, names the neighbor and family). One line
+counts what importing again did, whatever the number of
+routes: the neighbors, the routes put through the new policy, those it
+made something else of (`changed`: other attributes, another `set rpki`,
+held or used, or not kept), took out of use (`held`), put back into use
+(`released`) or no longer keeps (`dropped`), the destinations whose best
+route changed, and the families each neighbor is asked for again
+(`refresh`, `FAMILY@NEIGHBOR`, or `none`):
+
+```
+2026-10-22T12:34:56.789Z INFO  msg="rib: re-import" peers=198.51.100.1 routes=950000 changed=950000 held=0 released=0 dropped=12 best_changed=930000 refresh=none
+```
+
+On a full table this takes about a second of the RIB thread, as long as
+the neighbor sending the table again would (`benches/rib.rs`,
+`reimport_*`, in `bgpfc-rib`).

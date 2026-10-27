@@ -29,6 +29,7 @@ Config {
     rpki: Rpki {
         mode: Disabled,
         enforcement: DropInvalid,
+        startup: Accept,
         caches: [],
         sidecar: RpkiSidecar {
             pos: None,
@@ -57,6 +58,11 @@ Config {
         max_vrps: 4000000,
         backoff_min: 1s,
         backoff_max: 600s,
+        tcp_keepalive: RpkiKeepalive {
+            idle: 60s,
+            interval: 10s,
+            count: 6,
+        },
     },
     prefix_lists: [
         PrefixList {

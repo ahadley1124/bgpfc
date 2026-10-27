@@ -73,9 +73,12 @@
 //! configuration, never waits for a cache that does not answer.
 //!
 //! RFC 8210 §9 says routers SHOULD enable TCP keep-alives. std offers no
-//! way to set the socket option, so the client does without: the polls
-//! of the Refresh Interval and the response timeout find a dead
-//! connection instead.
+//! way to set the socket option, and this crate may not depend on
+//! `bgpfc-sys`, which sets it (AGENTS.md §2), so the client leaves it to
+//! the [`ConnectionCheck`] its caller gives it (see "Checking the other
+//! end"), which gets every connection first: bgpfcd turns keep-alive on
+//! there. A client without one does without, and the polls of the Refresh
+//! Interval and the response timeout find a dead connection, only later.
 //!
 //! # Checking the other end
 //!
@@ -86,7 +89,14 @@
 //! sets [`Config::check`]: a [`ConnectionCheck`] runs on every connection
 //! as it is made, on the attempt's thread and before anything is sent or
 //! read, and a connection it refuses is closed and fails like an attempt
-//! that found no cache.
+//! that found no cache. Since it gets every connection before the
+//! session does, it is also where the caller prepares one, such as by
+//! setting socket options the client cannot set itself (TCP keep-alive,
+//! RFC 8210 §9). When what the check asks or sets changes, such as the
+//! keep-alive settings at a reload, [`Client::check_again`] runs it on
+//! the connection in use, so the change needs neither a new connection
+//! nor a new client, which would load the cache's data afresh; a
+//! connection being made meanwhile is checked again before it is used.
 //!
 //! Implements: RFC 8210 §4 (the most preferred cache that accepts a
 //! connection, also one that comes back), §8.3 and §8.4 (other caches
@@ -257,8 +267,8 @@ pub struct Config {
     /// override ([`max_expire`](session::Config::max_expire)), for the
     /// session with each cache.
     pub session: session::Config,
-    /// What each new connection must pass before the client uses it, if
-    /// anything (see [`ConnectionCheck`]).
+    /// What each new connection must pass before the client uses it, and
+    /// what prepares it, if anything (see [`ConnectionCheck`]).
     pub check: Option<ConnectionCheck>,
 }
 
@@ -272,6 +282,12 @@ pub struct Config {
 /// It runs on the thread of the connection attempt, which the client does
 /// not wait for once it is stopped, so a check that takes a while holds up
 /// no stop.
+///
+/// It may also change the connection before the client uses it, such as
+/// by setting socket options: it is the first to get each one, before the
+/// session sends its first PDU. A caller whose check comes to ask or set
+/// something else, such as other socket options, has it run again on the
+/// connection in use with [`Client::check_again`].
 #[derive(Clone)]
 pub struct ConnectionCheck(Arc<CheckFn>);
 
@@ -449,16 +465,30 @@ struct Shared {
     /// Wakes the thread from its sleep, or from its wait for a connection
     /// attempt.
     wake: Condvar,
+    /// How many times [`Client::check_again`] has run, counted under the
+    /// slot's mutex: a connection checked before the last of them is
+    /// checked again before it is used.
+    checks: AtomicU64,
 }
 
 /// See [`Shared::slot`].
 #[derive(Debug, Default)]
 struct Slot {
     /// A clone of the thread's connection, for [`Client::stop`] to shut
-    /// down.
+    /// down and [`Client::check_again`] to check.
     stream: Option<TcpStream>,
     /// The outcome of the connection attempt under way, once it has one.
-    attempt: Option<io::Result<TcpStream>>,
+    attempt: Option<io::Result<Checked>>,
+}
+
+/// A connection that passed the [`ConnectionCheck`], if there is one.
+#[derive(Debug)]
+struct Checked {
+    stream: TcpStream,
+    /// [`Shared::checks`] when the check began. If it has moved on by the
+    /// time the connection is registered, the check that passed may have
+    /// asked for what the caller no longer wants, and runs again.
+    checks: u64,
 }
 
 impl Shared {
@@ -480,14 +510,18 @@ impl Shared {
     }
 
     /// Make the connection `stream` is a clone of one that a stop shuts
-    /// down. False if the client is stopping already.
-    fn register(&self, stream: TcpStream) -> bool {
+    /// down and [`Client::check_again`] checks; `None` if the client is
+    /// stopping already. Otherwise whether [`Client::check_again`] ran
+    /// since the check of the connection began, at [`Checked::checks`]:
+    /// it found no connection to check then, so the connection must be
+    /// checked again. Any later run finds it.
+    fn register(&self, stream: TcpStream, checked: u64) -> Option<bool> {
         let mut slot = lock(&self.slot);
         if self.stopping() {
-            return false;
+            return None;
         }
         slot.stream = Some(stream);
-        true
+        Some(self.checks.load(Ordering::Acquire) != checked)
     }
 
     fn unregister(&self) {
@@ -522,7 +556,7 @@ impl Shared {
         cache: &Cache,
         timeout: Duration,
         check: Option<&ConnectionCheck>,
-    ) -> Option<io::Result<TcpStream>> {
+    ) -> Option<io::Result<Checked>> {
         let shared = Arc::clone(self);
         let cache = cache.clone();
         let check = check.cloned();
@@ -530,11 +564,14 @@ impl Shared {
             .name("rtr-connect".to_owned())
             .spawn(move || {
                 let outcome = open(&cache, timeout).and_then(|stream| {
+                    // Read before the check begins: a `check_again` that
+                    // comes after this may have changed what it asks.
+                    let checks = shared.checks.load(Ordering::Acquire);
                     if let Some(Err(refused)) = check.map(|c| c.run(&stream)) {
                         let _ = stream.shutdown(Shutdown::Both);
                         return Err(refused);
                     }
-                    Ok(stream)
+                    Ok(Checked { stream, checks })
                 });
                 let mut slot = lock(&shared.slot);
                 if !shared.stopping() {
@@ -591,6 +628,8 @@ pub struct Client {
     shared: Arc<Shared>,
     status: Arc<Mutex<Status>>,
     thread: Option<JoinHandle<()>>,
+    /// [`Config::check`], for [`Client::check_again`].
+    check: Option<ConnectionCheck>,
     #[cfg(test)]
     clock: Clock,
 }
@@ -650,6 +689,7 @@ impl Client {
         let shared = Arc::new(Shared::default());
         #[cfg(test)]
         let client_clock = clock.clone();
+        let check = config.check.clone();
         let mut worker = Worker::new(config, sink, Arc::clone(&shared), clock);
         if let Some(held) = held {
             worker.hold(held);
@@ -662,6 +702,7 @@ impl Client {
             shared,
             status,
             thread: Some(thread),
+            check,
             #[cfg(test)]
             clock: client_clock,
         })
@@ -679,6 +720,40 @@ impl Client {
         StatusHandle {
             status: Arc::clone(&self.status),
         }
+    }
+
+    /// Run the [`ConnectionCheck`] of the client's [`Config`] again on the
+    /// connection in use, if there is one: for a caller whose check has
+    /// come to ask or set something else, such as other socket options,
+    /// and who wants that on the connection in use rather than from the
+    /// next one on. A connection being made meanwhile is checked again
+    /// before the client uses it, so none escapes the change. A client
+    /// without a check, or one stopped, has nothing to do.
+    ///
+    /// A connection the check now refuses is closed, as one refused when
+    /// it was made; the client connects again after the shortest
+    /// back-off, as when a cache closes a connection.
+    ///
+    /// The check runs on the caller's thread, and a [`Client::stop`] waits
+    /// for it.
+    ///
+    /// # Errors
+    /// The check's reason for refusing the connection in use, now closed.
+    pub fn check_again(&self) -> io::Result<()> {
+        let Some(check) = &self.check else {
+            return Ok(());
+        };
+        let slot = lock(&self.shared.slot);
+        // Under the mutex, so that a connection is either registered
+        // already, and checked here, or registered after this, and checked
+        // again by the client thread (see `Shared::register`).
+        self.shared.checks.fetch_add(1, Ordering::AcqRel);
+        let Some(stream) = &slot.stream else {
+            return Ok(());
+        };
+        check.run(stream).inspect_err(|_| {
+            let _ = stream.shutdown(Shutdown::Both);
+        })
     }
 
     /// Close the connection and join the thread. Calling it again does
@@ -1224,7 +1299,7 @@ impl<S: ValidationSink> Worker<S> {
                 None => return,
                 Some(Ok(probe)) => {
                     // The session with it opens a connection of its own.
-                    let _ = probe.shutdown(Shutdown::Both);
+                    let _ = probe.stream.shutdown(Shutdown::Both);
                     let now = self.clock.now();
                     self.close();
                     self.synced_on_conn = false;
@@ -1303,16 +1378,17 @@ impl<S: ValidationSink> Worker<S> {
         // The control plane sees the attempt while it lasts.
         self.publish_status(true);
         let check = self.check.as_ref();
-        let stream = match self
-            .shared
-            .connect(self.cache(), self.connect_timeout, check)?
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                self.pending_error = Some(e.to_string());
-                return Some(Event::Disconnected);
-            }
-        };
+        let Checked { stream, checks } =
+            match self
+                .shared
+                .connect(self.cache(), self.connect_timeout, check)?
+            {
+                Ok(checked) => checked,
+                Err(e) => {
+                    self.pending_error = Some(e.to_string());
+                    return Some(Event::Disconnected);
+                }
+            };
         let _ = stream.set_nodelay(true);
         // A cache that stops reading must not wedge the thread: a write
         // blocked this long fails the connection.
@@ -1325,9 +1401,19 @@ impl<S: ValidationSink> Worker<S> {
                 return Some(Event::Disconnected);
             }
         };
-        if !self.shared.register(clone) {
+        let Some(stale) = self.shared.register(clone, checks) else {
             let _ = stream.shutdown(Shutdown::Both);
             return None;
+        };
+        // `check_again` ran while the connection was being made: check it
+        // again, here, before anything is sent on it.
+        if let (true, Some(check)) = (stale, &self.check)
+            && let Err(refused) = check.run(&stream)
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+            self.shared.unregister();
+            self.pending_error = Some(refused.to_string());
+            return Some(Event::Disconnected);
         }
         self.next_conn_id += 1;
         self.conn = Some(Conn {

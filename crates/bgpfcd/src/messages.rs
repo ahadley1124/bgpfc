@@ -89,9 +89,11 @@ pub(crate) enum PeerInput {
     /// Soft reset: ask the peer for its routes again with ROUTE-REFRESH
     /// (RFC 2918 §4) for every negotiated family; the RIB re-sends ours.
     SoftReset,
-    /// Only the first half of a soft reset: ask the peer for its routes
-    /// again (after an import policy change).
-    RequestRoutes,
+    /// Ask the peer for its routes of these families again with
+    /// ROUTE-REFRESH (RFC 2918 §4): import policy dropped some of them,
+    /// which the Adj-RIB-In does not keep, and the policy a reload brought
+    /// may take them (`bgpfc_rib::Output::RequestRoutes`).
+    RequestRoutes(Vec<AddressFamily>),
     /// Report the session's state on the sender.
     Report(SyncSender<PeerReport>),
     /// The RIB found more routes of `family` than the neighbor's
@@ -133,8 +135,18 @@ pub(crate) struct PeerReport {
 /// asks it.
 #[derive(Debug)]
 pub(crate) enum FibMsg {
-    /// Loc-RIB changes, in order (RFC 4271 §9.3).
-    Changes(Vec<bgpfc_rib::FibChange>),
+    /// Loc-RIB changes, in order (RFC 4271 §9.3): a batch of what the
+    /// RIB made of one of its inputs.
+    Changes {
+        /// The changes.
+        changes: Vec<bgpfc_rib::FibChange>,
+        /// Whether more batches of the same input follow. The FIB thread
+        /// writes the line of an input that comes alone once its last
+        /// batch is in, and bounds its error lines per input (see
+        /// `crate::fib`, "Logging"); an input whose changes all went in
+        /// batches marked so ends with an empty one.
+        more: bool,
+    },
     /// Switch between dry-run and install. Sent by the RIB thread only
     /// (`RibMsg::FibMode`): going to install, its routes follow as
     /// `Reconcile`; either way `ReconcileEnd` ends the switch.
@@ -350,11 +362,17 @@ pub(crate) enum RibMsg {
     },
     /// A control-plane question.
     Query(RibQuery, SyncSender<RibReply>),
-    /// New policies after a reload; `reexport` lists the peers whose
-    /// export policy changed and whose Adj-RIB-Out is recomputed.
+    /// New policies after a reload: `reexport` lists the peers whose
+    /// export policy changed and whose Adj-RIB-Out is recomputed from the
+    /// Loc-RIB, then `reimport` those whose import policy changed and
+    /// whose routes are imported again from the Adj-RIB-In (RFC 4271 §3),
+    /// with ROUTE-REFRESH only for the families of what it did not keep
+    /// (RFC 2918).
     SetPolicies {
         /// The compiled policies.
         policies: NewPolicies,
+        /// Peers to import from again.
+        reimport: Vec<IpAddr>,
         /// Peers to re-export to.
         reexport: Vec<IpAddr>,
     },
@@ -380,6 +398,13 @@ pub(crate) enum RibMsg {
     /// every route again under it (RFC 6811 §5), holding or releasing
     /// routes and choosing again, with no UPDATE and no ROUTE-REFRESH.
     SetEnforcement(bgpfc_rpki::Enforcement),
+    /// The startup setting in effect (`rpki::startup`), after a reload or
+    /// before validation is turned off: judge again every route not
+    /// validated yet, `disabled`, holding it under `hold` and releasing it
+    /// under `accept` (RFC 6811 §2: only "explicitly configured" routes
+    /// leave the decision process for their state), with no UPDATE and no
+    /// ROUTE-REFRESH. The same setting again changes nothing.
+    SetStartup(bgpfc_rpki::Startup),
     /// Switch the FIB between dry-run and install: the RIB thread passes
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.

@@ -71,6 +71,9 @@ fn main() {
             config.neighbors.len(),
             config.policies.len()
         );
+        if let Some(warning) = weaker_owner_check(&opts, &config) {
+            eprintln!("{warning}");
+        }
         return;
     }
     bgpfc_log::init(config.log_level);
@@ -84,7 +87,8 @@ fn main() {
         router_id = config.router_id,
         fib_mode = config.fib.mode,
         rpki = config.rpki.mode,
-        enforcement = config.rpki.enforcement
+        enforcement = config.rpki.enforcement,
+        startup = config.rpki.startup
     );
     // Issue #60: a cache that cannot be found stops the start, before
     // anything is opened, rather than leaving every route unvalidated.
@@ -93,6 +97,42 @@ fn main() {
         std::process::exit(1);
     }
     run(&opts, config, engine);
+}
+
+/// What `--check` warns of with `mode sidecar` when the owner check of
+/// Routinator's port is weaker where bgpfcd would run
+/// ([`owner::weaker_here`]): as the user `--user` names, or else as the
+/// user `--check` runs as, in this user namespace. It is a warning, at
+/// the `mode sidecar` statement or the `sidecar` block, and the file is
+/// still ok: bgpfcd starts all the same, and warns again then.
+fn weaker_owner_check(opts: &args::Args, config: &bgpfc_config::Config) -> Option<String> {
+    if config.rpki.mode != bgpfc_config::ast::RpkiMode::Sidecar {
+        return None;
+    }
+    let uid = match &opts.user {
+        Some(user) => {
+            let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+            // A user that is not there stops the start; nothing to judge.
+            Some(bgpfc_sys::lookup_user(&passwd, user)?.uid)
+        }
+        None => None,
+    };
+    let (uid, found) = owner::weaker_here(uid)?;
+    if found.is_empty() {
+        return None;
+    }
+    let at = config
+        .rpki
+        .sidecar
+        .pos
+        .map_or_else(String::new, |pos| format!("{pos}:"));
+    Some(format!(
+        "{}:{at} warning: rpki sidecar: the owner check of Routinator's port is weaker \
+         for bgpfcd as uid {uid}: {}; bgpfcd starts all the same (docs/config.md, \
+         \"Who serves the sidecar's port\")",
+        opts.config.display(),
+        owner::reasons(&found)
+    ))
 }
 
 /// Parse, validate and compile the configuration file, with the command
@@ -190,8 +230,10 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     }
 
     // No validation source yet (issue #56): every route is `disabled`
-    // until the RTR client sends its first full set. The `enforcement` is
-    // set before the thread starts, so that no route is judged without it.
+    // until the RTR client sends its first full set. The `enforcement` and
+    // the `startup` are set before the thread starts, so that no route is
+    // judged without them: under `startup hold` every route that arrives
+    // before that set is held.
     rib::spawn(
         wiring::rib(&config, Box::new(engine)),
         wiring::rib_settings(&config),
@@ -374,12 +416,15 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
-                // Applied below, from the block in effect.
-                GlobalChange::Rpki => {}
+                // Applied below: the block from the one in effect, then the
+                // keep-alive, once the client the block runs is known.
+                GlobalChange::Rpki | GlobalChange::RpkiKeepalive => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
                 }
+                // So is the startup setting in effect, whatever changed.
+                GlobalChange::RpkiStartup => notes.push(rpki::startup_note(&new.rpki)),
                 GlobalChange::Log => bgpfc_log::init(new.log_level),
                 GlobalChange::Fib => {
                     if new.fib.table != self.config.fib.table
@@ -409,6 +454,11 @@ impl Coordinator<'_> {
             let done = self.rpki.reconfigure(&rpki, &new.rpki);
             notes.push(done.map_or_else(|e| e, str::to_owned));
         }
+        // RFC 8210 §9: the new keep-alive reaches the connection in use,
+        // with no new connection; a client just restarted has it already.
+        if diff.global.contains(&GlobalChange::RpkiKeepalive) {
+            notes.push(self.rpki.set_tcp_keepalive(&new.rpki));
+        }
         // RFC 4486 §4: de-configured peers and peers whose session
         // parameters changed get the matching Cease subcode.
         for addr in &diff.removed {
@@ -417,38 +467,7 @@ impl Coordinator<'_> {
         for addr in &diff.reset {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
         }
-        // Policies always follow the new file: the engine knows every
-        // neighbor's policy names.
-        let _ = self.rib_tx.send(RibMsg::SetPolicies {
-            policies: messages::NewPolicies(Box::new(engine)),
-            reexport: diff.policy_changed.clone(),
-        });
-        // RFC 6811 §5: a new `enforcement` judges every route again, under
-        // the new import policies, with no restart of the RTR client.
-        if diff.global.contains(&GlobalChange::RpkiEnforcement) {
-            let _ = self
-                .rib_tx
-                .send(RibMsg::SetEnforcement(new.rpki.enforcement));
-        }
-        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
-        // file without a reset. Sent before new peers start, so their
-        // sessions come up with the new values.
-        let _ = self
-            .rib_tx
-            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(&new)));
-        // RFC 4271 §6.7: so do the prefix limits; a session already over a
-        // lowered limit ends.
-        let _ = self
-            .rib_tx
-            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(&new)));
-        // Import policy changes need the peer's routes again (RFC 2918).
-        if let Ok(t) = self.table.read() {
-            for addr in &diff.policy_changed {
-                if let Some(h) = t.get(addr) {
-                    let _ = h.tx.try_send(PeerInput::RequestRoutes);
-                }
-            }
-        }
+        self.reload_rib(&new, engine, &diff);
         let mut started = Vec::new();
         for addr in diff.added.iter().chain(&diff.reset) {
             if let Some(n) = new.neighbor(*addr) {
@@ -475,6 +494,57 @@ impl Coordinator<'_> {
         );
         self.config = new;
         Ok(summary)
+    }
+
+    /// What a reload tells the RIB thread, in this order, after the `rpki`
+    /// block is reconfigured and before new peers start: the new
+    /// policies, then what acts on the validation state, which judges
+    /// routes again under them, then the per-neighbor settings.
+    fn reload_rib(
+        &self,
+        new: &bgpfc_config::Config,
+        engine: bgpfc_policy::Engine,
+        diff: &ConfigDiff,
+    ) {
+        // Policies always follow the new file: the engine knows every
+        // neighbor's policy names. RFC 4271 §3: the routes of neighbors
+        // whose import policy changed are imported again from the
+        // Adj-RIBs-In, with no ROUTE-REFRESH but for the routes import
+        // policy dropped, which the RIB asks for itself (RFC 2918); those
+        // whose export policy changed are sent the difference.
+        let _ = self.rib_tx.send(RibMsg::SetPolicies {
+            policies: messages::NewPolicies(Box::new(engine)),
+            reimport: diff.import_changed.clone(),
+            reexport: diff.export_changed.clone(),
+        });
+        // RFC 6811 §5: a new `enforcement` judges every route again, under
+        // the new import policies, with no restart of the RTR client.
+        if diff.global.contains(&GlobalChange::RpkiEnforcement) {
+            let _ = self
+                .rib_tx
+                .send(RibMsg::SetEnforcement(new.rpki.enforcement));
+        }
+        // RFC 6811 §2: the startup setting of the block now in effect, so
+        // that the routes not validated yet are held or used as it says:
+        // `hold` while a client waits for its first full set, `accept` once
+        // validation is off, which `Rpki::disable` has already told the
+        // RIB before it turned validation off. The same setting again
+        // changes nothing; a new one judges those routes again, under the
+        // new import policies, with no restart of the RTR client.
+        let _ = self.rib_tx.send(RibMsg::SetStartup(rpki::startup(
+            &self.rpki.in_effect(&new.rpki),
+        )));
+        // RFC 4271 §9.2.1.1: the advertisement intervals follow the new
+        // file without a reset. Sent before new peers start, so their
+        // sessions come up with the new values.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetIntervals(wiring::advertisement_intervals(new)));
+        // RFC 4271 §6.7: so do the prefix limits; a session already over a
+        // lowered limit ends.
+        let _ = self
+            .rib_tx
+            .send(RibMsg::SetPrefixLimits(wiring::prefix_limits(new)));
     }
 
     /// The running `rpki` block, its client and its sidecar.

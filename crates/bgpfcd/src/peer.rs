@@ -78,6 +78,11 @@ pub(crate) struct PeerHandle {
     /// current input (RFC 4271 §6.7), with the right Cease rather than
     /// the overrun's.
     pub(crate) prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
+    /// Families the RIB thread asks the peer for again, when
+    /// [`PeerInput::RequestRoutes`] did not fit in the full queue: the
+    /// peer thread sends their ROUTE-REFRESH after its current input (RFC
+    /// 2918 §4), as it ends the session for [`PeerHandle::prefix_limit`].
+    pub(crate) refresh: Arc<Mutex<Vec<AddressFamily>>>,
 }
 
 /// UPDATEs the RIB thread has encoded and the peer thread has not written
@@ -116,6 +121,7 @@ impl PeerHandle {
             outbox: channel().0,
             state: Arc::default(),
             prefix_limit: Arc::default(),
+            refresh: Arc::default(),
         }
     }
 
@@ -172,6 +178,7 @@ pub(crate) struct Peer {
     outbox: Receiver<Vec<Vec<u8>>>,
     outbox_state: Arc<Outbox>,
     prefix_limit: Arc<Mutex<Option<(AddressFamily, u32)>>>,
+    refresh: Arc<Mutex<Vec<AddressFamily>>>,
     /// When the FSM last changed state.
     state_since: Instant,
     updates_in: u64,
@@ -188,12 +195,14 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
     let (outbox_tx, outbox) = channel();
     let state = Arc::new(Outbox::default());
     let prefix_limit = Arc::new(Mutex::new(None));
+    let refresh = Arc::default();
     let handle = PeerHandle {
         addr: cfg.addr,
         tx: tx.clone(),
         outbox: outbox_tx,
         state: Arc::clone(&state),
         prefix_limit: Arc::clone(&prefix_limit),
+        refresh: Arc::clone(&refresh),
     };
     let fsm = Fsm::new(cfg.fsm.clone());
     let peer = Peer {
@@ -211,6 +220,7 @@ pub(crate) fn prepare(cfg: PeerConfig, rib: SyncSender<RibMsg>) -> (PeerHandle, 
         outbox,
         outbox_state: state,
         prefix_limit,
+        refresh,
         state_since: Instant::now(),
         updates_in: 0,
         updates_out: 0,
@@ -445,14 +455,14 @@ impl Peer {
                 }
             }
             PeerInput::SoftReset => {
-                if self.request_routes(now) {
+                if self.request_routes(None, now) {
                     self.rib_send(RibMsg::Resend {
                         peer: self.cfg.addr,
                     });
                 }
             }
-            PeerInput::RequestRoutes => {
-                self.request_routes(now);
+            PeerInput::RequestRoutes(families) => {
+                self.request_routes(Some(&families), now);
             }
             PeerInput::Report(reply) => {
                 let _ = reply.send(PeerReport {
@@ -476,6 +486,14 @@ impl Peer {
     /// What the RIB thread flagged because the queue was full when it had
     /// something to say.
     fn flags(&mut self, now: Instant) {
+        let families = self
+            .refresh
+            .lock()
+            .map(|mut f| std::mem::take(&mut *f))
+            .unwrap_or_default();
+        if !families.is_empty() {
+            self.request_routes(Some(&families), now);
+        }
         let pending = self.prefix_limit.lock().ok().and_then(|mut p| p.take());
         if let Some((family, limit)) = pending {
             self.prefix_limit(family, limit, now);
@@ -521,10 +539,13 @@ impl Peer {
         );
     }
 
-    /// RFC 2918 §4: ask for every negotiated family again, only if the
-    /// peer advertised the capability. Without it the request is refused
-    /// rather than turned into a hard reset. Whether anything was sent.
-    fn request_routes(&mut self, now: Instant) -> bool {
+    /// RFC 2918 §4: ask for every negotiated family again, or for those
+    /// of `only` that were negotiated, only if the peer advertised the
+    /// capability: "The <AFI, SAFI> carried in the ROUTE-REFRESH message
+    /// should be one of the <AFI, SAFI> that the peer advertised". Without
+    /// it the request is refused rather than turned into a hard reset.
+    /// Whether anything was sent.
+    fn request_routes(&mut self, only: Option<&[AddressFamily]>, now: Instant) -> bool {
         let Some(session) = self.session.clone() else {
             bgpfc_log::warn!(
                 "route refresh: session not established",
@@ -539,13 +560,20 @@ impl Peer {
             );
             return false;
         }
+        let mut sent = false;
         for family in &session.families {
+            if only.is_some_and(|o| !o.contains(family)) {
+                continue;
+            }
             let body = RouteRefreshMessage { family: *family }.encode();
             self.write_message(MessageType::RouteRefresh, &body);
             bgpfc_log::info!("route refresh sent", peer = self.cfg.addr, family = family);
+            sent = true;
         }
-        self.fsm.message_sent(now);
-        true
+        if sent {
+            self.fsm.message_sent(now);
+        }
+        sent
     }
 
     /// A TCP connection completed, ours or theirs.

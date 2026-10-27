@@ -49,7 +49,11 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   dry-run as the default and a runtime toggle; privilege drop and a capability
   check; clean shutdown on `SIGTERM`.
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
-  with a configuration diff ([`docs/control.md`](docs/control.md)).
+  with a configuration diff ([`docs/control.md`](docs/control.md)); a changed
+  import policy applies at once to the routes already received. Routes an
+  import policy rejected are not kept, so when it has rejected any route of
+  a family, the neighbor is also asked to send that whole family again with
+  a route refresh.
 - RPKI route origin validation (RFC 6811): a validation state on every
   route, from VRPs fetched over RTR (RFC 8210, falling back to RFC 6810) from
   the caches of an `rpki` block, with failover in order of preference, or
@@ -64,7 +68,8 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
   it concerns, through the same path as an UPDATE; each route that changed
   state is logged, and `bgpfcctl show rpki transitions` keeps the latest.
   Interop tests run it against StayRTR and BIRD, and the sidecar against a
-  stand-in for Routinator.
+  stand-in for Routinator and against Routinator 0.15 itself, offline, on
+  an RPKI repository the test signs and serves on loopback.
 
 Rough figures from the criterion benches on one core (`cargo bench`): UPDATE
 decode about 0.3 µs for one prefix and 4.4 µs for 500; RIB insert about 1 µs
@@ -116,7 +121,12 @@ to version 0 (RFC 6810), from the block's external caches, with failover in
 order of preference, a reconnect back-off, and the last VRPs kept while no
 cache answers, until they expire. Without the block, or with `mode
 disabled`, every route reads `disabled`. RTR runs over plain TCP only (RFC
-8210 §9), so the cache belongs on loopback or a trusted network.
+8210 §9), so the cache belongs on loopback or a trusted network. Every RTR
+connection has TCP keep-alive on, as §9 asks of routers: by default a first
+probe after a minute without traffic and one every 10 seconds after it, so
+that a cache that vanished without closing the connection is noticed within
+two minutes rather than at the next query, an hour on. `tcp-keepalive`
+changes the times, and a reload applies them to the connection in use.
 
 bgpfcd acts on the states (step 13) as the block's `enforcement` says
 ([`docs/config.md`](docs/config.md), "RPKI"): `drop-invalid`, the default,
@@ -135,7 +145,7 @@ bgpfcd can also run the validator itself (step 14). The one line
 software, as a child process, with its command line derived from the
 block (TALs, the ARIN agreement, refresh, cache directory, binary, and
 extra arguments or a Routinator config file as an escape hatch). bgpfcd
-checks Routinator's version at start: it is tested with 0.15.2, accepts
+checks Routinator's version at start: it is tested with 0.15.3, accepts
 any 0.15.x and refuses other releases with an error. Routinator serves
 RTR on a loopback port bgpfcd picks, and the RTR client connects to it
 with nothing else configured. bgpfcd restarts it with a back-off when it
@@ -148,8 +158,9 @@ a separate program that bgpfc neither bundles nor links; see "Routinator
 sidecar" under "Run". Its first validation run takes minutes from a cold
 cache, and bgpfcd does not wait for it: routes are used unvalidated until
 the first full set, then validated and acted on, and the wait is logged
-and shown ([`docs/config.md`](docs/config.md), "Startup window", which
-also shows how to hold routes until then instead). An external validator
+and shown ([`docs/config.md`](docs/config.md), "Startup window").
+`rpki { startup hold; }` holds every route until that set instead, in
+either mode, and `show rpki` and the log say that the routes are held. An external validator
 (`mode external`) and no validation (`mode disabled`, or no `rpki` block)
 work as before, without Routinator on the host.
 
@@ -183,7 +194,7 @@ crates/
   bgpfcd         daemon binary
   bgpfcctl       CLI binary
 fuzz/            cargo-fuzz targets (excluded from the workspace)
-interop/         tests against BIRD / FRR / GoBGP, StayRTR and a fake Routinator (dev-only)
+interop/         tests against BIRD / FRR / GoBGP, StayRTR, a fake and the real Routinator (dev-only)
 ```
 
 ## Build
@@ -240,14 +251,16 @@ control {
 # rpki {
 #     mode external;
 #     enforcement drop-invalid;   # drop-invalid | prefer-valid | off
+#     startup accept;             # accept | hold: routes until the first data
+#     tcp-keepalive idle 60;      # idle, interval, count: 60, 10, 6 by default
 #     cache 127.0.0.1 port 3323;
 # }
 #
 # Or let bgpfcd run Routinator 0.15.x itself, serving RTR on loopback
 # only and restarting it when it fails (README, "Routinator sidecar").
 # Routes are used unvalidated until its first validation run ends,
-# minutes from a cold start; ARIN's TAL needs `sidecar { accept-arin-rpa
-# yes; }`.
+# minutes from a cold start, unless `startup hold;` holds them; ARIN's
+# TAL needs `sidecar { accept-arin-rpa yes; }`.
 # rpki { mode sidecar; }
 
 prefix-list BOGONS {
@@ -287,6 +300,10 @@ In `fib { mode dry-run; }`, bgpfc computes every kernel route change and logs it
 but never writes to the kernel. `mode install` applies the changes. The mode can
 be overridden at startup with `bgpfcd --fib dry-run|install` and changed at
 runtime with `bgpfcctl fib mode <dry-run|install>`. **Dry-run is the default.**
+In either mode the log has a line at info at most once a second while the
+routing table changes, counting the routes installed and removed since the line
+before and naming the first few, and a line per route at debug
+(`docs/control.md`, "Validation state").
 
 In install mode, bgpfc only touches routes tagged with its own protocol number.
 At startup it flushes stale routes left by a previous run, and it never modifies
@@ -356,7 +373,7 @@ need a restart.
 
 ### Routinator sidecar
 
-With `rpki { mode sidecar; }` bgpfcd runs Routinator, tested with 0.15.2;
+With `rpki { mode sidecar; }` bgpfcd runs Routinator, tested with 0.15.3;
 any 0.15.x is accepted, and another release stops the start with `cannot
 start rpki` naming both versions.
 
@@ -386,7 +403,11 @@ start rpki` naming both versions.
   validation run, another local process could bind the port; bgpfcd's RTR
   client uses only a server that runs as bgpfcd's own user, as
   Routinator does, so give bgpfcd a user of its own (`bgpfc`, not
-  `nobody`).
+  `nobody`), and in a user namespace one the namespace maps: there every
+  unmapped user, root included, reads as `nobody` (`docs/config.md`, "Who
+  serves the sidecar's port"). bgpfcd warns at the start of the sidecar,
+  and `bgpfcd --check` too, when it runs as `nobody`, as the overflow
+  user, or in a user namespace, and starts all the same.
 - **systemd**: `contrib/bgpfcd.service` has `KillMode=mixed`, so that
   `systemctl stop` signals bgpfcd alone, which stops its RTR client and
   then Routinator itself; with the default mode systemd would signal
@@ -399,7 +420,8 @@ start rpki` naming both versions.
   logged at warn in bgpfcd's log, each line with `sidecar=routinator
   stream=stderr`; its standard output at info.
 - **The first validation run** takes minutes from a cold cache, less
-  from a warm one, and Routinator serves RTR only after it. `show rpki`
+  from a warm one, and Routinator serves RTR only after it. Routes are
+  used unvalidated meanwhile, or held with `startup hold;`. `show rpki`
   says `validation waiting` meanwhile, and `sidecar running` with
   Routinator's pid; a Routinator that keeps failing shows as `sidecar
   FAILED` there and as an alarm in `show status` (`docs/control.md`,

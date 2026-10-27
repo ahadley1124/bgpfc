@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bgpfc_rpki::{Enforcement, RovState};
+use bgpfc_rpki::{Enforcement, RovState, Startup};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -138,6 +138,13 @@ pub struct Rpki {
     /// documented meaning of `mode external` includes the default, and
     /// with `mode disabled` only a state import policy sets is acted on.
     pub enforcement: Enforcement,
+    /// `startup`: what a route not validated yet, `disabled`, does while
+    /// validation waits for its first full set of VRPs;
+    /// [`Rpki::DEFAULT_STARTUP`] unless given. RFC 6811 §2 lets a route
+    /// leave the decision process for its state only when "explicitly
+    /// configured to do so": [`Startup::Hold`] is that configuration.
+    /// With [`RpkiMode::Disabled`] no data comes, so it holds nothing.
+    pub startup: Startup,
     /// `cache` statements in file order: the router's cache list
     /// (RFC 8210 §10). At least one in [`RpkiMode::External`], none in
     /// [`RpkiMode::Sidecar`].
@@ -171,6 +178,10 @@ pub struct Rpki {
     pub backoff_min: Duration,
     /// The longest reconnect delay.
     pub backoff_max: Duration,
+    /// `tcp-keepalive [idle N] [interval N] [count N]`: how the kernel
+    /// probes an idle connection to a cache, which bgpfcd sets on every one
+    /// (RFC 8210 §9); [`RpkiKeepalive::DEFAULT`] where not given.
+    pub tcp_keepalive: RpkiKeepalive,
 }
 
 impl Rpki {
@@ -180,6 +191,13 @@ impl Rpki {
     /// apply none ("Absent specific operator configuration, policy MUST
     /// NOT be applied"); `enforcement off` gives that.
     pub const DEFAULT_ENFORCEMENT: Enforcement = Enforcement::DropInvalid;
+    /// The `startup` of a file that writes none: routes not validated yet
+    /// are used as received until the first full set validates them. RFC
+    /// 6811 §2: no route leaves the decision process for its state
+    /// "unless explicitly configured to do so", and holding them would
+    /// withdraw the whole table for as long as the cache takes, minutes
+    /// with a cold sidecar.
+    pub const DEFAULT_STARTUP: Startup = Startup::Accept;
     /// The rpki-rtr port (RFC 8210 §9, RFC 6810 §7).
     pub const DEFAULT_PORT: u16 = 323;
     /// The default `connect-timeout`.
@@ -236,6 +254,7 @@ impl Rpki {
         Rpki {
             mode,
             enforcement: Rpki::DEFAULT_ENFORCEMENT,
+            startup: Rpki::DEFAULT_STARTUP,
             caches: Vec::new(),
             sidecar: RpkiSidecar::default(),
             version: 1,
@@ -246,6 +265,7 @@ impl Rpki {
             max_vrps: Rpki::DEFAULT_MAX_VRPS,
             backoff_min,
             backoff_max,
+            tcp_keepalive: RpkiKeepalive::DEFAULT,
         }
     }
 
@@ -271,8 +291,8 @@ impl Rpki {
     /// in the same order with the same preferences, each host however it
     /// is spelled (see [`RpkiCache::is_at`]), and the same sidecar
     /// settings (see [`RpkiSidecar::same_as`]). A reload leaves the RTR
-    /// client and the sidecar alone unless this is false. The
-    /// `enforcement` is not compared.
+    /// client and the sidecar alone unless this is false. Neither the
+    /// `enforcement`, the `startup` nor the `tcp-keepalive` is compared.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
@@ -284,6 +304,13 @@ impl Rpki {
             // to it alone re-judges the routes; restarting the client for
             // it would reload every cache for nothing.
             enforcement: _,
+            // Nor is this: it acts on the routes while the client has no
+            // data, which the client neither knows nor changes.
+            startup: _,
+            // Nor this: bgpfcd sets it on the client's connections, the
+            // one in use included, without a new client, which would load
+            // every VRP afresh for a socket option.
+            tcp_keepalive: _,
             caches,
             sidecar,
             version,
@@ -511,6 +538,102 @@ impl Default for RpkiSidecar {
             stop_timeout: RpkiSidecar::DEFAULT_STOP_TIMEOUT,
             failure_threshold: RpkiSidecar::DEFAULT_FAILURE_THRESHOLD,
         }
+    }
+}
+
+/// The `tcp-keepalive` statement of `rpki`: how the kernel probes an idle
+/// connection to a cache (`tcp(7)`: `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
+/// `TCP_KEEPCNT`), which bgpfcd turns on for every connection, with `mode
+/// external` and `mode sidecar` alike. RFC 8210 §9: "To reduce exposure to
+/// dropped but non-terminated sessions, both caches and routers SHOULD
+/// enable keep-alives when available in the chosen transport protocol."
+///
+/// In sync, a connection is idle between polls, which come every Refresh
+/// Interval, an hour by default (RFC 8210 §6). Without probes, a cache that
+/// vanished without closing the connection (a crash, a power loss, a
+/// network that drops its packets) is noticed only when the next poll goes
+/// unanswered, more than an hour on; meanwhile the client neither moves to
+/// another cache (§10) nor hears the cache's Serial Notifies. The host's
+/// own default would probe only after two hours of silence (RFC 1122
+/// §4.2.3.6). The kernel drops a connection [`RpkiKeepalive::detection_time`]
+/// after its last segment, two minutes with the defaults.
+///
+/// Keep-alive acts only on a connection with nothing in flight. While a
+/// query is unanswered, the session's `response-timeout` finds a dead
+/// cache instead. Whole seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpkiKeepalive {
+    /// `idle`: how long nothing must arrive on the connection before the
+    /// first probe (`TCP_KEEPIDLE`).
+    pub idle: Duration,
+    /// `interval`: how long to wait for an answer to a probe before the
+    /// next (`TCP_KEEPINTVL`).
+    pub interval: Duration,
+    /// `count`: how many probes in a row may go unanswered before the
+    /// kernel drops the connection (`TCP_KEEPCNT`).
+    pub count: u32,
+}
+
+impl RpkiKeepalive {
+    /// The `idle` of a file that sets none: what Routinator sets on its
+    /// own end of each RTR connection by default (`--rtr-tcp-keepalive
+    /// 60`), so both ends start probing after the same minute of silence.
+    /// One small exchange a minute per connection costs nothing on the
+    /// controlled network RFC 8210 §9 asks for.
+    pub const DEFAULT_IDLE: Duration = Duration::from_mins(1);
+    /// The `interval` of a file that sets none. With
+    /// [`RpkiKeepalive::DEFAULT_COUNT`], the cache is declared gone after a
+    /// minute of unanswered probes, so a loss of a few seconds on that
+    /// network does not reset a session that would have lived on, and a
+    /// reconnect, which costs the cache a Serial Query at least (§8.1),
+    /// comes only for a cache that is really gone.
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
+    /// The `count` of a file that sets none.
+    pub const DEFAULT_COUNT: u32 = 6;
+    /// What a file that writes no `tcp-keepalive` runs with.
+    pub const DEFAULT: RpkiKeepalive = RpkiKeepalive {
+        idle: RpkiKeepalive::DEFAULT_IDLE,
+        interval: RpkiKeepalive::DEFAULT_INTERVAL,
+        count: RpkiKeepalive::DEFAULT_COUNT,
+    };
+    /// The longest `idle` the kernel takes: `MAX_TCP_KEEPIDLE`, 32767
+    /// seconds, in the kernel's `include/net/tcp.h`. It refuses a longer
+    /// one, and 0, with `EINVAL`.
+    pub const MAX_IDLE: Duration = Duration::from_secs(32_767);
+    /// The longest `interval` the kernel takes: `MAX_TCP_KEEPINTVL`, 32767
+    /// seconds, in `include/net/tcp.h`.
+    pub const MAX_INTERVAL: Duration = Duration::from_secs(32_767);
+    /// The most probes the kernel takes: `MAX_TCP_KEEPCNT`, 127, in
+    /// `include/net/tcp.h`.
+    pub const MAX_COUNT: u32 = 127;
+
+    /// The longest an idle connection to a cache that vanished stays open:
+    /// the idle time, then every probe's interval.
+    #[must_use]
+    pub fn detection_time(&self) -> Duration {
+        self.interval
+            .saturating_mul(self.count)
+            .saturating_add(self.idle)
+    }
+}
+
+impl Default for RpkiKeepalive {
+    /// [`RpkiKeepalive::DEFAULT`].
+    fn default() -> RpkiKeepalive {
+        RpkiKeepalive::DEFAULT
+    }
+}
+
+impl std::fmt::Display for RpkiKeepalive {
+    /// As the statement writes it: `idle 60 interval 10 count 6`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "idle {} interval {} count {}",
+            self.idle.as_secs(),
+            self.interval.as_secs(),
+            self.count
+        )
     }
 }
 
@@ -796,6 +919,7 @@ mod tests {
         assert_eq!(Rpki::default(), implicit);
         assert_eq!(implicit.mode, RpkiMode::Disabled);
         assert_eq!(implicit.enforcement, Rpki::DEFAULT_ENFORCEMENT);
+        assert_eq!(implicit.startup, Startup::Accept);
         assert_eq!(implicit.caches, []);
         assert_eq!(implicit.sidecar, RpkiSidecar::default());
         assert_eq!(implicit.sidecar.pos, None);
@@ -803,6 +927,54 @@ mod tests {
             (implicit.backoff_min, implicit.backoff_max),
             (Rpki::DEFAULT_BACKOFF_MIN, Rpki::DEFAULT_BACKOFF_MAX)
         );
+    }
+
+    /// What acts on the routes' states is not the RTR client's business:
+    /// a block that differs only there asks the client for the same. Nor
+    /// is the keep-alive, which bgpfcd sets on the client's connections.
+    #[test]
+    fn the_client_is_the_same_whatever_acts_on_the_state() {
+        let a = Rpki::defaults(RpkiMode::External);
+        let b = Rpki {
+            enforcement: Enforcement::Off,
+            startup: Startup::Hold,
+            tcp_keepalive: RpkiKeepalive {
+                count: 3,
+                ..RpkiKeepalive::DEFAULT
+            },
+            ..a.clone()
+        };
+        assert!(a.same_as(&b));
+        assert_ne!(a, b);
+        assert!(!a.same_as(&Rpki {
+            version: 0,
+            ..b.clone()
+        }));
+    }
+
+    /// The keep-alive's defaults notice a dead cache within two minutes,
+    /// and its bounds are the kernel's (`include/net/tcp.h`).
+    #[test]
+    fn the_keepalive_defaults_and_bounds() {
+        let k = Rpki::implicit().tcp_keepalive;
+        assert_eq!(k, RpkiKeepalive::DEFAULT);
+        assert_eq!(k, RpkiKeepalive::default());
+        assert_eq!(
+            (k.idle, k.interval, k.count),
+            (Duration::from_secs(60), Duration::from_secs(10), 6)
+        );
+        assert_eq!(k.detection_time(), Duration::from_secs(120));
+        assert_eq!(k.to_string(), "idle 60 interval 10 count 6");
+        // MAX_TCP_KEEPIDLE, MAX_TCP_KEEPINTVL, MAX_TCP_KEEPCNT.
+        assert_eq!(RpkiKeepalive::MAX_IDLE.as_secs(), 32_767);
+        assert_eq!(RpkiKeepalive::MAX_INTERVAL.as_secs(), 32_767);
+        assert_eq!(RpkiKeepalive::MAX_COUNT, 127);
+        let longest = RpkiKeepalive {
+            idle: RpkiKeepalive::MAX_IDLE,
+            interval: RpkiKeepalive::MAX_INTERVAL,
+            count: RpkiKeepalive::MAX_COUNT,
+        };
+        assert_eq!(longest.detection_time(), Duration::from_secs(32_767 * 128));
     }
 
     /// The back-off follows the mode; nothing else does.

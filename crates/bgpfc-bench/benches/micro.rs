@@ -90,6 +90,7 @@ fn peer() -> PeerInfo {
         receive_families: vec![AddressFamily::IPV4_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: Vec::new(),
         // The daemon's default for an external peer (RFC 4271 §10).
         advertisement_interval: default_interval(PeerKind::External),

@@ -10,8 +10,9 @@
 //! §9 and §10 (the `rpki` block: the Expire Interval cap and the
 //! back-off within their ranges, the protocol version, the rpki-rtr port,
 //! the cache list with preferences, the sidecar's RTR on loopback only);
-//! RFC 6811 §2 and §5 (the `rpki` block's `enforcement`: acting on the
-//! validation state only as configured). Issues #26 and #70-#72: the
+//! RFC 6811 §2 and §5 (the `rpki` block's `enforcement` and `startup`:
+//! acting on the validation state, and holding routes not validated yet,
+//! only as configured). Issues #26 and #70-#72: the
 //! `sidecar` block, Routinator's settings within the bounds of
 //! `bgpfc-sidecar`.
 //!

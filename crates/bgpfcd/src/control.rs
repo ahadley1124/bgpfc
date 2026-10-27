@@ -35,7 +35,7 @@ use bgpfc_control::json::Json;
 use bgpfc_control::proto;
 use bgpfc_fib::Mode;
 use bgpfc_rib::{Held, RouteStatus};
-use bgpfc_rpki::{RouteOrigin, RovState, Vrp, VrpSet};
+use bgpfc_rpki::{RouteOrigin, RovState, Startup, Vrp, VrpSet};
 use bgpfc_sidecar::SidecarState;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, RouterId};
@@ -657,6 +657,17 @@ impl Validation {
     }
 }
 
+/// What becomes of the routes while validation waits for the first full
+/// set, under the block's `startup` (RFC 6811 §2). A client runs while
+/// validation waits, so the block's mode validates and its setting is the
+/// one in effect (`rpki::startup`).
+const fn waiting_routes(startup: Startup) -> &'static str {
+    match startup {
+        Startup::Accept => "every route is disabled and used unvalidated",
+        Startup::Hold => "every route is disabled and held (startup hold)",
+    }
+}
+
 /// `n failures`, or `1 failure`.
 fn failures(n: u32) -> String {
     if n == 1 {
@@ -732,11 +743,13 @@ fn rpki_lines(r: &RpkiReport, now: Instant) -> Vec<String> {
     let mut lines = vec![
         format!("mode {}", r.config.mode),
         format!("enforcement {}", r.config.enforcement),
+        format!("startup {}", r.config.startup),
         match Validation::of(r) {
             Validation::Waiting(since) => format!(
-                "validation waiting {}s for the first full set: every route is disabled \
-                 and used unvalidated; enforcement acts once it arrives",
-                seconds_between(since, now)
+                "validation waiting {}s for the first full set: {}; enforcement acts once \
+                 it arrives",
+                seconds_between(since, now),
+                waiting_routes(r.config.startup)
             ),
             v => format!("validation {}", v.as_str()),
         },
@@ -864,6 +877,7 @@ fn write_rpki(j: &mut Json, r: &RpkiReport, now: Instant) {
     j.begin_object()
         .field_display("mode", r.config.mode)
         .field_display("enforcement", r.config.enforcement)
+        .field_display("startup", r.config.startup)
         .field_str("validation", validation.as_str())
         .field_opt_num(
             "waiting_seconds",
@@ -2039,6 +2053,7 @@ mod tests {
             receive_families: vec![v4, v6],
             four_octet_as: true,
             extended_messages: false,
+            route_refresh: true,
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::ZERO,
             prefix_limits: vec![(v4, 1000)],
@@ -2389,6 +2404,7 @@ mod tests {
             receive_families: vec![v4],
             four_octet_as: true,
             extended_messages: false,
+            route_refresh: true,
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::ZERO,
             prefix_limits: Vec::new(),
@@ -2707,6 +2723,7 @@ mod tests {
             [
                 "mode external",
                 "enforcement drop-invalid",
+                "startup accept",
                 "validation active",
                 "cache 127.0.0.1:3323 preference 0",
                 "cache rtr.example.net:323 preference 10, in use, current",
@@ -2721,7 +2738,7 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"external","enforcement":"drop-invalid","validation":"active","#,
+                r#"{"mode":"external","enforcement":"drop-invalid","startup":"accept","validation":"active","#,
                 r#""waiting_seconds":null,"sidecar":null,"caches":["#,
                 r#"{"host":"127.0.0.1","port":3323,"preference":0,"in_use":false,"#,
                 r#""current":false},"#,
@@ -2752,12 +2769,12 @@ mod tests {
         report.waiting_since = now.checked_sub(Duration::from_secs(3));
         let r = render_rpki(&report, now);
         assert!(
-            r.lines[2].starts_with("validation waiting 3s "),
+            r.lines[3].starts_with("validation waiting 3s "),
             "{:?}",
             r.lines
         );
         assert_eq!(
-            r.lines[5..],
+            r.lines[6..],
             [
                 "state connecting, version 1",
                 "session-id - serial -",
@@ -2778,7 +2795,7 @@ mod tests {
             s.running = false;
         }
         assert_eq!(
-            render_rpki(&report, now).lines[5],
+            render_rpki(&report, now).lines[6],
             "state stopped, version 1"
         );
         // Disabled: the configured caches, nothing else, every member there.
@@ -2794,6 +2811,7 @@ mod tests {
             [
                 "mode disabled",
                 "enforcement drop-invalid",
+                "startup accept",
                 "validation off",
                 "cache 192.0.2.10:323 preference 0"
             ]
@@ -2801,7 +2819,7 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","enforcement":"drop-invalid","validation":"off","#,
+                r#"{"mode":"disabled","enforcement":"drop-invalid","startup":"accept","validation":"off","#,
                 r#""waiting_seconds":null,"sidecar":null,"#,
                 r#""caches":[{"host":"192.0.2.10","port":323,"#,
                 r#""preference":0,"in_use":false,"current":false}],"#,
@@ -2822,6 +2840,7 @@ mod tests {
             [
                 "mode disabled",
                 "enforcement drop-invalid",
+                "startup accept",
                 "validation off"
             ]
         );
@@ -2846,7 +2865,7 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[3..9],
+            r.lines[4..10],
             [
                 "cache 127.0.0.1:3323 preference 0, current",
                 "cache rtr.example.net:323 preference 10, in use",
@@ -2877,7 +2896,7 @@ mod tests {
             r.lines
         );
         assert_eq!(
-            r.lines[8],
+            r.lines[9],
             "vrps ipv4 2 ipv6 1 from 192.0.2.99:323, expire in 7188s"
         );
         assert!(
@@ -2893,7 +2912,7 @@ mod tests {
              cache RTR.Example.NET. preference 10; }",
         );
         assert_eq!(
-            render_rpki(&respelled, now).lines[4],
+            render_rpki(&respelled, now).lines[5],
             "cache RTR.Example.NET.:323 preference 10, in use, current"
         );
         // Held data that expired is no cache's: every route not-found.
@@ -2903,7 +2922,7 @@ mod tests {
             (s.vrps_ipv4, s.vrps_ipv6, s.expires_at) = (0, 0, None);
         }
         let r = render_rpki(&report, now);
-        assert_eq!(r.lines[8], "vrps ipv4 0 ipv6 0");
+        assert_eq!(r.lines[9], "vrps ipv4 0 ipv6 0");
         assert!(
             r.json.contains(r#""vrps":{"ipv4":0,"ipv6":0,"from":null}"#),
             "{}",
@@ -2939,8 +2958,9 @@ mod tests {
                 let r = render_rpki(&report, now);
                 assert_eq!(r.lines[1], format!("enforcement {mode}"), "{block}");
                 assert!(
-                    r.json
-                        .contains(&format!(r#""enforcement":"{mode}","validation":"#)),
+                    r.json.contains(&format!(
+                        r#""enforcement":"{mode}","startup":"accept","validation":"#
+                    )),
                     "{}",
                     r.json
                 );
@@ -3027,8 +3047,9 @@ mod tests {
             [
                 "mode sidecar",
                 "enforcement drop-invalid",
+                "startup accept",
                 "validation active",
-                "sidecar running pid 4242 for 312s, routinator 0.15.2 (/usr/bin/routinator)",
+                "sidecar running pid 4242 for 312s, routinator 0.15.3 (/usr/bin/routinator)",
                 "sidecar rtr 127.0.0.1:41234, restarts 1, failures 0, \
                  last exit: killed by signal 9 (SIGKILL)",
                 "cache 127.0.0.1:41234 (sidecar) preference 0, in use, current",
@@ -3042,13 +3063,13 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"sidecar","enforcement":"drop-invalid","validation":"active","#,
+                r#"{"mode":"sidecar","enforcement":"drop-invalid","startup":"accept","validation":"active","#,
                 r#""waiting_seconds":null,"#,
                 r#""sidecar":{"state":"running","alarm":false,"pid":4242,"#,
                 r#""running_seconds":312,"retry_in_seconds":null,"restarts":1,"#,
                 r#""consecutive_failures":0,"last_exit":"killed by signal 9 (SIGKILL)","#,
                 r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
-                r#""version":"0.15.2"},"#,
+                r#""version":"0.15.3"},"#,
                 r#""caches":[{"host":"127.0.0.1","port":41234,"preference":0,"#,
                 r#""in_use":true,"current":true}],"#,
                 r#""running":true,"state":"idle","connected":true,"version":1,"#,
@@ -3068,7 +3089,7 @@ mod tests {
         }
         let r = render_rpki(&fresh, now);
         assert_eq!(
-            r.lines[4..6],
+            r.lines[5..7],
             [
                 "sidecar rtr [::1]:3323, restarts 0, failures 0",
                 "cache [::1]:3323 (sidecar) preference 0",
@@ -3147,8 +3168,8 @@ mod tests {
         for (state, line, pid, running, retry) in cases {
             let r = render_rpki(&sidecar_report(now, state), now);
             assert_eq!(
-                r.lines[3],
-                format!("sidecar {line}, routinator 0.15.2 (/usr/bin/routinator)")
+                r.lines[4],
+                format!("sidecar {line}, routinator 0.15.3 (/usr/bin/routinator)")
             );
             let alarm = matches!(state, SidecarState::Failed { .. });
             let json = format!(
@@ -3174,10 +3195,10 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[3..5],
+            r.lines[4..6],
             [
                 "sidecar FAILED after 7 failures in a row, next attempt in 280s, \
-                 routinator 0.15.2 (/usr/bin/routinator)",
+                 routinator 0.15.3 (/usr/bin/routinator)",
                 "sidecar rtr 127.0.0.1:41234, restarts 6, failures 7, \
                  last exit: exited with status 1",
             ]
@@ -3188,7 +3209,7 @@ mod tests {
                 r#""running_seconds":null,"retry_in_seconds":280,"restarts":6,"#,
                 r#""consecutive_failures":7,"last_exit":"exited with status 1","#,
                 r#""rtr":"127.0.0.1:41234","binary":"/usr/bin/routinator","#,
-                r#""version":"0.15.2"},"#
+                r#""version":"0.15.3"},"#
             )),
             "{}",
             r.json
@@ -3204,16 +3225,16 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert!(
-            r.lines[3].ends_with(r"(/opt/rout\ninator)"),
+            r.lines[4].ends_with(r"(/opt/rout\ninator)"),
             "{}",
-            r.lines[3]
+            r.lines[4]
         );
         assert!(
-            r.lines[4].ends_with(
+            r.lines[5].ends_with(
                 r"last exit: could not be started: Routinator 0.16.0 is not supported:\nneeds 0.15"
             ),
             "{}",
-            r.lines[4]
+            r.lines[5]
         );
         assert!(r.lines.iter().all(|l| !l.chars().any(char::is_control)));
         assert!(
@@ -3249,12 +3270,15 @@ mod tests {
         }
         let r = render_rpki(&report, now);
         assert_eq!(
-            r.lines[2],
-            "validation waiting 95s for the first full set: every route is disabled \
-             and used unvalidated; enforcement acts once it arrives"
+            r.lines[2..4],
+            [
+                "startup accept",
+                "validation waiting 95s for the first full set: every route is disabled \
+                 and used unvalidated; enforcement acts once it arrives"
+            ]
         );
         assert_eq!(
-            r.lines[5..],
+            r.lines[6..],
             [
                 "cache 127.0.0.1:41234 (sidecar) preference 0, current",
                 "state connecting, version 1",
@@ -3275,9 +3299,9 @@ mod tests {
         external.waiting_since = Some(now);
         let r = render_rpki(&external, now);
         assert!(
-            r.lines[2].starts_with("validation waiting 0s for the first full set: "),
+            r.lines[3].starts_with("validation waiting 0s for the first full set: "),
             "{}",
-            r.lines[2]
+            r.lines[3]
         );
         assert!(
             r.json
@@ -3285,6 +3309,40 @@ mod tests {
             "{}",
             r.json
         );
+    }
+
+    #[test]
+    fn rpki_status_says_the_routes_are_held_under_startup_hold() {
+        // RFC 6811 §2: held only as configured, and `show rpki` says that
+        // they are, while they wait; with data the setting holds nothing,
+        // and it is shown all the same.
+        let now = Instant::now();
+        let mut report = rpki_report(now, &[]);
+        report.config = rpki_block(
+            "rpki { mode external; startup hold; cache 127.0.0.1 port 3323;
+             cache rtr.example.net preference 10; }",
+        );
+        report.waiting_since = now.checked_sub(Duration::from_secs(7));
+        let r = render_rpki(&report, now);
+        assert_eq!(
+            r.lines[1..4],
+            [
+                "enforcement drop-invalid",
+                "startup hold",
+                "validation waiting 7s for the first full set: every route is disabled \
+                 and held (startup hold); enforcement acts once it arrives",
+            ]
+        );
+        assert!(
+            r.json.contains(
+                r#""enforcement":"drop-invalid","startup":"hold","validation":"waiting","waiting_seconds":7,"#
+            ),
+            "{}",
+            r.json
+        );
+        report.waiting_since = None;
+        let r = render_rpki(&report, now);
+        assert_eq!(r.lines[2..4], ["startup hold", "validation active"]);
     }
 
     #[test]
@@ -3303,7 +3361,7 @@ mod tests {
         assert_eq!(
             r.json,
             concat!(
-                r#"{"mode":"disabled","enforcement":"drop-invalid","validation":"off","#,
+                r#"{"mode":"disabled","enforcement":"drop-invalid","startup":"accept","validation":"off","#,
                 r#""waiting_seconds":null,"sidecar":null,"caches":[],"#,
                 r#""running":false,"state":null,"#,
                 r#""connected":false,"version":null,"session_id":null,"serial":null,"#,
@@ -3323,6 +3381,7 @@ mod tests {
             [
                 "mode sidecar",
                 "enforcement drop-invalid",
+                "startup accept",
                 "validation off",
                 "sidecar not running",
             ]
@@ -3345,7 +3404,7 @@ mod tests {
             render_rpki(&waiting, now),
         ];
         let expected = members(&r.json);
-        assert_eq!(expected.len(), 18, "{expected:?}");
+        assert_eq!(expected.len(), 19, "{expected:?}");
         for shape in shapes {
             assert_eq!(members(&shape.json), expected, "{}", shape.json);
         }

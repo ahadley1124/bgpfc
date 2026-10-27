@@ -6,7 +6,7 @@
 //!
 //! Implements: no RFC. Routinator builds its command line with clap as
 //! `Command::new("Routinator").version(crate_version!())` (`src/main.rs`
-//! at v0.15.2), so `--version` prints `Routinator 0.15.2`.
+//! at v0.15.3), so `--version` prints `Routinator 0.15.3`.
 
 use std::fmt;
 
@@ -39,14 +39,23 @@ impl fmt::Display for Version {
 }
 
 /// The newest stable Routinator release whose documentation the command
-/// line follows: 0.15.2, released 2026-06-08 (`Changelog.md`). Its manual
-/// page is <https://routinator.docs.nlnetlabs.nl/en/stable/manual-page.html>,
+/// line follows, and the one the interop tests run: 0.15.3, released
+/// 2026-10-26 (`Changelog.md`). Its manual page is
+/// <https://routinator.docs.nlnetlabs.nl/en/stable/manual-page.html>,
 /// built from
-/// <https://github.com/NLnetLabs/routinator/blob/v0.15.2/doc/manual/source/manual-page.rst>.
+/// <https://github.com/NLnetLabs/routinator/blob/v0.15.3/doc/manual/source/manual-page.rst>.
+///
+/// 0.15.3 is a security release of the series the command line was
+/// written for with 0.15.2: its manual page and the sources
+/// [`routinator_args`](crate::routinator_args) follows (`src/config.rs`,
+/// `src/tals.rs`, `src/main.rs`, `src/process.rs`) are those of v0.15.2,
+/// byte for byte, and `routinator --help`, `routinator server --help` and
+/// `routinator --tal=list` of the 0.15.3 package name every option and
+/// bundled TAL that command line uses.
 pub const TESTED_VERSION: Version = Version {
     major: 0,
     minor: 15,
-    patch: 2,
+    patch: 3,
     pre: None,
 };
 
@@ -177,7 +186,9 @@ mod tests {
     #[test]
     fn parses_good_and_odd_outputs() {
         let cases: &[(&str, Version)] = &[
-            // What clap prints for the release this crate targets.
+            // What clap prints for the release this crate targets, and
+            // for the one before it.
+            ("Routinator 0.15.3\n", v(0, 15, 3, None)),
             ("Routinator 0.15.2\n", v(0, 15, 2, None)),
             ("Routinator 0.14.2", v(0, 14, 2, None)),
             ("Routinator 0.15.0-rc1\n", v(0, 15, 0, Some("rc1"))),
@@ -242,7 +253,7 @@ mod tests {
             let parsed = parse_version(&format!("Routinator {text}")).unwrap();
             assert_eq!(parsed.to_string(), text);
         }
-        assert_eq!(TESTED_VERSION.to_string(), "0.15.2");
+        assert_eq!(TESTED_VERSION.to_string(), "0.15.3");
     }
 
     #[test]
@@ -278,7 +289,7 @@ mod tests {
         let err = check_version_output("Routinator 0.14.2\n").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Routinator 0.14.2 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.2"
+            "Routinator 0.14.2 is not supported: bgpfcd drives Routinator 0.15.x and was tested with 0.15.3"
         );
     }
 

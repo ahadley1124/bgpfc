@@ -65,8 +65,8 @@ pub(crate) const CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 ///   to write under `HOME` writes into the cache.
 /// - `PATH` is [`CHILD_PATH`].
 ///
-/// Everything else is dropped: `RSYNC_RSH`, which Routinator 0.15.2
-/// refuses to start with (`Changelog.md`), locale and proxy settings
+/// Everything else is dropped: `RSYNC_RSH`, which Routinator refuses to
+/// start with since 0.15.2 (`Changelog.md`), locale and proxy settings
 /// (Routinator takes RRDP proxies from its config file, `rrdp-proxies`),
 /// and whatever bgpfcd was started with. The child's behaviour then
 /// depends on bgpfcd's settings alone. [`command`] also keeps bgpfcd's

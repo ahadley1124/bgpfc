@@ -1,9 +1,10 @@
 //! Routinator's command line, written for
 //! [`TESTED_VERSION`](crate::TESTED_VERSION) from its manual page
 //! (<https://routinator.docs.nlnetlabs.nl/en/stable/manual-page.html>, the
-//! documentation of 0.15.2) and from its source at tag v0.15.2
+//! documentation of 0.15.3) and from its source at tag v0.15.3
 //! (`src/config.rs` for how command-line options and a config file
-//! combine, `src/tals.rs` for the bundled TALs).
+//! combine, `src/tals.rs` for the bundled TALs). Those files are the same
+//! at v0.15.2, for which the command line was first written.
 //!
 //! The shape is `routinator [options] server [server-options]` (manual
 //! page, "Synopsis"): global options before the command, server options
@@ -43,12 +44,12 @@ const TALS: &str = "bgpfcd derives the TAL options from the TAL settings";
 const FOREIGN_RTR: &str = "it would serve RTR on a listener bgpfcd does not control";
 const EXITS: &str = "Routinator would print and exit instead of serving";
 /// Routinator 0.15 spells the option `--systemd-listen` (`ServerArgs` in
-/// `src/config.rs` at v0.15.2); its manual page says `--listen-systemd`,
+/// `src/config.rs` at v0.15.3); its manual page says `--listen-systemd`,
 /// which clap rejects.
 const SYSTEMD: &str = "Routinator would take its RTR listener from systemd, and bgpfcd passes it none, so it would fail at every start";
 /// Routinator applies `--user` and `--group` in server mode, detached or
 /// not: `Server::run` calls `drop_privileges` (`src/process.rs` at
-/// v0.15.2) once it has bound its listeners.
+/// v0.15.3) once it has bound its listeners.
 const CREDENTIALS: &str = "Routinator would switch to it by itself, which clears the parent-death signal that ends it when bgpfcd dies";
 
 /// Long options the escape hatch may not carry, because bgpfcd sets them
@@ -131,7 +132,7 @@ const SHORT_WITH_VALUE: &[u8] = b"x";
 ///
 /// [`config_file`](SidecarConfig::config_file) is passed as `--config`
 /// and is trusted operator input: bgpfcd does not read it. Routinator
-/// 0.15.2 lets a command-line option replace a config file setting only
+/// 0.15 lets a command-line option replace a config file setting only
 /// when the option is given (`src/config.rs`), so the command line above
 /// replaces the file's `repository-dir`, `rtr-listen` and `refresh`, its
 /// `tals` only when at least one `--tal` is passed, and its
@@ -162,7 +163,7 @@ const SHORT_WITH_VALUE: &[u8] = b"x";
 ///   exists (manual page, `-c`). Point `HOME` at a directory bgpfcd
 ///   controls, so a stray file in the service user's home cannot change
 ///   the validator.
-/// - Routinator 0.15.2 refuses to start while `RSYNC_RSH` is set
+/// - Routinator refuses to start while `RSYNC_RSH` is set, since 0.15.2
 ///   (`Changelog.md`); remove it from the child's environment.
 /// - Routinator opens its RTR listener only after its first validation
 ///   run (manual page, `server`), which can take minutes with a cold
