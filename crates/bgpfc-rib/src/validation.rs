@@ -7,8 +7,10 @@
 //! the way an UPDATE takes them.
 //!
 //! The same walk judges every route again when the operator's
-//! enforcement mode changes ([`Rib::set_enforcement`]), and every route not
-//! validated yet when the startup setting changes ([`Rib::set_startup`]).
+//! enforcement mode changes ([`Rib::set_enforcement`]), every route not
+//! validated yet when the startup setting changes ([`Rib::set_startup`]),
+//! and every route of the peers whose import policy changed
+//! ([`Rib::reimport`]).
 //!
 //! Implements: RFC 6811 §2 ("The validation state of the Route MUST be
 //! set to reflect the result of the lookup"), §4 ("When a mapping is added
@@ -181,17 +183,25 @@ impl Revalidation {
     }
 }
 
-/// The counts of a [`Revalidation`] or a [`Rejudged`] as the pass gathers
-/// them.
+/// The counts of a [`Revalidation`], a [`Rejudged`] or a
+/// [`Reimport`](crate::Reimport) as the pass gathers them.
 #[derive(Default)]
-struct Tally {
-    routes: usize,
+pub(crate) struct Tally {
+    pub(crate) routes: usize,
     /// Routes per (from, to), indexed by [`slot`].
     moved: [[usize; 4]; 4],
     destinations: usize,
     sample: Vec<Prefix>,
-    held: usize,
-    released: usize,
+    pub(crate) held: usize,
+    pub(crate) released: usize,
+    /// Routes judged again that import policy and what acts on the state
+    /// now make something else of: other attributes, another state set,
+    /// held where used or the reverse, or held for another reason, or not
+    /// kept.
+    pub(crate) changed: usize,
+    /// Routes judged again that import policy now rejects whatever their
+    /// state, and that are no longer kept.
+    pub(crate) dropped: usize,
     transitions: Vec<Transition>,
     unlisted: usize,
 }
@@ -364,10 +374,10 @@ impl Rib {
     /// [`covered_ranges`]) cover, or all of them for `None`, with a
     /// [`Pass`] that judges again the routes `rejudge` names. The scratch
     /// gets the destinations to run Phase 3 for.
-    fn walk(
+    pub(crate) fn walk(
         &mut self,
         ranges: Option<&[RangeInclusive<Prefix>]>,
-        rejudge: Rejudge,
+        rejudge: Rejudge<'_>,
         scratch: &mut Scratch,
     ) -> Tally {
         let mut tally = Tally::default();
@@ -438,7 +448,7 @@ impl Rib {
 
 /// Destinations among `dirty` where the decision process chose another
 /// route, or none.
-fn best_changed(dirty: &[Dirty]) -> usize {
+pub(crate) fn best_changed(dirty: &[Dirty]) -> usize {
     dirty
         .iter()
         .filter(|d| !same_best(d.old.as_ref(), d.new.as_ref()))
@@ -456,7 +466,7 @@ fn same_best(a: Option<&Route>, b: Option<&Route>) -> bool {
 
 /// Which routes a [`Pass`] judges again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rejudge {
+pub(crate) enum Rejudge<'a> {
     /// Those whose state the validation source now gives differs: every
     /// route visited is validated again first (RFC 6811 §4).
     Restated,
@@ -465,6 +475,9 @@ enum Rejudge {
     /// Every route used with state `disabled`, with that state: the
     /// startup setting changed, which acts on no other.
     Unvalidated,
+    /// Every route of the peers whose slot is `true` here, with the state
+    /// it has: their import policy changed.
+    Import(&'a [bool]),
 }
 
 /// What validating routes again needs of the RIB, borrowed apart from
@@ -479,8 +492,9 @@ struct Pass<'a> {
     /// the startup setting.
     acting: (Enforcement, Startup),
     /// Which routes to judge again: those whose state changed, or with
-    /// the state they have, every route or those not validated yet.
-    rejudge: Rejudge,
+    /// the state they have, every route, those not validated yet or those
+    /// of some peers.
+    rejudge: Rejudge<'a>,
     interner: &'a mut Interner,
     tally: &'a mut Tally,
     scratch: &'a mut Scratch,
@@ -622,6 +636,12 @@ impl Pass<'_> {
         if self.rejudge == Rejudge::Unvalidated && route.effective_rov() != RovState::Disabled {
             return Redone::default();
         }
+        // A new import policy acts on the routes of its peers only.
+        if let Rejudge::Import(selected) = self.rejudge
+            && !selected.get(route.peer.index()).copied().unwrap_or(false)
+        {
+            return Redone::default();
+        }
         self.tally.routes += 1;
         // RFC 6811 §2, on the route as received, as on its arrival. A pass
         // that judges again whatever the state keeps the states: the
@@ -670,6 +690,7 @@ impl Pass<'_> {
             });
         }
         let was_held = route.held.is_some();
+        let was = (route.rov_set, route.held);
         let judged = judge(
             self.policies,
             self.acting,
@@ -683,17 +704,15 @@ impl Pass<'_> {
             Judged::Accepted { attrs, rov_set } => (attrs, rov_set, None, false),
             Judged::Held { by, rov_set } => (Arc::clone(&received), rov_set, Some(by), false),
             // Policy accepted the route with some state when it was last
-            // judged, so only a change of policy since, before the
-            // ROUTE-REFRESH that follows one, can leave none. Kept behind
-            // the candidates until the destination removes it, and no
-            // longer counted.
+            // judged, so only a change of policy since can leave none: the
+            // route is dropped, as one policy rejects on arrival is (see
+            // `judge`), and the family noted, so that a later policy that
+            // may take it asks the peer for it (RFC 2918). Kept behind the
+            // candidates until the destination removes it, and no longer
+            // counted.
             Judged::Dropped => {
-                let n = peer.adj_in_count.or_default(self.family);
-                *n = n.saturating_sub(1);
-                if was_held {
-                    let n = peer.adj_in_held.or_default(self.family);
-                    *n = n.saturating_sub(1);
-                }
+                forget(peer, self.family, was_held);
+                self.tally.dropped += 1;
                 dropped.push(route.peer);
                 (Arc::clone(&received), None, Some(Held::Policy), true)
             }
@@ -711,6 +730,9 @@ impl Pass<'_> {
         }
         let replaced = std::mem::replace(&mut route.attrs, attrs);
         let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
+        if gone || !unchanged || was != (rov_set, held) {
+            self.tally.changed += 1;
+        }
         self.scratch.released.push(replaced);
         route.received = (!Arc::ptr_eq(&route.attrs, &received)).then(|| Arc::clone(&received));
         route.rov_set = rov_set;
@@ -720,6 +742,22 @@ impl Pass<'_> {
             changed: !(was_held && is_held && unchanged),
             moved: was_held != is_held,
         }
+    }
+}
+
+/// A route of `peer`'s in `family`, `held` or not, that import policy
+/// now rejects whatever its state: no longer counted, and the family
+/// noted, so that a later policy that may take it asks the peer for it
+/// again (RFC 2918, [`Rib::reimport`]).
+fn forget(peer: &mut PeerState, family: AddressFamily, held: bool) {
+    let n = peer.adj_in_count.or_default(family);
+    *n = n.saturating_sub(1);
+    if held {
+        let n = peer.adj_in_held.or_default(family);
+        *n = n.saturating_sub(1);
+    }
+    if !peer.filtered.contains(&family) {
+        peer.filtered.push(family);
     }
 }
 

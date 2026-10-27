@@ -9,7 +9,10 @@
 //! so is what a change of the validation source did to the routes' RFC
 //! 6811 states, in one line per change, and what a change of the `rpki`
 //! block's `enforcement` did to their use (RFC 6811 §5), in one line too,
-//! as does a change of its `startup` (RFC 6811 §2).
+//! as does a change of its `startup` (RFC 6811 §2), and what importing a
+//! peer's routes again after its import policy changed did (RFC 4271 §3),
+//! after which the peer is asked for the routes import policy dropped
+//! earlier, if any, with ROUTE-REFRESH (RFC 2918 §4).
 //!
 //! Issue #59: "An operator needs to see that a prefix went Valid → Invalid
 //! at a specific time." After the line of a change of the validation
@@ -35,8 +38,8 @@ use std::time::{Duration, Instant, SystemTime};
 use bgpfc_fsm::Session;
 use bgpfc_log::Level;
 use bgpfc_rib::{
-    FibChange, Output, PeerInfo, Rejudged, Revalidation, Rib, RouteStatus, Sink, StartupChange,
-    Transition,
+    FibChange, Output, PeerInfo, Reimport, Rejudged, Revalidation, Rib, RouteStatus, Sink,
+    StartupChange, Transition,
 };
 use bgpfc_rpki::AffectedPrefixes;
 use bgpfc_wire::prefix::Prefix;
@@ -367,6 +370,7 @@ fn peer_info(peer: IpAddr, local_addr: IpAddr, s: &Session, interval: Duration) 
         receive_families: s.receive_families.clone(),
         four_octet_as: s.four_octet_as,
         extended_messages: s.extended_messages,
+        route_refresh: s.route_refresh,
         // RFC 8950 §4: what the RIB needs is what may be sent; what may
         // be received is the decoder's business.
         extended_next_hop: s.extended_next_hop_send.clone(),
@@ -513,6 +517,43 @@ impl Sink for Deliver<'_> {
                 // RFC 6811 §2: the routes not validated yet held or used
                 // under the operator's new startup setting, in one line.
                 log_line(Level::Info, STARTUP_CHANGED, &startup_changed(&r));
+            }
+            Output::Reimported(r) => {
+                // RFC 4271 §3 (a): a peer's routes put through its new
+                // import policy again, counted in one line however many;
+                // then what only the peer can send again and cannot be
+                // asked for, a line each.
+                log_line(Level::Info, REIMPORTED, &reimported(&r));
+                for (peer, family) in &r.missing {
+                    bgpfc_log::warn!(MISSING, peer = peer, family = family);
+                }
+            }
+            Output::RequestRoutes { peer, families } => self.request_routes(peer, families),
+        }
+    }
+}
+
+impl Deliver<'_> {
+    /// RFC 4271 §3 (b), RFC 2918 §4: have `peer`'s thread send a
+    /// ROUTE-REFRESH for each of `families`. A full queue means it is busy
+    /// and reads the slot after its current input; the RIB never blocks on
+    /// a peer (AGENTS.md §3).
+    fn request_routes(&self, peer: IpAddr, families: Vec<AddressFamily>) {
+        let Some(handle) = self.handle(peer) else {
+            return;
+        };
+        match handle.tx.try_send(PeerInput::RequestRoutes(families)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(input)) => {
+                if let (PeerInput::RequestRoutes(families), Ok(mut slot)) =
+                    (input, handle.refresh.lock())
+                {
+                    for f in families {
+                        if !slot.contains(&f) {
+                            slot.push(f);
+                        }
+                    }
+                }
             }
         }
     }
@@ -750,6 +791,51 @@ fn startup_changed(r: &StartupChange) -> [(&'static str, String); 6] {
         ("held", r.held.to_string()),
         ("released", r.released.to_string()),
         ("best_changed", r.best_changed.to_string()),
+    ]
+}
+
+/// The message of the line logged for what importing routes again after
+/// a change of import policy did.
+const REIMPORTED: &str = "rib: re-import";
+
+/// The message of the line logged for a family whose routes import policy
+/// dropped earlier, which the peer cannot be asked for again (RFC 2918
+/// §4): they come back when the peer sends them again, or with a hard
+/// `clear neighbor`.
+const MISSING: &str = "rib: re-import cannot ask the peer for the routes import policy dropped";
+
+/// The fields of that line: the peers whose routes were imported again,
+/// the routes put through import policy again, those it now makes
+/// something else of, those it took out of use (`held`), put back into
+/// use (`released`) and no longer keeps (`dropped`), the destinations
+/// whose best route changed, and the families each peer is asked for
+/// again with ROUTE-REFRESH (`refresh`, as `FAMILY@PEER`), or `none`.
+fn reimported(r: &Reimport) -> [(&'static str, String); 8] {
+    let refresh = if r.refresh.is_empty() {
+        "none".to_owned()
+    } else {
+        r.refresh
+            .iter()
+            .map(|(peer, family)| format!("{family}@{peer}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    [
+        (
+            "peers",
+            r.peers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        ("routes", r.routes.to_string()),
+        ("changed", r.changed.to_string()),
+        ("held", r.held.to_string()),
+        ("released", r.released.to_string()),
+        ("dropped", r.dropped.to_string()),
+        ("best_changed", r.best_changed.to_string()),
+        ("refresh", refresh),
     ]
 }
 
@@ -1199,6 +1285,15 @@ mod tests {
         rib_rx: &Receiver<RibMsg>,
     ) -> std::net::TcpStream {
         use bgpfc_wire::capability::Capability;
+        establish_with(listener, rib_rx, vec![Capability::Multiprotocol(V4)])
+    }
+
+    /// [`establish`], with the neighbor advertising `capabilities`.
+    fn establish_with(
+        listener: &std::net::TcpListener,
+        rib_rx: &Receiver<RibMsg>,
+        capabilities: Vec<bgpfc_wire::capability::Capability>,
+    ) -> std::net::TcpStream {
         use bgpfc_wire::header::{MessageType, frame};
         use std::io::Write as _;
         let (mut conn, _) = listener.accept().unwrap();
@@ -1209,7 +1304,7 @@ mod tests {
             Asn(65_001),
             HoldTime::new(90).unwrap(),
             RouterId::new(2).unwrap(),
-            vec![Capability::Multiprotocol(V4)],
+            capabilities,
         );
         conn.write_all(&frame(MessageType::Open, &open.encode().unwrap()).unwrap())
             .unwrap();
@@ -1292,6 +1387,127 @@ mod tests {
             bgpfc_wire::error::CeaseSubcode::AdministrativeShutdown,
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn a_request_for_routes_reaches_the_wire_for_the_negotiated_families() {
+        // RFC 2918 §4 through a real peer thread on loopback: the RIB asks
+        // for IPv4 and IPv6, the session negotiated IPv4 alone, so one
+        // ROUTE-REFRESH goes out, for <1, 0, 1>; then the same through the
+        // slot a full queue falls back to.
+        use bgpfc_wire::capability::Capability;
+        use bgpfc_wire::header::MessageType;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ip("127.0.0.1");
+        let mut fsm = bgpfc_fsm::Config::new(Asn(65_000), RouterId::new(1).unwrap(), Asn(65_001));
+        fsm.capabilities = vec![Capability::Multiprotocol(V4), Capability::RouteRefresh];
+        let cfg = crate::peer::PeerConfig {
+            addr,
+            port: listener.local_addr().unwrap().port(),
+            fsm,
+            allow_as_set: false,
+        };
+        let (rib_tx, rib_rx) = sync_channel(64);
+        let (h, peer) = crate::peer::prepare(cfg, rib_tx);
+        let table: PeerTable = std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::from([(addr, h.clone())]),
+        ));
+        let (fib_tx, _fib_rx) = sync_channel(4);
+        peer.start();
+        let mut conn = establish_with(
+            &listener,
+            &rib_rx,
+            vec![Capability::Multiprotocol(V4), Capability::RouteRefresh],
+        );
+        let mut expected = vec![0xff; 16];
+        expected.extend([0, 23, MessageType::RouteRefresh as u8, 0, 1, 0, 1]);
+        let asked = vec![Output::RequestRoutes {
+            peer: addr,
+            families: vec![V4, AddressFamily::IPV6_UNICAST],
+        }];
+        deliver(asked, &table, &fib_tx);
+        let next = |conn: &mut std::net::TcpStream| loop {
+            let (kind, frame) = read_message(conn);
+            if kind != MessageType::Keepalive as u8 {
+                return frame;
+            }
+        };
+        assert_eq!(next(&mut conn), expected);
+        // Through the slot: the next input the peer thread handles finds
+        // it. Had IPv6 gone out above, it would be read here instead.
+        h.refresh.lock().unwrap().push(V4);
+        let (report, _) = sync_channel(1);
+        h.tx.send(PeerInput::Report(report)).unwrap();
+        assert_eq!(next(&mut conn), expected);
+        assert!(h.refresh.lock().unwrap().is_empty());
+        h.tx.send(PeerInput::Stop(
+            bgpfc_wire::error::CeaseSubcode::AdministrativeShutdown,
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_request_for_routes_waits_in_the_slot_when_the_queue_is_full() {
+        let addr = ip("192.0.2.1");
+        let (h, rx) = handle_on_queue(addr);
+        let table: PeerTable = std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::from([(addr, h.clone())]),
+        ));
+        let (fib_tx, _fib_rx) = sync_channel(4);
+        let ask = |families: Vec<AddressFamily>| {
+            vec![Output::RequestRoutes {
+                peer: addr,
+                families,
+            }]
+        };
+        deliver(ask(vec![V4]), &table, &fib_tx);
+        assert!(matches!(rx.try_recv(), Ok(PeerInput::RequestRoutes(f)) if f == [V4]));
+        // The queue full: the families wait in the slot, each once.
+        h.tx.try_send(PeerInput::SoftReset).unwrap();
+        let v6 = AddressFamily::IPV6_UNICAST;
+        deliver(ask(vec![V4]), &table, &fib_tx);
+        deliver(ask(vec![V4, v6]), &table, &fib_tx);
+        assert_eq!(*h.refresh.lock().unwrap(), vec![V4, v6]);
+        assert!(matches!(rx.try_recv(), Ok(PeerInput::SoftReset)));
+        assert!(rx.try_recv().is_err());
+        // An unknown peer: nothing to ask.
+        let other = vec![Output::RequestRoutes {
+            peer: ip("192.0.2.9"),
+            families: vec![V4],
+        }];
+        deliver(other, &table, &fib_tx);
+    }
+
+    #[test]
+    fn a_reimport_is_one_info_line() {
+        // RFC 4271 §3: a peer's routes imported again under its new import
+        // policy, counted in one line, with the families asked for again.
+        let r = bgpfc_rib::Reimport {
+            peers: vec![ip("192.0.2.1"), ip("2001:db8::2")],
+            routes: 1000,
+            changed: 10,
+            held: 1,
+            released: 2,
+            dropped: 3,
+            best_changed: 12,
+            refresh: vec![
+                (ip("192.0.2.1"), V4),
+                (ip("2001:db8::2"), AddressFamily::IPV6_UNICAST),
+            ],
+            missing: vec![],
+        };
+        assert_eq!(
+            formatted(bgpfc_log::Level::Info, REIMPORTED, &reimported(&r)),
+            "1970-01-01T00:00:00.000Z INFO  msg=\"rib: re-import\" \
+             peers=192.0.2.1,2001:db8::2 routes=1000 changed=10 held=1 released=2 \
+             dropped=3 best_changed=12 \
+             refresh=ipv4-unicast@192.0.2.1,ipv6-unicast@2001:db8::2\n"
+        );
+        let none = bgpfc_rib::Reimport {
+            peers: vec![ip("192.0.2.1")],
+            ..bgpfc_rib::Reimport::default()
+        };
+        assert_eq!(reimported(&none)[7], ("refresh", "none".to_owned()));
     }
 
     #[test]

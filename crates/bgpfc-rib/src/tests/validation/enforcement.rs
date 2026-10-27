@@ -433,13 +433,14 @@ fn a_route_policy_rejects_by_state_is_held_by_policy_not_enforcement() {
 }
 
 #[test]
-fn an_import_policy_change_reaches_held_routes_through_their_updates() {
-    // `set_policies` judges no route again: a reload that changes an
-    // import policy asks the neighbor for its routes again (RFC 2918
-    // ROUTE-REFRESH), and a route held for policy is judged under the new
-    // policy when its UPDATE comes back. A change of `enforcement` in the
-    // same reload, which comes after the policies, judges every route at
-    // once under the new ones.
+fn an_import_policy_change_reaches_held_routes_at_once() {
+    // `set_policies` alone judges no route again: a route held for policy
+    // meets the new policy when its UPDATE comes again, or at once when
+    // the reload imports the neighbor's routes again from the Adj-RIB-In
+    // (`Rib::reimport`, RFC 4271 §3 (a)), held ones included, with no
+    // UPDATE and no ROUTE-REFRESH. A change of `enforcement` in the same
+    // reload, which comes after the policies, judges every route at once
+    // under the new ones too.
     let held_for_policy = |rib: &mut Rib| {
         let (e1, e2) = two_peers(rib);
         outputs(|o| rib.validation_changed(all(other_origin()), now(), o));
@@ -463,6 +464,29 @@ fn an_import_policy_change_reaches_held_routes_through_their_updates() {
     let out = send(&mut rib, &e1, &["192.0.2.0/24"]);
     assert_eq!(fib(&out).len(), 1);
     assert_eq!(sent(&out, &e2), (vec![p("192.0.2.0/24")], vec![]));
+    assert_eq!(
+        kept(&rib, "192.0.2.0/24"),
+        vec![(e1.addr, RovState::Invalid, None)]
+    );
+    assert_eq!(counted(&rib, e1.addr), (1, 0));
+
+    // Imported again: at once, with no UPDATE and nothing asked of e1.
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectInvalidTagValid));
+    let (e1, e2) = held_for_policy(&mut rib);
+    outputs(|o| rib.set_policies(Box::new(crate::AcceptAll), &[], now(), o));
+    let out = outputs(|o| rib.reimport(&[e1.addr], now(), o));
+    let Some(Output::Reimported(r)) = out.first() else {
+        panic!("{out:?}");
+    };
+    assert_eq!((r.routes, r.released, r.best_changed), (1, 1, 1));
+    assert_eq!(r.refresh, vec![]);
+    assert_eq!(fib(&out).len(), 1);
+    assert_eq!(sent(&out, &e2), (vec![p("192.0.2.0/24")], vec![]));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Output::RequestRoutes { .. })),
+        "{out:?}"
+    );
     assert_eq!(
         kept(&rib, "192.0.2.0/24"),
         vec![(e1.addr, RovState::Invalid, None)]

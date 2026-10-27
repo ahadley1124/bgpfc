@@ -134,6 +134,7 @@ fn peer() -> impl Strategy<Value = PeerInfo> {
         receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: if k == 3 {
             vec![AddressFamily::IPV4_UNICAST]
         } else {

@@ -89,9 +89,11 @@ pub(crate) enum PeerInput {
     /// Soft reset: ask the peer for its routes again with ROUTE-REFRESH
     /// (RFC 2918 §4) for every negotiated family; the RIB re-sends ours.
     SoftReset,
-    /// Only the first half of a soft reset: ask the peer for its routes
-    /// again (after an import policy change).
-    RequestRoutes,
+    /// Ask the peer for its routes of these families again with
+    /// ROUTE-REFRESH (RFC 2918 §4): import policy dropped some of them,
+    /// which the Adj-RIB-In does not keep, and the policy a reload brought
+    /// may take them (`bgpfc_rib::Output::RequestRoutes`).
+    RequestRoutes(Vec<AddressFamily>),
     /// Report the session's state on the sender.
     Report(SyncSender<PeerReport>),
     /// The RIB found more routes of `family` than the neighbor's

@@ -16,7 +16,9 @@
 //! RFC 4760 §3, §5, §7, §8 (each NLRI field with its own next hop,
 //! per-family RIBs, family disable, routes taken of the families we
 //! advertised and sent of the negotiated ones); RFC 2918 §4 (route refresh
-//! re-sends the Adj-RIB-Out); RFC 8950 §3–§5 (IPv4 routes with an IPv6
+//! re-sends the Adj-RIB-Out); RFC 4271 §3 (a changed import policy is
+//! applied to the routes the Adj-RIBs-In kept, and the peer asked again
+//! only for those they did not, see [`Rib::reimport`]); RFC 8950 §3–§5 (IPv4 routes with an IPv6
 //! next hop, see [`export`]); RFC 4271 §6.7 (a per-family prefix limit
 //! that ends the session, see [`Output::PrefixLimitExceeded`]);
 //! RFC 6811 §2 (every route received gets its validation state from a
@@ -49,6 +51,7 @@ pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+mod reimport;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -72,6 +75,7 @@ pub use bgpfc_rpki::{AspaState, Enforcement, RouteOrigin, RovState, Startup};
 pub use decision::{Candidate, Neighbor};
 pub use export::{Batch, Source};
 pub use peer::PeerInfo;
+pub use reimport::Reimport;
 pub use validation::{Rejudged, Revalidation, RouteStatus, StartupChange, Transition};
 
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
@@ -295,6 +299,23 @@ pub enum Output {
     /// it: one report, counted, followed by the FIB changes and UPDATEs
     /// that follow. The caller logs it.
     Startup(StartupChange),
+    /// The routes of peers whose import policy changed were put through
+    /// it again, from the Adj-RIBs-In (see [`Rib::reimport`]): one report,
+    /// counted, followed by the FIB changes and UPDATEs that follow, then
+    /// an [`Output::RequestRoutes`] for each peer it names to ask. The
+    /// caller logs it.
+    Reimported(Reimport),
+    /// Ask `peer` for its routes of `families` again with ROUTE-REFRESH
+    /// (RFC 2918 §4): import policy dropped some of them earlier, which
+    /// the Adj-RIB-In does not keep, and the policy now in use may take
+    /// them. The peer advertised the capability and these families.
+    RequestRoutes {
+        /// The peer.
+        peer: IpAddr,
+        /// The families, in the order the policy first dropped a route of
+        /// each.
+        families: Vec<AddressFamily>,
+    },
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -366,6 +387,11 @@ struct PeerState {
     adj_in_held: FamilyMap<usize>,
     /// The RFC 4271 §9.2.1.1 pacing state per family.
     pacing: FamilyMap<Pacing>,
+    /// Families in which import policy dropped a route this session (see
+    /// `judge`): the Adj-RIB-In lacks it, and only the peer can send it
+    /// again (RFC 2918). [`Rib::reimport`] asks for a family and forgets
+    /// it; a route the policy then drops again notes it again.
+    filtered: Vec<AddressFamily>,
     /// The session is going down: its routes are being removed, and it is
     /// sent nothing more.
     leaving: bool,
@@ -506,6 +532,9 @@ struct Scratch {
     delta: FamilyMap<isize>,
     /// Held routes added minus held routes removed, per family.
     held_delta: FamilyMap<isize>,
+    /// Families in which import policy dropped a route of the UPDATE,
+    /// for the peer's [`PeerState::filtered`].
+    filtered: Vec<AddressFamily>,
     /// The parts of the UPDATE ignored for their next hop (RFC 4271
     /// §6.3), reported before what the UPDATE changed.
     ignored: Vec<Output>,
@@ -529,9 +558,22 @@ impl Scratch {
         }
     }
 
+    /// Note that import policy dropped a route of `family`.
+    fn note_filtered(&mut self, family: AddressFamily) {
+        if !self.filtered.contains(&family) {
+            self.filtered.push(family);
+        }
+    }
+
     /// Add what the routes added and removed came to to `state`'s
-    /// counts, and start again from zero.
+    /// counts, and the families import policy dropped routes of to its
+    /// own, and start again from zero.
     fn count_into(&mut self, state: &mut PeerState) {
+        for family in self.filtered.drain(..) {
+            if !state.filtered.contains(&family) {
+                state.filtered.push(family);
+            }
+        }
         for (family, d) in self.delta.iter_mut() {
             let n = state.adj_in_count.or_default(family);
             *n = n.saturating_add_signed(*d);
@@ -618,8 +660,9 @@ impl Rib {
     /// whose export policy changed) what that changes: announcements for
     /// routes new or changed, withdrawals for routes no longer exported,
     /// found by exporting every best route under the old policies and the
-    /// new, paced like any other change (RFC 4271 §9.2.1.1). Import
-    /// changes are the caller's to re-evaluate (route refresh).
+    /// new, paced like any other change (RFC 4271 §9.2.1.1). The routes
+    /// of the peers whose import policy changed meet it through
+    /// [`Rib::reimport`], called after this, or as they arrive again.
     pub fn set_policies(
         &mut self,
         policies: Box<dyn Policies>,
@@ -659,6 +702,7 @@ impl Rib {
             adj_in_count: FamilyMap::default(),
             adj_in_held: FamilyMap::default(),
             pacing: FamilyMap::default(),
+            filtered: Vec::new(),
             leaving: false,
         });
         for family in families {
@@ -1106,17 +1150,17 @@ impl Rib {
                     &attrs,
                     rov,
                 );
-                match judged.into_route(&attrs, id, rov, aspa) {
-                    Some(route) => {
-                        let table = self.tables.or_default(family);
-                        announce(decide, table, family, prefix, route, scratch);
-                    }
+                if let Some(route) = judged.into_route(&attrs, id, rov, aspa) {
+                    let table = self.tables.or_default(family);
+                    announce(decide, table, family, prefix, route, scratch);
+                } else {
                     // Not kept, and one the peer sent before for the prefix
-                    // goes too: the new announcement replaced it.
-                    None => {
-                        if let Some(table) = self.tables.get_mut(family) {
-                            withdraw(decide, table, family, prefix, id, scratch);
-                        }
+                    // goes too: the new announcement replaced it. Noted, so
+                    // that a later import policy that may take it asks the
+                    // peer for it (RFC 2918, `Rib::reimport`).
+                    scratch.note_filtered(family);
+                    if let Some(table) = self.tables.get_mut(family) {
+                        withdraw(decide, table, family, prefix, id, scratch);
                     }
                 }
                 // RFC 4271 §6.7: "the number of address prefixes received
@@ -2210,7 +2254,9 @@ impl Judged {
 /// without a ROUTE-REFRESH. A route policy rejects whatever its state is
 /// dropped, as rejected routes were before validation existed: no change
 /// of state can bring it back, and holding it would let a filtered peer
-/// fill memory, past any `maximum-prefix`, with routes nothing uses. A
+/// fill memory, past any `maximum-prefix`, with routes nothing uses. Only
+/// a change of import policy can, and [`Rib::reimport`] then asks the
+/// peer for it again (RFC 4271 §3 (b), RFC 2918). A
 /// policy that does not read the state ([`Policies::import_reads_rov`])
 /// rejects with every state what it rejects with one, so it is not asked
 /// again: a filtered table costs one question per route, not four.

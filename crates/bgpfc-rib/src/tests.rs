@@ -22,6 +22,7 @@ use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
 mod adj_rib_in;
+mod reimport;
 mod validation;
 
 /// The routes the Adj-RIB-In holds for `prefix`, candidates first, each
@@ -101,6 +102,7 @@ fn peer(addr: &str, remote_as: u32, router_id: u32) -> PeerInfo {
         receive_families: vec![V4, V6],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: Vec::new(),
         // Pacing off: these tests are about what is sent; the RFC 4271
         // §9.2.1.1 tests below are about when.

@@ -4,8 +4,10 @@
 //! policy that acts on the validation state, it is a function of the
 //! Adj-RIBs-In, policy, the enforcement mode, the startup setting and the
 //! current validation source, whatever the interleaving of UPDATEs,
-//! validation changes (RFC 6811 §4) and changes of mode or setting. The
-//! FIB changes on the way chain up
+//! validation changes (RFC 6811 §4) and changes of mode or setting, and
+//! after a change of import policy applied from the Adj-RIBs-In (RFC 4271
+//! §3) with the ROUTE-REFRESH it asks for answered. The FIB changes on
+//! the way chain up
 //! to the same routes, and the count of held routes each peer has is
 //! right after every input.
 #![cfg(not(miri))]
@@ -75,6 +77,7 @@ fn peers() -> Vec<PeerInfo> {
             receive_families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
+            route_refresh: true,
             extended_next_hop: Vec::new(),
             // Unpaced, so the Adj-RIBs-Out are final after the last step;
             // tests/pacing.rs covers the paced case.
@@ -430,9 +433,19 @@ fn interleaved(
 /// The enforcement mode, the startup setting and the final validation
 /// source first, then the decisive steps.
 fn source_first(steps: &[Step], source: Option<&VrpSet>, mode: Acting) -> Outcome {
+    source_first_under(Box::new(ByState), steps, source, mode)
+}
+
+/// [`source_first`] under `policies`.
+fn source_first_under(
+    policies: Box<dyn Policies>,
+    steps: &[Step],
+    source: Option<&VrpSet>,
+    mode: Acting,
+) -> Outcome {
     let infos = peers();
     let now = Instant::now();
-    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(ByState));
+    let mut rib = Rib::with_policies(LOCAL_AS, policies);
     set_acting(&mut rib, mode, now);
     if let Some(source) = source {
         outputs(|o| {
@@ -452,6 +465,131 @@ fn source_first(steps: &[Step], source: Option<&VrpSet>, mode: Acting) -> Outcom
     for s in steps {
         let info = &infos[usize::from(s.peer)];
         outputs(|o| rib.update(info.addr, &update(s, info), now, o));
+    }
+    outcome(&rib, &infos)
+}
+
+/// One peer's import policy, among a few that differ in what they make of
+/// a route: those to the prefixes in `reject` (a bit each) are rejected
+/// whatever their state, then [`ByState`] decides, or, without
+/// `by_state`, the route is taken with `LOCAL_PREF` `pref` if given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Variant {
+    reject: u8,
+    by_state: bool,
+    pref: Option<u32>,
+}
+
+fn variant() -> impl Strategy<Value = Variant> {
+    (
+        0u8..8,
+        any::<bool>(),
+        proptest::option::of(prop_oneof![Just(50u32), Just(150), Just(300)]),
+    )
+        .prop_map(|(reject, by_state, pref)| Variant {
+            reject,
+            by_state,
+            pref,
+        })
+}
+
+/// Import policy per peer, by the last octet of its address; export as
+/// [`ByState`] for every peer.
+struct PerPeer([Variant; 4]);
+
+impl Policies for PerPeer {
+    fn import(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        p: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Imported {
+        let IpAddr::V4(addr) = peer.addr else {
+            unreachable!()
+        };
+        let v = self.0[usize::from(addr.octets()[3] - 1)];
+        let i = (0..3).find(|i| prefix(*i) == p).unwrap();
+        if v.reject & (1 << i) != 0 {
+            return Verdict::Reject.into();
+        }
+        if v.by_state {
+            return ByState.import(peer, family, p, a, rov);
+        }
+        match v.pref {
+            Some(pref) => {
+                let mut a = a.clone();
+                a.local_pref = Some(pref);
+                Verdict::Modified(a).into()
+            }
+            None => Verdict::Accept.into(),
+        }
+    }
+
+    fn export(
+        &self,
+        peer: &PeerInfo,
+        family: AddressFamily,
+        p: Prefix,
+        a: &PathAttrs,
+        rov: RovState,
+    ) -> Verdict {
+        ByState.export(peer, family, p, a, rov)
+    }
+}
+
+/// `steps` under `before`, then the import policies `after` for the peers
+/// marked in `changed`, applied from the Adj-RIBs-In (`Rib::reimport`):
+/// each peer asked for its routes again sends its last word on each
+/// prefix again, as a ROUTE-REFRESH has it do (RFC 2918 §4). Counts are
+/// checked after every input.
+fn reimported(
+    steps: &[Step],
+    (source, mode): (&VrpSet, Acting),
+    before: [Variant; 4],
+    after: [Variant; 4],
+    changed: [bool; 4],
+) -> Outcome {
+    let infos = peers();
+    let now = Instant::now();
+    let mut rib = Rib::with_policies(LOCAL_AS, Box::new(PerPeer(before)));
+    set_acting(&mut rib, mode, now);
+    let source = ValidationChange {
+        source: Arc::new(source.clone()),
+        affected: AffectedPrefixes::All,
+    };
+    outputs(|o| rib.validation_changed(source, now, o));
+    for info in &infos {
+        outputs(|o| rib.peer_up(info.clone(), now, o));
+    }
+    for s in steps {
+        let info = &infos[usize::from(s.peer)];
+        outputs(|o| rib.update(info.addr, &update(s, info), now, o));
+    }
+    let names: Vec<IpAddr> = infos
+        .iter()
+        .zip(changed)
+        .filter(|(_, c)| *c)
+        .map(|(i, _)| i.addr)
+        .collect();
+    outputs(|o| rib.set_policies(Box::new(PerPeer(after)), &[], now, o));
+    let out = outputs(|o| rib.reimport(&names, now, o));
+    check_counts(&rib, &infos);
+    let words = last_words(steps);
+    for o in out {
+        let Output::RequestRoutes { peer, families } = o else {
+            continue;
+        };
+        assert!(names.contains(&peer), "{peer} asked, not named");
+        assert_eq!(families, vec![V4]);
+        let i = infos.iter().position(|p| p.addr == peer).unwrap();
+        for s in words.iter().filter(|s| usize::from(s.peer) == i) {
+            if s.route.is_some() {
+                outputs(|o| rib.update(peer, &update(s, &infos[i]), now, o));
+            }
+        }
+        check_counts(&rib, &infos);
     }
     outcome(&rib, &infos)
 }
@@ -524,6 +662,37 @@ proptest! {
             .unwrap_or((Enforcement::Off, Startup::Accept));
         let expected = source_first(&last_words(&steps), sources.last(), last);
         prop_assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn loc_rib_after_a_reimport_equals_a_fresh_rib(
+        steps in proptest::collection::vec(step(), 0..12),
+        source in proptest::collection::vec(vrp(), 0..4),
+        mode in acting(),
+        before in proptest::array::uniform4(variant()),
+        new in proptest::array::uniform4(variant()),
+        changed in proptest::array::uniform4(any::<bool>()),
+    ) {
+        // RFC 4271 §3: a RIB whose import policy changed for some peers,
+        // imported again from what it kept and given again what it asked
+        // for, ends as one built under the new policies from the start:
+        // routes kept and held, Loc-RIB, Adj-RIBs-Out. The peers not named
+        // keep their policy.
+        let source: VrpSet = source.into_iter().collect();
+        let mut after = before;
+        for i in 0..4 {
+            if changed[i] {
+                after[i] = new[i];
+            }
+        }
+        let got = reimported(&steps, (&source, mode), before, after, changed);
+        let fresh = source_first_under(
+            Box::new(PerPeer(after)),
+            &last_words(&steps),
+            Some(&source),
+            mode,
+        );
+        prop_assert_eq!(got, fresh);
     }
 
     #[test]

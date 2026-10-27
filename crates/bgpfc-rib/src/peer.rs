@@ -2,7 +2,8 @@
 //!
 //! Implements: RFC 4760 §8 (families sent and taken); RFC 8654 §4 (message
 //! size); RFC 8950 §4 (which next hops a peer takes); RFC 4271 §6.7 (the
-//! per-family prefix limit), §6.3 a) (our own address is no next hop).
+//! per-family prefix limit), §6.3 a) (our own address is no next hop);
+//! RFC 2918 §2 (whether the peer may be asked for its routes again).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -37,6 +38,11 @@ pub struct PeerInfo {
     pub four_octet_as: bool,
     /// Both sides accept 65535-octet messages (RFC 8654 §4).
     pub extended_messages: bool,
+    /// The peer advertised the Route Refresh Capability (RFC 2918 §2), so
+    /// it may be asked for its routes of a family it advertised again
+    /// (§4): what [`Rib::reimport`](crate::Rib::reimport) needs for the
+    /// routes the Adj-RIB-In did not keep.
+    pub route_refresh: bool,
     /// Families whose routes may go to this peer with an IPv6 next hop,
     /// because it advertised Extended Next Hop Encoding for them, and so
     /// did we (RFC 8950 §4): IPv4 unicast or nothing. Which next hops are

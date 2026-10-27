@@ -195,6 +195,7 @@ mod tests {
             receive_families: vec![AddressFamily::IPV4_UNICAST],
             four_octet_as: true,
             extended_messages: false,
+            route_refresh: true,
             extended_next_hop: Vec::new(),
             advertisement_interval: Duration::from_secs(30),
             prefix_limits: Vec::new(),

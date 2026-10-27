@@ -31,6 +31,7 @@ use std::sync::{Arc, RwLock};
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
+use bgpfc_wire::types::AddressFamily;
 
 use crate::control::CoordMsg;
 use crate::coordinator::PeerTable;
@@ -423,11 +424,15 @@ impl Coordinator<'_> {
             self.stop_peer(*addr, CeaseSubcode::OtherConfigurationChange);
         }
         self.reload_rib(&new, engine, &diff);
-        // Import policy changes need the peer's routes again (RFC 2918).
+        // Import policy changes need the peer's routes again (RFC 2918),
+        // of every family it negotiated, which the peer thread knows.
         if let Ok(t) = self.table.read() {
             for addr in &diff.policy_changed {
                 if let Some(h) = t.get(addr) {
-                    let _ = h.tx.try_send(PeerInput::RequestRoutes);
+                    let _ = h.tx.try_send(PeerInput::RequestRoutes(vec![
+                        AddressFamily::IPV4_UNICAST,
+                        AddressFamily::IPV6_UNICAST,
+                    ]));
                 }
             }
         }

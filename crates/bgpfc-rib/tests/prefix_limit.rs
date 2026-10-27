@@ -50,6 +50,7 @@ fn info(limit: u32) -> PeerInfo {
         receive_families: vec![V4],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: vec![(V4, limit)],

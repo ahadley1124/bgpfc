@@ -2,10 +2,11 @@
 //! its Adj-RIB-Out. The RIB does not store an Adj-RIB-Out per peer; it
 //! works out what a peer was last told from the Loc-RIB and export, which
 //! is right only if every change reached the peer as an UPDATE. So: run
-//! random announcements, withdrawals, session resets and export policy
-//! changes over four peers, apply the UPDATEs each peer is sent to a table
-//! of its own, and compare it at the end with the export of the Loc-RIB,
-//! rewritten for the session (RFC 4271 §5.1).
+//! random announcements, withdrawals, session resets and policy changes,
+//! exported again and imported again from the Adj-RIBs-In as a reload
+//! does (RFC 4271 §3), over four peers, apply the UPDATEs each peer is
+//! sent to a table of its own, and compare it at the end with the export
+//! of the Loc-RIB, rewritten for the session (RFC 4271 §5.1).
 #![cfg(not(miri))]
 
 use std::collections::BTreeMap;
@@ -47,6 +48,7 @@ fn peers() -> Vec<PeerInfo> {
             receive_families: vec![V4],
             four_octet_as: true,
             extended_messages: false,
+            route_refresh: true,
             extended_next_hop: Vec::new(),
             // Pacing off: the property is about what is sent, which pacing
             // only delays; tests/pacing.rs is about when.
@@ -60,20 +62,47 @@ fn prefix(i: u8) -> Prefix {
     Prefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, i, 0)), 24).unwrap()
 }
 
-/// An export policy that depends on the prefix and the peer: one of two,
-/// so that a change between them re-exports.
+/// Policies that depend on the prefix and the peer: one of two, so that a
+/// change between them exports and imports again. The second rejects some
+/// routes on import, which the RIB then does not keep, and changes the
+/// `LOCAL_PREF` of others, which decides between routes.
 struct Picky(bool);
+
+/// The third octet of `p` and the last of `peer`'s address.
+fn octets(p: Prefix, peer: &PeerInfo) -> (u8, u8) {
+    let octet = match p.addr() {
+        IpAddr::V4(a) => a.octets()[2],
+        IpAddr::V6(_) => 0,
+    };
+    let last = match peer.addr {
+        IpAddr::V4(a) => a.octets()[3],
+        IpAddr::V6(_) => 0,
+    };
+    (octet, last)
+}
 
 impl Policies for Picky {
     fn import(
         &self,
-        _: &PeerInfo,
+        peer: &PeerInfo,
         _: AddressFamily,
-        _: Prefix,
-        _: &PathAttrs,
+        p: Prefix,
+        attrs: &PathAttrs,
         _: RovState,
     ) -> Imported {
-        Verdict::Accept.into()
+        if !self.0 {
+            return Verdict::Accept.into();
+        }
+        let (octet, last) = octets(p, peer);
+        match (octet + last) % 3 {
+            0 => Verdict::Reject.into(),
+            1 => {
+                let mut a = attrs.clone();
+                a.local_pref = Some(100 + u32::from(last) * 50);
+                Verdict::Modified(a).into()
+            }
+            _ => Verdict::Accept.into(),
+        }
     }
 
     fn export(
@@ -84,14 +113,7 @@ impl Policies for Picky {
         attrs: &PathAttrs,
         _: RovState,
     ) -> Verdict {
-        let octet = match p.addr() {
-            IpAddr::V4(a) => a.octets()[2],
-            IpAddr::V6(_) => 0,
-        };
-        let last = match peer.addr {
-            IpAddr::V4(a) => a.octets()[3],
-            IpAddr::V6(_) => 0,
-        };
+        let (octet, last) = octets(p, peer);
         match (octet + last + u8::from(self.0)) % 4 {
             0 => Verdict::Reject,
             1 => {
@@ -163,6 +185,9 @@ fn update(info: &PeerInfo, prefix: Prefix, path: &[u16], med: Option<u32>) -> De
     }
 }
 
+/// What a peer announced to us: path and MED per prefix.
+type Announced = BTreeMap<u8, (Vec<u16>, Option<u32>)>;
+
 /// Apply what the RIB asked to send to each peer to that peer's table.
 fn deliver(out: Vec<Output>, infos: &[PeerInfo], views: &mut [BTreeMap<Prefix, PathAttrs>]) {
     for o in out {
@@ -208,11 +233,15 @@ proptest! {
             deliver(out, &infos, &mut views);
         }
         let everyone: Vec<IpAddr> = infos.iter().map(|p| p.addr).collect();
+        // What each peer has announced to us, for a ROUTE-REFRESH to send
+        // again (RFC 2918 §4).
+        let mut theirs: Vec<Announced> = vec![BTreeMap::new(); infos.len()];
         for s in &steps {
             let mut out = Vec::new();
             match s {
                 Step::Announce { peer, prefix: n, path, med } => {
                     let info = &infos[usize::from(*peer)];
+                    theirs[usize::from(*peer)].insert(*n, (path.clone(), *med));
                     rib.update(info.addr, &update(info, prefix(*n), path, *med), now, &mut out);
                 }
                 Step::Withdraw { peer, prefix: n } => {
@@ -225,6 +254,7 @@ proptest! {
                         discarded: Vec::new(),
                         disabled: Vec::new(),
                     };
+                    theirs[usize::from(*peer)].remove(n);
                     rib.update(infos[usize::from(*peer)].addr, &u, now, &mut out);
                 }
                 Step::Reset { peer } => {
@@ -232,13 +262,31 @@ proptest! {
                     // starts from nothing and is sent the table again.
                     let i = usize::from(*peer);
                     rib.peer_down(infos[i].addr, now, &mut out);
+                    theirs[i].clear();
                     views[i].clear();
                     deliver(std::mem::take(&mut out), &infos, &mut views);
                     views[i].clear();
                     rib.peer_up(infos[i].clone(), now, &mut out);
                 }
                 Step::Policy(which) => {
+                    // A reload: export again, then import again, and the
+                    // peers asked send what they announced again.
                     rib.set_policies(Box::new(Picky(*which)), &everyone, now, &mut out);
+                    rib.reimport(&everyone, now, &mut out);
+                    let asked: Vec<IpAddr> = out
+                        .iter()
+                        .filter_map(|o| match o {
+                            Output::RequestRoutes { peer, .. } => Some(*peer),
+                            _ => None,
+                        })
+                        .collect();
+                    for peer in asked {
+                        let i = infos.iter().position(|p| p.addr == peer).unwrap();
+                        for (n, (path, med)) in &theirs[i] {
+                            let u = update(&infos[i], prefix(*n), path, *med);
+                            rib.update(peer, &u, now, &mut out);
+                        }
+                    }
                 }
             }
             deliver(out, &infos, &mut views);

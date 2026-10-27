@@ -192,9 +192,10 @@ fn accepted_routes_are_held_as_received_and_rejected_ones_are_dropped() {
 
 #[test]
 fn a_route_import_policy_rejected_is_used_once_policy_accepts_it_again() {
-    // How a reload's ROUTE-REFRESH re-evaluates: the peer sends the same
-    // route again, and import policy runs on it again even though nothing
-    // in it changed.
+    // How the ROUTE-REFRESH a reload sends for the routes import policy
+    // dropped re-evaluates (`Rib::reimport` does the routes kept): the
+    // peer sends the same route again, and import policy runs on it again
+    // even though nothing in it changed.
     let rejected = p("198.51.100.0/24");
     let mut rib = Rib::with_policies(LOCAL_AS, Box::new(RejectOneRaiseRest(rejected)));
     let e1 = peer("10.0.0.1", 65_001, 1);

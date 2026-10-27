@@ -50,6 +50,7 @@ fn peers() -> Vec<PeerInfo> {
         receive_families: vec![V4, V6],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: if enh { vec![V4] } else { Vec::new() },
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),

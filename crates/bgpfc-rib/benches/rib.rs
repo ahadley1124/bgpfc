@@ -1,9 +1,11 @@
 //! RIB insert and withdraw at scale (AGENTS.md §5, benches row), from one
 //! peer and from two that send the same table, as a multi-homed network
 //! has it, churn
-//! under the RFC 4271 §9.2.1.1 advertisement interval, and validating
+//! under the RFC 4271 §9.2.1.1 advertisement interval, validating
 //! routes again when the validation source changes (RFC 6811 §4), with the
-//! routes held until the first data under `startup hold` too. The
+//! routes held until the first data under `startup hold` too, and
+//! importing a peer's routes again from the Adj-RIB-In when its import
+//! policy changes (RFC 4271 §3). The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
 
@@ -12,7 +14,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bgpfc_rib::{Enforcement, Output, PeerInfo, Rib, Startup};
+use bgpfc_rib::{
+    Enforcement, Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Startup, Verdict,
+};
 use bgpfc_rpki::{AffectedPrefixes, ValidationChange, ValidationSource, Vrp, VrpSet};
 use bgpfc_wire::as_path::AsPath;
 use bgpfc_wire::attribute::{Origin, PathAttribute};
@@ -58,6 +62,7 @@ fn peer(i: u8) -> PeerInfo {
         receive_families: vec![AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST],
         four_octet_as: true,
         extended_messages: false,
+        route_refresh: true,
         extended_next_hop: Vec::new(),
         advertisement_interval: Duration::ZERO,
         prefix_limits: Vec::new(),
@@ -70,6 +75,46 @@ fn paced_peer(i: u8) -> PeerInfo {
         advertisement_interval: Duration::from_secs(30),
         prefix_limits: Vec::new(),
         ..peer(i)
+    }
+}
+
+/// An internal peer: it is sent `LOCAL_PREF` (RFC 4271 §5.1.5), so a
+/// change of it reaches the peer.
+fn internal(i: u8) -> PeerInfo {
+    PeerInfo {
+        remote_as: Asn(65_000),
+        kind: PeerKind::Internal,
+        ..peer(i)
+    }
+}
+
+/// Import policy that gives every route `LOCAL_PREF` `.0`; export takes
+/// every route.
+struct Pref(u32);
+
+impl Policies for Pref {
+    fn import(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        a: &PathAttrs,
+        _: RovState,
+    ) -> Imported {
+        let mut a = a.clone();
+        a.local_pref = Some(self.0);
+        Verdict::Modified(a).into()
+    }
+
+    fn export(
+        &self,
+        _: &PeerInfo,
+        _: AddressFamily,
+        _: Prefix,
+        _: &PathAttrs,
+        _: RovState,
+    ) -> Verdict {
+        Verdict::Accept
     }
 }
 
@@ -236,6 +281,43 @@ fn bench(c: &mut Criterion) {
     });
     group.finish();
     revalidation(c, routes, &v4, &v6);
+    reimport(c, routes, &v4, &v6);
+}
+
+/// RFC 4271 §3 (a) at scale: a reload that changes the import policy of
+/// the peer that sent the table imports every route of it again from the
+/// Adj-RIB-In (`Rib::reimport`), as `set_policies` and `reimport` do on
+/// the RIB thread. `same` gives the routes what they had, so that only the
+/// walk and the policy cost; the other changes the `LOCAL_PREF` of every
+/// route, so that every destination is decided again, changed in the FIB
+/// and sent again to an internal peer.
+fn reimport(c: &mut Criterion, routes: u32, v4: &[DecodedUpdate], v6: &[DecodedUpdate]) {
+    let now = Instant::now();
+    let mut rib = Rib::with_policies(Asn(65_000), Box::new(Pref(100)));
+    let mut out = Vec::new();
+    outputs(|o| rib.peer_up(peer(1), now, o));
+    outputs(|o| rib.peer_up(internal(2), now, o));
+    feed(&mut rib, peer(1).addr, v4.iter().chain(v6), now, &mut out);
+    let from = [peer(1).addr];
+    let reload = |rib: &mut Rib, pref: u32| {
+        outputs(|o| {
+            rib.set_policies(Box::new(Pref(pref)), &[], now, o);
+            rib.reimport(&from, now, o);
+        })
+    };
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    group.bench_function(format!("reimport_same_{routes}"), |b| {
+        b.iter(|| black_box(reload(&mut rib, 100)));
+    });
+    let mut flip = false;
+    group.bench_function(format!("reimport_{routes}"), |b| {
+        b.iter(|| {
+            flip = !flip;
+            black_box(reload(&mut rib, if flip { 200 } else { 100 }))
+        });
+    });
+    group.finish();
 }
 
 /// RFC 6811 §4 at scale. Every route of a table from one peer, exported to
