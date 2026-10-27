@@ -20,6 +20,9 @@
 //!
 //! And it sets TCP keep-alive on a connection (`tcp(7)`), which std
 //! cannot, for the RTR client's connections to its caches (RFC 8210 §9).
+//!
+//! It joins a network namespace (`setns(2)`), for a daemon told to run in
+//! one, and drops the capability that took (`capset(2)`).
 #![cfg(target_os = "linux")]
 
 #[cfg(feature = "profiling")]
@@ -28,15 +31,17 @@ mod caps;
 mod ffi;
 mod inherit;
 mod netlink;
+mod netns;
 mod privilege;
 mod process;
 mod signal;
 mod tcp;
 
-pub use caps::{Capability, Effective};
+pub use caps::{Capability, Effective, drop_capability};
 pub use inherit::clear_ambient_capabilities;
 pub use inherit::inherit_only_standard_streams;
 pub use netlink::NetlinkSocket;
+pub use netns::{NetNs, NetNsError, NsId, threads};
 pub use privilege::{Identity, drop_to, is_root, lookup_group, lookup_user};
 pub use process::send_signal_to_group;
 pub use process::wait_for_exit;

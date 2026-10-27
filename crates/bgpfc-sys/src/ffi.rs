@@ -57,8 +57,19 @@ pub(crate) const SIGINT: c_int = 2;
 pub(crate) const SIGKILL: c_int = 9;
 pub(crate) const SIGTERM: c_int = 15;
 // <asm-generic/errno-base.h>
+pub(crate) const EPERM: c_int = 1;
 pub(crate) const ESRCH: c_int = 3;
 pub(crate) const EINVAL: c_int = 22;
+pub(crate) const ENOTTY: c_int = 25;
+// <linux/sched.h>
+pub(crate) const CLONE_NEWNET: c_int = 0x4000_0000;
+// <linux/nsfs.h>: `NS_GET_NSTYPE` is `_IO(NSIO, 0x3)` with `NSIO` 0xb7, and
+// `_IO(type, nr)` is `(type << 8) | nr` (<asm-generic/ioctl.h>: no
+// direction and no size bits).
+pub(crate) const NS_GET_NSTYPE: c_ulong = 0xb703;
+// <linux/capability.h>
+pub(crate) const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+pub(crate) const LINUX_CAPABILITY_U32S_3: usize = 2;
 // <linux/prctl.h>
 pub(crate) const PR_SET_PDEATHSIG: c_int = 1;
 pub(crate) const PR_CAP_AMBIENT: c_int = 47;
@@ -67,6 +78,7 @@ pub(crate) const PR_CAP_AMBIENT_CLEAR_ALL: c_ulong = 4;
 pub(crate) const F_SETFD: c_int = 2;
 pub(crate) const FD_CLOEXEC: c_int = 1;
 pub(crate) const O_CLOEXEC: c_int = 0o2_000_000;
+pub(crate) const O_NONBLOCK: c_int = 0o4_000;
 // `_SC_OPEN_MAX`: <bits/confname.h> in glibc, <unistd.h> in musl.
 pub(crate) const SC_OPEN_MAX: c_int = 4;
 // <linux/wait.h>
@@ -93,6 +105,27 @@ pub(crate) struct sockaddr_nl {
     pub(crate) nl_pad: c_ushort,
     pub(crate) nl_pid: u32,
     pub(crate) nl_groups: u32,
+}
+
+/// `struct __user_cap_header_struct`, `<linux/capability.h>`: which
+/// layout of the sets `capget(2)` and `capset(2)` use, and whose (`pid` 0:
+/// the calling thread's).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct cap_user_header {
+    pub(crate) version: u32,
+    pub(crate) pid: c_int,
+}
+
+/// `struct __user_cap_data_struct`, `<linux/capability.h>`: 32
+/// capabilities of each set. Version 3 takes
+/// [`LINUX_CAPABILITY_U32S_3`] of them, bits 0-31 then 32-63.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct cap_user_data {
+    pub(crate) effective: u32,
+    pub(crate) permitted: u32,
+    pub(crate) inheritable: u32,
 }
 
 /// A signal handler as `signal(2)` takes it (`<signal.h>`).
@@ -151,6 +184,16 @@ unsafe extern "C" {
     pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     // <unistd.h>, sysconf(3)
     pub(crate) fn sysconf(name: c_int) -> c_long;
+    // <sched.h>, setns(2)
+    pub(crate) fn setns(fd: c_int, nstype: c_int) -> c_int;
+    // <sys/ioctl.h>, ioctl(2): variadic there, so variadic here. glibc
+    // declares the request `unsigned long`, musl `int`; every request
+    // passed here fits both. NS_GET_NSTYPE takes no third argument.
+    pub(crate) fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    // <sys/capability.h>, capget(2) and capset(2): system call wrappers
+    // both glibc and musl export.
+    pub(crate) fn capget(header: *mut cap_user_header, data: *mut cap_user_data) -> c_int;
+    pub(crate) fn capset(header: *mut cap_user_header, data: *const cap_user_data) -> c_int;
     // <sys/wait.h>
     pub(crate) fn waitid(
         idtype: idtype_t,
@@ -186,5 +229,26 @@ mod tests {
         assert_eq!(align_of::<siginfo_t>(), align_of::<c_ulong>());
         assert_eq!(size_of::<id_t>(), 4);
         assert_eq!(size_of::<idtype_t>(), 4);
+    }
+
+    /// `capget(2)` and `capset(2)`'s types, also under AGENTS.md §1.4.
+    #[test]
+    fn capability_layouts_match_the_headers() {
+        // sizeof(struct __user_cap_header_struct) == 8 and
+        // sizeof(struct __user_cap_data_struct) == 12 on every Linux
+        // target: `__u32` and `int` fields only.
+        assert_eq!(size_of::<cap_user_header>(), 8);
+        assert_eq!(align_of::<cap_user_header>(), 4);
+        assert_eq!(size_of::<cap_user_data>(), 12);
+        assert_eq!(align_of::<cap_user_data>(), 4);
+    }
+
+    /// The ioctl number, from its parts as `<asm-generic/ioctl.h>`
+    /// builds it.
+    #[test]
+    fn ns_get_nstype_is_io_nsio_3() {
+        const NSIO: c_ulong = 0xb7;
+        const IOC_TYPESHIFT: c_ulong = 8;
+        assert_eq!(NS_GET_NSTYPE, (NSIO << IOC_TYPESHIFT) | 0x3);
     }
 }
