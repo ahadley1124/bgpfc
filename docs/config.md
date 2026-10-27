@@ -1187,9 +1187,12 @@ A changed `netns`, added or removed, takes effect at the next restart,
 as a changed `listen` or `control` block, `fib { table }` or `fib {
 protocol }` does: the reload applies everything else and its summary
 says `netns changed: takes effect at the next restart; bgpfcd stays in
-PATH`, PATH being the namespace bgpfcd joined, or `the namespace it was
-started in`. With `--netns` the statement is overridden, so a change of
-it is none. The running
+PATH`, PATH being the namespace bgpfcd joined at startup, or `the
+namespace it was started in`. Every reload says so while the file names
+another namespace than that one, and none once it names that one again:
+the reload compares the file with the namespace bgpfcd is in, not with
+what an earlier reload read. With `--netns` the statement is overridden,
+so a change of it is none. The running
 daemon stays in the namespace it joined, where its sockets are: moving
 would need every one of them opened again, and the `CAP_SYS_ADMIN` it
 gave up. Refusing the whole reload, as for `router-id`, would hold back

@@ -30,7 +30,7 @@ mod wiring;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -300,6 +300,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
 
     let mut coord = Coordinator {
         opts,
+        joined: Joined(config.netns.clone()),
         config,
         table,
         rib_tx,
@@ -438,6 +439,9 @@ fn prepare_peer(
 /// and shutdown need.
 struct Coordinator<'a> {
     opts: &'a args::Args,
+    /// The network namespace bgpfcd joined at startup, which no reload
+    /// changes: `config` follows the file, `netns` included.
+    joined: Joined,
     config: bgpfc_config::Config,
     table: PeerTable,
     rib_tx: SyncSender<RibMsg>,
@@ -478,10 +482,12 @@ impl Coordinator<'_> {
                 GlobalChange::Listen | GlobalChange::Control => {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
-                GlobalChange::Netns => notes.push(netns_note(self.config.netns.as_deref())),
                 // Applied below: the block from the one in effect, then the
-                // keep-alive, once the client the block runs is known.
-                GlobalChange::Rpki | GlobalChange::RpkiKeepalive => {}
+                // keep-alive, once the client the block runs is known. And
+                // `netns` is said below, against the namespace bgpfcd is
+                // in rather than the file's last value, which no reload
+                // applied.
+                GlobalChange::Rpki | GlobalChange::RpkiKeepalive | GlobalChange::Netns => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
@@ -510,6 +516,9 @@ impl Coordinator<'_> {
                     }
                 }
             }
+        }
+        if let Some(note) = self.joined.note(&new) {
+            notes.push(note);
         }
         // A changed block, or an unchanged one an earlier reload could not
         // start.
@@ -674,70 +683,147 @@ fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy
     Ok((config, engine))
 }
 
-/// What a reload says of a changed `netns`, while bgpfcd stays in
-/// `running`, the namespace it joined at startup, or the one it was
-/// started in (docs/config.md, "Reload"): the namespace holds every socket
-/// bgpfcd has, and the capability to move went with the join.
-fn netns_note(running: Option<&Path>) -> String {
-    let running = running.map_or_else(
-        || "the namespace it was started in".to_owned(),
-        |p| p.display().to_string(),
-    );
-    format!("netns changed: takes effect at the next restart; bgpfcd stays in {running}")
+/// The network namespace bgpfcd joined at startup (`netns` or `--netns`),
+/// or `None` for the one it was started in: where it stays until it
+/// restarts, whatever a reload reads.
+#[derive(Debug)]
+struct Joined(Option<PathBuf>);
+
+impl Joined {
+    /// What a reload of `new` says of its `netns` (docs/config.md,
+    /// "Reload"): nothing when it names the namespace bgpfcd is in; else
+    /// that the change waits for the next restart, and where bgpfcd stays
+    /// meanwhile. Against the namespace joined, not the file a reload read
+    /// before, which named one bgpfcd never joined: the namespace holds
+    /// every socket bgpfcd has, and the capability to move went with the
+    /// join.
+    fn note(&self, new: &bgpfc_config::Config) -> Option<String> {
+        if new.netns == self.0 {
+            return None;
+        }
+        let running = self.0.as_deref().map_or_else(
+            || "the namespace it was started in".to_owned(),
+            |p| p.display().to_string(),
+        );
+        Some(format!(
+            "netns changed: takes effect at the next restart; bgpfcd stays in {running}"
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
-    /// The note names where bgpfcd stays until the restart.
+    /// A config file in a directory of its own, rewritten by each reload,
+    /// and the options that read it.
+    struct File {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl File {
+        fn new(name: &str) -> File {
+            let dir = std::env::temp_dir().join(format!("bgpfcd-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("bgpfc.conf");
+            File { dir, file }
+        }
+
+        /// The file, with `netns` (a statement or nothing).
+        fn write(&self, netns: &str) {
+            std::fs::write(
+                &self.file,
+                format!(
+                    "router-id 192.0.2.1; local-as 65000; {netns}\n\
+                     policy ANY {{ term all {{ action accept; }} }}\n\
+                     neighbor 192.0.2.2 {{ remote-as 65001; import ANY; export ANY; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn args(&self, extra: &str) -> args::Args {
+            args::parse(
+                &format!("-c {} {extra}", self.file.display())
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Reloads in a row, each with another `netns` in the file: the note
+    /// names the namespace bgpfcd joined at startup every time, and none
+    /// comes once the file names that one again; never a namespace an
+    /// earlier reload read and did not apply.
     #[test]
-    fn a_netns_change_waits_for_the_next_restart() {
+    fn reloads_name_the_namespace_joined_at_startup() {
+        let f = File::new("joined");
+        f.write("netns rvA;");
+        let (start, _) = load_checked(&f.args("")).unwrap();
+        let joined = Joined(start.netns.clone());
+        let stays = "netns changed: takes effect at the next restart; bgpfcd stays in \
+                     /run/netns/rvA";
+        let mut running = start;
+        for (netns, note) in [
+            ("netns rvC;", Some(stays)),
+            ("netns rvR;", Some(stays)),
+            ("netns rvA;", None),
+            ("netns rvR;", Some(stays)),
+            ("netns rvR;", Some(stays)),
+            ("", Some(stays)),
+        ] {
+            f.write(netns);
+            let (new, _) = load_checked(&f.args("")).unwrap();
+            assert_eq!(joined.note(&new).as_deref(), note, "{netns}");
+            // What the reload keeps as its running configuration: the file.
+            running = new;
+        }
+        assert_eq!(running.netns, None);
+        // Started in the namespace it was given: any `netns` waits.
+        let here = Joined(None);
+        f.write("netns blue;");
+        let (blue, _) = load_checked(&f.args("")).unwrap();
         assert_eq!(
-            netns_note(Some(Path::new("/run/netns/blue"))),
-            "netns changed: takes effect at the next restart; bgpfcd stays in /run/netns/blue"
+            here.note(&blue).as_deref(),
+            Some(
+                "netns changed: takes effect at the next restart; bgpfcd stays in the \
+                 namespace it was started in"
+            )
         );
-        assert_eq!(
-            netns_note(None),
-            "netns changed: takes effect at the next restart; bgpfcd stays in the namespace \
-             it was started in"
-        );
+        f.write("");
+        let (none, _) = load_checked(&f.args("")).unwrap();
+        assert_eq!(here.note(&none), None);
     }
 
     /// `--netns` overrides the statement, at a reload as at the start, so
     /// that a file that changes only `netns` is no change at all.
     #[test]
     fn netns_flag_overrides_the_file() {
-        let dir = std::env::temp_dir().join(format!("bgpfcd-netns-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("bgpfc.conf");
-        let text = |netns: &str| {
-            format!(
-                "router-id 192.0.2.1; local-as 65000; {netns}\n\
-                 policy ANY {{ term all {{ action accept; }} }}\n\
-                 neighbor 192.0.2.2 {{ remote-as 65001; import ANY; export ANY; }}\n"
-            )
-        };
-        let args = |extra: &str| {
-            args::parse(
-                &format!("-c {} {extra}", file.display())
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        std::fs::write(&file, text("netns red;")).unwrap();
-        let (red, _) = load_checked(&args("")).unwrap();
+        let f = File::new("netns");
+        f.write("netns red;");
+        let (red, _) = load_checked(&f.args("")).unwrap();
         assert_eq!(red.netns.as_deref(), Some(Path::new("/run/netns/red")));
-        let flag = args("--netns /proc/1/ns/net");
+        let flag = f.args("--netns /proc/1/ns/net");
         let (old, _) = load_checked(&flag).unwrap();
         assert_eq!(old.netns.as_deref(), Some(Path::new("/proc/1/ns/net")));
-        std::fs::write(&file, text("netns blue;")).unwrap();
+        f.write("netns blue;");
         let (new, _) = load_checked(&flag).unwrap();
-        std::fs::write(&file, text("")).unwrap();
+        f.write("");
         let (none, _) = load_checked(&flag).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        // The flag names the namespace joined: no note either.
+        let joined = Joined(old.netns.clone());
+        assert_eq!(joined.note(&new), None);
         assert!(ConfigDiff::between(&old, &new).is_empty());
         assert!(ConfigDiff::between(&old, &none).is_empty());
         // Without the flag, the file's statement is what counts.
