@@ -188,6 +188,7 @@ fn durations_print_for_people() {
 mod net {
     use std::io::{ErrorKind, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
 
@@ -1352,6 +1353,167 @@ mod net {
         router.serve_reset(SID, 1, &[a(), b()]);
         assert_eq!(next_change(&rx).affected, AffectedPrefixes::All);
         assert!(lock(&seen).iter().all(|&p| p == port));
+        client.stop();
+    }
+
+    /// What a check saw: the client's port of each connection it ran on,
+    /// and the setting it read then.
+    type Seen = Arc<Mutex<Vec<(u16, u32)>>>;
+
+    /// A check that records each run with the value of `setting`, and
+    /// refuses while `refuse` is set.
+    fn recording(
+        setting: &Arc<AtomicU32>,
+        refuse: &Arc<AtomicBool>,
+        seen: &Seen,
+    ) -> ConnectionCheck {
+        let (setting, refuse, seen) = (Arc::clone(setting), Arc::clone(refuse), Arc::clone(seen));
+        ConnectionCheck::new(move |stream: &TcpStream| {
+            let port = stream.local_addr()?.port();
+            lock(&seen).push((port, setting.load(Ordering::Acquire)));
+            if refuse.load(Ordering::Acquire) {
+                Err(io::Error::other("no longer the cache we want"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// `check_again` runs the check on the connection in use, on the
+    /// caller's thread, so that what it now asks or sets reaches that
+    /// connection without a new one. One the check now refuses is closed,
+    /// and the client connects again, checked. A stopped client has none.
+    #[test]
+    fn the_check_runs_again_on_the_connection_in_use() {
+        let cache = TestCache::new();
+        let setting = Arc::new(AtomicU32::new(1));
+        let refuse = Arc::new(AtomicBool::new(false));
+        let seen = Seen::default();
+        let config = Config {
+            check: Some(recording(&setting, &refuse, &seen)),
+            ..config(vec![cache.entry(0)])
+        };
+        let (mut client, rx) = start_with(config);
+        let mut router = cache.accept();
+        router.serve_reset(SID, 1, &[a()]);
+        next_change(&rx);
+        let port = router.stream.peer_addr().unwrap().port();
+        assert_eq!(*lock(&seen), [(port, 1)]);
+
+        setting.store(2, Ordering::Release);
+        client.check_again().unwrap();
+        assert_eq!(*lock(&seen), [(port, 1), (port, 2)]);
+        // The session goes on, on the same connection.
+        router.send(&[notify(SID, 2)]);
+        assert_eq!(router.recv(), serial_query(SID, 1));
+        router.send(&[response(V1, SID), eod(SID, 2)]);
+        eventually("the serial in the status", || {
+            client.status().serial == Some(2)
+        });
+
+        // Refused now: closed, and the next connection checked.
+        refuse.store(true, Ordering::Release);
+        let refused = client.check_again().unwrap_err();
+        assert!(refused.to_string().contains("no longer the cache we want"));
+        router.expect_close();
+        refuse.store(false, Ordering::Release);
+        let mut router = cache.accept();
+        assert_eq!(router.recv(), serial_query(SID, 2));
+        let next = router.stream.peer_addr().unwrap().port();
+        assert_ne!(next, port);
+        assert_eq!(lock(&seen).last(), Some(&(next, 2)));
+
+        client.stop();
+        let runs = lock(&seen).len();
+        client.check_again().unwrap();
+        assert_eq!(lock(&seen).len(), runs);
+        // Nor does a client without a check.
+        let (client, _rx) = start(vec![cache.entry(0)]);
+        client.check_again().unwrap();
+    }
+
+    /// `check`, its first run held until the test lets it go: the
+    /// receiver hears when it has run, the sender lets it return.
+    fn held_once(check: ConnectionCheck) -> (ConnectionCheck, Receiver<()>, Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some((entered_tx, go_rx)));
+        let held = ConnectionCheck::new(move |stream: &TcpStream| {
+            let outcome = check.run(stream);
+            if let Some((entered, go)) = lock(&gate).take() {
+                entered.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            outcome
+        });
+        (held, entered_rx, go_tx)
+    }
+
+    /// A `check_again` that comes while a connection is being made, after
+    /// its check began and before the client uses it, finds no connection
+    /// in use: the client thread checks that one again before it sends
+    /// anything, so no connection escapes what the check now asks; and one
+    /// it now refuses is closed unused, and the client connects again.
+    #[test]
+    fn a_connection_made_meanwhile_is_checked_again() {
+        let cache = TestCache::new();
+        let setting = Arc::new(AtomicU32::new(1));
+        let refuse = Arc::new(AtomicBool::new(false));
+        let seen = Seen::default();
+        let (check, entered, go) = held_once(recording(&setting, &refuse, &seen));
+        let (mut client, rx) = start_with(Config {
+            check: Some(check),
+            ..config(vec![cache.entry(0)])
+        });
+        let mut router = cache.accept();
+        entered.recv_timeout(WAIT).unwrap();
+        // The check ran with the old setting; the connection is not in
+        // use yet.
+        setting.store(2, Ordering::Release);
+        client.check_again().unwrap();
+        let port = router.stream.peer_addr().unwrap().port();
+        assert_eq!(*lock(&seen), [(port, 1)]);
+        go.send(()).unwrap();
+        // Checked again before the Reset Query went out.
+        assert_eq!(router.recv(), RESET_V1);
+        assert_eq!(*lock(&seen), [(port, 1), (port, 2)]);
+        router.send(&[response(V1, SID), eod(SID, 1)]);
+        next_change(&rx);
+        client.stop();
+
+        // Now refused: closed before anything is sent on it.
+        lock(&seen).clear();
+        let (check, entered, go) = held_once(recording(&setting, &refuse, &seen));
+        let (mut client, rx) = start_with(Config {
+            check: Some(check),
+            ..config(vec![cache.entry(0)])
+        });
+        let mut router = cache.accept();
+        entered.recv_timeout(WAIT).unwrap();
+        refuse.store(true, Ordering::Release);
+        client.check_again().unwrap();
+        go.send(()).unwrap();
+        router.expect_close();
+        eventually("the refusal in the status", || {
+            client
+                .status()
+                .last_error
+                .is_some_and(|e| e.contains("no longer the cache we want"))
+        });
+        refuse.store(false, Ordering::Release);
+        let mut router = loop {
+            let mut router = cache.accept();
+            let mut buf = [0; 64];
+            match router.stream.read(&mut buf) {
+                Ok(0) | Err(_) => {}
+                Ok(n) => {
+                    router.framer.feed(&buf[..n]);
+                    break router;
+                }
+            }
+        };
+        router.serve_reset(SID, 1, &[a()]);
+        next_change(&rx);
         client.stop();
     }
 }
