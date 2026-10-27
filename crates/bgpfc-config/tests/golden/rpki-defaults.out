@@ -21,6 +21,7 @@ Config {
     rpki: Rpki {
         mode: External,
         enforcement: DropInvalid,
+        startup: Accept,
         caches: [
             RpkiCache {
                 host: "rtr.example.net",

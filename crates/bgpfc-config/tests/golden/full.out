@@ -32,6 +32,7 @@ Config {
     rpki: Rpki {
         mode: External,
         enforcement: PreferValid,
+        startup: Hold,
         caches: [
             RpkiCache {
                 host: "127.0.0.1",

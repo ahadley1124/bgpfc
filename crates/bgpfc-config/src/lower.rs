@@ -13,6 +13,7 @@
 //! (`version`), §9 (port 323; the sidecar's RTR on loopback only), §10
 //! (`cache` and its `preference`); RFC 1123 §2.1 (cache host names); RFC
 //! 6811 §2 and §5 (`enforcement`: what the validation state does,
+//! configured; `startup`: routes held until the first data only when
 //! configured), §3 (`match rpki`, `set rpki`). Issues #70-#72: the
 //! `sidecar` block of `rpki`, within the bounds of `bgpfc-sidecar`.
 
@@ -21,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use bgpfc_rpki::{Enforcement, RovState};
+use bgpfc_rpki::{Enforcement, RovState, Startup};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::{AddressFamily, Asn, HoldTime, RouterId};
@@ -1192,6 +1193,7 @@ struct RpkiBuilder {
     /// Where the first `mode` statement is.
     mode_pos: Option<Pos>,
     enforcement: Once<Enforcement>,
+    startup: Once<Startup>,
     caches: Vec<RpkiCache>,
     /// Where every `cache` statement is, valid or not.
     cache_pos: Vec<Pos>,
@@ -1213,6 +1215,7 @@ impl RpkiBuilder {
             mode: Once::new("mode"),
             mode_pos: None,
             enforcement: Once::new("enforcement"),
+            startup: Once::new("startup"),
             caches: Vec::new(),
             cache_pos: Vec::new(),
             sidecar: Once::new("sidecar"),
@@ -1248,20 +1251,14 @@ impl RpkiBuilder {
             "enforcement" => {
                 // RFC 6811 §5: filter on the state, or adjust the degree of
                 // preference by it; or neither (RFC 8481 §5).
-                let v = l.arg(t).and_then(|a| {
-                    let e = a.value.parse::<Enforcement>().ok();
-                    if e.is_none() {
-                        l.err(
-                            a.pos,
-                            format!(
-                                "`{}` is not `drop-invalid`, `prefer-valid` or `off`",
-                                a.value
-                            ),
-                        );
-                    }
-                    e
-                });
+                let v = l.parse_arg::<Enforcement>(t, "`drop-invalid`, `prefer-valid` or `off`");
                 self.enforcement.set(l, t.pos, v);
+            }
+            "startup" => {
+                // RFC 6811 §2: routes leave the decision process for want
+                // of a state only when "explicitly configured to do so".
+                let v = l.parse_arg::<Startup>(t, "`accept` or `hold`");
+                self.startup.set(l, t.pos, v);
             }
             "cache" => {
                 self.cache_pos.push(t.pos);
@@ -1382,6 +1379,7 @@ impl RpkiBuilder {
         let rpki = Rpki {
             mode,
             enforcement: self.enforcement.value.unwrap_or(d.enforcement),
+            startup: self.startup.value.unwrap_or(d.startup),
             caches: self.caches,
             sidecar,
             version: self.version.value.unwrap_or(d.version),

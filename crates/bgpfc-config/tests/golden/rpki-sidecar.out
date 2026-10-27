@@ -21,11 +21,12 @@ Config {
     rpki: Rpki {
         mode: Sidecar,
         enforcement: PreferValid,
+        startup: Hold,
         caches: [],
         sidecar: RpkiSidecar {
             pos: Some(
                 Pos {
-                    line: 10,
+                    line: 11,
                     col: 5,
                 },
             ),

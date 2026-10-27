@@ -59,6 +59,7 @@ control-item = "socket" path ";"
 
 rpki-item    = "mode" ( "disabled" | "external" | "sidecar" ) ";"   (* required *)
              | "enforcement" ( "drop-invalid" | "prefer-valid" | "off" ) ";"   (* default drop-invalid *)
+             | "startup" ( "accept" | "hold" ) ";"     (* default accept *)
              | "cache" host { cache-option } ";"       (* repeatable; options once each; not with mode sidecar *)
              | "sidecar" "{" { sidecar-item } "}"      (* once; not with mode external *)
              | "version" ( "0" | "1" ) ";"             (* default 1 *)
@@ -354,8 +355,9 @@ of its validation state, unless explicitly configured to do so." bgpfcd
 keeps every route in the Adj-RIB-In whatever its state, and takes one out
 of route selection for its state only where the file says so: by `mode
 external` or `mode sidecar`, whose meaning includes `enforcement
-drop-invalid` as above, by an `enforcement` statement, or by an import
-policy that matches or sets the state (`match rpki`, `set rpki`). Without
+drop-invalid` as above, by an `enforcement` statement, by `startup hold`,
+or by an import policy that matches or sets the state (`match rpki`, `set
+rpki`). Without
 an `rpki` block, or with `mode disabled`, no route is validated, and no
 `enforcement` holds a `disabled` route; only an import policy that matches
 or sets the state can, such as one that rejects on `match rpki not-found`
@@ -367,6 +369,23 @@ configuration, policy MUST NOT be applied." bgpfcd's default departs from
 it, as the project chose (issue #61); `enforcement off;` gives the RFC 8481
 §5 behaviour.
 
+`startup` says what becomes of the routes while validation waits for its
+first data, in the startup window (see **Startup window** below), when
+no route has a state yet and every one is `disabled`:
+
+- `accept`, the default. They are used as received, and `enforcement`
+  acts once the first full set of VRPs has given them a state.
+- `hold`. They are held as `drop-invalid` holds an Invalid route: kept
+  in the Adj-RIB-In, counted as received and held, and neither installed
+  nor advertised, until the first full set gives them a state; then
+  `enforcement` acts on it, and a route it admits is used without an
+  UPDATE or a route refresh.
+
+The names are bgpfc's own words for what becomes of a route: import
+policy's `accept` lets it be used, and a *held* route is what `show
+routes held` lists. `startup` applies with `mode external` and `mode
+sidecar`; with `mode disabled` no data will come, and it holds nothing.
+
 Each route goes through these steps in order:
 
 1. The checks that make a route unusable whatever the policy, such as an
@@ -377,16 +396,17 @@ Each route goes through these steps in order:
 3. The import policy accepts the route, possibly with other attributes,
    or rejects it. It may match the state, and set the state the route is
    used with from then on (`set rpki`).
-4. `enforcement` acts on the state the route is used with, the one import
-   policy set or else the one the lookup gave: `drop-invalid` holds an
-   Invalid route. So `set rpki valid` in an import policy wins over
+4. `startup hold` holds a route used with state `disabled` while
+   validation waits for its first data; otherwise `enforcement` acts on
+   the state the route is used with, the one import policy set or else the
+   one the lookup gave: `drop-invalid` holds an Invalid route. So `set rpki valid` in an import policy wins over
    `drop-invalid`, and `match rpki invalid; action reject;` rejects in
    every mode.
 5. The Adj-RIB-In keeps the routes the import policy accepted and the ones
-   held for their state: by `enforcement`, or because the import policy
-   rejects them only in their current state, which it would accept in
-   another. A route the import policy rejects whatever its state is not
-   kept.
+   held for their state: by `startup` or `enforcement`, or because the
+   import policy rejects them only in their current state, which it would
+   accept in another. A route the import policy rejects whatever its state
+   is not kept.
 6. Route selection among the routes not held, ranking by state first under
    `prefer-valid`.
 7. The export policy of each neighbor, which sees the state the route is

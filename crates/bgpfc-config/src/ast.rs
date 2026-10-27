@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bgpfc_rpki::{Enforcement, RovState};
+use bgpfc_rpki::{Enforcement, RovState, Startup};
 use bgpfc_wire::attribute::Origin;
 use bgpfc_wire::community::{Community, ExtendedCommunity, LargeCommunity};
 use bgpfc_wire::prefix::Prefix;
@@ -138,6 +138,13 @@ pub struct Rpki {
     /// documented meaning of `mode external` includes the default, and
     /// with `mode disabled` only a state import policy sets is acted on.
     pub enforcement: Enforcement,
+    /// `startup`: what a route not validated yet, `disabled`, does while
+    /// validation waits for its first full set of VRPs;
+    /// [`Rpki::DEFAULT_STARTUP`] unless given. RFC 6811 §2 lets a route
+    /// leave the decision process for its state only when "explicitly
+    /// configured to do so": [`Startup::Hold`] is that configuration.
+    /// With [`RpkiMode::Disabled`] no data comes, so it holds nothing.
+    pub startup: Startup,
     /// `cache` statements in file order: the router's cache list
     /// (RFC 8210 §10). At least one in [`RpkiMode::External`], none in
     /// [`RpkiMode::Sidecar`].
@@ -180,6 +187,13 @@ impl Rpki {
     /// apply none ("Absent specific operator configuration, policy MUST
     /// NOT be applied"); `enforcement off` gives that.
     pub const DEFAULT_ENFORCEMENT: Enforcement = Enforcement::DropInvalid;
+    /// The `startup` of a file that writes none: routes not validated yet
+    /// are used as received until the first full set validates them. RFC
+    /// 6811 §2: no route leaves the decision process for its state
+    /// "unless explicitly configured to do so", and holding them would
+    /// withdraw the whole table for as long as the cache takes, minutes
+    /// with a cold sidecar.
+    pub const DEFAULT_STARTUP: Startup = Startup::Accept;
     /// The rpki-rtr port (RFC 8210 §9, RFC 6810 §7).
     pub const DEFAULT_PORT: u16 = 323;
     /// The default `connect-timeout`.
@@ -236,6 +250,7 @@ impl Rpki {
         Rpki {
             mode,
             enforcement: Rpki::DEFAULT_ENFORCEMENT,
+            startup: Rpki::DEFAULT_STARTUP,
             caches: Vec::new(),
             sidecar: RpkiSidecar::default(),
             version: 1,
@@ -271,8 +286,8 @@ impl Rpki {
     /// in the same order with the same preferences, each host however it
     /// is spelled (see [`RpkiCache::is_at`]), and the same sidecar
     /// settings (see [`RpkiSidecar::same_as`]). A reload leaves the RTR
-    /// client and the sidecar alone unless this is false. The
-    /// `enforcement` is not compared.
+    /// client and the sidecar alone unless this is false. Neither the
+    /// `enforcement` nor the `startup` is compared.
     #[must_use]
     pub fn same_as(&self, other: &Rpki) -> bool {
         // Destructured, so that a new setting cannot be left out.
@@ -284,6 +299,9 @@ impl Rpki {
             // to it alone re-judges the routes; restarting the client for
             // it would reload every cache for nothing.
             enforcement: _,
+            // Nor is this: it acts on the routes while the client has no
+            // data, which the client neither knows nor changes.
+            startup: _,
             caches,
             sidecar,
             version,
@@ -796,6 +814,7 @@ mod tests {
         assert_eq!(Rpki::default(), implicit);
         assert_eq!(implicit.mode, RpkiMode::Disabled);
         assert_eq!(implicit.enforcement, Rpki::DEFAULT_ENFORCEMENT);
+        assert_eq!(implicit.startup, Startup::Accept);
         assert_eq!(implicit.caches, []);
         assert_eq!(implicit.sidecar, RpkiSidecar::default());
         assert_eq!(implicit.sidecar.pos, None);
@@ -803,6 +822,24 @@ mod tests {
             (implicit.backoff_min, implicit.backoff_max),
             (Rpki::DEFAULT_BACKOFF_MIN, Rpki::DEFAULT_BACKOFF_MAX)
         );
+    }
+
+    /// What acts on the routes' states is not the RTR client's business:
+    /// a block that differs only there asks the client for the same.
+    #[test]
+    fn the_client_is_the_same_whatever_acts_on_the_state() {
+        let a = Rpki::defaults(RpkiMode::External);
+        let b = Rpki {
+            enforcement: Enforcement::Off,
+            startup: Startup::Hold,
+            ..a.clone()
+        };
+        assert!(a.same_as(&b));
+        assert_ne!(a, b);
+        assert!(!a.same_as(&Rpki {
+            version: 0,
+            ..b.clone()
+        }));
     }
 
     /// The back-off follows the mode; nothing else does.

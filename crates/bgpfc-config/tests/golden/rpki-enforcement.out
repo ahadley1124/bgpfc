@@ -21,6 +21,7 @@ Config {
     rpki: Rpki {
         mode: Disabled,
         enforcement: Off,
+        startup: Hold,
         caches: [],
         sidecar: RpkiSidecar {
             pos: None,

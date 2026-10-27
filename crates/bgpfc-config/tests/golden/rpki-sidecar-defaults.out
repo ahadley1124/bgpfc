@@ -21,6 +21,7 @@ Config {
     rpki: Rpki {
         mode: Sidecar,
         enforcement: DropInvalid,
+        startup: Accept,
         caches: [],
         sidecar: RpkiSidecar {
             pos: Some(
