@@ -69,10 +69,11 @@
 //! Implements: RFC 8210 §6 (the Expire Interval cap and the reconnect
 //! back-off configured), §7 (the version offered first), §9 and §13
 //! (unprotected TCP to the configured port, 323 by default, with TCP
-//! keep-alive on every connection; the sidecar's RTR on loopback only,
-//! and used only from a server of bgpfcd's own user), §10 (the cache list with preferences; the data kept
-//! across a new cache list, and across a restart of Routinator); RFC 6811
-//! §4 (each change of the VRPs reaches the RIB, which validates the
+//! keep-alive on every connection, as `tcp-keepalive` has it; the
+//! sidecar's RTR on loopback only, and used only from a server of
+//! bgpfcd's own user), §10 (the cache list with preferences; the data
+//! kept across a new cache list, and across a restart of Routinator); RFC
+//! 6811 §4 (each change of the VRPs reaches the RIB, which validates the
 //! affected routes again), §2 (routes not validated yet held only as
 //! configured, `startup hold`, and only while validation waits for data).
 
@@ -85,7 +86,7 @@ use std::path::Path;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bgpfc_config::ast::{self, RpkiMode};
 use bgpfc_config::{ConfigError, Pos};
@@ -303,17 +304,18 @@ pub(crate) fn resolve(rpki: &ast::Rpki) -> Result<(), String> {
 /// wired without operator configuration); `mode external` lists its
 /// caches itself.
 ///
-/// The client turns TCP keep-alive on for every connection it makes
-/// ([`RTR_KEEPALIVE`], RFC 8210 §9). With `mode sidecar` it also uses a
-/// connection only if its other end belongs to bgpfcd's own user, as
-/// Routinator, its child, does ([`owner::same_user`]): until Routinator
-/// binds its port, after its first validation run, any local process
-/// could bind it and serve VRPs of its own (RFC 8210 §9, §13). Both go
-/// through [`prepare`].
+/// The client turns TCP keep-alive on for every connection it makes, as
+/// `keepalive` has it when the connection is made (RFC 8210 §9). With
+/// `mode sidecar` it also uses a connection only if its other end belongs
+/// to bgpfcd's own user, as Routinator, its child, does
+/// ([`owner::same_user`]): until Routinator binds its port, after its
+/// first validation run, any local process could bind it and serve VRPs
+/// of its own (RFC 8210 §9, §13). Both go through [`prepare`].
 pub(crate) fn client_config(
     rpki: &ast::Rpki,
     router_id: RouterId,
     sidecar: Option<SocketAddr>,
+    keepalive: &Keepalive,
 ) -> Option<client::Config> {
     let caches = match rpki.mode {
         RpkiMode::Disabled => return None,
@@ -342,7 +344,7 @@ pub(crate) fn client_config(
         }
     };
     let mut config = client::Config::new(caches);
-    config.check = Some(prepare(rpki.mode == RpkiMode::Sidecar));
+    config.check = Some(prepare(rpki.mode == RpkiMode::Sidecar, keepalive.clone()));
     config.connect_timeout = rpki.connect_timeout;
     // With `mode sidecar` the block's default is `1 30` rather than
     // `1 600` (`ast::Rpki::default_backoff`), so that the client finds
@@ -371,47 +373,49 @@ pub(crate) fn client_config(
     Some(config)
 }
 
-/// TCP keep-alive on every connection to a cache. RFC 8210 §9: "To
-/// reduce exposure to dropped but non-terminated sessions, both caches and
-/// routers SHOULD enable keep-alives when available in the chosen
-/// transport protocol."
-///
-/// In sync, an RTR connection is idle between polls, which come every
-/// Refresh Interval, an hour by default (§6). Without probes, a cache
-/// that vanished without closing the connection (a crash, a power loss, a
-/// network that drops its packets) is noticed only when the next poll
-/// goes unanswered for the response timeout, more than an hour on; until
-/// then the client neither moves to another cache (§10) nor hears the
-/// cache's Serial Notifies again. The host's default would probe only
-/// after two hours of silence (RFC 1122 §4.2.3.6). With these values a
-/// dead cache is noticed within two minutes of its last segment:
-///
-/// - `idle` 60 s: what Routinator sets on its own end of each RTR
-///   connection by default (`--rtr-tcp-keepalive 60`), so both ends start
-///   probing after the same minute of silence; one small exchange a
-///   minute per connection costs nothing on the controlled network §9
-///   asks for.
-/// - `interval` 10 s and `probes` 6: the cache is declared gone after a
-///   minute of unanswered probes, so a loss of a few seconds on that
-///   network does not reset a session that would have lived on, and a
-///   reconnect, which costs the cache a Serial Query at least (§8.1),
-///   comes only for a cache that is really gone.
-///
-/// Keep-alive acts only on a connection with nothing in flight. While a
-/// query is unanswered, the session's response timeout finds a dead
-/// cache instead (§6, `response-timeout`). Not configurable: no value
-/// changes an outcome, only how soon a dead cache is noticed.
-pub(crate) const RTR_KEEPALIVE: TcpKeepalive = TcpKeepalive {
-    idle: Duration::from_secs(60),
-    interval: Duration::from_secs(10),
-    probes: 6,
-};
+/// The `tcp-keepalive` of a block as the kernel takes it.
+pub(crate) fn tcp_keepalive(k: &ast::RpkiKeepalive) -> TcpKeepalive {
+    TcpKeepalive {
+        idle: k.idle,
+        interval: k.interval,
+        probes: k.count,
+    }
+}
+
+/// The TCP keep-alive every connection to a cache gets (RFC 8210 §9:
+/// routers "SHOULD enable keep-alives when available"), as the block's
+/// `tcp-keepalive` has it (see [`ast::RpkiKeepalive`] for what the
+/// defaults are for): shared between the running block and its client's
+/// [`ConnectionCheck`], which reads it as it prepares each connection.
+#[derive(Clone, Debug)]
+pub(crate) struct Keepalive(Arc<Mutex<TcpKeepalive>>);
+
+impl Keepalive {
+    /// The keep-alive `k` says.
+    pub(crate) fn new(k: &ast::RpkiKeepalive) -> Keepalive {
+        Keepalive(Arc::new(Mutex::new(tcp_keepalive(k))))
+    }
+
+    /// What the next connection gets.
+    pub(crate) fn get(&self) -> TcpKeepalive {
+        *lock(&self.0)
+    }
+
+    /// Have the next connection get `k`; whether that is a change.
+    fn set(&self, k: &ast::RpkiKeepalive) -> bool {
+        let new = tcp_keepalive(k);
+        let mut current = lock(&self.0);
+        let changed = *current != new;
+        *current = new;
+        changed
+    }
+}
 
 /// What the client does with each connection it makes, before it sends
 /// or reads anything on it: with `owner_check` (`mode sidecar`), refuse
 /// one whose other end does not belong to bgpfcd's own user
 /// ([`owner::same_user`]); then, in every mode, turn on TCP keep-alive
-/// ([`RTR_KEEPALIVE`], RFC 8210 §9).
+/// as `keepalive` has it then (RFC 8210 §9).
 ///
 /// The keep-alive goes through the client's [`ConnectionCheck`] because
 /// that hook already runs on every connection the client makes, to every
@@ -424,12 +428,12 @@ pub(crate) const RTR_KEEPALIVE: TcpKeepalive = TcpKeepalive {
 /// asks for keep-alives "when available", and without them the polls
 /// and timeouts of §6 still find a dead cache, only later. The refusal is
 /// a warning, once per connection.
-fn prepare(owner_check: bool) -> ConnectionCheck {
+fn prepare(owner_check: bool, keepalive: Keepalive) -> ConnectionCheck {
     ConnectionCheck::new(move |stream: &TcpStream| {
         if owner_check {
             owner::same_user(stream)?;
         }
-        if let Err(e) = bgpfc_sys::set_tcp_keepalive(stream, RTR_KEEPALIVE) {
+        if let Err(e) = bgpfc_sys::set_tcp_keepalive(stream, keepalive.get()) {
             let cache = stream
                 .peer_addr()
                 .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
@@ -547,6 +551,9 @@ pub(crate) struct Rpki {
     client: Option<Client>,
     /// Routinator, supervised; the client's one cache.
     sidecar: Option<Sidecar>,
+    /// The keep-alive the client's connections get, from the block in
+    /// effect.
+    keepalive: Keepalive,
     /// Since when every route has waited for the first full set, unused
     /// for validation: set when a client starts with no data to hold,
     /// cleared by the first change it publishes, or when validation is
@@ -577,6 +584,7 @@ impl Rpki {
             router_id,
             client: None,
             sidecar: None,
+            keepalive: Keepalive::new(&config.tcp_keepalive),
             waiting: Arc::default(),
         };
         if config.mode == RpkiMode::Sidecar {
@@ -591,11 +599,14 @@ impl Rpki {
     }
 
     /// A client for `config`, holding `held`, if its mode runs one; with
-    /// `mode sidecar`, at the running sidecar's address. A client with no
-    /// data to hold leaves the routes waiting for its first full set.
+    /// `mode sidecar`, at the running sidecar's address. Its connections
+    /// get the block's keep-alive. A client with no data to hold leaves the
+    /// routes waiting for its first full set.
     fn spawn_client(&self, config: &ast::Rpki, held: Option<Held>) -> io::Result<Option<Client>> {
         let sidecar = self.sidecar.as_ref().map(Sidecar::rtr_addr);
-        let Some(client_config) = client_config(config, self.router_id, sidecar) else {
+        self.keepalive.set(&config.tcp_keepalive);
+        let Some(client_config) = client_config(config, self.router_id, sidecar, &self.keepalive)
+        else {
             return Ok(None);
         };
         bgpfc_log::info!(
@@ -607,6 +618,7 @@ impl Rpki {
                 .collect::<Vec<_>>()
                 .join(","),
             version = config.version,
+            tcp_keepalive = config.tcp_keepalive,
             held_vrps = held.as_ref().map_or(0, |h| h.vrps.len())
         );
         if held.is_none() {
@@ -891,6 +903,11 @@ mod tests {
             .unwrap()
     }
 
+    /// The keep-alive the block gives the client's connections.
+    fn keepalive(rpki: &ast::Rpki) -> Keepalive {
+        Keepalive::new(&rpki.tcp_keepalive)
+    }
+
     fn vrp(prefix: &str, max_len: u8, asn: u32) -> Vrp {
         Vrp::new(prefix.parse().unwrap(), max_len, Asn(asn)).unwrap()
     }
@@ -1033,7 +1050,7 @@ mod tests {
                 max-expire 3600; max-vrps 1000; backoff 2 300;
             }",
         );
-        let c = client_config(&cfg.rpki, router_id, None).unwrap();
+        let c = client_config(&cfg.rpki, router_id, None, &keepalive(&cfg.rpki)).unwrap();
         assert_eq!(
             c.caches,
             [
@@ -1066,7 +1083,7 @@ mod tests {
         );
         // The block's defaults are the client's.
         let cfg = config("rpki { mode external; cache 192.0.2.10; }");
-        let c = client_config(&cfg.rpki, router_id, None).unwrap();
+        let c = client_config(&cfg.rpki, router_id, None, &keepalive(&cfg.rpki)).unwrap();
         let defaults = client::Config::new(vec![Cache::new("192.0.2.10")]);
         assert_eq!(c.caches, defaults.caches);
         assert_eq!(c.connect_timeout, defaults.connect_timeout);
@@ -1076,9 +1093,12 @@ mod tests {
         assert_eq!(ast::Rpki::MIN_EXPIRE, session::Config::MIN_EXPIRE);
         assert_eq!(ast::Rpki::MAX_EXPIRE, session::Config::MAX_EXPIRE);
         // No client without the block, or with `mode disabled`.
-        assert!(client_config(&config("").rpki, router_id, None).is_none());
+        let none = config("");
+        assert!(client_config(&none.rpki, router_id, None, &keepalive(&none.rpki)).is_none());
         let disabled = config("rpki { mode disabled; cache 192.0.2.10; }");
-        assert!(client_config(&disabled.rpki, router_id, None).is_none());
+        assert!(
+            client_config(&disabled.rpki, router_id, None, &keepalive(&disabled.rpki)).is_none()
+        );
     }
 
     #[test]
@@ -1804,7 +1824,7 @@ mod tests {
              reply-timeout 600; max-expire 3600; max-vrps 1000; }",
         );
         let addr: SocketAddr = "127.0.0.1:3323".parse().unwrap();
-        let c = client_config(&cfg.rpki, router_id, Some(addr)).unwrap();
+        let c = client_config(&cfg.rpki, router_id, Some(addr), &keepalive(&cfg.rpki)).unwrap();
         let sidecar = Cache {
             host: "127.0.0.1".to_owned(),
             port: 3323,
@@ -1833,39 +1853,92 @@ mod tests {
         // RFC 8210 §9, §13: only a server of bgpfcd's own user is used,
         // and with keep-alive (see `every_rtr_connection_has_tcp_keep_alive`).
         assert!(c.check.is_some());
-        let v6 = client_config(&cfg.rpki, router_id, Some("[::1]:3323".parse().unwrap())).unwrap();
+        let v6 = client_config(
+            &cfg.rpki,
+            router_id,
+            Some("[::1]:3323".parse().unwrap()),
+            &keepalive(&cfg.rpki),
+        )
+        .unwrap();
         assert_eq!(v6.caches[0].host, "::1");
         assert_eq!(v6.caches[0].to_string(), "[::1]:3323");
         // A written back-off is the block's.
         let written = config("rpki { mode sidecar; backoff 2 5; }");
-        let c = client_config(&written.rpki, router_id, Some(addr)).unwrap();
+        let c = client_config(
+            &written.rpki,
+            router_id,
+            Some(addr),
+            &keepalive(&written.rpki),
+        )
+        .unwrap();
         assert_eq!(c.backoff.min, Duration::from_secs(2));
         assert_eq!(c.backoff.max, Duration::from_secs(5));
         // Only `mode sidecar` uses the sidecar's address.
         let external = config("rpki { mode external; cache 192.0.2.10; }");
-        let c = client_config(&external.rpki, router_id, Some(addr)).unwrap();
+        let c = client_config(
+            &external.rpki,
+            router_id,
+            Some(addr),
+            &keepalive(&external.rpki),
+        )
+        .unwrap();
         assert_eq!(c.caches, [Cache::new("192.0.2.10")]);
         // An external cache is another host's, so no owner check; but its
         // connections get keep-alive too.
         assert!(c.check.is_some());
         let disabled = config("rpki { mode disabled; }");
-        assert!(client_config(&disabled.rpki, router_id, Some(addr)).is_none());
+        assert!(
+            client_config(
+                &disabled.rpki,
+                router_id,
+                Some(addr),
+                &keepalive(&disabled.rpki)
+            )
+            .is_none()
+        );
     }
 
     /// RFC 8210 §9: every connection the client makes to a cache has TCP
-    /// keep-alive on, as [`RTR_KEEPALIVE`] sets it, before the client
-    /// sends its first query, with `mode external` and with `mode
-    /// sidecar`, whose owner check passes for a cache of this process.
+    /// keep-alive on, as the block's `tcp-keepalive` has it, its defaults
+    /// where it is not written, before the client sends its first query,
+    /// with `mode external` and with `mode sidecar`, whose owner check
+    /// passes for a cache of this process.
     #[test]
     fn every_rtr_connection_has_tcp_keep_alive() {
         let router_id = RouterId::new(0xC000_0201).unwrap();
         let cache = StubCache::new();
         let addr = SocketAddr::from(([127, 0, 0, 1], cache.port()));
-        for (block, sidecar) in [
-            (cache.block(), None),
-            ("rpki { mode sidecar; }".to_owned(), Some(addr)),
+        let defaults = TcpKeepalive {
+            idle: Duration::from_secs(60),
+            interval: Duration::from_secs(10),
+            probes: 6,
+        };
+        let written = TcpKeepalive {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(5),
+            probes: 3,
+        };
+        let external = format!(
+            "rpki {{ mode external; cache 127.0.0.1 port {}; }}",
+            cache.port()
+        );
+        let external_written = format!(
+            "rpki {{ mode external; cache 127.0.0.1 port {}; \
+             tcp-keepalive count 3 idle 45 interval 5; }}",
+            cache.port()
+        );
+        for (block, sidecar, expected) in [
+            (external, None, defaults),
+            (external_written, None, written),
+            ("rpki { mode sidecar; }".to_owned(), Some(addr), defaults),
+            (
+                "rpki { mode sidecar; tcp-keepalive idle 45 interval 5 count 3; }".to_owned(),
+                Some(addr),
+                written,
+            ),
         ] {
-            let mut c = client_config(&config(&block).rpki, router_id, sidecar).unwrap();
+            let rpki = config(&block).rpki;
+            let mut c = client_config(&rpki, router_id, sidecar, &keepalive(&rpki)).unwrap();
             // What the kernel has on the client's end once bgpfcd's check
             // has run on it.
             let prepare = c.check.take().expect("a check of every connection");
@@ -1885,13 +1958,45 @@ mod tests {
             );
             assert_eq!(
                 seen_rx.recv_timeout(WAIT).unwrap(),
-                (true, Ok(Some(RTR_KEEPALIVE))),
+                (true, Ok(Some(expected))),
                 "{block}"
             );
             client.stop();
         }
         // Two minutes from the last segment to a dead cache noticed.
-        assert_eq!(RTR_KEEPALIVE.detection_time(), Duration::from_secs(120));
+        assert_eq!(defaults.detection_time(), Duration::from_secs(120));
+    }
+
+    /// The bounds of `tcp-keepalive` are the kernel's: it takes the
+    /// longest the block allows, and refuses one more of each.
+    #[test]
+    fn the_block_s_keep_alive_bounds_are_the_kernel_s() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let longest = ast::RpkiKeepalive {
+            idle: ast::RpkiKeepalive::MAX_IDLE,
+            interval: ast::RpkiKeepalive::MAX_INTERVAL,
+            count: ast::RpkiKeepalive::MAX_COUNT,
+        };
+        bgpfc_sys::set_tcp_keepalive(&stream, tcp_keepalive(&longest)).unwrap();
+        assert_eq!(
+            bgpfc_sys::tcp_keepalive(&stream).unwrap(),
+            Some(tcp_keepalive(&longest))
+        );
+        let one_more = |k: TcpKeepalive| bgpfc_sys::set_tcp_keepalive(&stream, k).is_err();
+        let longest = tcp_keepalive(&longest);
+        assert!(one_more(TcpKeepalive {
+            idle: longest.idle + Duration::from_secs(1),
+            ..longest
+        }));
+        assert!(one_more(TcpKeepalive {
+            interval: longest.interval + Duration::from_secs(1),
+            ..longest
+        }));
+        assert!(one_more(TcpKeepalive {
+            probes: longest.probes + 1,
+            ..longest
+        }));
     }
 
     /// Issues #26 and #71: `mode sidecar` starts Routinator and wires the
