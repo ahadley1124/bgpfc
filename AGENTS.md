@@ -177,8 +177,9 @@ runtime and no hand-rolled epoll.
   a notification each, and when a change cannot be placed for sure (a
   route of bgpfcd's among others' at one destination and metric): 100 ms
   after the first cause and a second after the read before at the
-  earliest. It never writes to the kernel, in dry-run and install mode
-  alike.
+  earliest, and again, after a pause that doubles up to a minute, while a
+  read is not the whole table. It never writes to the kernel, in dry-run
+  and install mode alike.
 - **Control thread(s)**: the Unix-socket server and the HTTP server. They
   query the RIB and coordinator through request/response channels, for
   example `(Query, mpsc::Sender<Reply>)`. They never read shared state

@@ -58,6 +58,11 @@ pub struct Snapshot {
     pub mirror: Mirror,
     /// The interfaces, by index.
     pub links: Vec<Link>,
+    /// Whether it is the whole table: `false` when every try lost
+    /// notifications or met a change it cannot follow, so that a route
+    /// may have changed in the kernel since the dump read it, with
+    /// nothing left to say so. Read again then.
+    pub complete: bool,
 }
 
 /// A socket that follows the kernel's routes, interfaces and addresses.
@@ -111,7 +116,8 @@ impl Monitor {
     /// notifications were lost, or an interface went down or away, or an
     /// address went, during the dumps, the snapshot is taken again, up to
     /// three times; so it is when a change of routes came that the copy
-    /// cannot place ([`Unclear`]). The last is used as it is.
+    /// cannot place ([`Unclear`]). The last is used as it is, marked not
+    /// [`Snapshot::complete`].
     ///
     /// # Errors
     /// The socket's, a dump the kernel refuses, or a malformed reply.
@@ -139,6 +145,7 @@ impl Monitor {
                 return Ok(Snapshot {
                     mirror: d.mirror,
                     links: d.links.into_values().collect(),
+                    complete: !again,
                 });
             }
         }
@@ -686,22 +693,8 @@ mod root_tests {
             let before = monitor.snapshot().unwrap();
             let mut fib = Fib::new(Mode::Install, RT_TABLE_MAIN, RTPROT_BGP);
             fib.open().unwrap();
-            let changes: Vec<Change> = (0..2000u16)
-                .map(|i| {
-                    let [a, b] = i.to_be_bytes();
-                    Change {
-                        prefix: Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap(),
-                        hop: Some(crate::Hop {
-                            gateway: IpAddr::from([192, 0, 2, 1]),
-                            oif: None,
-                            onlink: false,
-                        }),
-                        previous: None,
-                    }
-                })
-                .collect();
             let mut out = Vec::new();
-            fib.set_all(changes, &mut out);
+            fib.set_all(many_routes(), &mut out);
             assert!(out.iter().all(|a| a.result.is_ok()));
             let lost = monitor.next_events().unwrap_err();
             assert!(
@@ -717,6 +710,69 @@ mod root_tests {
                 "{after:?}"
             );
             assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+        });
+    }
+
+    /// 2000 routes of ours, 10.0.0.0/24 to 10.7.207.0/24, through
+    /// 192.0.2.1.
+    fn many_routes() -> Vec<Change> {
+        (0..2000u16)
+            .map(|i| {
+                let [a, b] = i.to_be_bytes();
+                Change {
+                    prefix: Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap(),
+                    hop: Some(crate::Hop {
+                        gateway: IpAddr::from([192, 0, 2, 1]),
+                        oif: None,
+                        onlink: false,
+                    }),
+                    previous: None,
+                }
+            })
+            .collect()
+    }
+
+    /// While routes keep coming into the kernel faster than a small
+    /// receive buffer holds their notifications, as while a table loads,
+    /// every try of a snapshot loses some: it says it is not the whole
+    /// table, so that its reader reads again. Once they stop, a snapshot
+    /// is whole again.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN and CAP_NET_ADMIN: joins a network namespace and changes it"]
+    fn netns_a_snapshot_that_loses_notifications_is_not_whole() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        in_namespace(|| {
+            ip("link set lo up");
+            ip("addr add 192.0.2.10/24 dev lo");
+            let mut monitor = Monitor::open(RTPROT_BGP).unwrap();
+            monitor.socket().set_receive_buffer(4096).unwrap();
+            assert!(monitor.snapshot().unwrap().complete);
+            let go = Arc::new(AtomicBool::new(true));
+            // A thread started here is in the namespace too.
+            let writer = std::thread::spawn({
+                let go = Arc::clone(&go);
+                move || {
+                    let mut fib = Fib::new(Mode::Install, RT_TABLE_MAIN, RTPROT_BGP);
+                    fib.open().unwrap();
+                    while go.load(Ordering::Relaxed) {
+                        let mut out = Vec::new();
+                        fib.set_all(many_routes(), &mut out);
+                        assert!(out.iter().all(|a| a.result.is_ok()));
+                        assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+                    }
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut whole = 0;
+            while monitor.snapshot().unwrap().complete {
+                whole += 1;
+                assert!(Instant::now() < deadline, "{whole} snapshots were whole");
+            }
+            go.store(false, Ordering::Relaxed);
+            writer.join().expect("the writer");
+            assert!(monitor.snapshot().unwrap().complete);
         });
     }
 

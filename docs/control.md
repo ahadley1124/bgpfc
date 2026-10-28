@@ -399,26 +399,31 @@ notifications, when an interface goes down or away or an IPv4 address is
 removed, since IPv4 then removes the routes through it without a
 notification of their own, and when a change comes that it cannot place
 for sure, as where a route of bgpfcd's sits beside another program's at
-one prefix and metric; the RIB keeps its copy until the new one arrives
-whole. Such a reading comes 100 ms after what asked for it, with what
-else changed meanwhile, and a second after the start of the one before
-at the earliest. Notifications that come within 10 ms of the first of a
-batch reach the RIB together, by their net effect, so that a route
-deleted and added again at once changes nothing. The thread never writes
-to the kernel, in dry-run and install mode alike.
+one prefix and metric; the RIB keeps its copy until the new one arrives.
+Such a reading comes 100 ms after what asked for it, with what else
+changed meanwhile, and a second after the start of the one before at the
+earliest. One that lost notifications on the way, or met a change it could
+not place, is not the whole table: its line says `complete=no`, the RIB
+takes it all the same, and the thread reads again (`incomplete`) after a
+pause that doubles from a second to a minute while that goes on.
+Notifications that come within 10 ms of the first of a batch reach the RIB
+together, by their net effect, so that a route deleted and added again at
+once changes nothing. The thread never writes to the kernel, in dry-run
+and install mode alike.
 
 ```
 2026-10-27T12:34:56.789Z INFO  msg="kernel: table read" routes=12 links=4 reason=startup
 ```
 
 `routes` is the routes kept, `links` the interfaces. The line is at info
-at startup and after the thread opened a new socket (`reopened`, after
-an error of the old one, which is logged at error); at `debug` for the
-reads an interface going down (`link-down`) or away (`link-gone`), an
-IPv4 address removed (`address-removed`), lost notifications
-(`lost-events`) or a change it cannot place (`unclear`) ask for. Lost
-notifications also have a line at warn, at once and then at most one a
-minute, `times` counting those since the line before:
+at startup and after the thread opened a new socket (`reopened`, after an
+error of the old one, which is logged at error); at `debug` for the reads
+an interface going down (`link-down`) or away (`link-gone`), an IPv4
+address removed (`address-removed`), lost notifications (`lost-events`), a
+change it cannot place (`unclear`) or a reading before that was not whole
+(`incomplete`) ask for. Lost notifications also have a line at warn, at
+once and then at most one a minute, `times` counting those since the line
+before:
 
 ```
 2026-10-27T12:34:56.789Z WARN  msg="kernel: route events lost, reading the table again" times=1

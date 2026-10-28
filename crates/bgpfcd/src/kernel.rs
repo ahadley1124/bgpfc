@@ -38,16 +38,22 @@
 //! earliest, so that what else changes meanwhile, such as the rest of an
 //! interface's going, is read with it, and interfaces that come and go
 //! all the time cost a read a second at most; the changes that come
-//! meanwhile go to the RIB as they come. The RIB keeps its copy until the
-//! new one arrives whole. Any other error of the socket closes it, and the
-//! thread opens a new one and reads the table, after a pause that doubles
-//! up to a minute while that fails.
+//! meanwhile go to the RIB as they come. A read that lost notifications
+//! on the way, or met a change it could not place, is no whole table: the
+//! RIB takes it, as it is nearer the kernel's than the copy it has, and
+//! the thread reads again after a pause that doubles from [`RETRY_FIRST`]
+//! to [`RETRY_MAX`] while that goes on. The RIB keeps its copy until a new
+//! one arrives. Any other error of the socket closes it, and the thread
+//! opens a new one and reads the table, after a pause that doubles up to
+//! a minute while that fails.
 //!
 //! # Logging
 //!
-//! `kernel: table read`, with the routes kept, the interfaces and why: at
-//! info at startup and after a new socket, at debug when read again for
-//! an interface, an address or lost notifications. Lost notifications
+//! `kernel: table read`, with the routes kept, the interfaces and why, and
+//! `complete=no` for a read that is not the whole table: at info at
+//! startup and after a new socket, at debug when read again for an
+//! interface, an address, lost notifications, a change the copy could not
+//! place, or a read before that was not whole. Lost notifications
 //! have a line at warn of their own, the first at once and then at most
 //! one a minute, which counts those since the line before.
 
@@ -103,6 +109,15 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(100);
 /// times a second cost a read a second at most.
 pub(crate) const SPACING: Duration = Duration::from_secs(1);
 
+/// After a read that was not the whole table, the pause before the next,
+/// doubled while reads keep not being whole, up to [`RETRY_MAX`]: a table
+/// that loads into the kernel, bgpfcd's own among them, overflows the
+/// socket until it is in.
+pub(crate) const RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest pause between two reads that are not the whole table.
+pub(crate) const RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// Why the thread reads the whole table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -121,6 +136,8 @@ pub(crate) enum Reason {
     /// A change of routes that the copy cannot place for sure
     /// (`bgpfc_fib::mirror::Unclear`).
     Unclear,
+    /// The read before was not the whole table.
+    Incomplete,
 }
 
 impl Reason {
@@ -134,6 +151,7 @@ impl Reason {
             Reason::AddressRemoved => "address-removed",
             Reason::Reopened => "reopened",
             Reason::Unclear => "unclear",
+            Reason::Incomplete => "incomplete",
         }
     }
 }
@@ -164,6 +182,9 @@ pub(crate) struct Due {
     next: Option<(Reason, Instant)>,
     /// When the read before started.
     last: Option<Instant>,
+    /// The pause before reading again after a read that was not the
+    /// whole table; zero after one that was.
+    retry: Duration,
 }
 
 impl Due {
@@ -195,6 +216,22 @@ impl Due {
         self.next = None;
         self.last = Some(now);
         Some(reason)
+    }
+
+    /// A read ended at `now`, the whole table or not. After one that was
+    /// not whole, another comes after a pause that doubles while they are
+    /// not, from [`RETRY_FIRST`] to [`RETRY_MAX`], or sooner if asked for.
+    pub(crate) fn ended(&mut self, whole: bool, now: Instant) {
+        if whole {
+            self.retry = Duration::ZERO;
+            return;
+        }
+        self.retry = (self.retry * 2).clamp(RETRY_FIRST, RETRY_MAX);
+        let at = now + self.retry;
+        self.next = Some(match self.next {
+            Some((first, due)) => (first, due.min(at)),
+            None => (Reason::Incomplete, at),
+        });
     }
 }
 
@@ -336,13 +373,16 @@ fn run(mut t: Tracker, rib: &SyncSender<RibMsg>) {
 }
 
 impl Tracker {
-    /// Read the whole table on the socket, for `reason`.
+    /// Read the whole table on the socket, for `reason`; one that is not
+    /// whole asks for another ([`Due::ended`]).
     fn read(&mut self, reason: Reason) -> Result<KernelUpdate, FibError> {
         let snapshot = self.monitor.snapshot()?;
+        let complete = snapshot.complete;
         let (update, links, mirror) = table(snapshot);
         self.links = links;
         self.mirror = mirror;
-        let line = table_line(&update, reason);
+        self.due.ended(complete, Instant::now());
+        let line = table_line(&update, reason, complete);
         log_line(line.level, line.msg, &line.fields);
         Ok(update)
     }
@@ -485,9 +525,9 @@ pub(crate) fn classify(
     (changes, reason)
 }
 
-/// The line of a table read for `reason`: at info at startup and after a
-/// new socket, at debug otherwise.
-fn table_line(update: &KernelUpdate, reason: Reason) -> Line {
+/// The line of a table read for `reason`, `complete` or not: at info at
+/// startup and after a new socket, at debug otherwise.
+fn table_line(update: &KernelUpdate, reason: Reason, complete: bool) -> Line {
     let (routes, links) = match update {
         KernelUpdate::Table { routes, links } => (routes.len(), links.len()),
         KernelUpdate::Changes(_) => (0, 0),
@@ -499,14 +539,18 @@ fn table_line(update: &KernelUpdate, reason: Reason) -> Line {
             | Reason::LinkDown
             | Reason::LinkGone
             | Reason::AddressRemoved
-            | Reason::Unclear => Level::Debug,
+            | Reason::Unclear
+            | Reason::Incomplete => Level::Debug,
         },
         msg: TABLE_READ,
-        fields: vec![
+        fields: [
             ("routes", routes.to_string()),
             ("links", links.to_string()),
             ("reason", reason.as_str().to_owned()),
-        ],
+        ]
+        .into_iter()
+        .chain((!complete).then(|| ("complete", "no".to_owned())))
+        .collect(),
     }
 }
 
@@ -655,6 +699,7 @@ mod tests {
                     up: false,
                 },
             ],
+            complete: true,
         };
         let (update, links, mirror) = table(snapshot);
         assert_eq!(
@@ -839,7 +884,7 @@ mod tests {
             }],
             links: vec![(1, "lo".to_owned())],
         };
-        let line = table_line(&update, Reason::Startup);
+        let line = table_line(&update, Reason::Startup, true);
         assert_eq!(
             line,
             Line {
@@ -852,17 +897,25 @@ mod tests {
                 ],
             }
         );
-        assert_eq!(table_line(&update, Reason::Reopened).level, Level::Info);
+        assert_eq!(
+            table_line(&update, Reason::Reopened, true).level,
+            Level::Info
+        );
         for reason in [
             Reason::LostEvents,
             Reason::LinkDown,
             Reason::LinkGone,
             Reason::AddressRemoved,
+            Reason::Unclear,
+            Reason::Incomplete,
         ] {
-            let line = table_line(&update, reason);
+            let line = table_line(&update, reason, true);
             assert_eq!(line.level, Level::Debug);
             assert_eq!(line.fields[2], ("reason", reason.as_str().to_owned()));
         }
+        // A read that is not the whole table says so.
+        let line = table_line(&update, Reason::LostEvents, false);
+        assert_eq!(line.fields[3], ("complete", "no".to_owned()));
     }
 
     /// Datagrams a test hands the thread, one a read, as the socket would.
@@ -980,6 +1033,37 @@ mod tests {
         let later = t0 + ms(5000);
         due.ask(Reason::LostEvents, later);
         assert_eq!(due.start(later + SETTLE), Some(Reason::LostEvents));
+    }
+
+    /// A read that is not the whole table asks for another, after a pause
+    /// that doubles while they are not, up to a minute, and never gives up;
+    /// a whole one ends that. Something that asks sooner is held back by
+    /// the spacing alone, and its reason gives way to the first.
+    #[test]
+    fn reads_that_are_not_whole_are_read_again() {
+        let t0 = Instant::now();
+        let mut due = Due::default();
+        due.ended(true, t0);
+        assert_eq!(due.at(), None, "a whole read asks for no other");
+        let mut now = t0;
+        let mut pauses = Vec::new();
+        for _ in 0..9 {
+            due.ended(false, now);
+            let at = due.at().unwrap();
+            pauses.push((at - now).as_secs());
+            assert_eq!(due.start(at), Some(Reason::Incomplete));
+            now = at;
+        }
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        due.ended(false, now);
+        due.ask(Reason::AddressRemoved, now);
+        assert_eq!(due.at(), Some(now + SPACING));
+        assert_eq!(due.start(now + SPACING), Some(Reason::Incomplete));
+        // A whole read: the next that is not starts the pauses over.
+        due.ended(true, now + SPACING);
+        assert_eq!(due.at(), None);
+        due.ended(false, now + SPACING);
+        assert_eq!(due.at(), Some(now + SPACING + RETRY_FIRST));
     }
 
     /// Lost notifications: a line at once, then at most one a minute,
