@@ -3,11 +3,15 @@
 //! 2.4, 3.8).
 //!
 //! It owns a netlink socket of its own, subscribed to the route,
-//! interface and address groups (`bgpfc_fib::monitor::Monitor`), blocks
-//! in `recv`, and hands the RIB thread what matters as
-//! [`RibMsg::Kernel`]: the routes of the main table that are neither
-//! bgpfcd's own nor a default route (`bgpfc_fib::kernel::relevant`), and
-//! interface names for display. It never writes to the kernel, so it
+//! interface and address groups (`bgpfc_fib::monitor::Monitor`), waits
+//! on it, and hands the RIB thread what matters as [`RibMsg::Kernel`]:
+//! the routes of the main table that are neither bgpfcd's own nor a
+//! default route (`bgpfc_fib::kernel::relevant`), and interface names for
+//! display. It gathers the notifications that come within [`GATHER`] of
+//! the first and hands their net effect on together, so that a route
+//! deleted and added again, as BIRD replaces an IPv6 route and an
+//! operator does with `ip route del` and `ip route add`, moves nothing in
+//! the RIB, the FIB or the neighbors. It never writes to the kernel, so it
 //! works the same in dry-run and install mode. It resolves nothing
 //! itself: the set of next hops in use changes with every UPDATE, and
 //! only the RIB thread knows it.
@@ -78,6 +82,11 @@ const REOPEN_FIRST: Duration = Duration::from_secs(1);
 /// The longest pause between two attempts to open a new socket.
 const REOPEN_MAX: Duration = Duration::from_secs(60);
 
+/// How long the thread gathers notifications after the first of a batch
+/// before it hands them on: a route deleted and then added again, as two
+/// requests back to back, reaches the RIB as no change at all.
+pub(crate) const GATHER: Duration = Duration::from_millis(10);
+
 /// Why the thread reads the whole table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -129,6 +138,70 @@ pub(crate) struct Tracker {
     mirror: Mirror,
 }
 
+/// What the thread reads notifications from: the monitor's socket, and a
+/// script of datagrams in the tests.
+pub(crate) trait Source {
+    /// Whether a datagram, or an error such as `ENOBUFS`, waits to be read,
+    /// once one does or `timeout` has passed (`None`: no limit).
+    fn wait(&self, timeout: Option<Duration>) -> Result<bool, FibError>;
+    /// The notifications of the next datagram.
+    fn next_events(&mut self) -> Result<Vec<Event>, FibError>;
+}
+
+impl Source for Monitor {
+    fn wait(&self, timeout: Option<Duration>) -> Result<bool, FibError> {
+        Monitor::wait(self, timeout)
+    }
+
+    fn next_events(&mut self) -> Result<Vec<Event>, FibError> {
+        Monitor::next_events(self)
+    }
+}
+
+/// The notifications of one batch, in the order they came, and whether
+/// the kernel dropped some meanwhile (`ENOBUFS`).
+#[derive(Debug, Default)]
+pub(crate) struct Gathered {
+    events: Vec<Event>,
+    lost: bool,
+}
+
+/// The notifications on `source` that come within `window` of the first,
+/// which is waited for until `until` has passed (`None`: no limit): none
+/// if it has not come by then. The thread gathers for [`GATHER`].
+///
+/// # Errors
+/// The source's, but `ENOBUFS`, which the batch notes as lost.
+pub(crate) fn gather(
+    source: &mut impl Source,
+    until: Option<Duration>,
+    window: Duration,
+) -> Result<Gathered, FibError> {
+    let mut batch = Gathered::default();
+    if !source.wait(until)? {
+        return Ok(batch);
+    }
+    let first = Instant::now();
+    loop {
+        match source.next_events() {
+            Ok(events) => batch.events.extend(events),
+            // Notifications dropped; the next ones are read on.
+            Err(FibError::Io(e)) if e.raw_os_error() == Some(ENOBUFS) => batch.lost = true,
+            Err(e) => return Err(e),
+        }
+        let Some(left) = window
+            .checked_sub(first.elapsed())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        if !source.wait(Some(left))? {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
 /// Open the socket and read the kernel's table: what `main` gives the
 /// RIB before any route arrives (m15 design 3.8), and the socket the
 /// thread then follows the table on. Called before the privilege drop:
@@ -166,20 +239,22 @@ pub(crate) fn spawn(tracker: Tracker, rib: SyncSender<RibMsg>) {
 fn run(mut t: Tracker, rib: &SyncSender<RibMsg>) {
     let mut lost = Lost::default();
     loop {
-        let update = match t.monitor.next_events() {
-            Ok(events) => match classify(events, &mut t.links, &mut t.mirror) {
-                (_, Some(reason)) => {
+        let update = match gather(&mut t.monitor, None, GATHER) {
+            Ok(batch) => {
+                let (changes, reason) = classify(batch.events, &mut t.links, &mut t.mirror);
+                if batch.lost {
+                    if let Some(times) = lost.note(Instant::now()) {
+                        bgpfc_log::warn!(LOST, times = times);
+                    }
+                    t.read(Reason::LostEvents)
+                } else if let Some(reason) = reason {
                     bgpfc_log::debug!("kernel: reading the table again", reason = reason.as_str());
                     t.read(reason)
+                } else if changes.is_empty() {
+                    continue;
+                } else {
+                    Ok(KernelUpdate::Changes(changes))
                 }
-                (changes, None) if changes.is_empty() => continue,
-                (changes, None) => Ok(KernelUpdate::Changes(changes)),
-            },
-            Err(FibError::Io(e)) if e.raw_os_error() == Some(ENOBUFS) => {
-                if let Some(times) = lost.note(Instant::now()) {
-                    bgpfc_log::warn!(LOST, times = times);
-                }
-                t.read(Reason::LostEvents)
             }
             Err(e) => Err(e),
         };
@@ -271,7 +346,7 @@ pub(crate) fn kernel_route(prefix: Prefix, metric: u32, via: kernel::Via) -> Ker
     }
 }
 
-/// What one datagram of notifications means for the RIB's copy: for
+/// What a batch of notifications means for the RIB's copy: for
 /// each destination and metric whose routes they touched, the route the
 /// kernel uses there now, or its absence, when that differs from before
 /// them, so that a route removed and added again in one batch changes
@@ -398,6 +473,7 @@ impl Lost {
 mod tests {
     use super::*;
 
+    use std::collections::VecDeque;
     use std::net::IpAddr;
 
     use bgpfc_fib::kernel::{Link, NextHop, Route};
@@ -720,6 +796,96 @@ mod tests {
             assert_eq!(line.level, Level::Debug);
             assert_eq!(line.fields[2], ("reason", reason.as_str().to_owned()));
         }
+    }
+
+    /// Datagrams a test hands the thread, one a read, as the socket would.
+    struct Script(VecDeque<Result<Vec<Event>, FibError>>);
+
+    impl Source for Script {
+        fn wait(&self, _: Option<Duration>) -> Result<bool, FibError> {
+            Ok(!self.0.is_empty())
+        }
+
+        fn next_events(&mut self) -> Result<Vec<Event>, FibError> {
+            self.0.pop_front().expect("a datagram waits")
+        }
+    }
+
+    fn enobufs() -> FibError {
+        FibError::Io(std::io::Error::from_raw_os_error(ENOBUFS))
+    }
+
+    /// A route deleted and added again, as BIRD replaces an IPv6 route,
+    /// comes as two datagrams. Gathered together they change nothing; one
+    /// at a time, as each read used to hand them on, they took the route
+    /// away and then back, and with it every route through the next hops
+    /// it resolves.
+    #[test]
+    fn a_route_deleted_and_added_again_together_moves_nothing() {
+        let r = route("192.0.2.128/25", 5, Some("10.1.0.2"));
+        let datagrams = || {
+            Script(VecDeque::from([
+                Ok(vec![Event::RouteGone(r.clone())]),
+                Ok(vec![added(r.clone(), ADD)]),
+            ]))
+        };
+        let with_route = || {
+            let (mut links, mut mirror) = (Links::new(), Mirror::new(RTPROT_BGP));
+            classify(vec![added(r.clone(), ADD)], &mut links, &mut mirror);
+            (links, mirror)
+        };
+        let (mut links, mut mirror) = with_route();
+        let mut source = datagrams();
+        let batch = gather(&mut source, None, Duration::from_secs(3600)).unwrap();
+        assert!(source.0.is_empty() && !batch.lost);
+        assert_eq!(batch.events.len(), 2);
+        let (changes, reason) = classify(batch.events, &mut links, &mut mirror);
+        assert_eq!((changes, reason), (vec![], None));
+        // One datagram a batch: gone, then back.
+        let (mut links, mut mirror) = with_route();
+        let mut source = datagrams();
+        let mut each = Vec::new();
+        while !source.0.is_empty() {
+            let batch = gather(&mut source, None, Duration::ZERO).unwrap();
+            each.push(classify(batch.events, &mut links, &mut mirror).0);
+        }
+        assert_eq!(
+            each,
+            [
+                vec![KernelChange::Gone {
+                    prefix: p("192.0.2.128/25"),
+                    metric: 5
+                }],
+                vec![KernelChange::Route(rib_route(
+                    "192.0.2.128/25",
+                    5,
+                    Some("10.1.0.2")
+                ))],
+            ]
+        );
+    }
+
+    /// Nothing by the time given: an empty batch. Lost notifications are
+    /// noted and the next datagrams read on; any other error ends the
+    /// batch.
+    #[test]
+    fn a_batch_notes_lost_notifications_and_fails_on_other_errors() {
+        let mut none = Script(VecDeque::new());
+        let batch = gather(&mut none, Some(Duration::ZERO), GATHER).unwrap();
+        assert!(batch.events.is_empty() && !batch.lost);
+        let r = route("192.0.2.128/25", 5, Some("10.1.0.2"));
+        let mut lost = Script(VecDeque::from([
+            Err(enobufs()),
+            Ok(vec![added(r.clone(), ADD)]),
+        ]));
+        let batch = gather(&mut lost, None, Duration::from_secs(3600)).unwrap();
+        assert!(batch.lost);
+        assert_eq!(batch.events, [added(r, ADD)]);
+        let mut failed = Script(VecDeque::from([Err(FibError::Kernel(22))]));
+        assert!(matches!(
+            gather(&mut failed, None, GATHER),
+            Err(FibError::Kernel(22))
+        ));
     }
 
     /// Lost notifications: a line at once, then at most one a minute,

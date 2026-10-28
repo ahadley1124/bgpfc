@@ -26,6 +26,7 @@
 //! would otherwise be applied over newer dump entries.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use bgpfc_sys::NetlinkSocket;
 use bgpfc_wire::types::Afi;
@@ -141,6 +142,16 @@ impl Monitor {
                 });
             }
         }
+    }
+
+    /// Wait until a notification, or an error such as `ENOBUFS`, is there
+    /// to read with [`Monitor::next_events`] without blocking, or until
+    /// `timeout` passes (`None`: no limit): whether one is.
+    ///
+    /// # Errors
+    /// The socket's.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<bool, FibError> {
+        Ok(self.socket.wait(timeout)?)
     }
 
     /// The next notifications: one datagram's worth, decoded and filtered

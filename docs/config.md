@@ -1105,7 +1105,11 @@ cannot place for sure: where a route of bgpfcd's sits beside another
 program's at one prefix and metric, the kernel's notification does not
 say whose route a replacement replaced. Until a new reading is whole the RIB keeps
 the one it has, so neither at startup nor after lost notifications does a
-next hop look unresolvable, or resolvable, for want of a table.
+next hop look unresolvable, or resolvable, for want of a table. The
+notifications that come within a hundredth of a second of the first of a
+batch reach the RIB together, by their net effect: a route deleted and
+added again at once, as `ip route del` and `ip route add` in one
+`ip -batch`, or BIRD replacing an IPv6 route, changes nothing.
 
 **Network namespace.** `netns NAME;` makes bgpfcd join the network
 namespace `/run/netns/NAME`, the file `ip netns add NAME` creates

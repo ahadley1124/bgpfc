@@ -437,6 +437,36 @@ impl Routed {
         self.assert_in_use(e);
     }
 
+    /// The static route the next hop resolves through, deleted and added
+    /// again at once, in one `ip -batch` (as an operator replaces a route,
+    /// and BIRD an IPv6 one): the kernel thread hands the RIB the net
+    /// effect of what comes together, none, so no next hop changes, the
+    /// route stays installed and A keeps it.
+    fn assert_a_replace_moves_nothing(&self, e: &Expect) {
+        let a = self.lab.a_addr.to_string();
+        let next_hop = format!("{}/32", self.lo.c_next_hop);
+        let batch = self.lab.dir.join("replace.batch");
+        std::fs::write(
+            &batch,
+            format!(
+                "route del {next_hop} via {a} proto static\n\
+                 route add {next_hop} via {a} proto static\n"
+            ),
+        )
+        .expect("batch file");
+        let before = self.bgpfcd.log_text().len();
+        self.ip_in_b(&["-batch", &batch.display().to_string()]);
+        // Long enough for the kernel thread, the RIB and the FIB to have
+        // acted on it, and for a withdrawal to have reached A.
+        std::thread::sleep(Duration::from_secs(2));
+        let log = self.bgpfcd.log_text();
+        let after = log.get(before..).unwrap_or_default();
+        assert!(Routed::next_hops_changed(after).is_empty(), "{after}");
+        assert!(self.installed().starts_with(&e.via), "{}", self.report());
+        assert!(self.a_has_route(), "{}", self.report());
+        assert_eq!(self.next_hop(), e.resolved, "{}", self.report());
+    }
+
     /// C's route is the best, installed through A, which has it from
     /// bgpfcd, and its next hop resolves through the static route.
     fn assert_in_use(&self, e: &Expect) {
@@ -573,6 +603,7 @@ fn routes_install_via_the_resolved_gateway_and_follow_it() {
     s.assert_held_when_the_next_hop_goes();
     s.assert_back_when_the_next_hop_returns(&e);
     s.assert_another_programs_route_stays(&e);
+    s.assert_a_replace_moves_nothing(&e);
 
     // The session with C was never touched: one session, still up.
     assert!(s.neighbor_c().contains("state Established"));
