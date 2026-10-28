@@ -474,13 +474,25 @@ mod socket_tests {
             if host.is_ipv4() {
                 assert_eq!(near.ttl().unwrap(), 7);
             }
-            // The stream blocks again: a read waits for its timeout.
+            // The stream blocks again: a read waits for its timeout. A read
+            // with SO_RCVTIMEO is never restarted after a signal handler
+            // runs on its thread (signal(7)). As a user, the privilege tests
+            // in this binary call setgroups/setgid/setuid, and glibc runs a
+            // handler on every thread for those, so CI's read fails with
+            // EINTR; a stop and continue does the same. That shows it
+            // blocked too: a non-blocking read never sleeps, so it fails at
+            // once with EAGAIN and never with EINTR.
             near.set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
             let started = Instant::now();
             let e = near.read(&mut [0; 1]).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
-            assert!(started.elapsed() >= Duration::from_millis(150), "{host}");
+            match e.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() >= Duration::from_millis(150), "{host}");
+                }
+                _ => panic!("{host}: {e}"),
+            }
         }
     }
 
