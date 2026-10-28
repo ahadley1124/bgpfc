@@ -101,6 +101,7 @@ pub(crate) const FD_CLOEXEC: c_int = 1;
 pub(crate) const O_CLOEXEC: c_int = 0o2_000_000;
 pub(crate) const O_NONBLOCK: c_int = 0o4_000;
 // <asm-generic/poll.h>
+pub(crate) const POLLIN: c_short = 0x1;
 pub(crate) const POLLOUT: c_short = 0x4;
 pub(crate) const POLLERR: c_short = 0x8;
 pub(crate) const POLLHUP: c_short = 0x10;

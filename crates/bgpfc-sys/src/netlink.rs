@@ -11,7 +11,9 @@
 use std::ffi::{c_int, c_void};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
+use crate::connect::poll_millis;
 use crate::ffi;
 use crate::tcp::set_int;
 
@@ -179,6 +181,45 @@ impl NetlinkSocket {
         Ok(())
     }
 
+    /// Wait until [`NetlinkSocket::recv`] would not block, as a datagram
+    /// or an error such as `ENOBUFS` waits, or until `timeout` passes
+    /// (`None`: no limit), with `poll(2)`: whether it would not. A
+    /// reader that gathers what comes within a while, or that has
+    /// something to do at a time of its own, waits so rather than in
+    /// `recv`. A signal for the process (`EINTR`) does not end the wait
+    /// early.
+    ///
+    /// # Errors
+    /// The `poll` failure.
+    #[allow(unsafe_code, reason = "FFI call with a borrowed pollfd")]
+    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        let deadline = timeout.map(|t| Instant::now().checked_add(t));
+        let mut pfd = ffi::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: ffi::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let wait = match deadline {
+                Some(Some(d)) => poll_millis(d.saturating_duration_since(Instant::now())),
+                // No limit, or one too far to tell from none.
+                Some(None) | None => -1,
+            };
+            // SAFETY: `pfd` lives on this frame for the call and is the
+            // one entry the count says; the descriptor belongs to `self`,
+            // which outlives the call.
+            let rc = unsafe { ffi::poll(&raw mut pfd, 1, wait) };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(ffi::EINTR) {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(rc > 0);
+        }
+    }
+
     /// Receive one datagram into `buf`; the number of bytes written.
     /// Blocks until the kernel answers, or, on a subscribed socket, until
     /// a notification comes.
@@ -240,6 +281,31 @@ mod tests {
         assert!(n >= 16, "{n} bytes");
         // The reply's sequence number is ours.
         assert_eq!(u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]), 1);
+    }
+
+    /// A socket with nothing to read says so at once, or once its wait is
+    /// over; one the kernel has answered says it has something, and the
+    /// answer is there to read.
+    #[test]
+    fn wait_says_whether_a_datagram_waits() {
+        let s = NetlinkSocket::open().expect("netlink socket");
+        assert!(!s.wait(Some(Duration::ZERO)).unwrap());
+        let start = Instant::now();
+        assert!(!s.wait(Some(Duration::from_millis(30))).unwrap());
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        // RTM_GETLINK with NLM_F_DUMP, as in `open_send_and_receive`.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&20u32.to_ne_bytes());
+        msg.extend_from_slice(&18u16.to_ne_bytes());
+        msg.extend_from_slice(&0x301u16.to_ne_bytes());
+        msg.extend_from_slice(&1u32.to_ne_bytes());
+        msg.extend_from_slice(&0u32.to_ne_bytes());
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+        s.send(&msg).expect("send");
+        assert!(s.wait(Some(Duration::from_secs(5))).unwrap());
+        assert!(s.wait(None).unwrap());
+        let mut buf = vec![0u8; 65536];
+        assert!(s.recv(&mut buf).expect("recv") >= 16);
     }
 
     /// Joining groups needs no privilege, and the receive buffer can be

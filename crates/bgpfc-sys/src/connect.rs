@@ -320,7 +320,7 @@ fn wait_connected(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<(
 
 /// `left` as `poll(2)`'s timeout: milliseconds, rounded up so that a wait
 /// never ends before the deadline, and at most `c_int::MAX`.
-fn poll_millis(left: Duration) -> c_int {
+pub(crate) fn poll_millis(left: Duration) -> c_int {
     let millis = left.as_nanos().div_ceil(1_000_000);
     c_int::try_from(millis).unwrap_or(c_int::MAX)
 }
