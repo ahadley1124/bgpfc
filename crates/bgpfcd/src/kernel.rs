@@ -47,6 +47,14 @@
 //! opens a new one and reads the table, after a pause that doubles up to
 //! a minute while that fails.
 //!
+//! IPv4 removes bgpfcd's own routes through an interface that goes down,
+//! or loses its address, without a notification, and the interface may be
+//! back before the thread reads the table, which then changes nothing. So
+//! after a whole read that such an event, lost notifications, a change it
+//! could not place or a new socket asked for, the thread has the FIB check
+//! its routes against the kernel's ([`RibMsg::VerifyFib`]), after the
+//! RIB's changes of that table.
+//!
 //! # Logging
 //!
 //! `kernel: table read`, with the routes kept, the interfaces and why, and
@@ -141,6 +149,15 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
+    /// Whether what it stands for may have removed routes of bgpfcd's from
+    /// the kernel without a notification each, so that the FIB is to check
+    /// them once the table is read whole: an interface down or gone, an
+    /// address removed, notifications lost, a change that could not be
+    /// placed, a new socket.
+    pub(crate) const fn verifies(self) -> bool {
+        !matches!(self, Reason::Startup | Reason::Incomplete)
+    }
+
     /// The name the log lines use.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -172,6 +189,9 @@ pub(crate) struct Tracker {
     mirror: Mirror,
     /// The next read of the whole table.
     due: Due,
+    /// Whether the FIB is to check its routes once the RIB has the table
+    /// just read.
+    verify_now: bool,
 }
 
 /// A read of the whole table to come.
@@ -185,6 +205,9 @@ pub(crate) struct Due {
     /// The pause before reading again after a read that was not the
     /// whole table; zero after one that was.
     retry: Duration,
+    /// Whether the FIB is to check its routes once the table is read
+    /// whole ([`Reason::verifies`]).
+    verify: bool,
 }
 
 impl Due {
@@ -192,6 +215,7 @@ impl Due {
     /// [`SPACING`] after the start of the read before at the earliest;
     /// sooner if one is due sooner already, with the reason it has.
     pub(crate) fn ask(&mut self, reason: Reason, now: Instant) {
+        self.verify |= reason.verifies();
         let mut at = now + SETTLE;
         if let Some(last) = self.last {
             at = at.max(last + SPACING);
@@ -218,13 +242,15 @@ impl Due {
         Some(reason)
     }
 
-    /// A read ended at `now`, the whole table or not. After one that was
-    /// not whole, another comes after a pause that doubles while they are
-    /// not, from [`RETRY_FIRST`] to [`RETRY_MAX`], or sooner if asked for.
-    pub(crate) fn ended(&mut self, whole: bool, now: Instant) {
+    /// A read ended at `now`, the whole table or not: whether the FIB is
+    /// to check its routes now, which waits for a whole read. After one
+    /// that was not whole, another comes after a pause that doubles while
+    /// they are not, from [`RETRY_FIRST`] to [`RETRY_MAX`], or sooner if
+    /// asked for.
+    pub(crate) fn ended(&mut self, whole: bool, now: Instant) -> bool {
         if whole {
             self.retry = Duration::ZERO;
-            return;
+            return std::mem::take(&mut self.verify);
         }
         self.retry = (self.retry * 2).clamp(RETRY_FIRST, RETRY_MAX);
         let at = now + self.retry;
@@ -232,6 +258,7 @@ impl Due {
             Some((first, due)) => (first, due.min(at)),
             None => (Reason::Incomplete, at),
         });
+        false
     }
 }
 
@@ -314,6 +341,7 @@ pub(crate) fn open(protocol: u8) -> Result<(Tracker, KernelUpdate), FibError> {
         links: Links::new(),
         mirror: Mirror::new(protocol),
         due: Due::default(),
+        verify_now: false,
     };
     let update = tracker.read(Reason::Startup)?;
     Ok((tracker, update))
@@ -369,19 +397,26 @@ fn run(mut t: Tracker, rib: &SyncSender<RibMsg>) {
         if rib.send(RibMsg::Kernel(update)).is_err() {
             return;
         }
+        // Once the RIB has acted on the table, which may change no route
+        // even though the kernel lost some of bgpfcd's, as when an
+        // interface went down and came back up before the read.
+        if std::mem::take(&mut t.verify_now) && rib.send(RibMsg::VerifyFib).is_err() {
+            return;
+        }
     }
 }
 
 impl Tracker {
     /// Read the whole table on the socket, for `reason`; one that is not
-    /// whole asks for another ([`Due::ended`]).
+    /// whole asks for another, and a whole one says whether the FIB is to
+    /// check its routes ([`Due::ended`]).
     fn read(&mut self, reason: Reason) -> Result<KernelUpdate, FibError> {
         let snapshot = self.monitor.snapshot()?;
         let complete = snapshot.complete;
         let (update, links, mirror) = table(snapshot);
         self.links = links;
         self.mirror = mirror;
-        self.due.ended(complete, Instant::now());
+        self.verify_now = self.due.ended(complete, Instant::now());
         let line = table_line(&update, reason, complete);
         log_line(line.level, line.msg, &line.fields);
         Ok(update)
@@ -397,6 +432,8 @@ impl Tracker {
             match Monitor::open(self.protocol) {
                 Ok(monitor) => {
                     self.monitor = monitor;
+                    // What the old socket missed may have removed routes.
+                    self.due.verify = true;
                     match self.read(Reason::Reopened) {
                         Ok(update) => return update,
                         Err(e) => bgpfc_log::error!("kernel: cannot read the table", error = e),
@@ -1064,6 +1101,41 @@ mod tests {
         assert_eq!(due.at(), None);
         due.ended(false, now + SPACING);
         assert_eq!(due.at(), Some(now + SPACING + RETRY_FIRST));
+    }
+
+    /// The FIB checks its routes after a whole read that something which
+    /// may remove routes silently asked for: not after the startup read,
+    /// not after one that is not whole, which waits for the next, and once
+    /// for all that asked.
+    #[test]
+    fn the_fib_checks_its_routes_after_a_whole_read() {
+        let t0 = Instant::now();
+        let mut due = Due::default();
+        assert!(!due.ended(true, t0), "startup");
+        due.ask(Reason::LinkDown, t0);
+        due.ask(Reason::AddressRemoved, t0);
+        assert_eq!(due.start(t0 + SETTLE), Some(Reason::LinkDown));
+        assert!(!due.ended(false, t0 + SETTLE));
+        let retry = due.at().unwrap();
+        assert_eq!(due.start(retry), Some(Reason::Incomplete));
+        assert!(due.ended(true, retry));
+        // Asked for once, checked once.
+        let later = retry + SPACING;
+        due.ask(Reason::Unclear, later);
+        assert_eq!(due.start(later + SETTLE), Some(Reason::Unclear));
+        assert!(due.ended(true, later + SETTLE));
+        assert!(!due.ended(true, later + SETTLE));
+        for reason in [
+            Reason::LostEvents,
+            Reason::LinkDown,
+            Reason::LinkGone,
+            Reason::AddressRemoved,
+            Reason::Unclear,
+            Reason::Reopened,
+        ] {
+            assert!(reason.verifies(), "{reason:?}");
+        }
+        assert!(!Reason::Startup.verifies() && !Reason::Incomplete.verifies());
     }
 
     /// Lost notifications: a line at once, then at most one a minute,

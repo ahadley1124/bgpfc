@@ -911,4 +911,59 @@ mod root_tests {
             assert!(follow(&mut copy, &mut monitor, "192.0.2.4/32"));
         });
     }
+
+    /// IPv4 removes a route through an interface that goes down without a
+    /// notification, and the interface may be back before anything reads
+    /// the table: the FIB's check finds the loss and installs the route
+    /// again, and removes a route of its protocol it does not know.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN and CAP_NET_ADMIN: joins a network namespace and changes it"]
+    fn netns_a_check_puts_back_what_a_link_flap_took() {
+        in_namespace(|| {
+            ip("link set lo up");
+            ip("link add vf0 type veth peer name vf1");
+            ip("addr add 10.1.0.1/24 dev vf0");
+            ip("link set vf0 up");
+            ip("link set vf1 up");
+            let mut fib = Fib::new(Mode::Install, RT_TABLE_MAIN, RTPROT_BGP);
+            fib.open().unwrap();
+            let hop = crate::Hop {
+                gateway: IpAddr::from([10, 1, 0, 2]),
+                oif: Some(index_of("vf0")),
+                onlink: false,
+            };
+            let dst: Prefix = "203.0.113.0/24".parse().unwrap();
+            let set = fib.set(Change {
+                prefix: dst,
+                hop: Some(hop),
+                previous: None,
+            });
+            assert!(set.is_some_and(|a| a.result.is_ok()));
+            let mut out = Vec::new();
+            assert!(fib.verify(&mut out).unwrap().is_empty());
+            assert!(out.is_empty());
+            ip("link set vf0 down");
+            ip("link set vf0 up");
+            assert!(routes_to("203.0.113.0/24").is_empty(), "IPv4 kept it");
+            ip("route add 198.51.100.0/24 via 10.1.0.2 proto 186 metric 20");
+            let found = fib.verify(&mut out).unwrap();
+            assert_eq!(found.missing.len(), 1, "{found:?}");
+            assert_eq!(found.unknown.len(), 1, "{found:?}");
+            assert!(out.iter().all(|a| a.result.is_ok()), "{out:?}");
+            let back = routes_to("203.0.113.0/24");
+            assert!(
+                back.contains("via 10.1.0.2") && back.contains("proto bgp"),
+                "{back}"
+            );
+            assert_eq!(routes_to("198.51.100.0/24"), "");
+            assert_eq!(fib.installed().get(&dst), Some(&hop));
+            let mut again = Vec::new();
+            assert!(fib.verify(&mut again).unwrap().is_empty());
+            assert!(fib.clear().iter().all(|a| a.result.is_ok()));
+            // Dry-run checks nothing.
+            let mut dry = Fib::new(Mode::DryRun, RT_TABLE_MAIN, RTPROT_BGP);
+            dry.open().unwrap();
+            assert!(dry.verify(&mut again).unwrap().is_empty());
+        });
+    }
 }

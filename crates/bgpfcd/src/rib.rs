@@ -256,6 +256,17 @@ fn handle(
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
         RibMsg::Kernel(update) => kernel(rib, update, now, out),
+        // After the changes of the table it follows, which went first.
+        RibMsg::VerifyFib => verify_fib(fib),
+    }
+}
+
+/// The kernel thread's request that the FIB check the routes it
+/// installed, passed on in its place after the RIB's changes
+/// (`FibMsg::Verify`).
+fn verify_fib(fib: &SyncSender<FibMsg>) {
+    if fib.send(FibMsg::Verify).is_err() {
+        bgpfc_log::error!("fib thread gone");
     }
 }
 
@@ -2178,6 +2189,28 @@ mod tests {
                  next_hop=198.51.100.1 state=unresolved routes=3\n",
             ]
         );
+    }
+
+    /// The kernel thread's request that the FIB check its routes reaches
+    /// the FIB thread as it is, in its place among the RIB's changes.
+    #[test]
+    fn a_check_of_the_fib_goes_to_the_fib() {
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let (fib, fib_rx) = sync_channel(4);
+        let mut out = Vec::new();
+        super::handle(
+            &mut rib,
+            &mut settings,
+            &mut Transitions::default(),
+            RibMsg::VerifyFib,
+            Instant::now(),
+            &fib,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let msgs: Vec<FibMsg> = fib_rx.try_iter().collect();
+        assert!(matches!(&msgs[..], [FibMsg::Verify]), "{msgs:?}");
     }
 
     /// 192.0.2.0/24 connected on interface 2.

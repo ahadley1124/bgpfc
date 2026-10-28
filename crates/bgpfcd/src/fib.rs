@@ -234,6 +234,20 @@ fn serve(
                 fold.add(&applied, debug(), now(), out);
                 fold.end_change();
             }
+            FibMsg::Verify => {
+                match fib.verify(&mut applied) {
+                    Ok(found) if !found.is_empty() => out(lost_line(&found)),
+                    Ok(_) => {}
+                    Err(e) => out(Line {
+                        level: Level::Error,
+                        msg: "fib: cannot check the kernel's routes",
+                        fields: vec![("error", e.to_string())],
+                    }),
+                }
+                // A change of its own, as the startup flush is.
+                fold.add(&applied, debug(), now(), out);
+                fold.end_change();
+            }
             FibMsg::Mode(reply) => {
                 let _ = reply.send(fib.mode());
             }
@@ -357,6 +371,33 @@ impl Fold {
             self.logged = 0;
         }
         self.since = None;
+    }
+}
+
+/// The line of a check that found the kernel's routes differ from those
+/// installed: `missing`, the routes it lost, as IPv4 does those through an
+/// interface that goes down, installed again; `wrong`, those it has
+/// through another hop, set again; `unknown`, those of bgpfcd's protocol
+/// it has and the FIB did not install, removed; and the first prefixes.
+fn lost_line(found: &bgpfc_fib::Found) -> Line {
+    let mut sample = found
+        .missing
+        .iter()
+        .chain(&found.wrong)
+        .chain(&found.unknown)
+        .map(|(p, _)| *p)
+        .collect::<Vec<_>>();
+    let total = sample.len();
+    sample.truncate(SAMPLE);
+    Line {
+        level: Level::Info,
+        msg: "fib: kernel routes differ, repairing",
+        fields: vec![
+            ("missing", found.missing.len().to_string()),
+            ("wrong", found.wrong.len().to_string()),
+            ("unknown", found.unknown.len().to_string()),
+            ("prefixes", listed(&sample, total)),
+        ],
     }
 }
 
@@ -1111,6 +1152,56 @@ mod tests {
         assert!(errors <= FAILURES_LOGGED * summaries.len(), "{errors}");
         let failed: usize = summaries.iter().map(|(_, n)| n).sum();
         assert_eq!(failed, 2000);
+    }
+
+    /// A check of the kernel's routes is nothing to say in dry-run, which
+    /// installs nothing, and one error line when the kernel cannot be
+    /// read: here, with no socket.
+    #[test]
+    fn a_check_of_the_kernel_is_quiet_unless_it_fails() {
+        let script = || vec![Step::Msg(FibMsg::Verify), Step::Wait(ms(2000))];
+        assert_eq!(run(Instant::now(), script()), []);
+        let lines = run_in(Mode::Install, Instant::now(), script());
+        let written: Vec<(Level, &str)> = lines.iter().map(|(_, l)| (l.level, l.msg)).collect();
+        assert_eq!(
+            written,
+            [(Level::Error, "fib: cannot check the kernel's routes")],
+            "{lines:?}"
+        );
+        assert!(
+            field(&lines[0].1, "error").contains("not open"),
+            "{lines:?}"
+        );
+    }
+
+    /// The line of a check that found differences counts each kind and
+    /// names the first prefixes.
+    #[test]
+    fn the_line_of_a_check_counts_what_differs() {
+        let hop = Hop {
+            gateway: ip("192.0.2.1"),
+            oif: None,
+            onlink: false,
+        };
+        let found = bgpfc_fib::Found {
+            missing: vec![(p("203.0.113.0/24"), hop), (p("198.51.100.0/24"), hop)],
+            wrong: vec![],
+            unknown: vec![(p("192.0.2.128/25"), hop)],
+        };
+        let line = lost_line(&found);
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(
+            line.fields[..3],
+            [
+                ("missing", "2".to_owned()),
+                ("wrong", "0".to_owned()),
+                ("unknown", "1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            field(&line, "prefixes"),
+            "203.0.113.0/24,198.51.100.0/24,192.0.2.128/25"
+        );
     }
 
     /// Every sender gone: what was counted is written before the thread

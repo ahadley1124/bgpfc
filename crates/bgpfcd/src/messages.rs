@@ -177,6 +177,9 @@ pub(crate) enum FibMsg {
         /// Where the report goes.
         reply: SyncSender<FibReport>,
     },
+    /// Check that the kernel holds the routes installed, and install again
+    /// those it lost (`bgpfc_fib::Fib::verify`).
+    Verify,
     /// Remove every installed route and reply on the sender.
     Shutdown(SyncSender<()>),
 }
@@ -445,6 +448,11 @@ pub(crate) enum RibMsg {
     /// channel as the peers, so a busy RIB slows the kernel thread, whose
     /// socket may then overflow and is read again whole.
     Kernel(bgpfc_rib::nexthop::KernelUpdate),
+    /// Have the FIB check that the kernel still holds the routes it
+    /// installed (`FibMsg::Verify`), after the RIB's changes so far: the
+    /// kernel thread asks once it has read the whole table again after
+    /// something that may remove routes without a notification each.
+    VerifyFib,
 }
 
 /// A policy set on its way to the RIB thread (`dyn Policies` has no

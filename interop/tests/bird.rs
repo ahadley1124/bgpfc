@@ -440,6 +440,7 @@ fn fib_install_and_clean_shutdown() {
         routes(&lab).contains("192.0.2.0/24")
     });
     assert!(ok, "route not reinstalled:\n{}", bgpfcd.log_text());
+    assert_lost_routes_are_repaired(&lab, &bgpfcd);
 
     // SIGTERM: Cease to BIRD, routes gone, process exits.
     assert!(
@@ -465,6 +466,47 @@ fn fib_install_and_clean_shutdown() {
         "{}",
         bird.daemon.log_text()
     );
+}
+
+/// A's address on its link to B removed and added again at once: IPv4
+/// removes the routes through the interface without a notification each,
+/// and the connected route is back before the kernel thread reads the
+/// table, so that the RIB sees no change; the FIB's check after that read
+/// finds both routes lost and installs them again (RFC 4271 §9.1.2.1 2)
+/// row of COMPLIANCE.md). The link stays up, so BIRD keeps the session,
+/// as it would not were the link to go down.
+fn assert_lost_routes_are_repaired(lab: &Lab, bgpfcd: &interop::Daemon) {
+    let routes = || interop::Daemon::ip_in(lab, &lab.a, &["route", "show", "proto", "186"]);
+    let batch = lab.dir.join("readdress.batch");
+    let (link, addr) = (lab.a_link(), format!("{}/24", lab.a_addr));
+    std::fs::write(
+        &batch,
+        format!("address del {addr} dev {link}\naddress add {addr} dev {link}\n"),
+    )
+    .expect("batch file");
+    let before = bgpfcd.log_text().len();
+    let out = lab
+        .exec(&lab.a, "ip")
+        .args(["-batch", &batch.display().to_string()])
+        .output()
+        .expect("ip");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repaired =
+        |log: &str| log.contains("msg=\"fib: kernel routes differ, repairing\" missing=2");
+    let ok = wait_for(Duration::from_secs(15), || {
+        let r = routes();
+        r.contains("192.0.2.0/24")
+            && r.contains("198.51.100.0/24")
+            && repaired(bgpfcd.log_text().get(before..).unwrap_or_default())
+    });
+    let log = bgpfcd.log_text();
+    let after = log.get(before..).unwrap_or_default();
+    assert!(ok, "routes not repaired:\n{}\n{after}", routes());
+    assert!(!after.contains("session down"), "{after}");
 }
 
 /// The control plane end to end: bgpfcctl over the Unix socket, the HTTP

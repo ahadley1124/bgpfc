@@ -33,7 +33,7 @@ use std::fmt;
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
-pub use reconcile::{Hop, Merge, Op, Routes, Table};
+pub use reconcile::{Check, Found, Hop, Merge, Op, Routes, Table};
 pub use route::RouteMsg;
 
 /// Whether operations are sent to the kernel.
@@ -516,28 +516,91 @@ impl Fib {
     #[cfg(not(miri))]
     fn dump(&mut self, afi: Afi) -> Result<Vec<RouteMsg>, FibError> {
         let seq = self.next_seq();
-        let socket = self.socket.as_ref().ok_or_else(|| {
-            FibError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "netlink socket not open",
-            ))
-        })?;
-        socket.send(&RouteMsg::encode_dump(afi, seq))?;
         let mut routes = Vec::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = socket.recv(&mut buf)?;
-            for m in netlink::parse(&buf[..n])? {
-                if dump_reply(&m, seq, &mut routes)? {
-                    return Ok(routes);
+        dump_each(self.socket.as_ref(), afi, seq, |r| routes.push(r))?;
+        Ok(routes)
+    }
+
+    /// Make the kernel hold the routes this FIB believes installed, as
+    /// after a read of the kernel's table that followed something which
+    /// may have removed some behind its back: IPv4 removes the routes
+    /// through an interface that goes down, or loses its address, without
+    /// a notification each, and the interface may be back before anything
+    /// reads the table. Dumps the routes with our protocol number in our
+    /// table ([`Routes::check`]), adds again each route believed installed
+    /// that the kernel lost (where no route of another program has its
+    /// place, as any route added), sets again one the kernel has through
+    /// another hop, and removes one of ours the kernel has and this FIB
+    /// does not know; what it did goes to `out`. Dry-run installs nothing
+    /// and checks nothing.
+    ///
+    /// # Errors
+    /// A dump failure; nothing is changed then.
+    #[cfg(not(miri))]
+    pub fn verify(&mut self, out: &mut Vec<Applied>) -> Result<Found, FibError> {
+        if self.mode == Mode::DryRun {
+            return Ok(Found::default());
+        }
+        let (table, protocol) = (self.table, self.protocol);
+        let mut check = self.routes.check();
+        for afi in [Afi::Ipv4, Afi::Ipv6] {
+            self.seq = self.seq.wrapping_add(1).max(1);
+            dump_each(self.socket.as_ref(), afi, self.seq, |r| {
+                // A kernel without IPv6 answers the IPv6 dump with the
+                // routes of every family.
+                if r.protocol == protocol
+                    && r.table == table
+                    && r.dst.afi() == afi
+                    && let Some(gateway) = r.gateway
+                {
+                    let hop = Hop {
+                        gateway,
+                        oif: r.oif,
+                        onlink: r.onlink(),
+                    };
+                    check.kernel_has(r.dst, hop);
                 }
+            })?;
+        }
+        let found = check.finish();
+        let ops = self.routes.repair(found.clone());
+        self.run_into(&ops, out);
+        Ok(found)
+    }
+}
+
+/// Dump the unicast routes of `afi` on `socket` with sequence number
+/// `seq`, handing each to `each`.
+///
+/// # Errors
+/// The socket's, no socket, or [`dump_reply`]'s.
+#[cfg(not(miri))]
+fn dump_each(
+    socket: Option<&bgpfc_sys::NetlinkSocket>,
+    afi: Afi,
+    seq: u32,
+    mut each: impl FnMut(RouteMsg),
+) -> Result<(), FibError> {
+    let socket = socket.ok_or_else(|| {
+        FibError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "netlink socket not open",
+        ))
+    })?;
+    socket.send(&RouteMsg::encode_dump(afi, seq))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = socket.recv(&mut buf)?;
+        for m in netlink::parse(&buf[..n])? {
+            if dump_reply(&m, seq, &mut each)? {
+                return Ok(());
             }
         }
     }
 }
 
-/// Take one message of the reply to the dump `seq` into `routes`: whether
-/// it ended the dump.
+/// Take one message of the reply to the dump `seq`, a route to `each`:
+/// whether it ended the dump.
 ///
 /// # Errors
 /// A dump the kernel refuses, or ends with an error
@@ -546,7 +609,7 @@ impl Fib {
 fn dump_reply(
     m: &netlink::Message<'_>,
     seq: u32,
-    routes: &mut Vec<RouteMsg>,
+    each: &mut impl FnMut(RouteMsg),
 ) -> Result<bool, FibError> {
     if m.header.seq != seq {
         return Ok(false);
@@ -562,7 +625,7 @@ fn dump_reply(
         }
         route::RTM_NEWROUTE => {
             if let Some(r) = RouteMsg::decode(m.payload)? {
-                routes.push(r);
+                each(r);
             }
             Ok(false)
         }
@@ -807,7 +870,7 @@ mod tests {
         let mut routes = Vec::new();
         let take = |bytes: &[u8], routes: &mut Vec<RouteMsg>| {
             let m = netlink::parse(bytes).unwrap();
-            dump_reply(&m[0], 5, routes)
+            dump_reply(&m[0], 5, &mut |r| routes.push(r))
         };
         assert!(matches!(take(&part, &mut routes), Ok(false)));
         assert_eq!(routes.len(), 1);

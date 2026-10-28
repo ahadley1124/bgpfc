@@ -1100,21 +1100,26 @@ and sends no neighbor anything, since nothing a neighbor sees changed.
 IPv4 removes the routes through an interface that goes down, or that loses
 its address, without a notification each, so bgpfcd then reads the table
 whole again: a route through an interface counts only while the interface
-is up (RFC 4271 §9.1.2.1 2)). So it does when a change comes that it
-cannot place for sure: where a route of bgpfcd's sits beside another
-program's at one prefix and metric, the kernel's notification does not say
-whose route a replacement replaced. Such a reading comes a tenth of a
-second after what asked for it, with whatever else changed meanwhile, and
-a second after the one before at the earliest, however often interfaces
-come and go. One that lost notifications on the way is read again, after a
-pause that doubles from a second to a minute while that goes on, as when a
-full table loads into the kernel. The RIB keeps the reading it has until a
-new one arrives, so neither at startup nor after lost notifications does a
-next hop look unresolvable, or resolvable, for want of a table. The
-notifications that come within a hundredth of a second of the first of a
-batch reach the RIB together, by their net effect: a route deleted and
-added again at once, as `ip route del` and `ip route add` in one
-`ip -batch`, or BIRD replacing an IPv6 route, changes nothing.
+is up (RFC 4271 §9.1.2.1 2)). The kernel removes bgpfcd's own routes
+through it the same way, and an interface that is up again before the
+reading leaves the RIB nothing to see, so after such a reading the FIB
+checks the routes it installed against the kernel's and installs again
+those the kernel lost (`docs/control.md`, "Next hops"). So it does when a
+change comes that it cannot place for sure: where a route of bgpfcd's sits
+beside another program's at one prefix and metric, the kernel's
+notification does not say whose route a replacement replaced. Such a
+reading comes a tenth of a second after what asked for it, with whatever
+else changed meanwhile, and a second after the one before at the earliest,
+however often interfaces come and go. One that lost notifications on the
+way is read again, after a pause that doubles from a second to a minute
+while that goes on, as when a full table loads into the kernel. The RIB
+keeps the reading it has until a new one arrives, so neither at startup
+nor after lost notifications does a next hop look unresolvable, or
+resolvable, for want of a table. The notifications that come within a
+hundredth of a second of the first of a batch reach the RIB together, by
+their net effect: a route deleted and added again at once, as
+`ip route del` and `ip route add` in one `ip -batch`, or BIRD replacing an
+IPv6 route, changes nothing.
 
 **Network namespace.** `netns NAME;` makes bgpfcd join the network
 namespace `/run/netns/NAME`, the file `ip netns add NAME` creates

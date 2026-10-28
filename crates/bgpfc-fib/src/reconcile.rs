@@ -349,6 +349,40 @@ impl Routes {
             .chain(v6.map(|(p, id)| (*p, *id)))
     }
 
+    /// Start a check of what is believed installed against what the
+    /// kernel has with our protocol number ([`Check`]).
+    #[must_use]
+    pub fn check(&self) -> Check<'_> {
+        Check {
+            routes: self,
+            present_v4: Vec::new(),
+            present_v6: Vec::new(),
+            wrong: Vec::new(),
+            unknown: Vec::new(),
+        }
+    }
+
+    /// The operations that make the kernel hold what is believed installed
+    /// again, after a [`Check`]: a route the kernel lost is forgotten and
+    /// set, so that it goes in again where no route of another program
+    /// has its place; one the kernel has through another hop is set again;
+    /// one of ours the kernel has and that is not believed installed is
+    /// removed.
+    pub fn repair(&mut self, found: Found) -> Vec<Op> {
+        let mut ops = Vec::new();
+        for (prefix, hop) in found.missing {
+            self.install(prefix, None);
+            ops.push(Op::Set { prefix, hop });
+        }
+        for (prefix, hop) in found.wrong {
+            ops.push(Op::Set { prefix, hop });
+        }
+        for (prefix, hop) in found.unknown {
+            ops.push(Op::Delete { prefix, hop });
+        }
+        ops
+    }
+
     fn install(&mut self, prefix: Prefix, hop: Option<Hop>) {
         let new = hop.map(|h| self.hops.hold(h));
         let old = match (Ipv4Key::new(prefix), new) {
@@ -359,6 +393,88 @@ impl Routes {
         };
         if let Some(id) = old {
             self.hops.release(id);
+        }
+    }
+}
+
+/// A check of the routes believed installed against those the kernel has
+/// with our protocol number, which it is told one by one, in any order,
+/// as a dump lists them ([`Check::kernel_has`]). IPv4 removes the routes
+/// through an interface that goes down, or loses its address, without a
+/// notification each, and the interface may be back before anything
+/// reads the table: only such a check shows the loss. It keeps the
+/// prefixes the kernel has, a 5-octet key for an IPv4 one, to find at the
+/// end the routes believed installed that it lacks.
+#[derive(Debug)]
+pub struct Check<'a> {
+    routes: &'a Routes,
+    /// Every prefix of ours the kernel has.
+    present_v4: Vec<Ipv4Key>,
+    present_v6: Vec<Prefix>,
+    /// Routes the kernel has through another hop, with the hop believed.
+    wrong: Vec<(Prefix, Hop)>,
+    /// Routes of ours the kernel has that are not believed installed.
+    unknown: Vec<(Prefix, Hop)>,
+}
+
+/// What a [`Check`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    /// Routes believed installed that the kernel lacks, with their hop.
+    pub missing: Vec<(Prefix, Hop)>,
+    /// Routes the kernel has through another hop, with the hop believed.
+    pub wrong: Vec<(Prefix, Hop)>,
+    /// Routes of ours the kernel has that are not believed installed, with
+    /// the kernel's hop.
+    pub unknown: Vec<(Prefix, Hop)>,
+}
+
+impl Found {
+    /// Whether the kernel holds what is believed installed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.wrong.is_empty() && self.unknown.is_empty()
+    }
+}
+
+impl Check<'_> {
+    /// The kernel has a route of ours to `prefix` through `hop`. A hop
+    /// believed without an interface matches the kernel's on any.
+    pub fn kernel_has(&mut self, prefix: Prefix, hop: Hop) {
+        match Ipv4Key::new(prefix) {
+            Some(k) => self.present_v4.push(k),
+            None => self.present_v6.push(prefix),
+        }
+        match self.routes.installed(&prefix) {
+            Some(ours)
+                if ours.gateway == hop.gateway
+                    && ours.onlink == hop.onlink
+                    && ours.oif.is_none_or(|oif| Some(oif) == hop.oif) => {}
+            Some(ours) => self.wrong.push((prefix, ours)),
+            None => self.unknown.push((prefix, hop)),
+        }
+    }
+
+    /// What the check found, with the routes believed installed that the
+    /// kernel lacks, in prefix order.
+    #[must_use]
+    pub fn finish(mut self) -> Found {
+        let mut missing = Vec::new();
+        self.present_v4.sort_unstable();
+        self.present_v6.sort_unstable();
+        for (prefix, id) in self.routes.after(None) {
+            let present = match Ipv4Key::new(prefix) {
+                Some(k) => self.present_v4.binary_search(&k).is_ok(),
+                None => self.present_v6.binary_search(&prefix).is_ok(),
+            };
+            if !present {
+                missing.push((prefix, self.routes.hops.hop(id)));
+            }
+        }
+        Found {
+            missing,
+            wrong: self.wrong,
+            unknown: self.unknown,
         }
     }
 }
@@ -528,5 +644,77 @@ mod tests {
         r.set_installed(&kernel);
         assert_eq!(r.installed_table(), kernel);
         assert_eq!(r.hops(), 1);
+    }
+
+    /// The kernel lost two routes, has one through another hop and one
+    /// of ours that is not believed installed: the check finds each, and
+    /// the repair sets the lost ones again as new (forgotten first, so
+    /// that they go in only where no other route has their place), the
+    /// wrong one again, and removes the unknown one. A kernel that holds
+    /// what is believed asks for nothing.
+    #[test]
+    fn a_check_finds_what_the_kernel_lost() {
+        let mut r = Routes::new();
+        let on = |gateway: &str, oif| Hop {
+            oif: Some(oif),
+            ..h(gateway)
+        };
+        for (prefix, hop) in [
+            ("10.0.0.0/8", on("192.0.2.1", 2)),
+            ("10.1.0.0/16", on("192.0.2.1", 2)),
+            ("10.2.0.0/16", h("192.0.2.1")),
+            ("2001:db8::/32", on("fe80::1", 3)),
+            ("2001:db8:1::/48", on("fe80::1", 3)),
+        ] {
+            r.apply(&Op::Set {
+                prefix: p(prefix),
+                hop,
+            });
+        }
+        let mut check = r.check();
+        // Through another gateway; a hop believed with no interface
+        // matches the kernel's on any; one not believed at all.
+        check.kernel_has(p("10.1.0.0/16"), on("192.0.2.9", 2));
+        check.kernel_has(p("10.2.0.0/16"), on("192.0.2.1", 7));
+        check.kernel_has(p("2001:db8:1::/48"), on("fe80::1", 3));
+        check.kernel_has(p("172.16.0.0/12"), on("192.0.2.1", 2));
+        let found = check.finish();
+        assert_eq!(
+            found,
+            Found {
+                missing: vec![
+                    (p("10.0.0.0/8"), on("192.0.2.1", 2)),
+                    (p("2001:db8::/32"), on("fe80::1", 3)),
+                ],
+                wrong: vec![(p("10.1.0.0/16"), on("192.0.2.1", 2))],
+                unknown: vec![(p("172.16.0.0/12"), on("192.0.2.1", 2))],
+            }
+        );
+        let ops = r.repair(found);
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(ops[0], Op::Set { .. }) && matches!(ops[3], Op::Delete { .. }));
+        // The lost ones are no longer believed installed: they go in anew.
+        assert_eq!(r.installed(&p("10.0.0.0/8")), None);
+        assert_eq!(r.installed(&p("10.1.0.0/16")), Some(on("192.0.2.1", 2)));
+        assert_eq!(r.len(), 3);
+        // All there, and an onlink one that is so in the kernel too.
+        let mut whole = Routes::new();
+        let onlink = Hop {
+            onlink: true,
+            ..on("192.168.77.1", 3)
+        };
+        whole.apply(&Op::Set {
+            prefix: p("203.0.113.0/24"),
+            hop: onlink,
+        });
+        let mut check = whole.check();
+        check.kernel_has(p("203.0.113.0/24"), onlink);
+        let found = check.finish();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(whole.repair(found), []);
+        // The same gateway without onlink is another hop.
+        let mut check = whole.check();
+        check.kernel_has(p("203.0.113.0/24"), on("192.168.77.1", 3));
+        assert_eq!(check.finish().wrong.len(), 1);
     }
 }

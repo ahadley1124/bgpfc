@@ -409,7 +409,11 @@ pause that doubles from a second to a minute while that goes on.
 Notifications that come within 10 ms of the first of a batch reach the RIB
 together, by their net effect, so that a route deleted and added again at
 once changes nothing. The thread never writes to the kernel, in dry-run
-and install mode alike.
+and install mode alike. After a whole reading that an interface, an
+address, lost notifications or a change it could not place asked for,
+the FIB thread checks the routes it installed (below), since the kernel
+may have removed some of them without a word, and the interface be back
+up before the reading, so that the RIB sees nothing change.
 
 ```
 2026-10-27T12:34:56.789Z INFO  msg="kernel: table read" routes=12 links=4 reason=startup
@@ -428,6 +432,21 @@ before:
 ```
 2026-10-27T12:34:56.789Z WARN  msg="kernel: route events lost, reading the table again" times=1
 ```
+
+The FIB thread's check reads the kernel's routes with bgpfcd's protocol
+number in its table, in install mode only. Where they differ from those
+it installed, it installs again each route the kernel lost, sets again
+one the kernel has through another hop, and removes one of bgpfcd's
+protocol it did not install, and says so in one line at info, its
+operations then counted in a `fib: changes` line as any others:
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="fib: kernel routes differ, repairing" missing=2 wrong=0 unknown=0 prefixes=192.0.2.0/24,198.51.100.0/24
+```
+
+A check that finds nothing writes nothing; one that cannot read the
+kernel's routes writes `fib: cannot check the kernel's routes` at error
+with the `error`, and the next whole reading checks again.
 
 A change of the table that changes what a next hop in use resolves to is
 one line at info, however many routes it moves:

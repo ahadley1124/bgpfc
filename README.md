@@ -376,6 +376,9 @@ own: where another program's route has the destination and metric of one of
 bgpfc's, as zebra's IGP route to a prefix a neighbor also announces, the
 kernel keeps that route and bgpfc's is not installed, with an error line
 (`another route has this destination and metric`), until that route goes.
+The kernel removes routes through an interface that goes down without
+telling anyone, so bgpfc then checks its routes against the kernel's and
+installs again those it lost (`fib: kernel routes differ, repairing`).
 
 ## Run
 

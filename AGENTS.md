@@ -159,7 +159,10 @@ runtime and no hand-rolled epoll.
   table decides again only those destinations.
 - **FIB thread**: owns the netlink socket. It reconciles the desired routes
   from the RIB against the routes actually installed. In dry-run mode it logs
-  the netlink operations it would perform and stops there.
+  the netlink operations it would perform and stops there. In install mode,
+  when the kernel thread asks (`RibMsg::VerifyFib`, passed on in order as
+  `FibMsg::Verify`), it dumps the kernel's routes of its protocol and puts
+  back what the kernel removed without a notification (`Fib::verify`).
 - **Kernel thread**: owns a second netlink socket, subscribed to the route,
   link and address groups before it dumps. `main` reads the kernel's main
   table through it before the RIB thread exists, so no route is judged
@@ -178,8 +181,10 @@ runtime and no hand-rolled epoll.
   route of bgpfcd's among others' at one destination and metric): 100 ms
   after the first cause and a second after the read before at the
   earliest, and again, after a pause that doubles up to a minute, while a
-  read is not the whole table. It never writes to the kernel, in dry-run
-  and install mode alike.
+  read is not the whole table. After a whole read that any of those but
+  the startup asked for, it has the FIB check its routes
+  (`RibMsg::VerifyFib`). It never writes to the kernel, in dry-run and
+  install mode alike.
 - **Control thread(s)**: the Unix-socket server and the HTTP server. They
   query the RIB and coordinator through request/response channels, for
   example `(Query, mpsc::Sender<Reply>)`. They never read shared state
