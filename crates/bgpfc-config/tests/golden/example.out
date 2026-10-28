@@ -64,6 +64,7 @@ Config {
             count: 6,
         },
     },
+    netns: None,
     prefix_lists: [
         PrefixList {
             pos: Pos {
@@ -206,6 +207,8 @@ Config {
                 10,
             ),
             maximum_prefix: [],
+            multihop: None,
+            local_address: None,
         },
     ],
 }

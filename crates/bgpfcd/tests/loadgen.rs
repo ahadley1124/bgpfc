@@ -3,8 +3,10 @@
 //! the RIB exactly, and the report lines must parse; with two peers, the
 //! table one sends reaches the other and no session resets.
 //!
-//! Needs a profiling build and free localhost ports (127.0.0.1 and
-//! 127.0.0.2):
+//! Needs a profiling build, free localhost ports (127.0.0.1 and
+//! 127.0.0.2), and a network the kernel's main table has as connected, for
+//! the routes' next hop to resolve (RFC 4271 §9.1.2: bgpfcd holds a route
+//! whose next hop does not, and sends it on to no one):
 //!
 //! ```sh
 //! cargo test -p bgpfcd --features profiling -- --ignored
@@ -113,6 +115,44 @@ fn next(rx: &Receiver<String>, event: &str) -> String {
     }
 }
 
+/// A next hop the daemon resolves: an address on a network that the
+/// kernel's main table has as connected (no gateway), read from
+/// `/proc/net/route`, which lists that table's IPv4 routes in this network
+/// namespace, the daemon's. Not a default route, which bgpfcd never
+/// resolves through.
+fn connected_next_hop() -> Ipv4Addr {
+    // `<linux/route.h>`: the route is up, goes through a gateway, or
+    // forwards nothing (blackhole, unreachable, prohibit).
+    const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
+    const RTF_REJECT: u32 = 0x200;
+    let table = std::fs::read_to_string("/proc/net/route").unwrap();
+    // Each address is the 4 octets in network order, printed as a native
+    // u32 in hexadecimal.
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok().map(u32::to_ne_bytes);
+    for line in table.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (Some(dst), Some(flags), Some(mask)) = (
+            f.get(1).and_then(|s| hex(s)),
+            f.get(3).and_then(|s| u32::from_str_radix(s, 16).ok()),
+            f.get(7).and_then(|s| hex(s)),
+        ) else {
+            continue;
+        };
+        let (dst, mask) = (u32::from_be_bytes(dst), u32::from_be_bytes(mask));
+        if flags & RTF_UP == 0 || flags & (RTF_GATEWAY | RTF_REJECT) != 0 || mask == 0 {
+            continue;
+        }
+        // A host of the network, or the destination of a host route.
+        let host = if mask == u32::MAX { dst } else { dst | 1 };
+        return Ipv4Addr::from(host);
+    }
+    panic!(
+        "no connected IPv4 network in the main table (/proc/net/route): the routes' next hop \
+         would not resolve, and bgpfcd would hold them"
+    );
+}
+
 /// A synthetic table of [`PREFIXES`] for the daemon on `port`, the session
 /// held until the daemon stops.
 fn plan(port: u16) -> Plan {
@@ -129,7 +169,7 @@ fn plan(port: u16) -> Plan {
             prefixes: PREFIXES,
             attr_sets: 500,
             seed: 7,
-            next_hops: vec![Ipv4Addr::new(192, 0, 2, 9)],
+            next_hops: vec![connected_next_hop()],
         },
         scenario: Scenario::Load,
         seed: 7,

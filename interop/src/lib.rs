@@ -144,6 +144,18 @@ impl Lab {
         }
     }
 
+    /// The interface of A on its link to B.
+    #[must_use]
+    pub fn a_link(&self) -> String {
+        format!("v{}a", self.id)
+    }
+
+    /// The interface of B on its link to A.
+    #[must_use]
+    pub fn b_link(&self) -> String {
+        format!("v{}b", self.id)
+    }
+
     /// Add a third namespace `c`, joined to `a` by a second veth pair on
     /// `10.98.<subnet>.0/24`; the namespace name is returned and kept in
     /// `self.c`.
@@ -171,6 +183,116 @@ impl Lab {
         }
         self.c = Some(c.clone());
         c
+    }
+
+    /// Make A a router between B and C, which are then two hops apart
+    /// over loopback addresses, the lab of multihop sessions
+    /// (`interop/tests/multihop.rs`; `S` is the lab's subnet):
+    ///
+    /// ```text
+    ///  C                        A                           B
+    ///  lo 10.255.S.3/32         10.98.S.1 -- 10.98.S.2 (C)   lo 10.255.S.2/32
+    ///  lo 10.255.S.30/32        10.99.S.1 -- 10.99.S.2 (B)   10.255.S.3/32 via 10.99.S.1 proto static
+    ///  10.255.S.2/32 and        ip_forward=1                 10.255.S.30/32 via 10.99.S.1 proto static
+    ///  10.99.S.0/24 via         10.255.S.{2,3,30}/32 routes
+    ///    10.98.S.1
+    /// ```
+    ///
+    /// C's second loopback is a next hop apart from the session's
+    /// address, so that its route can go while the session stays. C also
+    /// reaches the link between A and B, so that it answers a connection
+    /// from B's address there, as a router's neighbors would.
+    ///
+    /// # Panics
+    /// If [`Lab::add_c`] was not called first, or `ip` fails.
+    #[must_use]
+    pub fn route_through_a(&self) -> Loopbacks {
+        let c = self
+            .c
+            .as_deref()
+            .expect("route_through_a needs add_c first");
+        let subnet = self.a_addr.octets()[2];
+        let lo = |host| Ipv4Addr::new(10, 255, subnet, host);
+        let loopbacks = Loopbacks {
+            b: lo(2),
+            c: lo(3),
+            c_next_hop: lo(30),
+        };
+        let host = |a: Ipv4Addr| format!("{a}/32");
+        let (b_lo, c_los) = (loopbacks.b, [loopbacks.c, loopbacks.c_next_hop]);
+        sh(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.a,
+                "sysctl",
+                "-qw",
+                "net.ipv4.ip_forward=1",
+            ],
+        );
+        sh(
+            "ip",
+            &["-n", &self.b, "addr", "add", &host(b_lo), "dev", "lo"],
+        );
+        for a in c_los {
+            sh("ip", &["-n", c, "addr", "add", &host(a), "dev", "lo"]);
+            // B reaches C's loopbacks by static routes through A.
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    &self.b,
+                    "route",
+                    "add",
+                    &host(a),
+                    "via",
+                    &self.a_addr.to_string(),
+                    "proto",
+                    "static",
+                ],
+            );
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    &self.a,
+                    "route",
+                    "add",
+                    &host(a),
+                    "via",
+                    &self.c_addr.to_string(),
+                ],
+            );
+        }
+        let [x, y, z, _] = self.b_addr.octets();
+        for to in [host(b_lo), format!("{}/24", Ipv4Addr::new(x, y, z, 0))] {
+            sh(
+                "ip",
+                &[
+                    "-n",
+                    c,
+                    "route",
+                    "add",
+                    &to,
+                    "via",
+                    &self.a2_addr.to_string(),
+                ],
+            );
+        }
+        sh(
+            "ip",
+            &[
+                "-n",
+                &self.a,
+                "route",
+                "add",
+                &host(b_lo),
+                "via",
+                &self.b_addr.to_string(),
+            ],
+        );
+        loopbacks
     }
 
     /// An address on the link between A and B where what A sends goes
@@ -228,6 +350,18 @@ impl Drop for Lab {
     }
 }
 
+/// The loopback addresses of a lab routed through A
+/// ([`Lab::route_through_a`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loopbacks {
+    /// B's, `10.255.S.2`: bgpfcd's session address.
+    pub b: Ipv4Addr,
+    /// C's, `10.255.S.3`: its speaker's session address.
+    pub c: Ipv4Addr,
+    /// C's second, `10.255.S.30`: a next hop other than the session's.
+    pub c_next_hop: Ipv4Addr,
+}
+
 /// A running process whose stderr goes to a file; killed on drop.
 pub struct Daemon {
     child: Child,
@@ -236,7 +370,14 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    fn start(mut cmd: Command, log: PathBuf) -> Daemon {
+    /// Spawn `cmd` with no standard input or output and its standard
+    /// error in the file `log`.
+    ///
+    /// # Panics
+    /// If the log file cannot be created or the process cannot be
+    /// spawned.
+    #[must_use]
+    pub fn start(mut cmd: Command, log: PathBuf) -> Daemon {
         let file = fs::File::create(&log).expect("log file");
         let child = cmd
             .stdin(Stdio::null())
@@ -292,8 +433,8 @@ impl Daemon {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// The process ID. `ip netns exec` executes the program in its own
-    /// place, so this is the daemon's, not `ip`'s.
+    /// The process ID. `ip netns exec` and `setpriv` execute the program
+    /// in their own place, so this is the daemon's, not theirs.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -445,6 +586,10 @@ pub struct BgpfcdOpts {
     pub extra: String,
     /// Further command-line arguments, such as `--user nobody`.
     pub args: Vec<String>,
+    /// Start the binary in the host's namespace, not through
+    /// `ip netns exec`: for a daemon that joins a namespace itself
+    /// (`--netns`).
+    pub from_host: bool,
 }
 
 impl BgpfcdOpts {
@@ -458,20 +603,21 @@ impl BgpfcdOpts {
             neighbors: vec![neighbor],
             extra: String::new(),
             args: Vec::new(),
+            from_host: false,
         }
     }
 }
 
-/// Write a configuration and start `bgpfcd` in namespace `ns` with debug
-/// logging and the further arguments of `opts`. Both families are
-/// offered, and an accept-all policy is used in both directions. The file
-/// is readable by every user, as a bgpfcd started with `--user` reads it
-/// again at a reload.
+/// Write the configuration of a `bgpfcd` for namespace `ns`,
+/// `bgpfcd-<ns>.conf` in the lab's directory, with debug logging. Both
+/// families are offered, and an accept-all policy is used in both
+/// directions. The file is readable by every user, as a bgpfcd started
+/// with `--user` reads it again at a reload. Its path is returned.
 ///
 /// # Panics
-/// If the config cannot be written or the process cannot be spawned.
+/// If the file cannot be written.
 #[must_use]
-pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+pub fn bgpfcd_config(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> PathBuf {
     use std::fmt::Write as _;
     let cfg = lab.dir.join(format!("bgpfcd-{ns}.conf"));
     let mut text = format!(
@@ -502,7 +648,23 @@ pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
     }
     fs::write(&cfg, text).expect("bgpfcd config");
     fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).expect("bgpfcd config mode");
-    let mut cmd = lab.exec(ns, bgpfcd_path().to_str().expect("path"));
+    cfg
+}
+
+/// Write a configuration ([`bgpfcd_config`]) and start `bgpfcd` in
+/// namespace `ns`, or, with `opts.from_host`, in the host's namespace,
+/// with the further arguments of `opts`. Its log is `bgpfcd-<ns>.log`.
+///
+/// # Panics
+/// If the config cannot be written or the process cannot be spawned.
+#[must_use]
+pub fn start_bgpfcd(lab: &Lab, ns: &str, opts: &BgpfcdOpts) -> Daemon {
+    let cfg = bgpfcd_config(lab, ns, opts);
+    let mut cmd = if opts.from_host {
+        Command::new(bgpfcd_path())
+    } else {
+        lab.exec(ns, bgpfcd_path().to_str().expect("path"))
+    };
     cmd.args(["-c", cfg.to_str().expect("path")]);
     cmd.args(&opts.args);
     Daemon::start(cmd, lab.dir.join(format!("bgpfcd-{ns}.log")))
@@ -542,6 +704,9 @@ pub struct BirdOpts {
     /// More options for the BGP protocol itself, such as
     /// `error wait time 1, 2;`.
     pub protocol: String,
+    /// What the `ipv4` channel exports: a filter, such as `filter {
+    /// bgp_next_hop = 192.0.2.30; accept; }`; empty is `all`.
+    pub export: String,
 }
 
 impl Bird {
@@ -576,7 +741,7 @@ impl Bird {
                  \x20   hold time {hold};\n\
                  {passive}\
                  \x20   {protocol}\n\
-                 \x20   ipv4 {{ import all; export all; {channel} }};\n\
+                 \x20   ipv4 {{ import all; export {export}; {channel} }};\n\
                  }}\n",
                 local = opts.local,
                 local_port = opts.local_port,
@@ -587,6 +752,11 @@ impl Bird {
                 hold = opts.hold_time,
                 channel = opts.channel,
                 protocol = opts.protocol,
+                export = if opts.export.is_empty() {
+                    "all"
+                } else {
+                    &opts.export
+                },
             ),
         )
         .expect("bird config");

@@ -25,6 +25,7 @@ fn bird_opts(lab: &Lab, passive: bool, statics: &[&str]) -> BirdOpts {
         statics: statics.iter().map(|s| (*s).to_owned()).collect(),
         channel: String::new(),
         protocol: String::new(),
+        export: String::new(),
     }
 }
 
@@ -205,6 +206,7 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
             statics: Vec::new(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     // The scenario re-announces the statics seconds after the first
@@ -218,12 +220,9 @@ fn routes_are_relayed_withdrawn_and_refreshed() {
         &lab,
         &lab.a.clone(),
         &BgpfcdOpts {
-            local_as: BGPFC_AS,
-            router_id: lab.a_addr,
             listen: vec![lab.a_addr.into(), lab.a2_addr.into()],
             neighbors: vec![NeighborOpts::new(lab.b_addr, BIRD_AS), to_bird2],
-            extra: String::new(),
-            args: Vec::new(),
+            ..bgpfcd_opts(&lab, false)
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -326,6 +325,7 @@ fn export_policy_filters_and_sets() {
             statics: Vec::new(),
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     let mut to_bird2 = NeighborOpts::new(lab.c_addr, BIRD2_AS);
@@ -350,6 +350,7 @@ fn export_policy_filters_and_sets() {
                     }"
             .to_owned(),
             args: Vec::new(),
+            from_host: false,
         },
     );
     assert_established(&lab, &bird_b, &bgpfcd);
@@ -439,6 +440,7 @@ fn fib_install_and_clean_shutdown() {
         routes(&lab).contains("192.0.2.0/24")
     });
     assert!(ok, "route not reinstalled:\n{}", bgpfcd.log_text());
+    assert_lost_routes_are_repaired(&lab, &bgpfcd);
 
     // SIGTERM: Cease to BIRD, routes gone, process exits.
     assert!(
@@ -464,6 +466,47 @@ fn fib_install_and_clean_shutdown() {
         "{}",
         bird.daemon.log_text()
     );
+}
+
+/// A's address on its link to B removed and added again at once: IPv4
+/// removes the routes through the interface without a notification each,
+/// and the connected route is back before the kernel thread reads the
+/// table, so that the RIB sees no change; the FIB's check after that read
+/// finds both routes lost and installs them again (RFC 4271 §9.1.2.1 2)
+/// row of COMPLIANCE.md). The link stays up, so BIRD keeps the session,
+/// as it would not were the link to go down.
+fn assert_lost_routes_are_repaired(lab: &Lab, bgpfcd: &interop::Daemon) {
+    let routes = || interop::Daemon::ip_in(lab, &lab.a, &["route", "show", "proto", "186"]);
+    let batch = lab.dir.join("readdress.batch");
+    let (link, addr) = (lab.a_link(), format!("{}/24", lab.a_addr));
+    std::fs::write(
+        &batch,
+        format!("address del {addr} dev {link}\naddress add {addr} dev {link}\n"),
+    )
+    .expect("batch file");
+    let before = bgpfcd.log_text().len();
+    let out = lab
+        .exec(&lab.a, "ip")
+        .args(["-batch", &batch.display().to_string()])
+        .output()
+        .expect("ip");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repaired =
+        |log: &str| log.contains("msg=\"fib: kernel routes differ, repairing\" missing=2");
+    let ok = wait_for(Duration::from_secs(15), || {
+        let r = routes();
+        r.contains("192.0.2.0/24")
+            && r.contains("198.51.100.0/24")
+            && repaired(bgpfcd.log_text().get(before..).unwrap_or_default())
+    });
+    let log = bgpfcd.log_text();
+    let after = log.get(before..).unwrap_or_default();
+    assert!(ok, "routes not repaired:\n{}\n{after}", routes());
+    assert!(!after.contains("session down"), "{after}");
 }
 
 /// The control plane end to end: bgpfcctl over the Unix socket, the HTTP
@@ -746,10 +789,17 @@ fn policy_reloads(lab: &Lab, socket: &std::path::Path, bgpfcd: &interop::Daemon)
 /// C's 203.0.113.0/24 to B with its own IPv4 address on that session (§5).
 /// A reload then turns the capability off towards C: the session resets
 /// and C no longer gets the route (§4).
+///
+/// The IPv6 next hop must resolve in A's routing table for the route to be
+/// used (RFC 4271 §9.1.2): A gets an IPv6 network on its link to B where
+/// the host runs IPv6. Where it does not, nothing can resolve it, and the
+/// route is held in the Adj-RIB-In, `next hop unresolvable`, neither
+/// installed nor sent on to C.
 #[test]
 #[ignore = "needs root, bird and iproute2"]
 fn extended_next_hop_with_bird() {
     let mut lab = Lab::new("e", 13);
+    let resolves = ipv6_on_link_to_b(&lab);
     let (bird_b, bird_c, bgpfcd, socket) = start_extended_next_hop_lab(&mut lab);
     let ctl = |args: &[&str]| interop::bgpfcctl(&socket, args);
     let ok = wait_for(ESTABLISH, || {
@@ -777,23 +827,28 @@ fn extended_next_hop_with_bird() {
     assert!(status.contains("IPv6 nexthop: ipv4"), "{status}");
 
     // RFC 8950 §3: BIRD's IPv6 next hop is decoded and kept in the RIB,
-    // and the FIB (dry-run here) is asked for an IPv4 route via it.
+    // and, where it resolves, the FIB (dry-run here) is asked for an IPv4
+    // route via it.
     let ok = wait_for(Duration::from_secs(15), || {
         ctl(&["show", "routes", "192.0.2.0/24"])
             .0
             .contains("2001:db8::1")
     });
     assert!(ok, "{}\n{}", ctl(&["show", "routes"]).0, bgpfcd.log_text());
-    let (out, ok) = ctl(&["show", "fib"]);
-    assert!(ok && out.contains("2001:db8::1"), "{out}");
-
-    // §5: passed on unchanged to the internal peer, encoding included.
     let route_c = || bird_c.birdc(&lab, &["show", "route", "all", "192.0.2.0/24"]);
-    let ok = wait_for(Duration::from_secs(15), || {
-        route_c().contains("BGP.next_hop: 2001:db8::1")
-    });
-    assert!(ok, "{}\n{}", route_c(), bgpfcd.log_text());
-    assert!(route_c().contains("BGP.as_path: 65001"), "{}", route_c());
+    if resolves {
+        let (out, ok) = ctl(&["show", "fib"]);
+        assert!(ok && out.contains("2001:db8::1"), "{out}");
+
+        // §5: passed on unchanged to the internal peer, encoding included.
+        let ok = wait_for(Duration::from_secs(15), || {
+            route_c().contains("BGP.next_hop: 2001:db8::1")
+        });
+        assert!(ok, "{}\n{}", route_c(), bgpfcd.log_text());
+        assert!(route_c().contains("BGP.as_path: 65001"), "{}", route_c());
+    } else {
+        assert_unresolvable_next_hop_held(&ctl);
+    }
 
     // §5: our own next hop towards B is of the session's protocol, IPv4.
     // The 30 s RFC 4271 §10 interval may hold it behind C's first route.
@@ -802,8 +857,41 @@ fn extended_next_hop_with_bird() {
         route_b().contains(&format!("BGP.next_hop: {}", lab.a_addr))
     });
     assert!(ok, "{}\n{}", route_b(), bgpfcd.log_text());
+    // Held, the route never reached C, in all that time.
+    if !resolves {
+        assert!(!route_c().contains("192.0.2.0/24"), "{}", route_c());
+    }
 
     assert_extended_next_hop_off_towards_c(&lab, &bird_c, &bgpfcd, &socket);
+}
+
+/// Give A an IPv6 network on its link to B, `2001:db8::/64`, so that the
+/// IPv6 next hop BIRD in B sends, `2001:db8::1`, resolves in A (RFC 4271
+/// §9.1.2). False where the host runs no IPv6, and nothing can.
+fn ipv6_on_link_to_b(lab: &Lab) -> bool {
+    std::process::Command::new("ip")
+        .args(["-n", &lab.a, "-6", "addr", "add", "2001:db8::2/64"])
+        .args(["dev", &lab.a_link(), "nodad"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// RFC 4271 §9.1.2: BIRD's route, whose IPv6 next hop nothing resolves,
+/// is held in the Adj-RIB-In and said to be so, its next hop is listed
+/// unresolved, and the FIB is asked for nothing.
+fn assert_unresolvable_next_hop_held(ctl: &impl Fn(&[&str]) -> (String, bool)) {
+    let (out, ok) = ctl(&["show", "routes", "192.0.2.0/24"]);
+    assert!(ok && out.contains("next hop unresolvable"), "{out}");
+    let (out, ok) = ctl(&["show", "nexthops"]);
+    assert!(
+        ok && out
+            .lines()
+            .any(|l| l.starts_with("2001:db8::1 ") && l.contains(" unresolved ")),
+        "{out}"
+    );
+    let (out, ok) = ctl(&["show", "fib"]);
+    assert!(ok && !out.contains("192.0.2.0/24"), "{out}");
 }
 
 /// B, C and bgpfcd for `extended_next_hop_with_bird`, all three with
@@ -834,6 +922,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             statics: vec!["203.0.113.0/24".to_owned()],
             channel: "extended next hop on;".to_owned(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     let socket = lab.dir.join("ctl.sock");
@@ -857,6 +946,7 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
             neighbors: vec![to_b, to_c],
             extra: format!("control {{ socket {}; }}", socket.display()),
             args: Vec::new(),
+            from_host: false,
         },
     );
     (bird_b, bird_c, bgpfcd, socket)
@@ -864,7 +954,8 @@ fn start_extended_next_hop_lab(lab: &mut Lab) -> (Bird, Bird, interop::Daemon, s
 
 /// Reload bgpfcd with `extended-next-hop` off towards C: the session resets
 /// (the OPEN changes), comes back without the capability, and C loses the
-/// route with the IPv6 next hop while bgpfcd keeps it (RFC 8950 §4, §5).
+/// route with the IPv6 next hop, or never had it where the next hop does
+/// not resolve, while bgpfcd keeps it (RFC 8950 §4, §5).
 fn assert_extended_next_hop_off_towards_c(
     lab: &Lab,
     bird_c: &Bird,

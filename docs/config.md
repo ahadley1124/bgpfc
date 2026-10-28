@@ -44,7 +44,9 @@ global       = "router-id" ipv4 ";"              (* required; not 0.0.0.0 *)
              | "listen" "{" "address" ip ";" [ "port" u16 ";" ] "}"   (* repeatable *)
              | "fib" "{" { fib-item } "}"
              | "control" "{" { control-item } "}"
-             | "rpki" "{" { rpki-item } "}" ;    (* none: validation disabled *)
+             | "rpki" "{" { rpki-item } "}"      (* none: validation disabled *)
+             | "netns" netns ";" ;               (* once; default: the namespace
+                                                    bgpfcd is started in *)
 
 level        = "error" | "warn" | "info" | "debug" | "trace" ;    (* default info *)
 
@@ -142,6 +144,8 @@ neighbor-item
              | "extended-next-hop" yes-no ";"        (* default no *)
              | "restart-limit" ( u32 | "off" ) ";"  (* default 10 *)
              | "maximum-prefix" family u32 ";"     (* once per family; default none *)
+             | "multihop" [ u8 ] ";"                 (* 1-255, bare 255; default 1 external, the system's internal *)
+             | "local-address" ip ";"                (* the neighbor's family; default the kernel's choice *)
              | "passive" yes-no ";"                  (* default no *)
              | "allow-as-set" yes-no ";"             (* default no *)
              | "collision-detect-established" yes-no ";" ;   (* default no *)
@@ -161,6 +165,7 @@ Value syntax:
 | `large-community` | `global:local1:local2`, each 32-bit |
 | `name` | any word |
 | `path` | any word or string |
+| `netns` | a name in `/run/netns`: one path component, not empty, without `/`, not `.` or `..`, at most 255 octets (iproute2's rule); or an absolute path, starting with `/` |
 
 ## Semantics
 
@@ -267,6 +272,82 @@ seconds for an external neighbor, 5 for an internal one. `0` sends every
 change at once. `allow-as-set yes` accepts `AS_SET` in received
 UPDATEs against RFC 9774 §3. `collision-detect-established yes` lets a new
 connection replace an Established session per RFC 4271 §6.8.
+
+`multihop` sets the TTL (IPv4) or hop limit (IPv6) of every segment
+bgpfcd sends the neighbor, the SYN of its own connections included:
+
+| Neighbor | `multihop` | TTL sent |
+|---|---|---|
+| external (`remote-as` is not `local-as`) | none | 1 |
+| external | `multihop;` | 255 |
+| external | `multihop N;` | N, from 1 to 255 |
+| internal | none | the system's (`net.ipv4.ip_default_ttl`, 64 by default; IPv6 `hop_limit`) |
+| internal | `multihop;` or `multihop N;` | 255 or N |
+
+As with FRR and BIRD, an external neighbor is taken to be directly
+connected: TTL 1 reaches the next router and no further. One more than a
+hop away, such as one peered over loopback addresses, needs `multihop N`
+with N at least the number of hops to it, or a bare `multihop` for 255. An internal
+neighbor needs no `multihop`, since it keeps the system's TTL, as BIRD's
+and FRR's internal sessions do; `multihop N` there sets N all the same.
+`multihop` sets only what bgpfcd sends and checks nothing of what it
+receives: checking the TTL of arriving packets is the Generalized TTL
+Security Mechanism (GTSM, RFC 5082), which bgpfcd does not implement.
+
+A connection the neighbor opens gets the neighbor's TTL as soon as bgpfcd
+accepts it, so from bgpfcd's first segment on it, its OPEN. The SYN-ACK
+that answered the neighbor's SYN has left by then with the listener's TTL,
+the system's: one listener serves every neighbor.
+
+An external neighbor more than one hop away without `multihop` never
+comes up, and it shows:
+
+- bgpfcd's own connections fail at once, as the first router answers the
+  SYN with an ICMP Time Exceeded: a warning `msg="connect failed"
+  peer=P error="No route to host (os error 113)" ttl=1 hint="external
+  neighbor: more than one hop away needs multihop"`, again at debug while
+  the same error repeats. The hint comes with that error, with `Network
+  is unreachable` and with a timeout. bgpfcd retries every
+  `connect-retry-time`, as after any failed connection.
+- A connection the neighbor opens is accepted only while bgpfcd is not
+  Idle (RFC 4271 §8.2.2: Idle refuses connections). As its own
+  connections fail at once and each failure puts it in Idle, in practice
+  that takes `passive yes`; without it bgpfcd closes the neighbor's
+  connections, with a line at debug, `msg="connection while idle,
+  closing"`. An accepted connection brings the neighbor's OPEN, which the
+  neighbor sends with its own TTL, and bgpfcd moves to OpenConfirm; but
+  its OPEN and KEEPALIVE die at the first router, so the session ends
+  when the negotiated hold time expires (`hold-time`, 90 seconds by
+  default, or the neighbor's if lower), with a warning `msg="connection
+  closed with a socket error"` that has the same error as
+  `socket_error=`, and the same hint.
+- `bgpfcctl show neighbor` says `ttl 1`, and the error as `last error`
+  with how long ago it was.
+- The neighbor sees connections that never bring an OPEN, which its own
+  timers end (BIRD logs them as `Connection lost` or a hold timer
+  expiry).
+
+`local-address 192.0.2.1;` runs the session from that address. bgpfcd
+binds its own connections to it before connecting, and closes a
+connection the neighbor opens to any other of its addresses, with an info
+line `msg="connection to another local address, closing"` that names
+both. Either way it is the session's local address, which bgpfcd
+advertises as the next hop to an external neighbor and for `set next-hop
+self` (RFC 4271 §5.1.3). Its use is peering from a loopback address, so
+that the session survives the loss of an interface. Refusing the other
+addresses keeps it there, as BIRD's `local` address does: a session
+accepted on an interface address would end with that interface, and
+advertise that address as its next hop, with nothing to tell the
+operator why. The neighbor must then reach the address, through a route
+to it, and bgpfcd must listen on it (`listen`), or on the wildcard
+address, its default, to accept the neighbor's connections. Its family
+is the neighbor's, and it is not unspecified (`0.0.0.0`, `::`),
+multicast, the neighbor's own address or an IPv6 link-local address,
+which a socket can only be bound to with an interface that bgpfcd has
+no way to be given. An address the host does not have fails every
+connect with `Cannot assign requested address`. Without
+`local-address` the kernel picks the source address by route, and a
+connection the neighbor opens is accepted on any local address.
 
 `extended-next-hop yes` advertises the Extended Next Hop Encoding
 capability of RFC 8950 for IPv4 unicast, which must then be in `families`.
@@ -888,10 +969,11 @@ Routinator 0.15 also wants such a file to set `repository-dir`, although
 the command line overrides it.
 
 **Route selection.** Of the routes to a destination that the import
-policy accepted and that are not held, bgpfcd uses one, chosen by removing
-routes from consideration in this order until one is left (RFC 4271
-§9.1.2.2: "The criteria MUST be applied in the order specified"; issue
-#47):
+policy accepted and that are not held, for their validation state (see
+**RPKI**) or for a next hop that does not resolve (see **Next hops**
+below), bgpfcd uses one, chosen by removing routes from consideration in
+this order until one is left (RFC 4271 §9.1.2.2: "The criteria MUST be
+applied in the order specified"; issue #47):
 
 1. Under `enforcement prefer-valid` only, the validation state the route is
    used with: Valid, then `not-found` and `disabled`, then Invalid (RFC
@@ -905,22 +987,12 @@ routes from consideration in this order until one is left (RFC 4271
    still under consideration count: a route an earlier step removed takes
    no other out, however low its MULTI_EXIT_DISC.
 6. d): routes from external neighbors over routes from internal ones.
-7. e): the lowest interior cost to the next hop. bgpfcd runs no IGP, so
-   every route ties, as with BIRD and FRR when they know no IGP metric.
+7. e): the lowest interior cost to the next hop. bgpfcd runs no IGP, and
+   does not take the metric of the kernel route a next hop resolves
+   through for one, so every route ties, as with BIRD and FRR when they
+   know no IGP metric.
 8. f): the lowest BGP Identifier of the neighbor.
 9. g): the lowest neighbor address.
-
-RFC 4271 §9.1.2 also takes out of route selection a route whose NEXT_HOP
-cannot be resolved ("the BGP route MUST be excluded from the Phase 2
-decision function"), and issue #47 makes routes with an unreachable next
-hop ineligible. bgpfcd does not apply this rule: it runs no IGP and reads
-no routes from the kernel, so every next hop counts as resolvable, as
-every interior cost counts as equal in step 7. A route whose next hop is
-unreachable can therefore be chosen and advertised. With `fib { mode
-install; }` the kernel refuses to install a route whose gateway it cannot
-reach directly, and the failure is logged at error as `fib: failed` (the
-first three of a change, three a second at most, and every one counted on
-the `fib: changes` lines, `docs/control.md`), but the route stays chosen.
 
 Steps 2 to 9 are RFC 4271's, unchanged. `prefer-valid` puts the state
 first, as the most significant part of the degree of preference that RFC
@@ -954,13 +1026,161 @@ The other common behaviours are policies:
   Such routes are held for their state too (see **RPKI** above), so they
   are used again once they are no longer Invalid.
 
+**Next hops.** RFC 4271 §9.1.2 takes out of route selection a route
+whose NEXT_HOP cannot be resolved ("the BGP route MUST be excluded from
+the Phase 2 decision function"), and issue #47 makes routes with an
+unreachable next hop ineligible. bgpfcd resolves every next hop in the
+kernel's main routing table, the routes that connected networks, static
+routes and an IGP daemon put there, which a thread of its own reads
+whole at startup, before any route is judged, and then follows through
+the kernel's notifications (`docs/control.md`, "Next hops"):
+
+- The next hop resolved is the one the route is used with, after import
+  policy, so that `set next-hop self` on import counts. Of an IPv6 next
+  hop it is the global address; a link-local address the neighbor sends
+  after it (RFC 2545 §3) is neither resolved nor installed, as with
+  BIRD's `next hop prefer global`. An IPv4 route with an IPv6 next hop
+  (RFC 8950) resolves in the IPv6 routes.
+- It resolves through the longest matching route ("only the longest
+  matching route SHOULD be considered", RFC 4271 §9.1.2.1), and among
+  routes to the same prefix through the one of lowest metric, as the
+  kernel does. Where the kernel holds several routes with one prefix and
+  metric (`ip route append` and `prepend`, or the gateways of one metric
+  that IPv6 makes the next hops of one route), bgpfcd keeps each in the
+  kernel's order and resolves through the first that forwards, as the
+  kernel does; one of them removed leaves the others.
+- Never through a route of bgpfcd's own, those that carry the `fib {
+  protocol }` number, so never through another BGP route, and never
+  through a default route (`0.0.0.0/0`, `::/0`): FRR's defaults, as
+  without `resolve-via-default`. A next hop only such a route covers
+  does not resolve. So no route resolves through itself or through
+  another that resolves through it (the mutual recursion of RFC 4271
+  §9.1.2.1), and installing a route never changes what a next hop
+  resolves to: bgpfcd installs a route only where no route of another
+  program has its destination and metric (see `fib` in the README,
+  "FIB dry-run"), so no route a next hop resolves through is replaced. A
+  blackhole, unreachable, prohibit or throw route resolves
+  nothing, and hides a less specific route as in the kernel.
+- Only the main table counts, whatever `fib { table }` says: policy
+  routing rules and VRFs are not looked at. A route of another program
+  with bgpfcd's protocol number is taken for bgpfcd's own.
+
+A route whose next hop does not resolve stays in the Adj-RIB-In, counted
+as received and held, but is no candidate, so it is neither installed nor
+advertised: `show routes` marks it `next hop unresolvable`. A route held
+for its validation state shows that reason whatever its next hop, since
+the RPKI rules come first; once they admit it, its next hop is checked.
+When its next hop resolves again, it is a candidate again at once, with
+no UPDATE from the neighbor and no run of import policy.
+
+With `fib { mode install; }` a route goes to the kernel through the hop
+its next hop resolves to: the next hop itself, on the interface of the
+connected route that covers it, or else the gateway and interface of the
+kernel route that resolves it, the immediate next hop, as BIRD's
+`gateway recursive` and FRR do. The interface is always given, so that a
+next hop that comes back through another interface is installed again
+through it. A gateway that kernel route has `onlink`, on the interface's
+link though no route covers it, as an IGP's route over an unnumbered link
+has, goes in `onlink` too: the kernel refuses such a gateway otherwise.
+Dry-run mode resolves the same way and installs nothing.
+
+A change of the kernel's table decides again only the destinations with a
+route through a next hop whose resolution it changed, however large the
+table, and is one line at info, `rib: next hops changed`, never a line a
+route (`docs/control.md`, "Next hops"). A next hop that no longer resolves
+takes its routes out of use: each destination then uses its next best
+route, or its route is withdrawn from the kernel and from the neighbors at
+once. When the next hop resolves again they are installed again at once,
+and announced again as any change is under `advertisement-interval` (see
+**Neighbors**): within the interval since the prefix was last announced it
+waits for the interval's end, so that a next hop that flaps costs a
+neighbor at most one announcement an interval. A next hop that only moves
+to another gateway or interface has its routes installed again through it
+and sends no neighbor anything, since nothing a neighbor sees changed.
+IPv4 removes the routes through an interface that goes down, or that loses
+its address, without a notification each, so bgpfcd then reads the table
+whole again: a route through an interface counts only while the interface
+is up (RFC 4271 §9.1.2.1 2)). The kernel removes bgpfcd's own routes
+through it the same way, and an interface that is up again before the
+reading leaves the RIB nothing to see, so after such a reading the FIB
+checks the routes it installed against the kernel's and installs again
+those the kernel lost (`docs/control.md`, "Next hops"). So it does when a
+change comes that it cannot place for sure: where a route of bgpfcd's sits
+beside another program's at one prefix and metric, the kernel's
+notification does not say whose route a replacement replaced. Such a
+reading comes a tenth of a second after what asked for it, with whatever
+else changed meanwhile, and a second after the one before at the earliest,
+however often interfaces come and go. One that lost notifications on the
+way is read again, after a pause that doubles from a second to a minute
+while that goes on, as when a full table loads into the kernel. The RIB
+keeps the reading it has until a new one arrives, so neither at startup
+nor after lost notifications does a next hop look unresolvable, or
+resolvable, for want of a table. The notifications that come within a
+hundredth of a second of the first of a batch reach the RIB together, by
+their net effect: a route deleted and added again at once, as
+`ip route del` and `ip route add` in one `ip -batch`, or BIRD replacing an
+IPv6 route, changes nothing.
+
+**Network namespace.** `netns NAME;` makes bgpfcd join the network
+namespace `/run/netns/NAME`, the file `ip netns add NAME` creates
+(iproute2's convention); a value that starts with `/` is a path used as
+it is, such as `/proc/PID/ns/net`, the namespace process PID is in, or
+`/var/run/netns/NAME`. Any other value, such as `a/b`, `..` or an empty
+string, is an error. `bgpfcd --netns` overrides the statement (see
+**Command line**). Without either, bgpfcd runs in the namespace it is
+started in.
+
+bgpfcd joins the namespace itself, at startup, before it opens a socket
+or starts a thread, so that everything it does happens there, as if it
+had been started with `ip netns exec NAME`: the BGP listeners and
+sessions, the routes it installs (`fib { table }` names a table of that
+namespace), the HTTP API's listener, the connections to RTR caches, and
+Routinator with `mode sidecar`. The control socket is a file, so
+`bgpfcctl` reaches it from any namespace. The configuration file, the
+`token-file` and every other file are read as before the join: the
+namespace changes the network, not the file system.
+
+Joining needs `CAP_SYS_ADMIN` (`setns(2)`): root has it, and a bgpfcd run
+as an unprivileged user needs it besides the others (README, "Run").
+bgpfcd checks for it before the join, and stops with `cannot join network
+namespace` and `setns(2) needs CAP_SYS_ADMIN` without it. With the
+capability effective, `setns(2)` still refuses a namespace that another
+user namespace than bgpfcd's owns, such as one made by `unshare -U`, and
+a seccomp filter can refuse the call, as systemd's
+`RestrictNamespaces=yes` does; the error then says `setns(2) refused
+although CAP_SYS_ADMIN is effective` and names both causes
+(`RestrictNamespaces=net` lets bgpfcd join). It gives the
+capability up right after the join, as root and as a user alike, so that
+nothing it runs later holds it; the log says `network namespace joined`,
+with the namespace's identity (`dev:inode` of its file), then
+`capability dropped`. Started inside the namespace already, such as with
+`ip netns exec`, bgpfcd does not join and needs no capability. Whatever
+stops the join stops the start: bgpfcd never runs in another namespace
+than the one it was told.
+
+`ip netns exec` does more than join the namespace: it gives the program
+a mount namespace of its own, in which `/sys` shows the namespace's
+interfaces, and the files of `/etc/netns/NAME/`, typically `resolv.conf`
+and `hosts`, stand in for those of `/etc`. bgpfcd does neither. It reads
+nothing under `/sys` and no setting under `/proc/sys/net`, and the
+socket tables it reads, `/proc/net/tcp` and `/proc/net/tcp6` for the
+sidecar's port, are the namespace's. What differs is name resolution:
+the host names of `rpki` caches, and Routinator's repository hosts, are
+looked up from inside the namespace with the host's `/etc/resolv.conf`
+and `/etc/hosts`, and a resolver on the host's loopback, such as
+systemd-resolved's `127.0.0.53`, cannot be reached from there. Give the
+caches by address, or use a resolver the namespace reaches.
+
 **Validation.** After parsing, these checks run and every failure is
 reported with the position of the item at fault: every `prefix-list` and
 `policy` reference resolves; no neighbor is defined twice; every neighbor
 has `remote-as`, `import` and `export`; no neighbor's `export` policy has
-`set rpki`; the HTTP listen address is a loopback address; timer
+`set rpki`; the HTTP listen address is a loopback address; `netns` is a
+name or an absolute path (above); timer
 constraints above; `extended-next-hop` only with `ipv4-unicast` in
-`families`; `maximum-prefix` only for a family in `families`; an `rpki`
+`families`; `maximum-prefix` only for a family in `families`; `multihop`
+from 1 to 255; a `local-address` of the neighbor's family that is not
+unspecified, multicast, the neighbor's own address or IPv6 link-local; an `rpki`
 block has a `mode`, at least one `cache` with `mode external`, no cache
 twice, `connect-timeout` ≤ `response-timeout` ≤ `reply-timeout`,
 `max-vrps` at least 1, a `backoff` MAX no lower than its MIN, no `cache`
@@ -978,8 +1198,9 @@ it fails, the running configuration stays and the errors are logged.
 Otherwise the daemon applies the difference: new neighbors start, removed
 ones stop with Cease / Peer De-configured, neighbors whose session
 parameters changed (anything but `description`, `import`, `export`,
-`advertisement-interval` and `maximum-prefix`; `restart-limit` included)
-reset with Cease / Other Configuration Change and start again, and
+`advertisement-interval` and `maximum-prefix`; `restart-limit`,
+`multihop` and `local-address` included) reset with Cease / Other
+Configuration Change and start again, and
 neighbors whose policies, or the prefix lists those policies use, changed
 are re-evaluated without a reset. A changed `import` policy applies at
 once to the routes the neighbor sent, from those bgpfcd kept (RFC 4271
@@ -1001,6 +1222,21 @@ a session that already holds more routes than its new limit ends as if it
 had just exceeded it, and a raised limit does not start a neighbor the old
 one stopped (`bgpfcctl clear neighbor` does). A changed `router-id` or
 `local-as` resets every session.
+
+A changed `netns`, added or removed, takes effect at the next restart,
+as a changed `listen` or `control` block, `fib { table }` or `fib {
+protocol }` does: the reload applies everything else and its summary
+says `netns changed: takes effect at the next restart; bgpfcd stays in
+PATH`, PATH being the namespace bgpfcd joined at startup, or `the
+namespace it was started in`. Every reload says so while the file names
+another namespace than that one, and none once it names that one again:
+the reload compares the file with the namespace bgpfcd is in, not with
+what an earlier reload read. With `--netns` the statement is overridden,
+so a change of it is none. The running
+daemon stays in the namespace it joined, where its sockets are: moving
+would need every one of them opened again, and the `CAP_SYS_ADMIN` it
+gave up. Refusing the whole reload, as for `router-id`, would hold back
+the other changes for no gain.
 
 A changed `rpki` block restarts the RTR client with the new settings. The
 VRPs the old client had stay in use until a cache of the new list has sent
@@ -1076,18 +1312,25 @@ block alone: bgpfcd keeps retrying it at the back-off's cap.
 
 ```
 bgpfcd -c FILE [--check] [--log-level LEVEL] [--fib dry-run|install]
-       [--user USER [--group GROUP]]
+       [--netns NAME|PATH] [--user USER [--group GROUP]]
 ```
 
 `--check` parses and validates the file (policies included), prints any
 errors, and exits with status 0 or 1 without starting anything; it does not
-look up the names of `rpki` caches or run Routinator.
-`--log-level` and `--fib` override the corresponding settings in the file
-for this run. `--user` is for a daemon started as root: the listeners and
+look up the names of `rpki` caches or run Routinator. With a network
+namespace, from `netns` or `--netns`, it also opens the namespace's file
+and checks that it is one, which needs no privilege, and says `netns PATH`
+after the counts; it does not join it.
+`--log-level`, `--fib` and `--netns` override the corresponding settings in
+the file for this run, and at every reload. `--netns` takes what `netns`
+takes: a name in `/run/netns` or an absolute path (see **Network
+namespace**). `--user` is for a daemon started as root: the listeners and
 the netlink socket are opened first, then the process drops to that user
 (README, "Option B"). Without it, an unprivileged daemon must hold
 `CAP_NET_BIND_SERVICE` for a listen port below 1024 and `CAP_NET_ADMIN`
 for `fib { mode install; }`; the daemon checks and names what is missing.
+To join a network namespace it needs `CAP_SYS_ADMIN` as well, root or
+not, which it gives up right after the join (see **Network namespace**).
 
 `SIGTERM` and `SIGINT` shut the daemon down: every session gets a Cease
 (Administrative Shutdown) and every route it installed is removed.

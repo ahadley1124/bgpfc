@@ -15,9 +15,12 @@
 //! 6811 §2 and §5 (`enforcement`: what the validation state does,
 //! configured; `startup`: routes held until the first data only when
 //! configured), §3 (`match rpki`, `set rpki`). Issues #70-#72: the
-//! `sidecar` block of `rpki`, within the bounds of `bgpfc-sidecar`.
+//! `sidecar` block of `rpki`, within the bounds of `bgpfc-sidecar`. The
+//! `netns` statement, a name as iproute2 takes one or an absolute path
+//! ([`netns_path`](crate::netns_path)).
 
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -190,6 +193,7 @@ impl Lowerer {
         let mut fib = Once::new("fib");
         let mut control = Once::new("control");
         let mut rpki = Once::new("rpki");
+        let mut netns = Once::new("netns");
         let mut listen = Vec::new();
         let mut prefix_lists: Vec<PrefixList> = Vec::new();
         let mut policies: Vec<Policy> = Vec::new();
@@ -229,6 +233,14 @@ impl Lowerer {
                     let v = self.rpki(s);
                     rpki.set(self, s.pos, v);
                 }
+                "netns" => {
+                    let v = self.arg(s).and_then(|a| {
+                        crate::netns_path(&a.value)
+                            .map_err(|e| self.err(a.pos, format!("`netns` {e}")))
+                            .ok()
+                    });
+                    netns.set(self, s.pos, v);
+                }
                 "prefix-list" => {
                     if let Some(p) = self.prefix_list(s) {
                         if prefix_lists.iter().any(|q| q.name == p.name) {
@@ -266,6 +278,7 @@ impl Lowerer {
             fib: fib.value.unwrap_or_default(),
             control: control.value.unwrap_or_default(),
             rpki: rpki.value.unwrap_or_else(Rpki::implicit),
+            netns: netns.value,
             prefix_lists,
             policies,
             neighbors,
@@ -1699,6 +1712,8 @@ struct NeighborBuilder {
     extended_next_hop: Once<bool>,
     restart_limit: Once<Option<u32>>,
     maximum_prefix: Vec<(AddressFamily, u32)>,
+    multihop: Once<NonZeroU8>,
+    local_address: Once<IpAddr>,
 }
 
 impl NeighborBuilder {
@@ -1721,6 +1736,8 @@ impl NeighborBuilder {
             extended_next_hop: Once::new("extended-next-hop"),
             restart_limit: Once::new("restart-limit"),
             maximum_prefix: Vec::new(),
+            multihop: Once::new("multihop"),
+            local_address: Once::new("local-address"),
         }
     }
 
@@ -1819,6 +1836,14 @@ impl NeighborBuilder {
                 self.restart_limit.set(l, t.pos, v);
             }
             "maximum-prefix" => self.maximum_prefix(l, t),
+            "multihop" => {
+                let v = multihop(l, t);
+                self.multihop.set(l, t.pos, v);
+            }
+            "local-address" => {
+                let v = l.parse_arg::<IpAddr>(t, "an IP address");
+                self.local_address.set(l, t.pos, v);
+            }
             _ => l.unknown(t, "`neighbor`"),
         }
     }
@@ -1897,7 +1922,37 @@ impl NeighborBuilder {
                 .value
                 .unwrap_or(Some(DEFAULT_RESTART_LIMIT)),
             maximum_prefix: self.maximum_prefix,
+            multihop: self.multihop.value,
+            local_address: self.local_address.value,
         })
+    }
+}
+
+/// `multihop [TTL]`: the TTL as written, from 1 to 255; the bare keyword
+/// is 255, the most a TTL can be.
+fn multihop(l: &mut Lowerer, t: &Statement) -> Option<NonZeroU8> {
+    if t.block.is_some() {
+        l.err(t.pos, "`multihop` does not take a block");
+        return None;
+    }
+    match t.args.as_slice() {
+        [] => Some(NonZeroU8::MAX),
+        [a] => {
+            let ttl: u8 = l.parse(a, "a TTL (1-255)")?;
+            let ttl = NonZeroU8::new(ttl);
+            if ttl.is_none() {
+                // A TTL of 0 would never leave the host.
+                l.err(a.pos, "`multihop` takes 1-255");
+            }
+            ttl
+        }
+        args => {
+            l.err(
+                t.pos,
+                format!("`multihop` takes no argument or one, found {}", args.len()),
+            );
+            None
+        }
     }
 }
 

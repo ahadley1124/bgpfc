@@ -28,6 +28,14 @@
 //! the RIB validates the affected routes again, and what follows is
 //! delivered like any other output. The RIB starts with no source (every
 //! route `disabled`) and keeps it until a change says otherwise.
+//!
+//! So do the kernel's routing table and its changes, from the kernel
+//! thread, as [`RibMsg::Kernel`] (RFC 4271 §9.1.2): the RIB resolves again
+//! the next hops a change may move, holds the routes whose next hop no
+//! longer resolves and releases those whose next hop does again, and what
+//! follows is delivered like any other output, after one line that counts
+//! it. The RIB is given the first table before the thread starts
+//! (`crate::kernel::open`), so that no route is judged without one.
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -37,6 +45,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bgpfc_fsm::Session;
 use bgpfc_log::Level;
+use bgpfc_rib::nexthop::{KernelChange, KernelUpdate, NextHopsChanged, Resolution};
 use bgpfc_rib::{
     FibChange, Output, PeerInfo, Reimport, Rejudged, Revalidation, Rib, RouteStatus, Sink,
     StartupChange, Transition,
@@ -48,8 +57,8 @@ use bgpfc_wire::update::PeerKind;
 
 use crate::coordinator::PeerTable;
 use crate::messages::{
-    FibMsg, Intervals, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply, RibSettings,
-    RouteReport, TransitionsReport,
+    FibMsg, Intervals, NextHopsReport, PAGE, PeerInput, Recorded, RibMsg, RibQuery, RibReply,
+    RibSettings, RouteReport, TransitionsReport,
 };
 use crate::peer::SendError;
 
@@ -246,6 +255,65 @@ fn handle(
         // The changes of earlier messages went to the FIB first: the loop
         // hands them on after each.
         RibMsg::FibMode(mode, reply) => fib_mode(rib, fib, mode, reply),
+        RibMsg::Kernel(update) => kernel(rib, update, now, out),
+        // After the changes of the table it follows, which went first.
+        RibMsg::VerifyFib => verify_fib(fib),
+    }
+}
+
+/// The kernel thread's request that the FIB check the routes it
+/// installed, passed on in its place after the RIB's changes
+/// (`FibMsg::Verify`).
+fn verify_fib(fib: &SyncSender<FibMsg>) {
+    if fib.send(FibMsg::Verify).is_err() {
+        bgpfc_log::error!("fib thread gone");
+    }
+}
+
+/// RFC 4271 §9.1.2: the kernel's table, or a change of it, from the
+/// kernel thread. The next hops it may move are resolved again; one line
+/// counts what that did (`Output::NextHops`).
+fn kernel(rib: &mut Rib, update: KernelUpdate, now: Instant, out: &mut impl Sink) {
+    if bgpfc_log::enabled(Level::Debug) {
+        log_line(Level::Debug, KERNEL_UPDATE, &kernel_update(&update));
+    }
+    rib.kernel(update, now, out);
+}
+
+/// The message of the line, at debug, for each input from the kernel
+/// thread.
+const KERNEL_UPDATE: &str = "rib: kernel routes";
+
+/// The fields of that line: a whole table, with its routes and
+/// interfaces, or the routes added or replaced and removed, and the
+/// interfaces named and gone.
+fn kernel_update(update: &KernelUpdate) -> Vec<(&'static str, String)> {
+    match update {
+        KernelUpdate::Table { routes, links } => vec![
+            ("table", routes.len().to_string()),
+            ("links", links.len().to_string()),
+        ],
+        KernelUpdate::Changes(changes) => {
+            let count = |f: fn(&KernelChange) -> bool| changes.iter().filter(|c| f(c)).count();
+            vec![
+                (
+                    "routes",
+                    count(|c| matches!(c, KernelChange::Route(_))).to_string(),
+                ),
+                (
+                    "gone",
+                    count(|c| matches!(c, KernelChange::Gone { .. })).to_string(),
+                ),
+                (
+                    "links",
+                    count(|c| matches!(c, KernelChange::Link { .. })).to_string(),
+                ),
+                (
+                    "links_gone",
+                    count(|c| matches!(c, KernelChange::LinkGone(_))).to_string(),
+                ),
+            ]
+        }
     }
 }
 
@@ -281,8 +349,8 @@ fn fib_mode(rib: &Rib, fib: &SyncSender<FibMsg>, mode: bgpfc_fib::Mode, reply: S
     let mut ok = send(FibMsg::SetMode(mode));
     if mode == bgpfc_fib::Mode::Install {
         let mut batch = Vec::with_capacity(RECONCILE_BATCH);
-        for route in rib.fib_routes() {
-            batch.push(route);
+        for (prefix, hop) in rib.fib_routes() {
+            batch.push((prefix, crate::fib::fib_hop(hop)));
             if batch.len() == RECONCILE_BATCH {
                 ok &= send(FibMsg::Reconcile(std::mem::take(&mut batch)));
                 batch.reserve(RECONCILE_BATCH);
@@ -548,6 +616,16 @@ impl Sink for Deliver<'_> {
                 }
             }
             Output::RequestRoutes { peer, families } => self.request_routes(peer, families),
+            Output::NextHops(r) => {
+                // RFC 4271 §9.1.2: a change of the kernel's routing table
+                // moved what next hops resolve to. One line however many
+                // routes it moved; the routes show in the FIB's folded
+                // `fib: changes` lines, and a line per next hop at debug.
+                let debug = bgpfc_log::enabled(Level::Debug);
+                for line in next_hop_lines(&r, debug) {
+                    log_line(line.level, line.msg, &line.fields);
+                }
+            }
         }
     }
 }
@@ -639,6 +717,78 @@ pub(crate) const LOGGED: usize = 100;
 /// The message of the line per route a change of the validation source
 /// moved (issue #59).
 const TRANSITION: &str = "rib: route validation state changed";
+
+/// The message of the line logged when a change of the kernel's routing
+/// table changed what next hops resolve to.
+const NEXT_HOPS_CHANGED: &str = "rib: next hops changed";
+
+/// The message of the line, at debug, for each next hop it changed.
+const NEXT_HOP_CHANGED: &str = "rib: next hop changed";
+
+/// The next hops the line names; `...` marks the rest.
+const NEXT_HOPS_SHOWN: usize = 8;
+
+/// What a change of the kernel's routing table is logged with: a line at
+/// info with the next hops that now resolve, no longer resolve, or
+/// resolve through another hop, the routes that change took out of use
+/// (`held`) and put back (`released`), the destinations whose best route
+/// changed, and the first [`NEXT_HOPS_SHOWN`] next hops as they are now
+/// (`10.0.0.9 via 10.99.7.1 dev v12b`, `198.51.100.9 unresolved`); and
+/// with `debug` a line for each next hop. Never a line per route: a next
+/// hop that covers a full table moves a million routes.
+fn next_hop_lines(r: &NextHopsChanged, debug: bool) -> Vec<Line> {
+    let mut shown: Vec<String> = r
+        .next_hops
+        .iter()
+        .take(NEXT_HOPS_SHOWN)
+        .map(ToString::to_string)
+        .collect();
+    if r.next_hops.len() > NEXT_HOPS_SHOWN {
+        shown.push("...".to_owned());
+    }
+    let mut lines = vec![Line {
+        level: Level::Info,
+        msg: NEXT_HOPS_CHANGED,
+        fields: vec![
+            ("resolved", r.resolved.to_string()),
+            ("unresolved", r.unresolved.to_string()),
+            ("moved", r.moved.to_string()),
+            ("held", r.held.to_string()),
+            ("released", r.released.to_string()),
+            ("best_changed", r.best_changed.to_string()),
+            ("next_hops", shown.join(",")),
+        ],
+    }];
+    if !debug {
+        return lines;
+    }
+    for n in &r.next_hops {
+        let mut fields = vec![("next_hop", n.addr.to_string())];
+        match n.resolution {
+            Resolution::Unresolved => fields.push(("state", "unresolved".to_owned())),
+            Resolution::Resolved { hop, through } => {
+                fields.push(("state", "resolved".to_owned()));
+                fields.push(("gateway", hop.gateway.to_string()));
+                if let Some(oif) = hop.oif {
+                    fields.push(("oif", oif.to_string()));
+                }
+                if let Some(name) = &n.interface {
+                    fields.push(("interface", name.clone()));
+                }
+                if let Some(through) = through {
+                    fields.push(("through", through.to_string()));
+                }
+            }
+        }
+        fields.push(("routes", n.routes.to_string()));
+        lines.push(Line {
+            level: Level::Debug,
+            msg: NEXT_HOP_CHANGED,
+            fields,
+        });
+    }
+    lines
+}
 
 /// One line to log, its field values already text.
 #[derive(Debug, PartialEq, Eq)]
@@ -927,6 +1077,10 @@ fn route_report(prefix: Prefix, r: &bgpfc_rib::RouteRef<'_>, best: bool) -> Rout
 fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
     match q {
         RibQuery::Transitions => RibReply::Transitions(transitions.report()),
+        RibQuery::NextHops => RibReply::NextHops(NextHopsReport {
+            next_hops: rib.next_hops(),
+            kernel_routes: rib.kernel_routes(),
+        }),
         RibQuery::Peers => RibReply::Peers(
             rib.peers()
                 .map(|p| (p.clone(), rib.peer_stats(p.addr).unwrap_or_default()))
@@ -976,9 +1130,12 @@ fn answer(rib: &Rib, transitions: &Transitions, q: &RibQuery) -> RibReply {
             }
             RibReply::Routes(page)
         }
-        RibQuery::FibRoutes { after } => {
-            RibReply::FibRoutes(rib.fib_routes_after(*after).take(PAGE).collect())
-        }
+        RibQuery::FibRoutes { after } => RibReply::FibRoutes(
+            rib.fib_routes_after(*after)
+                .take(PAGE)
+                .map(|(prefix, hop)| (prefix, crate::fib::fib_hop(hop)))
+                .collect(),
+        ),
     }
 }
 
@@ -1359,6 +1516,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);
@@ -1425,6 +1585,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);
@@ -1659,6 +1822,9 @@ mod tests {
             port: listener.local_addr().unwrap().port(),
             fsm,
             allow_as_set: false,
+            ttl: None,
+            local: None,
+            single_hop: false,
         };
         let (rib_tx, rib_rx) = sync_channel(64);
         let (h, peer) = crate::peer::prepare(cfg, rib_tx);
@@ -1959,6 +2125,281 @@ mod tests {
         bgpfc_log::format_line(std::time::UNIX_EPOCH, level, msg, &fields)
     }
 
+    /// A change of the kernel's table is one line at info, however many
+    /// next hops it moved, the first eight named as they are now; and at
+    /// debug a line per next hop.
+    #[test]
+    fn next_hop_changes_are_one_line() {
+        use bgpfc_rib::nexthop::{Hop, NextHopReport};
+        let unresolved = |i: u8| NextHopReport {
+            addr: IpAddr::from([198, 51, 100, i]),
+            resolution: Resolution::Unresolved,
+            interface: None,
+            routes: 3,
+        };
+        let moved = NextHopReport {
+            addr: ip("10.255.7.30"),
+            resolution: Resolution::Resolved {
+                hop: Hop {
+                    gateway: ip("10.99.7.1"),
+                    oif: Some(4),
+                    onlink: false,
+                },
+                through: Some("10.255.7.30/32".parse().unwrap()),
+            },
+            interface: Some("v12b".to_owned()),
+            routes: 1,
+        };
+        let mut r = NextHopsChanged {
+            resolved: 0,
+            unresolved: 9,
+            moved: 1,
+            next_hops: vec![moved],
+            held: 27,
+            released: 0,
+            best_changed: 27,
+        };
+        r.next_hops.extend((1..10).map(unresolved));
+        let written = |lines: &[Line]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| formatted(l.level, l.msg, &l.fields))
+                .collect()
+        };
+        let lines = next_hop_lines(&r, false);
+        assert_eq!(
+            written(&lines),
+            [
+                "1970-01-01T00:00:00.000Z INFO  msg=\"rib: next hops changed\" resolved=0 \
+              unresolved=9 moved=1 held=27 released=0 best_changed=27 \
+              next_hops=\"10.255.7.30 via 10.99.7.1 dev v12b,198.51.100.1 unresolved,\
+              198.51.100.2 unresolved,198.51.100.3 unresolved,198.51.100.4 unresolved,\
+              198.51.100.5 unresolved,198.51.100.6 unresolved,198.51.100.7 unresolved,...\"\n"
+            ]
+        );
+        let lines = next_hop_lines(&r, true);
+        assert_eq!(lines.len(), 11);
+        assert_eq!(
+            written(&lines[1..3]),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: next hop changed\" \
+                 next_hop=10.255.7.30 state=resolved gateway=10.99.7.1 oif=4 interface=v12b \
+                 through=10.255.7.30/32 routes=1\n",
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"rib: next hop changed\" \
+                 next_hop=198.51.100.1 state=unresolved routes=3\n",
+            ]
+        );
+    }
+
+    /// The kernel thread's request that the FIB check its routes reaches
+    /// the FIB thread as it is, in its place among the RIB's changes.
+    #[test]
+    fn a_check_of_the_fib_goes_to_the_fib() {
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let (fib, fib_rx) = sync_channel(4);
+        let mut out = Vec::new();
+        super::handle(
+            &mut rib,
+            &mut settings,
+            &mut Transitions::default(),
+            RibMsg::VerifyFib,
+            Instant::now(),
+            &fib,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let msgs: Vec<FibMsg> = fib_rx.try_iter().collect();
+        assert!(matches!(&msgs[..], [FibMsg::Verify]), "{msgs:?}");
+    }
+
+    /// 192.0.2.0/24 connected on interface 2.
+    fn connected_on_eth0() -> bgpfc_rib::nexthop::KernelRoute {
+        use bgpfc_rib::nexthop::{KernelRoute, Via};
+        KernelRoute {
+            prefix: "192.0.2.0/24".parse().unwrap(),
+            metric: 0,
+            via: Via::Unicast {
+                gateway: None,
+                oif: 2,
+                onlink: false,
+            },
+        }
+    }
+
+    /// A next hop on that network, as it resolves: itself on interface 2.
+    fn connected_hop(next_hop: &str) -> bgpfc_rib::nexthop::Hop {
+        bgpfc_rib::nexthop::Hop {
+            gateway: ip(next_hop),
+            oif: Some(2),
+            onlink: false,
+        }
+    }
+
+    /// The kernel thread's table and changes go to the RIB as they come
+    /// (RFC 4271 §9.1.2): a route whose next hop the table resolves goes
+    /// to the FIB through the interface it is reached on; when the
+    /// connected network goes, it is held, after one line that counts it,
+    /// and leaves the FIB; when it comes back, so does the route.
+    #[test]
+    fn the_kernels_table_resolves_and_holds_routes() {
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let connected = connected_on_eth0();
+        let table = KernelUpdate::Table {
+            routes: vec![connected],
+            links: vec![(2, "eth0".to_owned())],
+        };
+        assert_eq!(
+            kernel_update(&table),
+            [("table", "1".to_owned()), ("links", "1".to_owned())]
+        );
+        let out = handle(&mut rib, &mut settings, RibMsg::Kernel(table), now);
+        assert!(out.is_empty(), "{out:?}");
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        let out = handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        let hop = connected_hop("192.0.2.1");
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Fib(c) if c.next_hop == Some(hop))),
+            "{out:?}"
+        );
+        let gone = KernelUpdate::Changes(vec![KernelChange::Gone {
+            prefix: connected.prefix,
+            metric: 0,
+        }]);
+        assert_eq!(
+            kernel_update(&gone),
+            [
+                ("routes", "0".to_owned()),
+                ("gone", "1".to_owned()),
+                ("links", "0".to_owned()),
+                ("links_gone", "0".to_owned()),
+            ]
+        );
+        let out = handle(&mut rib, &mut settings, RibMsg::Kernel(gone), now);
+        assert!(
+            matches!(&out[0], Output::NextHops(r) if r.unresolved == 1 && r.held == 1),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::Fib(c) if c.next_hop.is_none() && c.previous == Some(hop)
+            )),
+            "{out:?}"
+        );
+        assert_eq!(rib.peer_stats(ip("192.0.2.1")).unwrap().held, [(V4, 1)]);
+        let back = KernelUpdate::Changes(vec![KernelChange::Route(connected)]);
+        let out = handle(&mut rib, &mut settings, RibMsg::Kernel(back), now);
+        assert!(
+            matches!(&out[0], Output::NextHops(r) if r.resolved == 1 && r.released == 1),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Output::Fib(c) if c.next_hop == Some(hop) && c.previous.is_none()
+            )),
+            "{out:?}"
+        );
+        // `show nexthops` asks the RIB thread: the next hop, what it
+        // resolves through, and the routes of the kernel's table.
+        let RibReply::NextHops(report) = answer(&rib, &Transitions::default(), &RibQuery::NextHops)
+        else {
+            panic!("expected next hops");
+        };
+        assert_eq!(report.kernel_routes, Some(1));
+        assert_eq!(
+            report.next_hops,
+            [bgpfc_rib::nexthop::NextHopReport {
+                addr: ip("192.0.2.1"),
+                resolution: Resolution::Resolved {
+                    hop,
+                    through: Some(connected.prefix),
+                },
+                interface: Some("eth0".to_owned()),
+                routes: 1,
+            }]
+        );
+    }
+
+    /// A switch to install mode reconciles the FIB against the RIB's
+    /// routes through the hops they resolve to, interface included, as
+    /// `show fib` lists what the RIB wants.
+    #[test]
+    fn the_reconcile_and_show_fib_carry_the_interface() {
+        use bgpfc_rib::nexthop::{KernelRoute, Via};
+        let now = Instant::now();
+        let mut rib = Rib::new(Asn(65_000));
+        let mut settings = RibSettings::default();
+        let table = KernelUpdate::Table {
+            routes: vec![KernelRoute {
+                prefix: "192.0.2.0/24".parse().unwrap(),
+                metric: 0,
+                via: Via::Unicast {
+                    gateway: None,
+                    oif: 7,
+                    onlink: false,
+                },
+            }],
+            links: vec![(7, "v7".to_owned())],
+        };
+        handle(&mut rib, &mut settings, RibMsg::Kernel(table), now);
+        handle(
+            &mut rib,
+            &mut settings,
+            up("192.0.2.1", 65_001, PeerKind::External),
+            now,
+        );
+        handle(
+            &mut rib,
+            &mut settings,
+            routes("192.0.2.1", 65_001, &["198.51.100.0/24"]),
+            now,
+        );
+        let want = vec![(
+            "198.51.100.0/24".parse().unwrap(),
+            bgpfc_fib::Hop {
+                gateway: ip("192.0.2.1"),
+                oif: Some(7),
+                onlink: false,
+            },
+        )];
+        let (fib, fib_rx) = sync_channel(8);
+        let (reply, _) = sync_channel(1);
+        fib_mode(&rib, &fib, bgpfc_fib::Mode::Install, reply);
+        let msgs: Vec<FibMsg> = fib_rx.try_iter().collect();
+        assert!(
+            matches!(&msgs[..], [
+                FibMsg::SetMode(bgpfc_fib::Mode::Install),
+                FibMsg::Reconcile(routes),
+                FibMsg::ReconcileEnd(_),
+            ] if *routes == want),
+            "{msgs:?}"
+        );
+        let answer = answer(
+            &rib,
+            &Transitions::default(),
+            &RibQuery::FibRoutes { after: None },
+        );
+        assert!(
+            matches!(&answer, RibReply::FibRoutes(routes) if *routes == want),
+            "{answer:?}"
+        );
+    }
+
     /// The FIB thread logs a line per input (`crate::fib`, "Logging"):
     /// an input's changes go in batches of [`FIB_BATCH`] at most, all but
     /// the last marked `more`, and one that filled its last batch exactly
@@ -1969,7 +2410,11 @@ mod tests {
             Output::Fib(FibChange {
                 family: V4,
                 prefix: format!("10.{}.{}.0/24", i / 256, i % 256).parse().unwrap(),
-                next_hop: Some(ip("192.0.2.1")),
+                next_hop: Some(bgpfc_rib::nexthop::Hop {
+                    gateway: ip("192.0.2.1"),
+                    oif: None,
+                    onlink: false,
+                }),
                 previous: None,
             })
         };

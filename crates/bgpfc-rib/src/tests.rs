@@ -18,10 +18,12 @@ use bgpfc_wire::update::{DecodeContext, DecodedUpdate, PeerKind, UpdateMessage};
 use crate::attrs::{PathAttrs, announced};
 use crate::decision::{Candidate, Neighbor, ORDER, Step, best};
 use crate::export::{Source, export};
+use crate::nexthop::Hop;
 use crate::peer::PeerInfo;
 use crate::{FibChange, Output, Rib};
 
 mod adj_rib_in;
+mod nexthop;
 mod reimport;
 mod validation;
 
@@ -57,6 +59,16 @@ fn ip(s: &str) -> IpAddr {
 
 fn p(s: &str) -> Prefix {
     s.parse().unwrap()
+}
+
+/// The hop of a route through `gateway` in a RIB with no kernel table:
+/// the next hop itself, no interface.
+fn gw(gateway: &str) -> Hop {
+    Hop {
+        gateway: ip(gateway),
+        oif: None,
+        onlink: false,
+    }
 }
 
 fn attrs(path: &[u32], next_hop: &str) -> PathAttrs {
@@ -755,7 +767,7 @@ fn link_local_next_hops_are_never_passed_on() {
     let sent = decode_sent(sends(&out, int.addr)[0], &int);
     assert_eq!(sent[0].mp_reach.as_ref().unwrap().next_hop, global);
     // The FIB still gets the global address.
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("2001:db8:1::1")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("2001:db8:1::1")));
 }
 
 /// `info` with RFC 8950 extended next hop negotiated for IPv4 unicast.
@@ -873,8 +885,8 @@ fn rfc8950_ipv4_routes_with_ipv6_next_hops_end_to_end() {
         vec![FibChange {
             family: V4,
             prefix: dst,
-            next_hop: Some(ip("2001:db8::1")),
-            previous: Some(ip("10.0.0.4")),
+            next_hop: Some(gw("2001:db8::1")),
+            previous: Some(gw("10.0.0.4")),
         }]
     );
     // B: MP_REACH_NLRI for IPv4 with our IPv6 address, no NEXT_HOP.
@@ -961,13 +973,13 @@ fn announce_withdraw_and_fib_changes() {
             FibChange {
                 family: V4,
                 prefix: p("192.0.2.0/24"),
-                next_hop: Some(ip("10.0.0.1")),
+                next_hop: Some(gw("10.0.0.1")),
                 previous: None,
             },
             FibChange {
                 family: V4,
                 prefix: p("198.51.100.0/24"),
-                next_hop: Some(ip("10.0.0.1")),
+                next_hop: Some(gw("10.0.0.1")),
                 previous: None,
             },
         ]
@@ -999,7 +1011,7 @@ fn announce_withdraw_and_fib_changes() {
     // e2 is not.
     let b = attrs(&[65_002], "10.0.0.2");
     let out = outputs(|o| rib.update(e2.addr, &announce(&["192.0.2.0/24"], &b), now(), o));
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.2")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.2")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].nlri, vec![p("192.0.2.0/24")]);
     // e2 had e1's route; its own is not sent back, so it is withdrawn.
@@ -1011,7 +1023,7 @@ fn announce_withdraw_and_fib_changes() {
 
     // Withdraw from e2: back to e1's route; e2 gets it, e1 gets a withdraw.
     let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), now(), o));
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.1")));
     let m = decode_sent(sends(&out, e1.addr)[0], &e1);
     assert_eq!(m[0].withdrawn, vec![p("192.0.2.0/24")]);
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
@@ -1111,7 +1123,7 @@ fn a_next_hop_that_is_our_own_address_is_ignored() {
             family: V4,
             prefix: dst,
             next_hop: None,
-            previous: Some(ip("10.0.0.1")),
+            previous: Some(gw("10.0.0.1")),
         }]
     );
     assert_eq!(
@@ -1131,7 +1143,7 @@ fn a_next_hop_that_is_our_own_address_is_ignored() {
             o,
         );
     });
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.1")));
 }
 
 #[test]
@@ -1213,7 +1225,7 @@ fn prefix_in_both_withdrawn_and_nlri_is_announced() {
     u.message.withdrawn = vec![p("192.0.2.0/24")];
     let out = outputs(|o| rib.update(e1.addr, &u, now(), o));
     assert_eq!(fib(&out).len(), 1);
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.1")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.1")));
     assert_eq!(rib.loc_rib(V4).count(), 1);
 }
 
@@ -1305,7 +1317,7 @@ fn routes_of_a_family_only_we_advertised_are_taken_and_go_with_the_session() {
             family: V6,
             prefix: p("2001:db8:1::/48"),
             next_hop: None,
-            previous: Some(ip("2001:db8::1")),
+            previous: Some(gw("2001:db8::1")),
         }]
     );
     assert!(rib.loc_rib(V6).all(|(_, b)| b.peer == e2.addr));
@@ -1326,34 +1338,6 @@ fn as_loop_routes_are_excluded() {
     assert_eq!(rib.loc_rib(V4).count(), 1);
     let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &a), now(), o));
     assert_eq!(fib(&out)[0].next_hop, None);
-}
-
-#[test]
-fn every_next_hop_counts_as_resolvable() {
-    // RFC 4271 §9.1.2: "If the NEXT_HOP attribute of a BGP route depicts
-    // an address that is not resolvable ... the BGP route MUST be excluded
-    // from the Phase 2 decision function." bgpfcd runs no IGP and reads no
-    // route from the kernel, so it cannot tell (COMPLIANCE.md, RFC 4271
-    // §9.1.2; docs/config.md, "Route selection"): a next hop on no
-    // network the router is attached to is chosen, installed and
-    // advertised like any other.
-    let mut rib = Rib::new(LOCAL_AS);
-    let e1 = peer("10.0.0.1", 65_001, 1);
-    let e2 = peer("10.0.0.2", 65_002, 2);
-    outputs(|o| rib.peer_up(e1.clone(), now(), o));
-    outputs(|o| rib.peer_up(e2.clone(), now(), o));
-    let far = attrs(&[65_001], "203.0.113.99");
-    let out = outputs(|o| rib.update(e1.addr, &announce(&["192.0.2.0/24"], &far), now(), o));
-    assert_eq!(
-        fib(&out),
-        vec![FibChange {
-            family: V4,
-            prefix: p("192.0.2.0/24"),
-            next_hop: Some(ip("203.0.113.99")),
-            previous: None,
-        }]
-    );
-    assert_eq!(sends(&out, e2.addr).len(), 1);
 }
 
 #[test]
@@ -1453,9 +1437,9 @@ fn an_incorrect_mp_attribute_disables_its_family_for_the_session() {
     let changes = fib(&out);
     assert_eq!(changes.len(), 3, "{changes:?}");
     for (prefix, next_hop) in [
-        ("2001:db8:1::/48", Some(ip("2001:db8::2"))),
+        ("2001:db8:1::/48", Some(gw("2001:db8::2"))),
         ("2001:db8:2::/48", None),
-        ("198.51.100.0/24", Some(ip("10.0.0.1"))),
+        ("198.51.100.0/24", Some(gw("10.0.0.1"))),
     ] {
         assert!(
             changes
@@ -2725,7 +2709,7 @@ fn best_route_is_listed_first() {
     assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e2.addr);
     // The best goes: the next best (shorter path) takes its place.
     let out = outputs(|o| rib.update(e2.addr, &withdraw(&["192.0.2.0/24"]), now(), o));
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.3")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.3")));
     assert_eq!(order(&rib), vec![e3.addr, e1.addr]);
     // A non-best route going changes nothing.
     let out = outputs(|o| rib.update(e1.addr, &withdraw(&["192.0.2.0/24"]), now(), o));
@@ -2843,7 +2827,7 @@ fn a_prefix_listed_twice_in_an_update_changes_once() {
     let changes = fib(&out);
     assert_eq!(changes.len(), 2, "{changes:?}");
     assert_eq!(changes[0].prefix, p("192.0.2.0/24"));
-    assert_eq!(changes[0].next_hop, Some(ip("10.0.0.9")));
+    assert_eq!(changes[0].next_hop, Some(gw("10.0.0.9")));
     let sent = decode_sent(sends(&out, e2.addr)[0], &e2);
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].withdrawn.len(), 0);

@@ -2274,6 +2274,7 @@ mod tests {
         let opts = crate::args::parse(&["-c".to_owned(), "unused.conf".to_owned()]).unwrap();
         let mut coordinator = crate::Coordinator {
             opts: &opts,
+            joined: crate::Joined(None),
             config: cfg,
             table: crate::coordinator::PeerTable::default(),
             rib_tx,

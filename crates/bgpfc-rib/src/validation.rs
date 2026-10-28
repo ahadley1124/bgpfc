@@ -10,7 +10,10 @@
 //! enforcement mode changes ([`Rib::set_enforcement`]), every route not
 //! validated yet when the startup setting changes ([`Rib::set_startup`]),
 //! and every route of the peers whose import policy changed
-//! ([`Rib::reimport`]).
+//! ([`Rib::reimport`]); and visits the destinations of the next hops whose
+//! resolution a change of the kernel's table moved
+//! ([`Rib::kernel`](crate::Rib::kernel)), moving their routes between the
+//! candidates and the routes held for their next hop.
 //!
 //! Implements: RFC 6811 §2 ("The validation state of the Route MUST be
 //! set to reflect the result of the lookup"), §4 ("When a mapping is added
@@ -34,6 +37,7 @@ use bgpfc_rpki::{
 use bgpfc_wire::prefix::{Ipv4Key, Prefix};
 use bgpfc_wire::types::{AddressFamily, Afi, Asn};
 
+use crate::nexthop::{NextHops, Shift};
 use crate::store::{Destination, PeerId, Route, Table};
 use crate::{
     Decide, Dirty, Held, Interner, Judged, Output, PeerState, Policies, Rib, Scratch, Sink, judge,
@@ -384,6 +388,7 @@ impl Rib {
         // Empty destinations to remove once a table's walk is done.
         let mut empty: Vec<Prefix> = Vec::new();
         let mut moves: Vec<Move> = Vec::new();
+        let mut keys: Vec<IpAddr> = Vec::new();
         // IPv4 before IPv6, whichever table came first, for the order of
         // the sample and the transitions.
         let mut tables: Vec<(AddressFamily, &mut Table)> = self.tables.iter_mut().collect();
@@ -399,10 +404,13 @@ impl Rib {
                 acting: (cx.enforcement, cx.startup),
                 rejudge,
                 interner: &mut cx.interner,
+                nexthops: &mut self.s.nexthops,
                 tally: &mut tally,
                 scratch: &mut *scratch,
                 empty: &mut empty,
                 moves: &mut moves,
+                keys: &mut keys,
+                relinked: false,
             };
             match ranges {
                 None => {
@@ -444,6 +452,52 @@ impl Rib {
         }
         tally
     }
+
+    /// Visit the destinations `v4` and `v6` (sorted, each once) of every
+    /// table with a [`Pass`] that follows `shifts`, the next hops whose
+    /// resolution changed ([`Rejudge::NextHop`]). A table they hold at
+    /// least one in [`DENSE`] destinations of is walked once alongside
+    /// them, else each is looked up. The scratch gets the destinations to
+    /// run Phase 3 for.
+    pub(crate) fn walk_points(
+        &mut self,
+        v4: &[Ipv4Key],
+        v6: &[Prefix],
+        shifts: &[(IpAddr, Shift)],
+        scratch: &mut Scratch,
+    ) -> Tally {
+        let mut tally = Tally::default();
+        let (mut empty, mut moves, mut keys) = (Vec::new(), Vec::new(), Vec::new());
+        let mut tables: Vec<(AddressFamily, &mut Table)> = self.tables.iter_mut().collect();
+        tables.sort_by_key(|(family, _)| *family);
+        for (family, table) in tables {
+            let cx = &mut self.s.cx;
+            let mut pass = Pass {
+                family,
+                local_as: cx.local_as,
+                source: &*cx.validation,
+                peers: &mut self.s.peers,
+                policies: &*cx.policies,
+                acting: (cx.enforcement, cx.startup),
+                rejudge: Rejudge::NextHop(shifts),
+                interner: &mut cx.interner,
+                nexthops: &mut self.s.nexthops,
+                tally: &mut tally,
+                scratch: &mut *scratch,
+                empty: &mut empty,
+                moves: &mut moves,
+                keys: &mut keys,
+                relinked: false,
+            };
+            let size = table.v4.len() + table.v6.len();
+            let dense = (v4.len() + v6.len()).saturating_mul(DENSE) >= size;
+            walk_points(&mut table.v4, v4, dense, |k, d| {
+                pass.destination(k.prefix(), d);
+            });
+            walk_points(&mut table.v6, v6, dense, |p, d| pass.destination(*p, d));
+        }
+        tally
+    }
 }
 
 /// Destinations among `dirty` where the decision process chose another
@@ -478,6 +532,12 @@ pub(crate) enum Rejudge<'a> {
     /// Every route of the peers whose slot is `true` here, with the state
     /// it has: their import policy changed.
     Import(&'a [bool]),
+    /// No route is judged again: the routes whose next hop these say now
+    /// resolves, or no longer does, move between the candidates and the
+    /// routes held for their next hop, and a destination whose best route
+    /// goes through a next hop that moved is noted for the FIB. Sorted by
+    /// next hop.
+    NextHop(&'a [(IpAddr, Shift)]),
 }
 
 /// What validating routes again needs of the RIB, borrowed apart from
@@ -496,6 +556,8 @@ struct Pass<'a> {
     /// of some peers.
     rejudge: Rejudge<'a>,
     interner: &'a mut Interner,
+    /// The next-hop index, kept up to date as routes change next hop.
+    nexthops: &'a mut NextHops,
     tally: &'a mut Tally,
     scratch: &'a mut Scratch,
     /// Destinations left with no route, for the caller to remove.
@@ -503,6 +565,11 @@ struct Pass<'a> {
     /// The routes of the destination being validated again whose state
     /// moved among valid, invalid and not-found.
     moves: &'a mut Vec<Move>,
+    /// The next hops the destination's routes had before they were
+    /// judged again, for the next-hop index.
+    keys: &'a mut Vec<IpAddr>,
+    /// Whether a route of the destination changed next hop, or went.
+    relinked: bool,
 }
 
 /// A route whose state moved among valid, invalid and not-found, until
@@ -536,6 +603,9 @@ impl Pass<'_> {
     /// route, changed.
     fn destination(&mut self, prefix: Prefix, dest: &mut Destination) {
         let old = dest.best().cloned();
+        self.keys.clear();
+        self.keys.extend(dest.routes().iter().map(Route::next_hop));
+        self.relinked = false;
         let mut done = Redone::default();
         // The routes no state admits any more.
         let mut dropped: Vec<PeerId> = Vec::new();
@@ -556,6 +626,11 @@ impl Pass<'_> {
                 self.scratch.released.extend(r.received);
             }
         }
+        // After the loop and the drops: which next hops the destination
+        // has a route through now.
+        if self.relinked {
+            self.nexthops.remark(prefix, self.keys, dest);
+        }
         if done.restated {
             self.tally.destinations += 1;
             if self.tally.sample.len() < Revalidation::SAMPLE {
@@ -568,26 +643,33 @@ impl Pass<'_> {
                 enforcement: self.acting.0,
             }
             .run(dest);
-            let new = dest.best();
-            // A pass that is not a change of the validation source judges
-            // routes again whose state did not change, and most come out
-            // as they were: only a destination whose best route is
-            // another, or is used otherwise, is noted, so that a pass
-            // over a full table does not note every destination.
-            let same = match (&old, new) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.same(b) && a.same_state(b),
-                _ => false,
-            };
-            if self.rejudge == Rejudge::Restated || !same {
-                self.scratch.dirty.push(Dirty {
-                    family: self.family,
-                    prefix,
-                    old,
-                    new: new.cloned(),
-                    merged: false,
-                });
+        }
+        let new = dest.best();
+        // A pass that is not a change of the validation source judges
+        // routes again whose state did not change, and most come out as
+        // they were: only a destination whose best route is another, or
+        // is used otherwise, or goes through a next hop that moved, is
+        // noted, so that a pass over a full table does not note every
+        // destination.
+        let same = match (&old, new) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b) && a.same_state(b),
+            _ => false,
+        };
+        let moved = match self.rejudge {
+            Rejudge::NextHop(shifts) => {
+                new.is_some_and(|r| shift(shifts, r.next_hop()) == Some(Shift::Moved))
             }
+            _ => false,
+        };
+        if (done.changed && (self.rejudge == Rejudge::Restated || !same)) || moved {
+            self.scratch.dirty.push(Dirty {
+                family: self.family,
+                prefix,
+                old,
+                new: new.cloned(),
+                merged: false,
+            });
         }
         self.list(prefix, dest);
         if dest.is_empty() {
@@ -632,6 +714,9 @@ impl Pass<'_> {
     /// the pass judges it again whatever its state, judge it again;
     /// `dropped` gets its peer if no state admits it any more.
     fn route(&mut self, prefix: Prefix, route: &mut Route, dropped: &mut Vec<PeerId>) -> Redone {
+        if let Rejudge::NextHop(shifts) = self.rejudge {
+            return self.follow(route, shifts);
+        }
         // The startup setting acts on no route that has a state.
         if self.rejudge == Rejudge::Unvalidated && route.effective_rov() != RovState::Disabled {
             return Redone::default();
@@ -694,7 +779,7 @@ impl Pass<'_> {
         let judged = judge(
             self.policies,
             self.acting,
-            self.interner,
+            (&mut *self.interner, &mut *self.nexthops),
             &peer.info,
             (self.family, prefix),
             &received,
@@ -703,6 +788,7 @@ impl Pass<'_> {
         let (attrs, rov_set, held, gone) = match judged {
             Judged::Accepted { attrs, rov_set } => (attrs, rov_set, None, false),
             Judged::Held { by, rov_set } => (Arc::clone(&received), rov_set, Some(by), false),
+            Judged::Unresolved { attrs, rov_set } => (attrs, rov_set, Some(Held::NextHop), false),
             // Policy accepted the route with some state when it was last
             // judged, so only a change of policy since can leave none: the
             // route is dropped, as one policy rejects on arrival is (see
@@ -730,6 +816,7 @@ impl Pass<'_> {
         }
         let replaced = std::mem::replace(&mut route.attrs, attrs);
         let unchanged = Arc::ptr_eq(&replaced, &route.attrs);
+        self.relink(replaced.next_hop_addr(), route.next_hop(), gone);
         if gone || !unchanged || was != (rov_set, held) {
             self.tally.changed += 1;
         }
@@ -743,6 +830,67 @@ impl Pass<'_> {
             moved: was_held != is_held,
         }
     }
+}
+
+impl Pass<'_> {
+    /// Count a route judged again whose next hop went from `was` to
+    /// `now`, or that is `gone`, in the next-hop index; which next hops the
+    /// destination has a route through is worked out once all its routes
+    /// are judged ([`NextHops::remark`]).
+    fn relink(&mut self, was: IpAddr, now: IpAddr, gone: bool) {
+        if gone || was != now {
+            self.nexthops.count(was, false);
+            if !gone {
+                self.nexthops.count(now, true);
+            }
+            self.relinked = true;
+        }
+    }
+
+    /// A change of the kernel's table moved `route`'s next hop as `shifts`
+    /// say, or did not: a candidate whose next hop no longer resolves is
+    /// held for it, a route held for its next hop that resolves again is a
+    /// candidate, and nothing else changes. Neither policy nor the
+    /// validation rules run: they admitted the route before its next hop
+    /// was looked at (`judge`), and their own changes judge it again.
+    fn follow(&mut self, route: &mut Route, shifts: &[(IpAddr, Shift)]) -> Redone {
+        let now_held = match (shift(shifts, route.next_hop()), route.held) {
+            (Some(Shift::Unresolved), None) => true,
+            (Some(Shift::Resolved), Some(Held::NextHop)) => false,
+            _ => return Redone::default(),
+        };
+        self.tally.routes += 1;
+        // Always found: the Adj-RIBs-In hold routes only of peers that
+        // are up.
+        if let Some(peer) = self.peers[route.peer.index()].as_mut() {
+            let n = peer.adj_in_held.or_default(self.family);
+            if now_held {
+                *n += 1;
+            } else {
+                *n = n.saturating_sub(1);
+            }
+        }
+        if now_held {
+            self.tally.held += 1;
+            route.held = Some(Held::NextHop);
+        } else {
+            self.tally.released += 1;
+            route.held = None;
+        }
+        Redone {
+            restated: false,
+            changed: true,
+            moved: true,
+        }
+    }
+}
+
+/// How `shifts` (sorted by next hop) say `next_hop` moved, if they name it.
+fn shift(shifts: &[(IpAddr, Shift)], next_hop: IpAddr) -> Option<Shift> {
+    shifts
+        .binary_search_by_key(&next_hop, |(a, _)| *a)
+        .ok()
+        .map(|i| shifts[i].1)
 }
 
 /// A route of `peer`'s in `family`, `held` or not, that import policy
@@ -814,6 +962,37 @@ fn of_family(ranges: &[RangeInclusive<Prefix>], afi: Afi) -> &[RangeInclusive<Pr
         Afi::Ipv4 => &ranges[..split],
         Afi::Ipv6 => &ranges[split..],
         Afi::Unknown(_) => &[],
+    }
+}
+
+/// Visit the destinations of `table` at `keys` (sorted, each once): in one
+/// pass over the table alongside them when `dense`, else a lookup each.
+fn walk_points<K: Ord, T>(
+    table: &mut BTreeMap<K, T>,
+    keys: &[K],
+    dense: bool,
+    mut visit: impl FnMut(&K, &mut T),
+) {
+    if keys.is_empty() {
+        return;
+    }
+    if !dense {
+        for k in keys {
+            if let Some(v) = table.get_mut(k) {
+                visit(k, v);
+            }
+        }
+        return;
+    }
+    let mut keys = keys.iter().peekable();
+    for (k, v) in table.iter_mut() {
+        while keys.next_if(|x| *x < k).is_some() {}
+        let Some(next) = keys.peek() else {
+            return;
+        };
+        if *next == k {
+            visit(k, v);
+        }
     }
 }
 

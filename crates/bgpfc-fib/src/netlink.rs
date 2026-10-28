@@ -17,10 +17,17 @@ pub const NLM_F_MULTI: u16 = 0x02;
 pub const NLM_F_ACK: u16 = 0x04;
 /// `NLM_F_DUMP` = `NLM_F_ROOT | NLM_F_MATCH`.
 pub const NLM_F_DUMP: u16 = 0x300;
-/// `NLM_F_REPLACE`.
+/// `NLM_F_REPLACE`: replace the first route with the destination and
+/// metric of the new one, whoever's it is.
 pub const NLM_F_REPLACE: u16 = 0x100;
+/// `NLM_F_EXCL`: add only where no route has the destination and metric
+/// of the new one; the kernel answers `EEXIST` otherwise.
+pub const NLM_F_EXCL: u16 = 0x200;
 /// `NLM_F_CREATE`.
 pub const NLM_F_CREATE: u16 = 0x400;
+/// `NLM_F_APPEND`: add after the routes with the same destination and
+/// metric.
+pub const NLM_F_APPEND: u16 = 0x800;
 
 /// `sizeof(struct nlmsghdr)`.
 pub const HEADER_LEN: usize = 16;
@@ -70,6 +77,10 @@ pub enum NetlinkError {
     },
     /// A route message payload shorter than `struct rtmsg`.
     ShortRoute,
+    /// An interface message payload shorter than `struct ifinfomsg`.
+    ShortLink,
+    /// An address message payload shorter than `struct ifaddrmsg`.
+    ShortAddress,
 }
 
 impl fmt::Display for NetlinkError {
@@ -78,6 +89,10 @@ impl fmt::Display for NetlinkError {
             NetlinkError::Truncated { at } => write!(f, "truncated netlink message at offset {at}"),
             NetlinkError::BadAttribute { at } => write!(f, "bad netlink attribute at offset {at}"),
             NetlinkError::ShortRoute => f.write_str("route message shorter than struct rtmsg"),
+            NetlinkError::ShortLink => f.write_str("link message shorter than struct ifinfomsg"),
+            NetlinkError::ShortAddress => {
+                f.write_str("address message shorter than struct ifaddrmsg")
+            }
         }
     }
 }
@@ -191,9 +206,36 @@ pub fn parse_error(payload: &[u8]) -> Result<i32, NetlinkError> {
     }
 }
 
+/// The value of an `NLMSG_DONE` payload: how the dump ended, a negative
+/// errno for an error, zero when it ended well. The kernel writes it in
+/// `netlink_dump_done` (`dump_done_errno`), iproute2 reads it
+/// (`rtnl_dump_done`), and a dump that ends with an error is not the whole
+/// table. A payload too short to hold one says nothing more than that the
+/// dump ended: zero.
+#[must_use]
+pub fn parse_done(payload: &[u8]) -> i32 {
+    payload
+        .first_chunk::<4>()
+        .map_or(0, |b| i32::from_ne_bytes(*b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a dump carries how it ended: an error such as `ENOMEM`
+    /// (12) as its negative, zero for success; no payload, success.
+    #[test]
+    fn the_end_of_a_dump_says_how_it_ended() {
+        assert_eq!(parse_done(&(-12i32).to_ne_bytes()), -12);
+        assert_eq!(parse_done(&0i32.to_ne_bytes()), 0);
+        assert_eq!(parse_done(&[]), 0);
+        assert_eq!(parse_done(&[0xff, 0xff]), 0);
+        // Extended acknowledgement attributes may follow the errno.
+        let mut long = (-4i32).to_ne_bytes().to_vec();
+        long.extend_from_slice(&[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(parse_done(&long), -4);
+    }
 
     #[test]
     fn encode_pads_and_parse_splits() {
@@ -242,6 +284,14 @@ mod tests {
         assert_eq!(
             NetlinkError::ShortRoute.to_string(),
             "route message shorter than struct rtmsg"
+        );
+        assert_eq!(
+            NetlinkError::ShortLink.to_string(),
+            "link message shorter than struct ifinfomsg"
+        );
+        assert_eq!(
+            NetlinkError::ShortAddress.to_string(),
+            "address message shorter than struct ifaddrmsg"
         );
     }
 }

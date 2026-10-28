@@ -12,6 +12,7 @@ use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
 use crate::netlink::{self, Attr, NetlinkError};
+use crate::reconcile::Hop;
 
 /// `RTM_NEWROUTE`.
 pub const RTM_NEWROUTE: u16 = 24;
@@ -28,25 +29,31 @@ pub const RT_TABLE_MAIN: u32 = 254;
 /// table id above 255.
 const RT_TABLE_UNSPEC: u8 = 0;
 /// `RTN_UNICAST`.
-const RTN_UNICAST: u8 = 1;
+pub(crate) const RTN_UNICAST: u8 = 1;
 /// `RT_SCOPE_UNIVERSE`.
 const RT_SCOPE_UNIVERSE: u8 = 0;
 /// `RT_SCOPE_NOWHERE`: what `ip route del` sends.
 const RT_SCOPE_NOWHERE: u8 = 255;
 /// `RTM_F_CLONED`: routes the kernel made itself; never ours.
-const RTM_F_CLONED: u32 = 0x200;
+pub(crate) const RTM_F_CLONED: u32 = 0x200;
+/// `RTNH_F_ONLINK`: the gateway is taken to be on the link of the
+/// interface, though no route covers it, as `ip route add ... onlink`
+/// says; the kernel refuses a gateway no route covers otherwise. In
+/// `rtm_flags` for a route with one next hop, in `rtnh_flags` for each of
+/// several.
+pub const RTNH_F_ONLINK: u8 = 4;
 
 // enum rtattr_type_t
-const RTA_DST: u16 = 1;
-const RTA_OIF: u16 = 4;
-const RTA_GATEWAY: u16 = 5;
-const RTA_PRIORITY: u16 = 6;
-const RTA_TABLE: u16 = 15;
-const RTA_VIA: u16 = 18;
+pub(crate) const RTA_DST: u16 = 1;
+pub(crate) const RTA_OIF: u16 = 4;
+pub(crate) const RTA_GATEWAY: u16 = 5;
+pub(crate) const RTA_PRIORITY: u16 = 6;
+pub(crate) const RTA_TABLE: u16 = 15;
+pub(crate) const RTA_VIA: u16 = 18;
 
 // <bits/socket.h>
-const AF_INET: u8 = 2;
-const AF_INET6: u8 = 10;
+pub(crate) const AF_INET: u8 = 2;
+pub(crate) const AF_INET6: u8 = 10;
 
 /// `offsetof(struct rtvia, rtvia_addr)`: `<linux/rtnetlink.h>` declares
 /// `struct rtvia { __kernel_sa_family_t rtvia_family; __u8 rtvia_addr[]; }`,
@@ -55,10 +62,13 @@ const AF_INET6: u8 = 10;
 const RTVIA_ADDR_OFFSET: usize = 2;
 
 /// `sizeof(struct rtmsg)`.
-const RTMSG_LEN: usize = 12;
+pub(crate) const RTMSG_LEN: usize = 12;
 
-/// The metric every route we install gets, as BIRD and FRR do for
-/// external BGP routes (`RTA_PRIORITY`).
+/// The metric every route we install gets (`RTA_PRIORITY`), the one FRR's
+/// zebra gives every route it installs. The kernel keeps routes to one
+/// destination with different metrics apart and forwards through the
+/// lowest; one with the same metric would be replaced by ours, so ours
+/// goes in only where none has it ([`RouteMsg::encode_add_with`]).
 pub const METRIC: u32 = 20;
 
 /// A unicast route as this daemon installs or reads it.
@@ -83,19 +93,32 @@ pub struct RouteMsg {
 }
 
 impl RouteMsg {
-    /// A unicast route to `dst` via `gateway` with our metric.
+    /// A unicast route to `dst` through `hop` (its gateway, and its
+    /// interface as `RTA_OIF` when it has one, `RTNH_F_ONLINK` when the
+    /// gateway is on its link though no route covers it) with our metric.
     #[must_use]
-    pub fn unicast(dst: Prefix, gateway: IpAddr, table: u32, protocol: u8) -> RouteMsg {
+    pub fn unicast(dst: Prefix, hop: Hop, table: u32, protocol: u8) -> RouteMsg {
         RouteMsg {
             dst,
             table,
             protocol,
-            gateway: Some(gateway),
-            oif: None,
+            gateway: Some(hop.gateway),
+            oif: hop.oif,
             priority: Some(METRIC),
             kind: RTN_UNICAST,
-            flags: 0,
+            flags: if hop.onlink {
+                u32::from(RTNH_F_ONLINK)
+            } else {
+                0
+            },
         }
+    }
+
+    /// Whether the route's gateway is on its interface's link though no
+    /// route covers it (`RTNH_F_ONLINK` in `rtm_flags`).
+    #[must_use]
+    pub fn onlink(&self) -> bool {
+        self.flags & u32::from(RTNH_F_ONLINK) != 0
     }
 
     fn family(&self) -> u8 {
@@ -121,7 +144,8 @@ impl RouteMsg {
             scope,
             kind,
         ];
-        p.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
+        // rtm_flags: what `unicast` set, RTNH_F_ONLINK or nothing.
+        p.extend_from_slice(&self.flags.to_ne_bytes());
         netlink::push_attr(&mut p, RTA_DST, &addr_bytes(self.dst.addr()));
         if let Some(gw) = self.gateway {
             match (self.dst.afi(), gw) {
@@ -145,10 +169,31 @@ impl RouteMsg {
         p
     }
 
-    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_REPLACE`: add or replace.
+    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_REPLACE`: add, or replace
+    /// the first route with this destination and metric, whoever's it is.
+    /// For a route of ours whose hop changes, which must not leave the
+    /// destination without a route in between.
     #[must_use]
     pub fn encode_set(&self, seq: u32) -> Vec<u8> {
         self.encode_set_with(seq, true)
+    }
+
+    /// `RTM_NEWROUTE` with `NLM_F_CREATE | NLM_F_EXCL`: add where no route
+    /// has this destination and metric, and only there. The kernel answers
+    /// `EEXIST` where one has: another program's route, which is not ours
+    /// to replace (AGENTS.md §3, "Never touch routes with another protocol
+    /// number"). With an acknowledgement only if `ack`.
+    #[must_use]
+    pub fn encode_add_with(&self, seq: u32, ack: bool) -> Vec<u8> {
+        netlink::encode(
+            RTM_NEWROUTE,
+            netlink::NLM_F_REQUEST
+                | if ack { netlink::NLM_F_ACK } else { 0 }
+                | netlink::NLM_F_CREATE
+                | netlink::NLM_F_EXCL,
+            seq,
+            &self.payload(RT_SCOPE_UNIVERSE, RTN_UNICAST),
+        )
     }
 
     /// As [`RouteMsg::encode_set`], asking for an acknowledgement only if
@@ -281,7 +326,7 @@ fn encode_via(gw: IpAddr) -> Vec<u8> {
 /// The gateway in an `RTA_VIA` value (`struct rtvia`, `<linux/rtnetlink.h>`),
 /// or `None` for a family other than IPv4 and IPv6 (the kernel also uses
 /// it for MPLS) or an address of the wrong length.
-fn decode_via(value: &[u8]) -> Option<IpAddr> {
+pub(crate) fn decode_via(value: &[u8]) -> Option<IpAddr> {
     let family = <[u8; RTVIA_ADDR_OFFSET]>::try_from(value.get(..RTVIA_ADDR_OFFSET)?).ok()?;
     let family = u16::from_ne_bytes(family);
     let addr = value.get(RTVIA_ADDR_OFFSET..)?;
@@ -301,7 +346,7 @@ fn addr_bytes(a: IpAddr) -> Vec<u8> {
     }
 }
 
-fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
+pub(crate) fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
     match afi {
         Afi::Ipv4 => <[u8; 4]>::try_from(value).ok().map(IpAddr::from),
         Afi::Ipv6 => <[u8; 16]>::try_from(value).ok().map(IpAddr::from),
@@ -309,7 +354,7 @@ fn parse_addr(afi: Afi, value: &[u8]) -> Option<IpAddr> {
     }
 }
 
-fn parse_u32(value: &[u8]) -> Option<u32> {
+pub(crate) fn parse_u32(value: &[u8]) -> Option<u32> {
     <[u8; 4]>::try_from(value).ok().map(u32::from_ne_bytes)
 }
 
@@ -323,6 +368,15 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// A hop through `gateway`, with no interface.
+    fn h(gateway: &str) -> Hop {
+        Hop {
+            gateway: ip(gateway),
+            oif: None,
+            onlink: false,
+        }
     }
 
     /// Replace the sequence number and flags of a framed message so a
@@ -368,12 +422,7 @@ mod tests {
 
     #[test]
     fn requests_match_iproute2_captures() {
-        let r = RouteMsg::unicast(
-            p("192.0.2.0/24"),
-            ip("127.0.0.1"),
-            RT_TABLE_MAIN,
-            RTPROT_BGP,
-        );
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), h("127.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
         assert_eq!(
             normalise(r.encode_set(5)),
             framed(RTM_NEWROUTE, &ADD4_PAYLOAD)
@@ -382,18 +431,34 @@ mod tests {
             normalise(r.encode_delete(5)),
             framed(RTM_DELROUTE, &DEL4_PAYLOAD)
         );
-        let r6 = RouteMsg::unicast(p("2001:db8:1::/48"), ip("::1"), RT_TABLE_MAIN, RTPROT_BGP);
+        let r6 = RouteMsg::unicast(p("2001:db8:1::/48"), h("::1"), RT_TABLE_MAIN, RTPROT_BGP);
         assert_eq!(
             normalise(r6.encode_set(1)),
             framed(RTM_NEWROUTE, &ADD6_PAYLOAD)
         );
-        let mut t = RouteMsg::unicast(p("203.0.113.0/24"), ip("127.0.0.1"), 300, RTPROT_BGP);
+        let mut t = RouteMsg::unicast(p("203.0.113.0/24"), h("127.0.0.1"), 300, RTPROT_BGP);
         t.priority = None;
         assert_eq!(
             normalise(t.encode_set(1)),
             framed(RTM_NEWROUTE, &TABLE300_PAYLOAD)
         );
-        // Flags we actually send.
+        // `ip route add` asks for NLM_F_EXCL, as a route of ours sent the
+        // first time does.
+        let add = r.encode_add_with(5, true);
+        assert_eq!(
+            u16::from_ne_bytes([add[6], add[7]]),
+            netlink::NLM_F_REQUEST
+                | netlink::NLM_F_ACK
+                | netlink::NLM_F_CREATE
+                | netlink::NLM_F_EXCL
+        );
+        assert_eq!(normalise(add), framed(RTM_NEWROUTE, &ADD4_PAYLOAD));
+        let quiet = r.encode_add_with(5, false);
+        assert_eq!(
+            u16::from_ne_bytes([quiet[6], quiet[7]]),
+            netlink::NLM_F_REQUEST | netlink::NLM_F_CREATE | netlink::NLM_F_EXCL
+        );
+        // Flags we send for a route of ours whose hop changes.
         let m = r.encode_set(9);
         assert_eq!(
             u16::from_ne_bytes([m[6], m[7]]),
@@ -453,7 +518,7 @@ mod tests {
         // RFC 8950 §3 next hop in the FIB: RTA_VIA, never RTA_GATEWAY.
         let r = RouteMsg::unicast(
             p("198.51.100.0/24"),
-            ip("2001:db8::1"),
+            h("2001:db8::1"),
             RT_TABLE_MAIN,
             RTPROT_BGP,
         );
@@ -514,7 +579,7 @@ mod tests {
             ("0.0.0.0/0", "10.0.0.1", 300),
             ("::/0", "2001:db8::1", RT_TABLE_MAIN),
         ] {
-            let r = RouteMsg::unicast(p(prefix), ip(gw), table, RTPROT_BGP);
+            let r = RouteMsg::unicast(p(prefix), h(gw), table, RTPROT_BGP);
             let m = r.encode_set(1);
             let back = RouteMsg::decode(&m[netlink::HEADER_LEN..])
                 .unwrap()
@@ -522,7 +587,7 @@ mod tests {
             assert_eq!(back, r, "{prefix}");
         }
         // Not unicast, cloned, unknown family: None.
-        let r = RouteMsg::unicast(p("192.0.2.0/24"), ip("10.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), h("10.0.0.1"), RT_TABLE_MAIN, RTPROT_BGP);
         let mut m = r.encode_set(1);
         m[netlink::HEADER_LEN + 7] = 6; // RTN_BLACKHOLE
         assert_eq!(RouteMsg::decode(&m[netlink::HEADER_LEN..]).unwrap(), None);
@@ -538,5 +603,96 @@ mod tests {
         let mut m = r.encode_set(1);
         m[netlink::HEADER_LEN + 1] = 40;
         assert_eq!(RouteMsg::decode(&m[netlink::HEADER_LEN..]).unwrap(), None);
+    }
+
+    /// A hop with an interface: `RTA_OIF` after the gateway, as `ip route
+    /// add ... via GATEWAY dev DEV` sends it, in a set and in a delete,
+    /// and back.
+    #[test]
+    fn a_hop_with_an_interface_names_it() {
+        let hop = Hop {
+            gateway: ip("10.0.0.9"),
+            oif: Some(3),
+            onlink: false,
+        };
+        let r = RouteMsg::unicast(p("192.0.2.0/24"), hop, RT_TABLE_MAIN, RTPROT_BGP);
+        assert_eq!(r.oif, Some(3));
+        for m in [r.encode_set(1), r.encode_delete(1)] {
+            let attrs = netlink::parse_attrs(&m[netlink::HEADER_LEN + RTMSG_LEN..]).unwrap();
+            let types: Vec<u16> = attrs.iter().map(|a| a.ty).collect();
+            assert_eq!(types, [RTA_DST, RTA_GATEWAY, RTA_OIF, RTA_PRIORITY]);
+            assert_eq!(attrs[2].value, 3u32.to_ne_bytes());
+        }
+        let back = RouteMsg::decode(&r.encode_set(1)[netlink::HEADER_LEN..]).unwrap();
+        assert_eq!(back, Some(r));
+    }
+
+    /// `strace -e trace=sendmsg ip route add 203.0.113.0/24 via
+    /// 192.168.77.1 dev v0 proto 186 metric 20 onlink`, with `v0` at index
+    /// 3 and no route covering the gateway: `rtm_flags` 4,
+    /// `RTNH_F_ONLINK`, without which the kernel refuses such a gateway
+    /// ("Nexthop has invalid gateway"). iproute2 puts `RTA_OIF` last.
+    const ADD_ONLINK_PAYLOAD: [u8; 44] = [
+        0x02, 0x18, 0x00, 0x00, 0xfe, 0xba, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, // rtmsg
+        0x08, 0x00, 0x01, 0x00, 0xcb, 0x00, 0x71, 0x00, // RTA_DST
+        0x08, 0x00, 0x05, 0x00, 0xc0, 0xa8, 0x4d, 0x01, // RTA_GATEWAY
+        0x08, 0x00, 0x06, 0x00, 0x14, 0x00, 0x00, 0x00, // RTA_PRIORITY 20
+        0x08, 0x00, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00, // RTA_OIF 3
+    ];
+
+    /// The `struct rtmsg` of a payload and its attributes, in type order:
+    /// the kernel reads them in any order.
+    fn parts(payload: &[u8]) -> (Vec<u8>, Vec<(u16, Vec<u8>)>) {
+        let mut attrs: Vec<(u16, Vec<u8>)> = netlink::parse_attrs(&payload[RTMSG_LEN..])
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.ty, a.value.to_vec()))
+            .collect();
+        attrs.sort();
+        (payload[..RTMSG_LEN].to_vec(), attrs)
+    }
+
+    /// A hop whose gateway the kernel route that resolves it has `onlink`
+    /// goes in with `RTNH_F_ONLINK` too, as iproute2 sends it, in a set
+    /// and in a delete, and back.
+    #[test]
+    fn an_onlink_hop_says_so() {
+        let hop = Hop {
+            gateway: ip("192.168.77.1"),
+            oif: Some(3),
+            onlink: true,
+        };
+        let r = RouteMsg::unicast(p("203.0.113.0/24"), hop, RT_TABLE_MAIN, RTPROT_BGP);
+        assert!(r.onlink());
+        let set = r.encode_set(1);
+        assert_eq!(
+            parts(&set[netlink::HEADER_LEN..]),
+            parts(&ADD_ONLINK_PAYLOAD)
+        );
+        let delete = r.encode_delete(1);
+        assert_eq!(delete[netlink::HEADER_LEN + 8], RTNH_F_ONLINK);
+        let back = RouteMsg::decode(&set[netlink::HEADER_LEN..])
+            .unwrap()
+            .unwrap();
+        assert_eq!(back, r);
+        assert!(back.onlink());
+        assert!(
+            RouteMsg::decode(&ADD_ONLINK_PAYLOAD)
+                .unwrap()
+                .unwrap()
+                .onlink()
+        );
+        // Without it, nothing in rtm_flags.
+        let plain = RouteMsg::unicast(
+            p("203.0.113.0/24"),
+            Hop {
+                onlink: false,
+                ..hop
+            },
+            RT_TABLE_MAIN,
+            RTPROT_BGP,
+        );
+        assert!(!plain.onlink());
+        assert_eq!(plain.encode_set(1)[netlink::HEADER_LEN + 8], 0);
     }
 }

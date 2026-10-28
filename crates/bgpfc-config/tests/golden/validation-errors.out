@@ -22,3 +22,18 @@ validation-errors.conf:15:1: neighbor 2001:db8::4: extended-next-hop needs the i
 validation-errors.conf:15:1: neighbor 2001:db8::4: maximum-prefix for ipv4-unicast, which is not in its families
   neighbor 2001:db8::4 {
   ^
+validation-errors.conf:22:1: neighbor 2001:db8::7: local-address 192.0.2.1 is IPv4, the neighbor IPv6
+  neighbor 2001:db8::7 { remote-as 65001; import A; export A; local-address 192.0.2.1; }
+  ^
+validation-errors.conf:23:1: neighbor 192.0.2.8: local-address 0.0.0.0 is unspecified; leave the statement out to let the kernel choose
+  neighbor 192.0.2.8 { remote-as 65001; import A; export A; local-address 0.0.0.0; }
+  ^
+validation-errors.conf:24:1: neighbor 192.0.2.9: local-address 224.0.0.5 is a multicast address
+  neighbor 192.0.2.9 { remote-as 65001; import A; export A; local-address 224.0.0.5; }
+  ^
+validation-errors.conf:25:1: neighbor 192.0.2.10: local-address 192.0.2.10 is the neighbor's own address
+  neighbor 192.0.2.10 { remote-as 65001; import A; export A; local-address 192.0.2.10; }
+  ^
+validation-errors.conf:26:1: neighbor 2001:db8::11: local-address fe80::1 is link-local, which needs an interface bgpfcd cannot be given
+  neighbor 2001:db8::11 { remote-as 65001; import A; export A; local-address fe80::1; }
+  ^

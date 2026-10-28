@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::mem;
+use std::net::IpAddr;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
@@ -33,7 +34,10 @@ impl PeerId {
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
     /// Its attributes as import policy gave them, shared with every route
-    /// that has the same ones; as received for a held route.
+    /// that has the same ones; as received for a route held for its
+    /// validation state, which policy judges again when that changes. A
+    /// route held for its next hop keeps the policy's: it is a candidate
+    /// as it is once the next hop resolves.
     pub(crate) attrs: Arc<PathAttrs>,
     /// Its attributes as its peer sent them, when import policy changed
     /// them: import policy runs on these again when the route's
@@ -49,9 +53,10 @@ pub(crate) struct Route {
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub(crate) aspa: AspaState,
     /// Why the Adj-RIB-In holds the route but it is no candidate (RFC
-    /// 6811 §2), if it is not one: import policy rejected it for its
-    /// validation state alone, or enforcement rules out the state it is
-    /// used with. A destination keeps these after its candidates.
+    /// 6811 §2, RFC 4271 §9.1.2), if it is not one: import policy rejected
+    /// it for its validation state alone, enforcement rules out the state
+    /// it is used with, or its next hop does not resolve. A destination
+    /// keeps these after its candidates.
     pub(crate) held: Option<Held>,
 }
 
@@ -77,13 +82,20 @@ impl Route {
     pub(crate) fn received(&self) -> &Arc<PathAttrs> {
         self.received.as_ref().unwrap_or(&self.attrs)
     }
+
+    /// The next hop the route is used with, the key of the next-hop index:
+    /// that of its attributes after import policy, the global address for
+    /// IPv6.
+    pub(crate) fn next_hop(&self) -> IpAddr {
+        self.attrs.next_hop_addr()
+    }
 }
 
 /// Every route to one destination: the candidates first, the best of them
 /// first of all (Phase 2 moves it there), then the routes held for their
-/// validation state (see [`Held`]). One route is held inline; more go in a
-/// boxed slice sized exactly, which keeps a destination at 24 octets
-/// beside a 24-octet route.
+/// validation state or their next hop (see [`Held`]). One route is held
+/// inline; more go in a boxed slice sized exactly, which keeps a
+/// destination at 24 octets beside a 24-octet route.
 #[derive(Debug)]
 pub(crate) enum Destination {
     /// One route, the common case.
@@ -120,6 +132,14 @@ impl Destination {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.routes().is_empty()
+    }
+
+    /// Whether a route here, but the one at `except`, has next hop `addr`.
+    pub(crate) fn has_next_hop(&self, addr: IpAddr, except: Option<usize>) -> bool {
+        self.routes()
+            .iter()
+            .enumerate()
+            .any(|(i, r)| Some(i) != except && r.next_hop() == addr)
     }
 
     /// The index of `peer`'s route.

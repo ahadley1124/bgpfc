@@ -83,6 +83,9 @@ Config {
             count: 4,
         },
     },
+    netns: Some(
+        "/run/netns/blue",
+    ),
     prefix_lists: [
         PrefixList {
             pos: Pos {
@@ -285,6 +288,12 @@ Config {
                     1000,
                 ),
             ],
+            multihop: Some(
+                2,
+            ),
+            local_address: Some(
+                192.0.2.1,
+            ),
         },
         Neighbor {
             pos: Pos {
@@ -344,6 +353,10 @@ Config {
                     1200000,
                 ),
             ],
+            multihop: Some(
+                255,
+            ),
+            local_address: None,
         },
     ],
 }

@@ -36,7 +36,11 @@
 //!   shutdown.
 //!
 //! Each operation also has a line of its own at debug (`fib: dry-run` or
-//! `fib: applied`, with the prefix and gateway), written as it is done. A
+//! `fib: applied`, with the prefix, the gateway and the interface it is
+//! reached on; `fib: already gone` for a delete the kernel answered
+//! `ESRCH`, having removed the route itself, as IPv4 does with the routes
+//! through an interface that goes down, which counts as a delete), written
+//! as it is done. A
 //! failed one has a line at error (`fib: failed`) instead, at once, for
 //! the first [`FAILURES_LOGGED`] of a change, and for no more than
 //! [`FAILURES_LOGGED`] in all between two `fib: changes` lines, and at
@@ -49,7 +53,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bgpfc_fib::{Applied, Change, Fib, Merge, Mode, Op};
+use bgpfc_fib::{Applied, Change, Fib, Hop, Merge, Mode, Op};
 use bgpfc_log::Level;
 use bgpfc_wire::prefix::Prefix;
 
@@ -122,6 +126,19 @@ pub(crate) fn start(mut fib: Fib) -> Result<SyncSender<FibMsg>, bgpfc_fib::FibEr
     Ok(tx)
 }
 
+/// The RIB's hop of a route as the FIB takes it: the gateway, and the
+/// interface of the kernel route that resolves the next hop, with its
+/// `onlink`; none while the RIB has no kernel table, and the kernel
+/// chooses (the two crates are siblings, AGENTS.md §2, so their types
+/// meet here).
+pub(crate) fn fib_hop(hop: bgpfc_rib::nexthop::Hop) -> Hop {
+    Hop {
+        gateway: hop.gateway,
+        oif: hop.oif,
+        onlink: hop.onlink,
+    }
+}
+
 /// What writes the thread's lines to the log; the tests keep them
 /// instead.
 fn logger() -> impl FnMut(Line) {
@@ -177,8 +194,8 @@ fn serve(
             FibMsg::Changes { changes, more } => {
                 let changes = changes.iter().map(|c| Change {
                     prefix: c.prefix,
-                    gateway: c.next_hop,
-                    previous: c.previous,
+                    hop: c.next_hop.map(fib_hop),
+                    previous: c.previous.map(fib_hop),
                 });
                 fib.set_all(changes, &mut applied);
                 fold.add(&applied, debug(), now(), out);
@@ -214,6 +231,20 @@ fn serve(
                 }
                 let _ = reply.send(ops + applied.len());
                 ops = 0;
+                fold.add(&applied, debug(), now(), out);
+                fold.end_change();
+            }
+            FibMsg::Verify => {
+                match fib.verify(&mut applied) {
+                    Ok(found) if !found.is_empty() => out(lost_line(&found)),
+                    Ok(_) => {}
+                    Err(e) => out(Line {
+                        level: Level::Error,
+                        msg: "fib: cannot check the kernel's routes",
+                        fields: vec![("error", e.to_string())],
+                    }),
+                }
+                // A change of its own, as the startup flush is.
                 fold.add(&applied, debug(), now(), out);
                 fold.end_change();
             }
@@ -283,6 +314,8 @@ impl Fold {
                     Level::Debug,
                     if a.dry_run {
                         "fib: dry-run"
+                    } else if a.already_gone {
+                        "fib: already gone"
                     } else {
                         "fib: applied"
                     },
@@ -341,18 +374,53 @@ impl Fold {
     }
 }
 
-/// The line of one operation: its kind, prefix and gateway, and the
-/// kernel's error if it failed.
+/// The line of a check that found the kernel's routes differ from those
+/// installed: `missing`, the routes it lost, as IPv4 does those through an
+/// interface that goes down, installed again; `wrong`, those it has
+/// through another hop, set again; `unknown`, those of bgpfcd's protocol
+/// it has and the FIB did not install, removed; and the first prefixes.
+fn lost_line(found: &bgpfc_fib::Found) -> Line {
+    let mut sample = found
+        .missing
+        .iter()
+        .chain(&found.wrong)
+        .chain(&found.unknown)
+        .map(|(p, _)| *p)
+        .collect::<Vec<_>>();
+    let total = sample.len();
+    sample.truncate(SAMPLE);
+    Line {
+        level: Level::Info,
+        msg: "fib: kernel routes differ, repairing",
+        fields: vec![
+            ("missing", found.missing.len().to_string()),
+            ("wrong", found.wrong.len().to_string()),
+            ("unknown", found.unknown.len().to_string()),
+            ("prefixes", listed(&sample, total)),
+        ],
+    }
+}
+
+/// The line of one operation: its kind, prefix, gateway and, when known,
+/// the index of the interface the gateway is reached on (`oif`, the
+/// kernel's `RTA_OIF`), `onlink=yes` for a gateway on that interface's
+/// link that no route covers, and the kernel's error if it failed.
 fn op_line(a: &Applied, level: Level, msg: &'static str) -> Line {
-    let (op, prefix, gateway) = match &a.op {
-        Op::Set { prefix, gateway } => ("install", prefix, gateway),
-        Op::Delete { prefix, gateway } => ("delete", prefix, gateway),
+    let (op, prefix, hop) = match &a.op {
+        Op::Set { prefix, hop } => ("install", prefix, hop),
+        Op::Delete { prefix, hop } => ("delete", prefix, hop),
     };
     let mut fields = vec![
         ("op", op.to_owned()),
         ("prefix", prefix.to_string()),
-        ("gateway", gateway.to_string()),
+        ("gateway", hop.gateway.to_string()),
     ];
+    if let Some(oif) = hop.oif {
+        fields.push(("oif", oif.to_string()));
+    }
+    if hop.onlink {
+        fields.push(("onlink", "yes".to_owned()));
+    }
     if let Err(e) = &a.result {
         fields.push(("error", e.to_string()));
     }
@@ -466,14 +534,33 @@ mod tests {
         format!("10.{}.{}.0/24", i / 256, i % 256)
     }
 
+    /// A hop through `gateway`, with no interface.
+    fn gw(gateway: &str) -> Hop {
+        Hop {
+            gateway: ip(gateway),
+            oif: None,
+            onlink: false,
+        }
+    }
+
+    /// The hop of [`set`] and [`delete`]: through 192.0.2.1 on interface
+    /// 2.
+    fn hop() -> Hop {
+        Hop {
+            oif: Some(2),
+            ..gw("192.0.2.1")
+        }
+    }
+
     fn set(prefix: &str, dry_run: bool) -> Applied {
         Applied {
             op: Op::Set {
                 prefix: p(prefix),
-                gateway: ip("192.0.2.1"),
+                hop: hop(),
             },
             result: Ok(()),
             dry_run,
+            already_gone: false,
         }
     }
 
@@ -481,10 +568,11 @@ mod tests {
         Applied {
             op: Op::Delete {
                 prefix: p(prefix),
-                gateway: ip("192.0.2.1"),
+                hop: hop(),
             },
             result: Ok(()),
             dry_run,
+            already_gone: false,
         }
     }
 
@@ -572,7 +660,7 @@ mod tests {
     }
 
     /// At debug every operation has a line of its own too, as it is done,
-    /// with its prefix and gateway.
+    /// with its prefix, gateway and interface, when known.
     #[test]
     fn each_operation_has_a_line_at_debug() {
         let lines = change_lines(
@@ -586,9 +674,9 @@ mod tests {
             written(&lines),
             [
                 "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: dry-run\" op=install \
-                 prefix=192.0.2.0/24 gateway=192.0.2.1\n",
+                 prefix=192.0.2.0/24 gateway=192.0.2.1 oif=2\n",
                 "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: dry-run\" op=delete \
-                 prefix=198.51.100.0/24 gateway=192.0.2.1\n",
+                 prefix=198.51.100.0/24 gateway=192.0.2.1 oif=2\n",
                 "1970-01-01T00:00:00.000Z INFO  msg=\"fib: changes\" mode=dry-run install=1 \
                  delete=1 failed=0 prefixes=192.0.2.0/24,198.51.100.0/24\n",
             ]
@@ -596,6 +684,41 @@ mod tests {
         let lines = change_lines(&[&[set("192.0.2.0/24", false)]], true);
         assert_eq!(lines[0].msg, "fib: applied");
         assert_eq!(lines[1].fields[0], ("mode", "install".to_owned()));
+        // A hop with no interface known has no `oif`.
+        let mut op = set("192.0.2.0/24", false);
+        op.op = Op::Set {
+            prefix: p("192.0.2.0/24"),
+            hop: gw("192.0.2.1"),
+        };
+        let lines = change_lines(&[&[op]], true);
+        assert_eq!(
+            written(&lines[..1]),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: applied\" op=install \
+              prefix=192.0.2.0/24 gateway=192.0.2.1\n"
+            ]
+        );
+    }
+
+    /// A delete the kernel answered `ESRCH` had nothing left to remove:
+    /// the kernel removed the route itself. It has a line of its own at
+    /// debug that says so, and counts as a delete, not a failure.
+    #[test]
+    fn a_route_already_gone_counts_as_deleted() {
+        let gone = Applied {
+            already_gone: true,
+            ..delete("198.51.100.0/24", false)
+        };
+        let lines = change_lines(&[&[gone]], true);
+        assert_eq!(
+            written(&lines),
+            [
+                "1970-01-01T00:00:00.000Z DEBUG msg=\"fib: already gone\" op=delete \
+                 prefix=198.51.100.0/24 gateway=192.0.2.1 oif=2\n",
+                "1970-01-01T00:00:00.000Z INFO  msg=\"fib: changes\" mode=install install=0 \
+                 delete=1 failed=0 prefixes=198.51.100.0/24\n",
+            ]
+        );
     }
 
     /// The first three failures of a change are at error, the others at
@@ -618,7 +741,7 @@ mod tests {
             written(&lines[..1]),
             [
                 "1970-01-01T00:00:00.000Z ERROR msg=\"fib: failed\" op=install \
-              prefix=10.0.0.0/24 gateway=192.0.2.1 \
+              prefix=10.0.0.0/24 gateway=192.0.2.1 oif=2 \
               error=\"kernel refused: Operation not permitted (os error 1)\"\n"
             ]
         );
@@ -804,10 +927,59 @@ mod tests {
             .map(|i| FibChange {
                 family: AddressFamily::IPV4_UNICAST,
                 prefix: p(&nth(i)),
-                next_hop: Some(ip("192.0.2.1")),
+                next_hop: Some(bgpfc_rib::nexthop::Hop {
+                    gateway: ip("192.0.2.1"),
+                    oif: None,
+                    onlink: false,
+                }),
                 previous: None,
             })
             .collect()
+    }
+
+    /// The RIB's hop reaches the FIB as it is: gateway, interface and
+    /// `onlink`; the line of its operation says `onlink=yes` of such a
+    /// gateway.
+    #[test]
+    fn rib_hops_reach_the_fib_with_their_interface() {
+        for (oif, onlink) in [(None, false), (Some(3), false), (Some(3), true)] {
+            let rib = bgpfc_rib::nexthop::Hop {
+                gateway: ip("fe80::1"),
+                oif,
+                onlink,
+            };
+            assert_eq!(
+                fib_hop(rib),
+                Hop {
+                    gateway: ip("fe80::1"),
+                    oif,
+                    onlink,
+                }
+            );
+        }
+        let applied = Applied {
+            op: Op::Set {
+                prefix: "203.0.113.0/24".parse().unwrap(),
+                hop: Hop {
+                    gateway: ip("192.168.77.1"),
+                    oif: Some(3),
+                    onlink: true,
+                },
+            },
+            result: Ok(()),
+            dry_run: false,
+            already_gone: false,
+        };
+        assert_eq!(
+            op_line(&applied, Level::Debug, "fib: applied").fields,
+            [
+                ("op", "install".to_owned()),
+                ("prefix", "203.0.113.0/24".to_owned()),
+                ("gateway", "192.168.77.1".to_owned()),
+                ("oif", "3".to_owned()),
+                ("onlink", "yes".to_owned()),
+            ]
+        );
     }
 
     fn changes(range: std::ops::Range<usize>, more: bool) -> Step {
@@ -848,7 +1020,7 @@ mod tests {
                 Step::Msg(FibMsg::SetMode(Mode::Install)),
                 Step::Msg(FibMsg::Reconcile(vec![(
                     p("192.0.2.0/24"),
-                    ip("192.0.2.1"),
+                    gw("192.0.2.1"),
                 )])),
                 Step::Msg(FibMsg::ReconcileEnd(end_tx)),
                 // Half an input, then the shutdown, before its line is due.
@@ -980,6 +1152,56 @@ mod tests {
         assert!(errors <= FAILURES_LOGGED * summaries.len(), "{errors}");
         let failed: usize = summaries.iter().map(|(_, n)| n).sum();
         assert_eq!(failed, 2000);
+    }
+
+    /// A check of the kernel's routes is nothing to say in dry-run, which
+    /// installs nothing, and one error line when the kernel cannot be
+    /// read: here, with no socket.
+    #[test]
+    fn a_check_of_the_kernel_is_quiet_unless_it_fails() {
+        let script = || vec![Step::Msg(FibMsg::Verify), Step::Wait(ms(2000))];
+        assert_eq!(run(Instant::now(), script()), []);
+        let lines = run_in(Mode::Install, Instant::now(), script());
+        let written: Vec<(Level, &str)> = lines.iter().map(|(_, l)| (l.level, l.msg)).collect();
+        assert_eq!(
+            written,
+            [(Level::Error, "fib: cannot check the kernel's routes")],
+            "{lines:?}"
+        );
+        assert!(
+            field(&lines[0].1, "error").contains("not open"),
+            "{lines:?}"
+        );
+    }
+
+    /// The line of a check that found differences counts each kind and
+    /// names the first prefixes.
+    #[test]
+    fn the_line_of_a_check_counts_what_differs() {
+        let hop = Hop {
+            gateway: ip("192.0.2.1"),
+            oif: None,
+            onlink: false,
+        };
+        let found = bgpfc_fib::Found {
+            missing: vec![(p("203.0.113.0/24"), hop), (p("198.51.100.0/24"), hop)],
+            wrong: vec![],
+            unknown: vec![(p("192.0.2.128/25"), hop)],
+        };
+        let line = lost_line(&found);
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(
+            line.fields[..3],
+            [
+                ("missing", "2".to_owned()),
+                ("wrong", "0".to_owned()),
+                ("unknown", "1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            field(&line, "prefixes"),
+            "203.0.113.0/24,198.51.100.0/24,192.0.2.128/25"
+        );
     }
 
     /// Every sender gone: what was counted is written before the thread

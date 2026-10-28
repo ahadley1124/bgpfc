@@ -3,27 +3,37 @@
 //! kernel has (AGENTS.md §3, "FIB"; README, "FIB dry-run").
 //!
 //! Routes carry our protocol number in one table; nothing else is ever
-//! touched. In dry-run mode every operation is computed and reported but
-//! not sent. The socket comes from `bgpfc-sys`; everything else here is
-//! `#![forbid(unsafe_code)]`.
+//! touched. Each goes through a [`Hop`]: the gateway, and the interface
+//! when the caller knows it. In dry-run mode every operation is computed
+//! and reported but not sent. The socket comes from `bgpfc-sys`;
+//! everything else here is `#![forbid(unsafe_code)]`.
 //!
 //! Implements: `rtnetlink(7)` `RTM_NEWROUTE` / `RTM_DELROUTE` /
 //! `RTM_GETROUTE`; RFC 8950 §3 (IPv6 next hop for IPv4 routes via
 //! `RTA_VIA`).
+//!
+//! It also reads, without writing, what the kernel's main table holds
+//! and how it changes ([`kernel`]: route, interface and address
+//! notifications, decoded and filtered; `monitor`: the subscribed socket,
+//! a snapshot and the changes after it), for the RIB to resolve next hops
+//! against (RFC 4271 §9.1.2, §9.1.2.1).
 #![forbid(unsafe_code)]
 
+pub mod kernel;
+pub mod mirror;
+#[cfg(not(miri))]
+pub mod monitor;
 pub mod netlink;
 pub mod reconcile;
 pub mod route;
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::IpAddr;
 
 use bgpfc_wire::prefix::Prefix;
 use bgpfc_wire::types::Afi;
 
-pub use reconcile::{Merge, Op, Routes, Table};
+pub use reconcile::{Check, Found, Hop, Merge, Op, Routes, Table};
 pub use route::RouteMsg;
 
 /// Whether operations are sent to the kernel.
@@ -53,6 +63,10 @@ pub enum FibError {
     Kernel(i32),
     /// The kernel's reply was malformed.
     Protocol(netlink::NetlinkError),
+    /// The kernel has another route with this destination and metric, in
+    /// this table (`EEXIST`, `<asm-generic/errno-base.h>`): another
+    /// program's, which bgpfcd leaves in place rather than replace it.
+    Occupied,
 }
 
 impl fmt::Display for FibError {
@@ -67,6 +81,10 @@ impl fmt::Display for FibError {
                 )
             }
             FibError::Protocol(e) => write!(f, "netlink reply: {e}"),
+            FibError::Occupied => f.write_str(
+                "another route has this destination and metric (File exists): \
+                 left in place, as bgpfcd replaces no route of another program",
+            ),
         }
     }
 }
@@ -90,10 +108,16 @@ impl From<netlink::NetlinkError> for FibError {
 pub struct Applied {
     /// The operation.
     pub op: Op,
-    /// `Ok` when sent and acknowledged (or when dry-run skipped it).
+    /// `Ok` when sent and acknowledged (or when dry-run skipped it), or
+    /// when the kernel no longer had a route it was to delete.
     pub result: Result<(), FibError>,
     /// Whether it was only reported (dry-run).
     pub dry_run: bool,
+    /// A delete the kernel answered `ESRCH` (`<asm-generic/errno-base.h>`,
+    /// 3): it had removed the route already, as it does with the routes
+    /// through an interface that goes down. Done all the same: the route
+    /// is gone, as the delete wanted.
+    pub already_gone: bool,
 }
 
 /// A change of the RIB's route for one prefix.
@@ -101,10 +125,33 @@ pub struct Applied {
 pub struct Change {
     /// The destination.
     pub prefix: Prefix,
-    /// The next hop now, or `None` when the RIB has no route.
-    pub gateway: Option<IpAddr>,
-    /// The next hop before, or `None` when the RIB had no route.
-    pub previous: Option<IpAddr>,
+    /// The hop now, or `None` when the RIB has no route.
+    pub hop: Option<Hop>,
+    /// The hop before, or `None` when the RIB had no route.
+    pub previous: Option<Hop>,
+}
+
+/// `ESRCH`, `<asm-generic/errno-base.h>`: what the kernel answers a delete
+/// of a route it does not have.
+const ESRCH: i32 = 3;
+
+/// `EEXIST`, `<asm-generic/errno-base.h>`: what the kernel answers a route
+/// added with `NLM_F_EXCL` where one has its destination and metric.
+const EEXIST: i32 = 17;
+
+/// What the kernel's answer `errno` (0 for success) to `op` means: the
+/// result and whether the route was already gone. A delete answered
+/// `ESRCH` is done: the kernel removed the route itself, as IPv4 does
+/// with the routes through an interface that goes down. A route added
+/// answered `EEXIST` found another program's route at its destination
+/// and metric, which stays ([`FibError::Occupied`]).
+fn outcome(op: &Op, errno: i32) -> (Result<(), FibError>, bool) {
+    match (op, errno) {
+        (_, 0) => (Ok(()), false),
+        (Op::Delete { .. }, ESRCH) => (Ok(()), true),
+        (Op::Set { .. }, EEXIST) => (Err(FibError::Occupied), false),
+        (_, e) => (Err(FibError::Kernel(e)), false),
+    }
 }
 
 /// Operations sent to the kernel in one netlink message at most.
@@ -171,7 +218,7 @@ impl Fib {
     /// At most `limit` of the routes believed installed, after `from`, in
     /// prefix order.
     #[must_use]
-    pub fn installed_after(&self, from: Option<Prefix>, limit: usize) -> Vec<(Prefix, IpAddr)> {
+    pub fn installed_after(&self, from: Option<Prefix>, limit: usize) -> Vec<(Prefix, Hop)> {
         self.routes.installed_after(from).take(limit).collect()
     }
 
@@ -201,9 +248,18 @@ impl Fib {
             for r in self.dump(afi)? {
                 if r.protocol == self.protocol
                     && r.table == self.table
-                    && let Some(gw) = r.gateway
+                    && let Some(gateway) = r.gateway
                 {
-                    installed.insert(r.dst, gw);
+                    // The kernel reports the interface, which a delete
+                    // may name.
+                    installed.insert(
+                        r.dst,
+                        Hop {
+                            gateway,
+                            oif: r.oif,
+                            onlink: r.onlink(),
+                        },
+                    );
                 }
             }
         }
@@ -254,7 +310,7 @@ impl Fib {
     fn plan_one(&self, change: Change) -> Option<Op> {
         let Change {
             prefix,
-            gateway,
+            hop,
             previous,
         } = change;
         // Dry-run installs nothing, so what it reports is the change of the
@@ -264,9 +320,9 @@ impl Fib {
         } else {
             self.routes.installed(&prefix)
         };
-        match (gateway, reference) {
-            (Some(d), i) if i != Some(d) => Some(Op::Set { prefix, gateway: d }),
-            (None, Some(i)) => Some(Op::Delete { prefix, gateway: i }),
+        match (hop, reference) {
+            (Some(d), i) if i != Some(d) => Some(Op::Set { prefix, hop: d }),
+            (None, Some(i)) => Some(Op::Delete { prefix, hop: i }),
             _ => None,
         }
     }
@@ -285,7 +341,7 @@ impl Fib {
     pub fn reconcile(
         &mut self,
         merge: &mut Merge,
-        routes: &[(Prefix, IpAddr)],
+        routes: &[(Prefix, Hop)],
         out: &mut Vec<Applied>,
     ) {
         let mut ops = std::mem::take(&mut self.pending);
@@ -328,6 +384,7 @@ impl Fib {
                 op: op.clone(),
                 result: Ok(()),
                 dry_run,
+                already_gone: false,
             }));
             if dry_run {
                 continue;
@@ -378,12 +435,22 @@ impl Fib {
         for (seq, op) in (first..).zip(ops) {
             let ack = seq == last;
             self.buf.extend_from_slice(&match op {
-                Op::Set { prefix, gateway } => {
-                    RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol)
+                // A route of ours whose hop changes replaces itself, with
+                // no moment without a route; one not installed yet goes in
+                // only where no route has its destination and metric, so
+                // that another program's is never replaced (AGENTS.md §3).
+                // A batch changes a prefix once at most, so what is
+                // installed is what the operation finds.
+                Op::Set { prefix, hop } if self.routes.installed(prefix).is_some() => {
+                    RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
                         .encode_set_with(seq, ack)
                 }
-                Op::Delete { prefix, gateway } => {
-                    RouteMsg::unicast(*prefix, *gateway, self.table, self.protocol)
+                Op::Set { prefix, hop } => {
+                    RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
+                        .encode_add_with(seq, ack)
+                }
+                Op::Delete { prefix, hop } => {
+                    RouteMsg::unicast(*prefix, *hop, self.table, self.protocol)
                         .encode_delete_with(seq, ack)
                 }
             });
@@ -429,8 +496,7 @@ impl Fib {
                     continue;
                 };
                 match netlink::parse_error(m.payload) {
-                    Ok(0) => {}
-                    Ok(code) => a.result = Err(FibError::Kernel(-code)),
+                    Ok(code) => (a.result, a.already_gone) = outcome(&a.op, -code),
                     Err(e) => a.result = Err(FibError::Protocol(e)),
                 }
                 done |= m.header.seq == last;
@@ -450,42 +516,128 @@ impl Fib {
     #[cfg(not(miri))]
     fn dump(&mut self, afi: Afi) -> Result<Vec<RouteMsg>, FibError> {
         let seq = self.next_seq();
-        let socket = self.socket.as_ref().ok_or_else(|| {
-            FibError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "netlink socket not open",
-            ))
-        })?;
-        socket.send(&RouteMsg::encode_dump(afi, seq))?;
         let mut routes = Vec::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = socket.recv(&mut buf)?;
-            for m in netlink::parse(&buf[..n])? {
-                if m.header.seq != seq {
-                    continue;
+        dump_each(self.socket.as_ref(), afi, seq, |r| routes.push(r))?;
+        Ok(routes)
+    }
+
+    /// Make the kernel hold the routes this FIB believes installed, as
+    /// after a read of the kernel's table that followed something which
+    /// may have removed some behind its back: IPv4 removes the routes
+    /// through an interface that goes down, or loses its address, without
+    /// a notification each, and the interface may be back before anything
+    /// reads the table. Dumps the routes with our protocol number in our
+    /// table ([`Routes::check`]), adds again each route believed installed
+    /// that the kernel lost (where no route of another program has its
+    /// place, as any route added), sets again one the kernel has through
+    /// another hop, and removes one of ours the kernel has and this FIB
+    /// does not know; what it did goes to `out`. Dry-run installs nothing
+    /// and checks nothing.
+    ///
+    /// # Errors
+    /// A dump failure; nothing is changed then.
+    #[cfg(not(miri))]
+    pub fn verify(&mut self, out: &mut Vec<Applied>) -> Result<Found, FibError> {
+        if self.mode == Mode::DryRun {
+            return Ok(Found::default());
+        }
+        let (table, protocol) = (self.table, self.protocol);
+        let mut check = self.routes.check();
+        for afi in [Afi::Ipv4, Afi::Ipv6] {
+            self.seq = self.seq.wrapping_add(1).max(1);
+            dump_each(self.socket.as_ref(), afi, self.seq, |r| {
+                // A kernel without IPv6 answers the IPv6 dump with the
+                // routes of every family.
+                if r.protocol == protocol
+                    && r.table == table
+                    && r.dst.afi() == afi
+                    && let Some(gateway) = r.gateway
+                {
+                    let hop = Hop {
+                        gateway,
+                        oif: r.oif,
+                        onlink: r.onlink(),
+                    };
+                    check.kernel_has(r.dst, hop);
                 }
-                match m.header.ty {
-                    netlink::NLMSG_DONE => return Ok(routes),
-                    netlink::NLMSG_ERROR => {
-                        let code = netlink::parse_error(m.payload)?;
-                        return Err(FibError::Kernel(-code));
-                    }
-                    route::RTM_NEWROUTE => {
-                        if let Some(r) = RouteMsg::decode(m.payload)? {
-                            routes.push(r);
-                        }
-                    }
-                    _ => {}
-                }
+            })?;
+        }
+        let found = check.finish();
+        let ops = self.routes.repair(found.clone());
+        self.run_into(&ops, out);
+        Ok(found)
+    }
+}
+
+/// Dump the unicast routes of `afi` on `socket` with sequence number
+/// `seq`, handing each to `each`.
+///
+/// # Errors
+/// The socket's, no socket, or [`dump_reply`]'s.
+#[cfg(not(miri))]
+fn dump_each(
+    socket: Option<&bgpfc_sys::NetlinkSocket>,
+    afi: Afi,
+    seq: u32,
+    mut each: impl FnMut(RouteMsg),
+) -> Result<(), FibError> {
+    let socket = socket.ok_or_else(|| {
+        FibError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "netlink socket not open",
+        ))
+    })?;
+    socket.send(&RouteMsg::encode_dump(afi, seq))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = socket.recv(&mut buf)?;
+        for m in netlink::parse(&buf[..n])? {
+            if dump_reply(&m, seq, &mut each)? {
+                return Ok(());
             }
         }
+    }
+}
+
+/// Take one message of the reply to the dump `seq`, a route to `each`:
+/// whether it ended the dump.
+///
+/// # Errors
+/// A dump the kernel refuses, or ends with an error
+/// ([`netlink::parse_done`]), which is not the whole table; a malformed
+/// message.
+fn dump_reply(
+    m: &netlink::Message<'_>,
+    seq: u32,
+    each: &mut impl FnMut(RouteMsg),
+) -> Result<bool, FibError> {
+    if m.header.seq != seq {
+        return Ok(false);
+    }
+    match m.header.ty {
+        netlink::NLMSG_DONE => match netlink::parse_done(m.payload) {
+            code if code < 0 => Err(FibError::Kernel(-code)),
+            _ => Ok(true),
+        },
+        netlink::NLMSG_ERROR => {
+            let code = netlink::parse_error(m.payload)?;
+            Err(FibError::Kernel(-code))
+        }
+        route::RTM_NEWROUTE => {
+            if let Some(r) = RouteMsg::decode(m.payload)? {
+                each(r);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::net::IpAddr;
 
     fn p(s: &str) -> Prefix {
         s.parse().unwrap()
@@ -495,11 +647,20 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn ch(prefix: &str, gateway: Option<&str>, previous: Option<&str>) -> Change {
+    /// A hop through `gateway`, with no interface.
+    fn h(gateway: &str) -> Hop {
+        Hop {
+            gateway: ip(gateway),
+            oif: None,
+            onlink: false,
+        }
+    }
+
+    fn ch(prefix: &str, hop: Option<&str>, previous: Option<&str>) -> Change {
         Change {
             prefix: p(prefix),
-            gateway: gateway.map(ip),
-            previous: previous.map(ip),
+            hop: hop.map(h),
+            previous: previous.map(h),
         }
     }
 
@@ -513,7 +674,7 @@ mod tests {
             out.op,
             Op::Set {
                 prefix: p("192.0.2.0/24"),
-                gateway: ip("10.0.0.1")
+                hop: h("10.0.0.1")
             }
         );
         assert_eq!(fib.installed().len(), 0);
@@ -528,7 +689,7 @@ mod tests {
             out.op,
             Op::Delete {
                 prefix: p("192.0.2.0/24"),
-                gateway: ip("10.0.0.2")
+                hop: h("10.0.0.2")
             }
         );
         assert!(fib.set(ch("192.0.2.0/24", None, None)).is_none());
@@ -570,8 +731,13 @@ mod tests {
         let mut fib = Fib::new(Mode::DryRun, route::RT_TABLE_MAIN, route::RTPROT_BGP);
         let mut merge = Merge::default();
         let mut out = Vec::new();
-        fib.reconcile(&mut merge, &[(p("10.0.0.0/8"), ip("192.0.2.1"))], &mut out);
-        fib.reconcile(&mut merge, &[(p("2001:db8::/32"), ip("fe80::1"))], &mut out);
+        fib.reconcile(&mut merge, &[(p("10.0.0.0/8"), h("192.0.2.1"))], &mut out);
+        let ll = Hop {
+            gateway: ip("fe80::1"),
+            oif: Some(2),
+            onlink: false,
+        };
+        fib.reconcile(&mut merge, &[(p("2001:db8::/32"), ll)], &mut out);
         fib.reconcile_end(merge, &mut out);
         assert_eq!(out.len(), 2);
         assert!(
@@ -587,7 +753,7 @@ mod tests {
         let mut fib = Fib::new(Mode::Install, route::RT_TABLE_MAIN, route::RTPROT_BGP);
         let changes = (0..=u8::MAX).chain(0..3).map(|i| Change {
             prefix: Prefix::new(IpAddr::from([10, i, 0, 0]), 16).unwrap(),
-            gateway: Some(ip("192.0.2.1")),
+            hop: Some(h("192.0.2.1")),
             previous: None,
         });
         let mut out = Vec::new();
@@ -620,22 +786,22 @@ mod tests {
                 let [a, b] = i.to_be_bytes();
                 Change {
                     prefix: Prefix::new(IpAddr::from([10, a, b, 0]), 24).unwrap(),
-                    gateway: Some(ip("192.0.2.1")),
+                    hop: Some(h("192.0.2.1")),
                     previous: None,
                 }
             })
             .collect();
         // One request the kernel refuses, in the middle of the first
         // batch: no route to the gateway.
-        changes[100].gateway = Some(ip("203.0.113.1"));
+        changes[100].hop = Some(h("203.0.113.1"));
         // The same prefix twice in the second batch: the second change
         // sees the first carried out.
         changes.push(Change {
-            gateway: Some(ip("192.0.2.2")),
+            hop: Some(h("192.0.2.2")),
             ..changes[260]
         });
         changes.push(Change {
-            gateway: None,
+            hop: None,
             ..changes[261]
         });
         let mut out = Vec::new();
@@ -644,15 +810,24 @@ mod tests {
         let failed: Vec<usize> = (0..out.len()).filter(|&i| out[i].result.is_err()).collect();
         assert_eq!(failed, vec![100]);
         assert!(matches!(out[100].result, Err(FibError::Kernel(_))));
+        // The kernel reports the interface we let it choose.
+        let strip = |t: Table| -> Table {
+            t.into_iter()
+                .map(|(p, hop)| (p, Hop { oif: None, ..hop }))
+                .collect()
+        };
         let kernel = installed();
-        assert_eq!(kernel, fib.installed());
+        assert_eq!(strip(kernel.clone()), fib.installed());
         assert_eq!(kernel.len(), 298);
-        assert_eq!(kernel.get(&changes[260].prefix), Some(&ip("192.0.2.2")));
+        assert_eq!(
+            kernel.get(&changes[260].prefix).map(|h| h.gateway),
+            Some(ip("192.0.2.2"))
+        );
         // A reconcile in two parts to the first ten routes, one of them
         // with another gateway: the rest are removed.
-        let mut want: Table = kernel.iter().take(10).map(|(p, g)| (*p, *g)).collect();
-        want.insert(changes[3].prefix, ip("192.0.2.3"));
-        let want: Vec<(Prefix, IpAddr)> = want.into_iter().collect();
+        let mut want: Table = fib.installed().into_iter().take(10).collect();
+        want.insert(changes[3].prefix, h("192.0.2.3"));
+        let want: Vec<(Prefix, Hop)> = want.into_iter().collect();
         let mut merge = Merge::default();
         let mut out = Vec::new();
         fib.reconcile(&mut merge, &want[..4], &mut out);
@@ -661,9 +836,92 @@ mod tests {
         assert!(out.iter().all(|a| a.result.is_ok()));
         assert_eq!(out.len(), 1 + 288);
         let kernel = installed();
-        assert_eq!(kernel.into_iter().collect::<Vec<_>>(), want);
+        assert_eq!(strip(kernel).into_iter().collect::<Vec<_>>(), want);
+        // A route the kernel removed behind our back: its delete is
+        // answered ESRCH, and done.
+        let mut other = Fib::new(Mode::Install, TABLE, route::RTPROT_BGP);
+        other.open().unwrap();
+        other.sync().unwrap();
+        assert_eq!(installed().len(), 0);
+        let gone = fib.set(Change {
+            prefix: want[0].0,
+            hop: None,
+            previous: Some(want[0].1),
+        });
+        let gone = gone.unwrap();
+        assert!(gone.result.is_ok() && gone.already_gone, "{gone:?}");
         assert!(fib.clear().iter().all(|a| a.result.is_ok()));
         assert_eq!(installed().len(), 0);
+    }
+
+    /// The routes a dump lists are kept until its end, which fails it if
+    /// it carries an error: a table the kernel could not finish listing
+    /// is not the whole table, and the startup flush must not take it as
+    /// one.
+    #[test]
+    fn a_dump_that_ends_with_an_error_fails() {
+        let payload = |code: i32| code.to_ne_bytes();
+        let ours = RouteMsg::unicast(p("192.0.2.0/24"), h("10.0.0.1"), 254, 186);
+        let mut part = ours.encode_set(5);
+        // A part of a dump: NLM_F_MULTI, the type of the routes it lists.
+        part[6..8].copy_from_slice(&netlink::NLM_F_MULTI.to_ne_bytes());
+        let done = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 5, &payload(0));
+        let failed = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 5, &payload(-12));
+        let mut routes = Vec::new();
+        let take = |bytes: &[u8], routes: &mut Vec<RouteMsg>| {
+            let m = netlink::parse(bytes).unwrap();
+            dump_reply(&m[0], 5, &mut |r| routes.push(r))
+        };
+        assert!(matches!(take(&part, &mut routes), Ok(false)));
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].dst, p("192.0.2.0/24"));
+        assert!(matches!(take(&done, &mut routes), Ok(true)));
+        assert!(matches!(
+            take(&failed, &mut routes),
+            Err(FibError::Kernel(12))
+        ));
+        // Another request's messages are not this dump's.
+        let other = netlink::encode(netlink::NLMSG_DONE, netlink::NLM_F_MULTI, 6, &payload(-12));
+        assert!(matches!(take(&other, &mut routes), Ok(false)));
+    }
+
+    #[test]
+    fn a_delete_answered_esrch_counts_as_done() {
+        let delete = Op::Delete {
+            prefix: p("192.0.2.0/24"),
+            hop: h("10.0.0.1"),
+        };
+        let set = Op::Set {
+            prefix: p("192.0.2.0/24"),
+            hop: h("10.0.0.1"),
+        };
+        assert!(matches!(outcome(&delete, 0), (Ok(()), false)));
+        assert!(matches!(outcome(&set, 0), (Ok(()), false)));
+        assert!(matches!(outcome(&delete, ESRCH), (Ok(()), true)));
+        // Another program's route at the destination and metric: it stays.
+        assert!(matches!(
+            outcome(&set, EEXIST),
+            (Err(FibError::Occupied), false)
+        ));
+        assert!(
+            FibError::Occupied
+                .to_string()
+                .starts_with("another route has this destination and metric"),
+        );
+        assert!(matches!(
+            outcome(&delete, EEXIST),
+            (Err(FibError::Kernel(EEXIST)), false)
+        ));
+        // Only a delete: a route that cannot be set is a failure.
+        assert!(matches!(
+            outcome(&set, ESRCH),
+            (Err(FibError::Kernel(ESRCH)), false)
+        ));
+        // ENETUNREACH (101) on a delete is a failure too.
+        assert!(matches!(
+            outcome(&delete, 101),
+            (Err(FibError::Kernel(101)), false)
+        ));
     }
 
     #[cfg(not(miri))]

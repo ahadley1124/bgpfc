@@ -5,7 +5,8 @@
 //! routes again when the validation source changes (RFC 6811 §4), with the
 //! routes held until the first data under `startup hold` too, and
 //! importing a peer's routes again from the Adj-RIB-In when its import
-//! policy changes (RFC 4271 §3). The
+//! policy changes (RFC 4271 §3), and a next hop that covers a full table
+//! no longer resolving, resolving again or moving (RFC 4271 §9.1.2). The
 //! default sizes are a fraction of a full table so the bench finishes
 //! quickly; set `BGPFC_BENCH_ROUTES` to 1250000 for the full-table figure.
 
@@ -14,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bgpfc_rib::nexthop::{KernelChange, KernelRoute, KernelUpdate, Via};
 use bgpfc_rib::{
     Enforcement, Imported, Output, PathAttrs, PeerInfo, Policies, Rib, RovState, Startup, Verdict,
 };
@@ -282,6 +284,7 @@ fn bench(c: &mut Criterion) {
     group.finish();
     revalidation(c, routes, &v4, &v6);
     reimport(c, routes, &v4, &v6);
+    nexthops(c, routes);
 }
 
 /// RFC 4271 §3 (a) at scale: a reload that changes the import policy of
@@ -455,6 +458,143 @@ fn startup(
             black_box(outputs(|o| rib.set_startup(startup, now, o)))
         });
     });
+}
+
+/// `n` IPv4 routes as [`updates`] makes them, with next hop `next_hop`.
+fn updates_via(n: u32, peer_as: u32, origin: u32, next_hop: Ipv4Addr) -> Vec<DecodedUpdate> {
+    let mut out = updates(n, false, peer_as, origin);
+    for u in &mut out {
+        for a in &mut u.message.attributes {
+            if let PathAttribute::NextHop(n) = a {
+                *n = next_hop;
+            }
+        }
+    }
+    out
+}
+
+/// RFC 4271 §9.1.2 at scale (design: the RIB stall when one next hop
+/// covers a full table). One external peer sends `routes` IPv4 routes
+/// through next hop 192.0.2.1, on a network the kernel's table has as
+/// connected, and a second peer is up to export to:
+///
+/// - `next_hop_unresolved`: the connected route goes, so every route is
+///   held, every destination leaves the FIB and is withdrawn from the
+///   other peer;
+/// - `next_hop_resolved_again`: it comes back;
+/// - `next_hop_moved`: the connected route is replaced by one through a
+///   gateway on another interface, and back: every route goes to the FIB
+///   again through the new hop, with no decision and no UPDATE;
+/// - `next_hop_flip_1000_of`: a second next hop with 1000 routes of its
+///   own resolves and stops resolving in the same table: the cost follows
+///   its 1000 routes, not the table (the index of next hop to
+///   destinations).
+///
+/// Only the change measured is timed in the first two; its reverse,
+/// which sets the next iteration up, is not.
+fn nexthops(c: &mut Criterion, routes: u32) {
+    let net = |a: u8, b: u8, c: u8, len: u8| {
+        Prefix::new(IpAddr::V4(Ipv4Addr::new(a, b, c, 0)), len).unwrap()
+    };
+    let unicast = |gateway: Option<IpAddr>, oif: u32| Via::Unicast {
+        gateway,
+        oif,
+        onlink: false,
+    };
+    let connected = |prefix: Prefix, oif: u32| KernelRoute {
+        prefix,
+        metric: 0,
+        via: unicast(None, oif),
+    };
+    let lan = net(192, 0, 2, 24);
+    let other = net(198, 51, 100, 24);
+    let change = |changes: Vec<KernelChange>| KernelUpdate::Changes(changes);
+    let gone = |prefix: Prefix| change(vec![KernelChange::Gone { prefix, metric: 0 }]);
+    let back = |prefix: Prefix, oif: u32| change(vec![KernelChange::Route(connected(prefix, oif))]);
+    let now = Instant::now();
+    let mut rib = Rib::new(Asn(65_000));
+    let mut out = Vec::new();
+    outputs(|o| {
+        rib.kernel(
+            KernelUpdate::Table {
+                routes: vec![connected(lan, 2), connected(other, 3)],
+                links: Vec::new(),
+            },
+            now,
+            o,
+        );
+    });
+    outputs(|o| rib.peer_up(peer(1), now, o));
+    outputs(|o| rib.peer_up(peer(2), now, o));
+    outputs(|o| rib.peer_up(peer(3), now, o));
+    let table = updates_via(routes, 65_001, 7, Ipv4Addr::new(192, 0, 2, 1));
+    feed(&mut rib, peer(1).addr, &table, now, &mut out);
+    // 1000 routes of their own, from 100.64.0.0/24 on, through 198.51.100.1.
+    let mut few = updates_via(1000, 65_003, 7, Ipv4Addr::new(198, 51, 100, 1));
+    for u in &mut few {
+        for p in &mut u.message.nlri {
+            let IpAddr::V4(a) = p.addr() else {
+                continue;
+            };
+            let [_, b, c, _] = a.octets();
+            *p = net(100, 64 + b, c, 24);
+        }
+    }
+    feed(&mut rib, peer(3).addr, &few, now, &mut out);
+    assert_eq!(
+        rib.loc_rib(AddressFamily::IPV4_UNICAST).count(),
+        usize::try_from(routes).unwrap() + 1000
+    );
+
+    let mut group = c.benchmark_group("rib");
+    group.sample_size(10);
+    // One direction timed, the other not.
+    let timed = |rib: &mut Rib, measured: &KernelUpdate, reverse: &KernelUpdate, iters: u64| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            let start = Instant::now();
+            black_box(outputs(|o| rib.kernel(measured.clone(), now, o)));
+            total += start.elapsed();
+            black_box(outputs(|o| rib.kernel(reverse.clone(), now, o)));
+        }
+        total
+    };
+    group.bench_function(format!("next_hop_unresolved_{routes}"), |b| {
+        b.iter_custom(|iters| timed(&mut rib, &gone(lan), &back(lan, 2), iters));
+    });
+    group.bench_function(format!("next_hop_resolved_again_{routes}"), |b| {
+        b.iter_custom(|iters| {
+            outputs(|o| rib.kernel(gone(lan), now, o));
+            let total = timed(&mut rib, &back(lan, 2), &gone(lan), iters);
+            outputs(|o| rib.kernel(back(lan, 2), now, o));
+            total
+        });
+    });
+    let through = change(vec![KernelChange::Route(KernelRoute {
+        prefix: lan,
+        metric: 0,
+        via: unicast(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), 3),
+    })]);
+    let mut moved = false;
+    group.bench_function(format!("next_hop_moved_{routes}"), |b| {
+        b.iter(|| {
+            moved = !moved;
+            let update = if moved { through.clone() } else { back(lan, 2) };
+            black_box(outputs(|o| rib.kernel(update, now, o)))
+        });
+    });
+    if moved {
+        outputs(|o| rib.kernel(back(lan, 2), now, o));
+    }
+    let mut flipped = false;
+    group.bench_function(format!("next_hop_flip_1000_of_{routes}"), |b| {
+        b.iter(|| {
+            flipped = !flipped;
+            let update = if flipped { gone(other) } else { back(other, 3) };
+            black_box(outputs(|o| rib.kernel(update, now, o)))
+        });
+    });
+    group.finish();
 }
 
 /// Entry point; `criterion_main!` is not used because its generated items

@@ -6,7 +6,8 @@
 //! descriptors never cross its boundary. Every entry point is declared by
 //! hand in `ffi.rs` with the header it comes from (AGENTS.md §1.4).
 //!
-//! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`; the
+//! Implements: `netlink(7)` socket plumbing for `bgpfc-fib`, with the
+//! `rtnetlink(7)` multicast groups it follows the kernel's routes by; the
 //! self-pipe signal handler of AGENTS.md §3; the two privilege modes of
 //! the README; with the `profiling` feature, the counting allocator of
 //! `docs/PROFILING.md`.
@@ -20,23 +21,34 @@
 //!
 //! And it sets TCP keep-alive on a connection (`tcp(7)`), which std
 //! cannot, for the RTR client's connections to its caches (RFC 8210 §9).
+//!
+//! It joins a network namespace (`setns(2)`), for a daemon told to run in
+//! one, and drops the capability that took (`capset(2)`).
+//!
+//! And it opens outgoing TCP connections with a TTL and a source address
+//! set before the SYN, and sets the TTL of an accepted one, which std
+//! cannot either, for bgpfcd's BGP sessions (`multihop`, `local-address`).
 #![cfg(target_os = "linux")]
 
 #[cfg(feature = "profiling")]
 pub mod alloc;
 mod caps;
+mod connect;
 mod ffi;
 mod inherit;
 mod netlink;
+mod netns;
 mod privilege;
 mod process;
 mod signal;
 mod tcp;
 
-pub use caps::{Capability, Effective};
+pub use caps::{Capability, Effective, drop_capability};
+pub use connect::{TcpConnect, set_ttl, ttl};
 pub use inherit::clear_ambient_capabilities;
 pub use inherit::inherit_only_standard_streams;
 pub use netlink::NetlinkSocket;
+pub use netns::{NetNs, NetNsError, NsId, threads};
 pub use privilege::{Identity, drop_to, is_root, lookup_group, lookup_user};
 pub use process::send_signal_to_group;
 pub use process::wait_for_exit;

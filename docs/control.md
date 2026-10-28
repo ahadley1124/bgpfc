@@ -30,9 +30,10 @@ failure, 2 on a usage error.
 |---|---|
 | `show status` | version, local AS, router ID, neighbor counts, FIB mode, the `rpki` mode with whether validation is off, waiting or active, and the alarms (see [Alarms](#alarms)) |
 | `show neighbors` | one line per configured neighbor: AS, FSM state, time in state, routes received and advertised |
-| `show neighbor ADDR` | the same in detail, with routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state, see [Validation state](#validation-state)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
-| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the routes held for their validation state, marked `!` and followed by `held by enforcement`, `held by startup` or `held by policy`; with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
-| `show fib` | FIB mode and every desired route with `installed` or `pending`, and every installed route not desired as `stale`, in prefix order |
+| `show neighbor ADDR` | the same in detail: the session's `local address` (the connection's, else the configured `local-address`, else `-`), the `ttl` bgpfcd sends the neighbor with (`1` for an external neighbor without `multihop`, the `multihop` value, or `system default`), and until a session comes up the `last error` of a connection, with how long ago it was (a failed connect, or a socket error a connection closed with, such as the `No route to host` of a neighbor TTL 1 does not reach: `docs/config.md`, "Neighbors"); routes received, held and advertised per family next to the family's `maximum-prefix` (received is what the RFC 4271 §6.7 limit counts; held is how many of those are held for their validation state or an unresolvable next hop, see [Validation state](#validation-state) and [Next hops](#next-hops)), the negotiated session (router ID, timers, capabilities, families, and the families whose routes may carry an IPv6 next hop under RFC 8950, from the neighbor and to it), and whether the `restart-limit` left the neighbor Idle (RFC 4486 §4) |
+| `show routes [ipv4\|ipv6] [PREFIX] [held]` | the Loc-RIB of a family; with a prefix, every route the Adj-RIBs-In hold for it: the candidates, the chosen one marked `*`, then the held routes, marked `!`: those held for their validation state followed by `held by enforcement`, `held by startup` or `held by policy`, and those whose next hop does not resolve by `next hop unresolvable` (see [Next hops](#next-hops)); with `held`, only the held routes, of the family or of the prefix. Each route has its origin validation state (`rov`), and after `>` the state import policy set (see [Validation state](#validation-state)) |
+| `show fib` | FIB mode and every desired route, with its gateway (followed by `onlink` for a gateway on the interface's link that no route covers) and the index of its interface (`oif`, `-` when unknown), `installed` when the FIB has it through that gateway and interface or `pending`, and every installed route not desired as `stale`, in prefix order |
+| `show nexthops` | every next hop the routes use, whether it resolves in the kernel's routing table, the gateway and interface the routes through it are installed with, the kernel route it resolves through, and how many routes use it; then how many routes the copy of the kernel's table holds (see [Next hops](#next-hops)) |
 | `show rpki` | the `rpki` mode and enforcement, whether validation is off, waiting for its first data or active, Routinator's state with `mode sidecar`, the cache list with the cache in use, and where the RTR client stands with it (see [RPKI](#rpki)) |
 | `show rpki transitions` | the latest routes whose origin validation state changed, oldest first, each with its time (see [Changes of state](#changes-of-state)) |
 | `show rpki validate PREFIX ASN` | the origin validation state of a route to PREFIX originated by ASN (`64496` or `AS64496`) against the VRPs in use, with every VRP that covers it, marked `matches` where it matches (RFC 6811 §2) |
@@ -82,6 +83,7 @@ connections are served at once (`503`); reads and writes time out after
 | `GET /v1/neighbors/{addr}` | `show neighbor ADDR` (`404` if unknown) |
 | `GET /v1/routes?family=ipv4\|ipv6[&prefix=P][&held=1]` | `show routes` |
 | `GET /v1/fib` | `show fib` |
+| `GET /v1/nexthops` | `show nexthops` |
 | `GET /v1/rpki` | `show rpki` |
 | `GET /v1/rpki/transitions` | `show rpki transitions` |
 | `GET /v1/rpki/validate?prefix=P&origin=ASN` | `show rpki validate` (`400` without both) |
@@ -96,6 +98,7 @@ Example objects:
  "rpki":{"mode":"sidecar","validation":"active"},"alarms":["rpki-sidecar-failed"]}
 
 [{"address":"198.51.100.1","remote_as":64511,"state":"Established","since_seconds":120,
+  "local_address":"198.51.100.2","ttl":1,"last_error":null,"last_error_seconds_ago":null,
   "admin_down":false,"restart_limit_reached":false,"updates_in":4,"updates_out":2,
   "received":2,"held":1,"advertised":1,
   "prefixes":[{"family":"ipv4-unicast","received":2,"held":1,"advertised":1,"limit":1000},
@@ -112,7 +115,12 @@ Example objects:
   "peer":"198.51.100.2","best":false,"rov":"invalid","rov_set":null,"held":"enforcement",
   "as_path":[64497],"communities":[],"large_communities":[]}]
 
-{"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","installed":true}]}
+{"mode":"install","routes":[{"prefix":"192.0.2.0/24","gateway":"198.51.100.1","oif":3,"installed":true}]}
+
+{"kernel_routes":12,"next_hops":[{"next_hop":"10.255.7.30","resolved":true,"gateway":"10.99.7.1",
+ "oif":3,"interface":"v12b","through":"10.255.7.30/32","routes":1},
+ {"next_hop":"198.51.100.9","resolved":false,"gateway":null,"oif":null,"interface":null,
+ "through":null,"routes":3}]}
 
 {"mode":"external","enforcement":"drop-invalid","validation":"active","waiting_seconds":null,
  "sidecar":null,"caches":[{"host":"127.0.0.1","port":3323,
@@ -188,7 +196,8 @@ enforcement` (the `enforcement` rules out the state it is used with),
 `held by startup` (`startup hold`: it is `disabled`, waiting for the first
 full set to give it a state) or `held by policy` (the import policy
 rejects it in its state and would accept it in another); the JSON has
-`held` (`enforcement`, `startup`, `policy` or `null`). A held route keeps the attributes its neighbor sent, and is shown
+`held` (`enforcement`, `startup`, `policy` or `null`, and `next-hop` for
+a route held for its next hop, see [Next hops](#next-hops)). A held route keeps the attributes its neighbor sent, and is shown
 with them: the import policy runs on them again when the route is used
 again, so what the policy sets, such as a `set local-pref`, shows only
 then. `show routes held` lists every held route of a family, and `show
@@ -302,9 +311,11 @@ hop. The `enforcement` change above, `best_changed=4800`, comes with
 
 For the FIB thread a change is what the RIB made of one of its inputs (an
 UPDATE, a session that went down, a change of the VRPs or of
-`enforcement`, a reload), a switch to install mode with its reconcile,
-the removal of stale routes at startup, or that of every route at
-shutdown. A change that comes a second or more after the last line gets
+`enforcement`, a reload, a change of the kernel's routing table that
+changed what a next hop resolves to), a switch to install mode with its
+reconcile, the removal of stale routes at startup, or that of every route
+at shutdown.
+A change that comes a second or more after the last line gets
 its line at once, as soon as it is applied. Those that follow within the
 second are added up and written a second after that line: a table that
 loads from a peer, an UPDATE at a time, or a burst of VRP changes, costs
@@ -317,17 +328,144 @@ mixes the modes, and at shutdown, so that every operation is counted on
 some line. The lines' counts add up to every operation done.
 
 Each route has a line of its own at `debug` (`fib: dry-run` or `fib:
-applied`, with `op`, `prefix` and `gateway`), written as it is done. A
+applied`, with `op`, `prefix`, `gateway` and `oif`, and `onlink=yes` for
+a gateway on the interface's link that no route covers), written as it
+is done. A route goes through the hop its next hop resolves to (see [Next
+hops](#next-hops)): `gateway` is the next hop itself on a connected
+network, else the gateway of the kernel route that resolves it, and `oif`
+the index of the interface it is reached on. A delete the kernel answers
+`ESRCH`, having removed the route itself, as IPv4 does with the routes
+through an interface that goes down, is done all the same: its line says
+`fib: already gone`, and it counts as a `delete`, not a failure. A route
+bgpfcd installs for the first time goes in only where the kernel has no
+route with its destination and metric (20, as FRR's zebra gives its own):
+where another program's route is there, the kernel keeps that one and
+answers `EEXIST`, and the route's line is a failure, `error="another route
+has this destination and metric (File exists): left in place, as bgpfcd
+replaces no route of another program"`; `show fib` lists the route
+`pending`. When that route leaves the kernel's table, the RIB offers the
+route again, and it goes in. A
 failed operation has one at error (`fib: failed`, with the kernel's
 `error`), at once, the first three of a change, and three at most between
 two `fib: changes` lines, whatever the number of changes; the others at
 `debug`. The `fib: changes` line that counts them is then at error too,
 with every failure in `failed`. A kernel that refuses one route, for want
-of `CAP_NET_ADMIN` or for a next hop it cannot reach directly, often
-refuses the whole table, and the first already names the reason; a table
-that loads from a peer, a change an UPDATE, so costs at most three error
+of `CAP_NET_ADMIN` for instance, often refuses the whole table, and the
+first already names the reason; a table that loads from a peer, a change
+an UPDATE, so costs at most three error
 lines and one `fib: changes` line a second, not a line a route. At
 `log { level warn; }` the FIB thread writes only its failures.
+
+## Next hops
+
+A route is used only if its next hop resolves in the kernel's main
+routing table (RFC 4271 §9.1.2; `docs/config.md`, "Route selection"):
+`show nexthops` and `GET /v1/nexthops` list every next hop the routes
+use, in address order, held routes included:
+
+```
+next-hop                                state      gateway                                 interface       through                                       routes
+10.255.7.30                             resolved   10.99.7.1                               v12b            10.255.7.30/32                                     1
+198.51.100.9                            unresolved -                                       -               -                                                  3
+kernel routes 12
+```
+
+A resolved next hop gives the hop its routes are installed through: the
+next hop itself on a connected network, else the gateway of the kernel
+route that resolves it (`through`), with the interface it is reached on
+(its name, or its index when the name is unknown). A gateway that the
+kernel route has `onlink`, on the interface's link though no route covers
+it, as an IGP's route over an unnumbered link has, shows as `GATEWAY
+onlink`, and its JSON has `"onlink":true`: routes go to the kernel
+through it `onlink` too, as the kernel requires. A route whose next hop
+does not resolve stays in the Adj-RIB-In, counted as received and held,
+but is no candidate for route selection, so it is neither installed nor
+advertised; it is used again, with no UPDATE from its neighbor, once its
+next hop resolves. `show routes PREFIX` lists it after the candidates,
+marked `!`, followed by `next hop unresolvable`, and its JSON has
+`"held":"next-hop"`. A route held for its validation state shows that
+reason, whatever its next hop: the RPKI rules come first. In the JSON,
+`gateway`, `oif`, `interface` and `through` are `null` where the text
+has `-`; `kernel_routes` counts the routes the copy below holds.
+
+A kernel thread follows that table: it reads it whole at startup, before
+the RIB judges any route, and then the kernel's notifications of the
+routes of both families, of the interfaces and of the IPv4 addresses
+removed. It keeps the routes a next hop may resolve through: neither
+bgpfcd's own nor a default route, each route where the kernel holds
+several with one prefix and metric, and hands the RIB the one the kernel
+uses there. It reads the table whole again when the kernel drops
+notifications, when an interface goes down or away or an IPv4 address is
+removed, since IPv4 then removes the routes through it without a
+notification of their own, and when a change comes that it cannot place
+for sure, as where a route of bgpfcd's sits beside another program's at
+one prefix and metric; the RIB keeps its copy until the new one arrives.
+Such a reading comes 100 ms after what asked for it, with what else
+changed meanwhile, and a second after the start of the one before at the
+earliest. One that lost notifications on the way, or met a change it could
+not place, is not the whole table: its line says `complete=no`, the RIB
+takes it all the same, and the thread reads again (`incomplete`) after a
+pause that doubles from a second to a minute while that goes on.
+Notifications that come within 10 ms of the first of a batch reach the RIB
+together, by their net effect, so that a route deleted and added again at
+once changes nothing. The thread never writes to the kernel, in dry-run
+and install mode alike. After a whole reading that an interface, an
+address, lost notifications or a change it could not place asked for,
+the FIB thread checks the routes it installed (below), since the kernel
+may have removed some of them without a word, and the interface be back
+up before the reading, so that the RIB sees nothing change.
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="kernel: table read" routes=12 links=4 reason=startup
+```
+
+`routes` is the routes kept, `links` the interfaces. The line is at info
+at startup and after the thread opened a new socket (`reopened`, after an
+error of the old one, which is logged at error); at `debug` for the reads
+an interface going down (`link-down`) or away (`link-gone`), an IPv4
+address removed (`address-removed`), lost notifications (`lost-events`), a
+change it cannot place (`unclear`) or a reading before that was not whole
+(`incomplete`) ask for. Lost notifications also have a line at warn, at
+once and then at most one a minute, `times` counting those since the line
+before:
+
+```
+2026-10-27T12:34:56.789Z WARN  msg="kernel: route events lost, reading the table again" times=1
+```
+
+The FIB thread's check reads the kernel's routes with bgpfcd's protocol
+number in its table, in install mode only. Where they differ from those
+it installed, it installs again each route the kernel lost, sets again
+one the kernel has through another hop, and removes one of bgpfcd's
+protocol it did not install, and says so in one line at info, its
+operations then counted in a `fib: changes` line as any others:
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="fib: kernel routes differ, repairing" missing=2 wrong=0 unknown=0 prefixes=192.0.2.0/24,198.51.100.0/24
+```
+
+A check that finds nothing writes nothing; one that cannot read the
+kernel's routes writes `fib: cannot check the kernel's routes` at error
+with the `error`, and the next whole reading checks again.
+
+A change of the table that changes what a next hop in use resolves to is
+one line at info, however many routes it moves:
+
+```
+2026-10-27T12:34:56.789Z INFO  msg="rib: next hops changed" resolved=0 unresolved=1 moved=1 held=3 released=0 best_changed=3 next_hops="10.0.0.9 via 10.99.7.1 dev v12b,198.51.100.9 unresolved"
+```
+
+`resolved` next hops resolve now and did not, `unresolved` no longer do,
+and `moved` resolve through another gateway or interface. `held` routes
+the change took out of use, `released` it put back into use, and
+`best_changed` destinations then have another best route, or none. A
+route whose next hop moved stays the best and goes to the kernel again
+through the new hop, with no UPDATE to any neighbor. `next_hops` names
+the first eight next hops it changed as they are now, `...` marking the
+rest; at `debug` each has a line of its own (`rib: next hop changed`,
+with its `gateway`, `oif`, `interface`, the kernel route it resolves
+`through`, and its `routes`). The routes it moves show in the FIB
+thread's `fib: changes` lines, never a line a route at info.
 
 ## RPKI
 
@@ -477,8 +615,9 @@ connection in use at once as well as every later one (the summary says
 `rpki tcp-keepalive idle N interval N count N`, the log `rpki: tcp
 keep-alive changed`).
 `router-id` and `local-as` changes are refused, and `listen`,
-`control`, `fib { table }` and `fib { protocol }` changes are noted for the
-next restart.
+`control`, `fib { table }`, `fib { protocol }` and `netns` changes are
+noted for the next restart (`netns changed: takes effect at the next
+restart; bgpfcd stays in PATH`).
 
 A route an import policy rejects whatever its validation state is not
 kept, so importing again cannot bring it back: when import policy has

@@ -3,11 +3,13 @@
 //! Each peer thread owns one channel of [`PeerInput`]; connection reader
 //! threads, the coordinator and the control plane write to it. Peer
 //! threads send [`RibMsg`] to the RIB thread over a bounded channel so
-//! that a flooding peer blocks instead of growing memory, and so does the
-//! RTR client with its validation changes.
+//! that a flooding peer blocks instead of growing memory, and so do the
+//! RTR client with its validation changes and the kernel thread with the
+//! kernel's routing table.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpStream};
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime};
@@ -119,6 +121,15 @@ pub(crate) struct PeerReport {
     pub(crate) state: bgpfc_fsm::State,
     /// How long the state has been held.
     pub(crate) since: Duration,
+    /// Our address on the connection the FSM runs on, else the configured
+    /// `local-address`, if any.
+    pub(crate) local_addr: Option<IpAddr>,
+    /// The TTL sent to the neighbor; `None` for the system's.
+    pub(crate) ttl: Option<NonZeroU8>,
+    /// The last connection error and how long ago it was, until a session
+    /// comes up: a failed connect, or a socket error a connection closed
+    /// with before its session was up (`docs/config.md`, "Neighbors").
+    pub(crate) last_error: Option<(String, Duration)>,
     /// Negotiated session, when Established.
     pub(crate) session: Option<Session>,
     /// UPDATEs received since the thread started.
@@ -153,7 +164,7 @@ pub(crate) enum FibMsg {
     SetMode(bgpfc_fib::Mode),
     /// The RIB's routes, continuing in prefix order those sent since
     /// `SetMode`.
-    Reconcile(Vec<(Prefix, IpAddr)>),
+    Reconcile(Vec<(Prefix, bgpfc_fib::Hop)>),
     /// The end of a switch; the reply says how many operations it took.
     ReconcileEnd(SyncSender<usize>),
     /// Report the mode on the sender.
@@ -166,6 +177,9 @@ pub(crate) enum FibMsg {
         /// Where the report goes.
         reply: SyncSender<FibReport>,
     },
+    /// Check that the kernel holds the routes installed, and install again
+    /// those it lost (`bgpfc_fib::Fib::verify`).
+    Verify,
     /// Remove every installed route and reply on the sender.
     Shutdown(SyncSender<()>),
 }
@@ -181,8 +195,8 @@ pub(crate) const PAGE: usize = 4096;
 pub(crate) struct FibReport {
     /// The mode.
     pub(crate) mode: bgpfc_fib::Mode,
-    /// Routes believed installed: a page.
-    pub(crate) installed: Vec<(Prefix, IpAddr)>,
+    /// Routes believed installed, each with its hop: a page.
+    pub(crate) installed: Vec<(Prefix, bgpfc_fib::Hop)>,
 }
 
 /// A question for the RIB thread.
@@ -199,20 +213,24 @@ pub(crate) enum RibQuery {
         prefix: Option<Prefix>,
         /// Without `prefix`: the last route of the page before, if any.
         after: Option<Prefix>,
-        /// Only the routes held for their validation state, which are no
-        /// candidates (RFC 6811 §2): of the destination, or without
+        /// Only the routes held, for their validation state (RFC 6811 §2)
+        /// or an unresolvable next hop (RFC 4271 §9.1.2), which are no
+        /// candidates: of the destination, or without
         /// `prefix`, a page of the family's after `after`, which ends
         /// between two destinations.
         held: bool,
     },
-    /// The next hop of the destinations after `after`, as the FIB is to
-    /// install them: a page.
+    /// The hop of the destinations after `after`, gateway and interface,
+    /// as the FIB is to install them: a page.
     FibRoutes {
         /// The last route of the page before, if any.
         after: Option<Prefix>,
     },
     /// The most recent changes of a route's RFC 6811 state (issue #59).
     Transitions,
+    /// Every next hop the routes use, and what it resolves to (RFC 4271
+    /// §9.1.2).
+    NextHops,
 }
 
 /// One route in a reply: of the Loc-RIB, a candidate, or a route held
@@ -245,9 +263,23 @@ pub(crate) enum RibReply {
     /// Answer to [`RibQuery::Routes`].
     Routes(Vec<RouteReport>),
     /// Answer to [`RibQuery::FibRoutes`].
-    FibRoutes(Vec<(Prefix, IpAddr)>),
+    FibRoutes(Vec<(Prefix, bgpfc_fib::Hop)>),
     /// Answer to [`RibQuery::Transitions`].
     Transitions(TransitionsReport),
+    /// Answer to [`RibQuery::NextHops`].
+    NextHops(NextHopsReport),
+}
+
+/// The next hops the RIB's routes use, and the size of its copy of the
+/// kernel's routing table they resolve against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NextHopsReport {
+    /// Each next hop in use, in address order.
+    pub(crate) next_hops: Vec<bgpfc_rib::nexthop::NextHopReport>,
+    /// Routes in the copy of the kernel's table; `None` without one, when
+    /// every next hop resolves to itself (never in bgpfcd, which gives
+    /// the RIB a table before any route).
+    pub(crate) kernel_routes: Option<usize>,
 }
 
 /// A route's move from one RFC 6811 state to another, as the RIB thread
@@ -409,6 +441,18 @@ pub(crate) enum RibMsg {
     /// it on, with its routes for the reconcile going to install. The
     /// FIB replies with the number of operations it took.
     FibMode(bgpfc_fib::Mode, SyncSender<usize>),
+    /// The kernel's routing table, whole or what changed in it, from the
+    /// kernel thread (`crate::kernel`): resolve again the next hops it may
+    /// change, and decide again the destinations of those whose
+    /// resolution it changed (RFC 4271 §9.1.2). On the same bounded
+    /// channel as the peers, so a busy RIB slows the kernel thread, whose
+    /// socket may then overflow and is read again whole.
+    Kernel(bgpfc_rib::nexthop::KernelUpdate),
+    /// Have the FIB check that the kernel still holds the routes it
+    /// installed (`FibMsg::Verify`), after the RIB's changes so far: the
+    /// kernel thread asks once it has read the whole table again after
+    /// something that may remove routes without a notification each.
+    VerifyFib,
 }
 
 /// A policy set on its way to the RIB thread (`dyn Policies` has no

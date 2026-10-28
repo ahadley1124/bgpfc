@@ -6,14 +6,18 @@
 //! that owns the configuration and the peer table and acts on signals
 //! and reload requests. Since step 12 the coordinator also runs the RTR
 //! client of the `rpki` block, which feeds the RIB thread, and since step
-//! 14, with `mode sidecar`, Routinator as the client's cache.
+//! 14, with `mode sidecar`, Routinator as the client's cache. Since step
+//! 15 a kernel thread follows the kernel's routing table, which the RIB
+//! resolves next hops against (RFC 4271 §9.1.2).
 #![forbid(unsafe_code)]
 
 mod args;
 mod control;
 mod coordinator;
 mod fib;
+mod kernel;
 mod messages;
+mod netns;
 mod owner;
 mod peer;
 mod privileges;
@@ -26,8 +30,10 @@ mod wiring;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use bgpfc_config::diff::{ConfigDiff, GlobalChange};
 use bgpfc_wire::error::CeaseSubcode;
@@ -65,8 +71,21 @@ fn main() {
     };
     let (config, engine) = load(&opts);
     if opts.check {
+        // The namespace must open, and be one, where bgpfcd would start;
+        // joining it is the start's business, and needs a privilege that
+        // checking does not.
+        let netns = match &config.netns {
+            Some(path) => match bgpfc_sys::NetNs::open(path) {
+                Ok(_) => format!(", netns {}", path.display()),
+                Err(e) => {
+                    eprintln!("bgpfcd: network namespace {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            },
+            None => String::new(),
+        };
         println!(
-            "{}: ok ({} neighbors, {} policies)",
+            "{}: ok ({} neighbors, {} policies{netns})",
             opts.config.display(),
             config.neighbors.len(),
             config.policies.len()
@@ -76,13 +95,25 @@ fn main() {
         }
         return;
     }
+    // Logging opens no socket and starts no thread: stderr only.
     bgpfc_log::init(config.log_level);
+    // Before anything that starts a thread or opens a socket, which would
+    // stay outside the namespace (docs/config.md, "Network namespace"):
+    // the profiling reporter, the name lookups of the `rpki` caches, and
+    // everything `run` does.
+    if let Some(path) = &config.netns {
+        netns::join(path);
+    }
     #[cfg(feature = "profiling")]
     profiling::init();
     bgpfc_log::info!(
         "bgpfcd starting",
         version = env!("CARGO_PKG_VERSION"),
         config = opts.config.display(),
+        netns = config
+            .netns
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), |p| p.display().to_string()),
         local_as = config.local_as,
         router_id = config.router_id,
         fib_mode = config.fib.mode,
@@ -163,6 +194,9 @@ fn load(opts: &args::Args) -> (bgpfc_config::Config, bgpfc_policy::Engine) {
     if let Some(mode) = opts.fib {
         config.fib.mode = mode;
     }
+    if let Some(path) = &opts.netns {
+        config.netns = Some(path.clone());
+    }
     (config, engine)
 }
 
@@ -199,6 +233,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
             std::process::exit(1);
         }
     };
+    let (kernel, kernel_table) = open_kernel(&config);
     let (rib_tx, rib_rx) = sync_channel(RIB_QUEUE);
     let table: PeerTable = Arc::new(RwLock::new(HashMap::new()));
     let mut peers = Vec::new();
@@ -234,13 +269,23 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
     // the `startup` are set before the thread starts, so that no route is
     // judged without them: under `startup hold` every route that arrives
     // before that set is held.
+    //
+    // The kernel's table goes in first, before any route, so that no
+    // route is judged against none (m15 design 3.8): every next hop
+    // looking unresolvable would withdraw everything, every one looking
+    // resolvable would install routes that fail. Then the kernel thread
+    // follows it, before any peer starts; what changed since the table
+    // was read waits on its socket.
+    let mut rib = wiring::rib(&config, Box::new(engine));
+    rib.kernel(kernel_table, Instant::now(), &mut Vec::new());
     rib::spawn(
-        wiring::rib(&config, Box::new(engine)),
+        rib,
         wiring::rib_settings(&config),
         rib_rx,
         Arc::clone(&table),
         fib_tx.clone(),
     );
+    kernel::spawn(kernel, rib_tx.clone());
     // After the privilege drop, so that Routinator, with `mode sidecar`,
     // is born with the service user's credentials and no capabilities
     // (m14 design §4.1); its version check may take up to ten seconds,
@@ -255,6 +300,7 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
 
     let mut coord = Coordinator {
         opts,
+        joined: Joined(config.netns.clone()),
         config,
         table,
         rib_tx,
@@ -285,6 +331,23 @@ fn run(opts: &args::Args, config: bgpfc_config::Config, engine: bgpfc_policy::En
                 }
                 let _ = reply.send(r);
             }
+        }
+    }
+}
+
+/// The kernel's routing table, which next hops resolve against (RFC 4271
+/// §9.1.2), and the socket that follows it: opened while privileged, for
+/// the larger receive buffer `CAP_NET_ADMIN` allows. Exits if the table
+/// cannot be read, as a failed FIB sync does: without it no route could
+/// be judged.
+fn open_kernel(
+    config: &bgpfc_config::Config,
+) -> (kernel::Tracker, bgpfc_rib::nexthop::KernelUpdate) {
+    match kernel::open(config.fib.protocol) {
+        Ok(k) => k,
+        Err(e) => {
+            bgpfc_log::error!("cannot read the kernel's routing table", error = e);
+            std::process::exit(1);
         }
     }
 }
@@ -376,6 +439,9 @@ fn prepare_peer(
 /// and shutdown need.
 struct Coordinator<'a> {
     opts: &'a args::Args,
+    /// The network namespace bgpfcd joined at startup, which no reload
+    /// changes: `config` follows the file, `netns` included.
+    joined: Joined,
     config: bgpfc_config::Config,
     table: PeerTable,
     rib_tx: SyncSender<RibMsg>,
@@ -417,8 +483,11 @@ impl Coordinator<'_> {
                     notes.push(format!("{g:?} changed: takes effect at the next restart"));
                 }
                 // Applied below: the block from the one in effect, then the
-                // keep-alive, once the client the block runs is known.
-                GlobalChange::Rpki | GlobalChange::RpkiKeepalive => {}
+                // keep-alive, once the client the block runs is known. And
+                // `netns` is said below, against the namespace bgpfcd is
+                // in rather than the file's last value, which no reload
+                // applied.
+                GlobalChange::Rpki | GlobalChange::RpkiKeepalive | GlobalChange::Netns => {}
                 // Sent to the RIB thread below, after the policies.
                 GlobalChange::RpkiEnforcement => {
                     notes.push(format!("rpki enforcement {}", new.rpki.enforcement));
@@ -447,6 +516,9 @@ impl Coordinator<'_> {
                     }
                 }
             }
+        }
+        if let Some(note) = self.joined.note(&new) {
+            notes.push(note);
         }
         // A changed block, or an unchanged one an earlier reload could not
         // start.
@@ -605,5 +677,159 @@ fn load_checked(opts: &args::Args) -> Result<(bgpfc_config::Config, bgpfc_policy
     if let Some(mode) = opts.fib {
         config.fib.mode = mode;
     }
+    if let Some(path) = &opts.netns {
+        config.netns = Some(path.clone());
+    }
     Ok((config, engine))
+}
+
+/// The network namespace bgpfcd joined at startup (`netns` or `--netns`),
+/// or `None` for the one it was started in: where it stays until it
+/// restarts, whatever a reload reads.
+#[derive(Debug)]
+struct Joined(Option<PathBuf>);
+
+impl Joined {
+    /// What a reload of `new` says of its `netns` (docs/config.md,
+    /// "Reload"): nothing when it names the namespace bgpfcd is in; else
+    /// that the change waits for the next restart, and where bgpfcd stays
+    /// meanwhile. Against the namespace joined, not the file a reload read
+    /// before, which named one bgpfcd never joined: the namespace holds
+    /// every socket bgpfcd has, and the capability to move went with the
+    /// join.
+    fn note(&self, new: &bgpfc_config::Config) -> Option<String> {
+        if new.netns == self.0 {
+            return None;
+        }
+        let running = self.0.as_deref().map_or_else(
+            || "the namespace it was started in".to_owned(),
+            |p| p.display().to_string(),
+        );
+        Some(format!(
+            "netns changed: takes effect at the next restart; bgpfcd stays in {running}"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// A config file in a directory of its own, rewritten by each reload,
+    /// and the options that read it.
+    struct File {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl File {
+        fn new(name: &str) -> File {
+            let dir = std::env::temp_dir().join(format!("bgpfcd-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("bgpfc.conf");
+            File { dir, file }
+        }
+
+        /// The file, with `netns` (a statement or nothing).
+        fn write(&self, netns: &str) {
+            std::fs::write(
+                &self.file,
+                format!(
+                    "router-id 192.0.2.1; local-as 65000; {netns}\n\
+                     policy ANY {{ term all {{ action accept; }} }}\n\
+                     neighbor 192.0.2.2 {{ remote-as 65001; import ANY; export ANY; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn args(&self, extra: &str) -> args::Args {
+            args::parse(
+                &format!("-c {} {extra}", self.file.display())
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Reloads in a row, each with another `netns` in the file: the note
+    /// names the namespace bgpfcd joined at startup every time, and none
+    /// comes once the file names that one again; never a namespace an
+    /// earlier reload read and did not apply.
+    #[test]
+    fn reloads_name_the_namespace_joined_at_startup() {
+        let f = File::new("joined");
+        f.write("netns rvA;");
+        let (start, _) = load_checked(&f.args("")).unwrap();
+        let joined = Joined(start.netns.clone());
+        let stays = "netns changed: takes effect at the next restart; bgpfcd stays in \
+                     /run/netns/rvA";
+        let mut running = start;
+        for (netns, note) in [
+            ("netns rvC;", Some(stays)),
+            ("netns rvR;", Some(stays)),
+            ("netns rvA;", None),
+            ("netns rvR;", Some(stays)),
+            ("netns rvR;", Some(stays)),
+            ("", Some(stays)),
+        ] {
+            f.write(netns);
+            let (new, _) = load_checked(&f.args("")).unwrap();
+            assert_eq!(joined.note(&new).as_deref(), note, "{netns}");
+            // What the reload keeps as its running configuration: the file.
+            running = new;
+        }
+        assert_eq!(running.netns, None);
+        // Started in the namespace it was given: any `netns` waits.
+        let here = Joined(None);
+        f.write("netns blue;");
+        let (blue, _) = load_checked(&f.args("")).unwrap();
+        assert_eq!(
+            here.note(&blue).as_deref(),
+            Some(
+                "netns changed: takes effect at the next restart; bgpfcd stays in the \
+                 namespace it was started in"
+            )
+        );
+        f.write("");
+        let (none, _) = load_checked(&f.args("")).unwrap();
+        assert_eq!(here.note(&none), None);
+    }
+
+    /// `--netns` overrides the statement, at a reload as at the start, so
+    /// that a file that changes only `netns` is no change at all.
+    #[test]
+    fn netns_flag_overrides_the_file() {
+        let f = File::new("netns");
+        f.write("netns red;");
+        let (red, _) = load_checked(&f.args("")).unwrap();
+        assert_eq!(red.netns.as_deref(), Some(Path::new("/run/netns/red")));
+        let flag = f.args("--netns /proc/1/ns/net");
+        let (old, _) = load_checked(&flag).unwrap();
+        assert_eq!(old.netns.as_deref(), Some(Path::new("/proc/1/ns/net")));
+        f.write("netns blue;");
+        let (new, _) = load_checked(&flag).unwrap();
+        f.write("");
+        let (none, _) = load_checked(&flag).unwrap();
+        // The flag names the namespace joined: no note either.
+        let joined = Joined(old.netns.clone());
+        assert_eq!(joined.note(&new), None);
+        assert!(ConfigDiff::between(&old, &new).is_empty());
+        assert!(ConfigDiff::between(&old, &none).is_empty());
+        // Without the flag, the file's statement is what counts.
+        assert_eq!(
+            ConfigDiff::between(&red, &new).global,
+            vec![GlobalChange::Netns]
+        );
+    }
 }

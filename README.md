@@ -11,20 +11,20 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 > CI, but young: it has not run in production anywhere.
 > [`COMPLIANCE.md`](COMPLIANCE.md) tracks every MUST, SHOULD and MAY. Every MUST
 > row is `done` for RFC 4760, 8950, 5492, 6793, 2918, 7606, 8654, 1997, 4360,
-> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 6811. RFC 4271 has six
-> rows open. Two need the host's interfaces and routes, which bgpfc does not
-> track, so the kernel's verdict is logged instead: next-hop resolvability
-> (§9.1.2), and a next hop on a shared subnet for one-hop EBGP (§6.3 b). One is
-> partial: a received next hop is checked against our own address on that
-> session, not against every address of the host (§6.3 a). Two are deliberate
-> deviations: a NOTIFICATION received in OpenSent closes the connection without
-> an FSM error in reply, as BIRD and FRR do (§8.2.2), and the
-> MinRouteAdvertisementInterval timer paces announcements but never holds back
-> a withdrawal (§9.2.1.1). The sixth applies only under `enforcement
-> prefer-valid`: the validation state ranks routes before LOCAL_PREF, and that
-> rank is not passed on to internal neighbors (§9.1.1). RFC 2545 has one partial
-> row for the same lack of interfaces: bgpfc never sends a link-local next hop,
-> which §3 asks for where it shares a subnet with the next hop and the peer. RFC
+> 8092, 4486, 6608, 9003, 7607, 9072, 9687, 9774 and 6811. RFC 4271 has five
+> rows open. Next hops resolve in the kernel's routing table (§9.1.2), but
+> one check is not made yet: that a one-hop EBGP neighbor's next hop is on a
+> subnet shared with us (§6.3 b). One is partial: a received next hop is
+> checked against our own address on that session, not against every address
+> of the host (§6.3 a). Two are deliberate deviations: a NOTIFICATION received
+> in OpenSent closes the connection without an FSM error in reply, as BIRD and
+> FRR do (§8.2.2), and the MinRouteAdvertisementInterval timer paces
+> announcements but never holds back a withdrawal (§9.2.1.1). The fifth
+> applies only under `enforcement prefer-valid`: the validation state ranks
+> routes before LOCAL_PREF, and that rank is not passed on to internal
+> neighbors (§9.1.1). RFC 2545 has one partial row: bgpfc cannot tell when
+> it shares a subnet with the next hop and the peer, so it never sends the
+> link-local next hop §3 asks for there. RFC
 > 8481, which clarifies RFC 6811, has one deliberate deviation: turning
 > validation on with `mode external` or `mode sidecar` also holds Invalid
 > routes back unless `enforcement` says otherwise, the project's chosen default
@@ -48,6 +48,15 @@ client, and a small localhost HTTP/JSON API for inspecting the running daemon.
 - Routes installed through rtnetlink under a dedicated protocol number, with
   dry-run as the default and a runtime toggle; privilege drop and a capability
   check; clean shutdown on `SIGTERM`.
+- Next hops resolved in the kernel's main routing table, which bgpfcd follows
+  over rtnetlink (RFC 4271 §9.1.2): a route whose next hop does not resolve is
+  held, neither installed nor advertised, until it does, and routes are
+  installed through the gateway and interface that resolve their next hop.
+  `bgpfcctl show nexthops` lists them.
+- Neighbors more than one hop away, such as over loopback addresses: external
+  sessions are sent with TTL 1 unless `multihop` says otherwise, as with BIRD
+  and FRR, and `local-address` runs a session from an address of the host.
+  bgpfcd also joins a network namespace by itself (`netns`, `--netns`).
 - `bgpfcctl` over a Unix socket and a loopback HTTP/JSON API, including reload
   with a configuration diff ([`docs/control.md`](docs/control.md)); a changed
   import policy applies at once to the routes already received. Routes an
@@ -163,6 +172,22 @@ and shown ([`docs/config.md`](docs/config.md), "Startup window").
 either mode, and `show rpki` and the log say that the routes are held. An external validator
 (`mode external`) and no validation (`mode disabled`, or no `rpki` block)
 work as before, without Routinator on the host.
+
+### Multihop, next hops and network namespaces
+
+[`AGENTS.md`](AGENTS.md) §9 step 15 is done. External neighbors are sent
+TTL 1, and `multihop` raises it for neighbors further away, as BIRD and FRR
+do; `local-address` binds a session to an address of the host, typically a
+loopback, and a connection the neighbor opens to another address is
+refused. Next hops resolve in the kernel's main routing table, through
+connected, static and IGP routes but never through a default route or
+bgpfcd's own: a route whose next hop does not resolve is held, and comes
+back with no UPDATE when it resolves, and routes are installed through the
+immediate gateway and interface. `netns` or `--netns` names the network
+namespace bgpfcd joins at startup ("Network namespace" under "Run").
+Checking the TTL of what neighbors send (GTSM, RFC 5082), the RFC 4271
+§6.3 b subnet check and an interior cost from the kernel's metrics come
+later.
 
 ### Later
 
@@ -289,10 +314,49 @@ neighbor 198.51.100.1 {
     import UPSTREAM-IN;
     export UPSTREAM-OUT;
 }
+
+# A neighbor two hops away, peered between loopback addresses. bgpfcd
+# sends external neighbors TTL 1 unless `multihop` raises it, and runs
+# the session from `local-address`, on which it listens through `::`
+# above. Each end needs a route to the other's loopback, such as
+# `ip route add 192.0.2.30/32 via GATEWAY`, and the neighbor's next hops
+# must resolve in the kernel's main table (docs/config.md, "Neighbors"
+# and "Next hops").
+# neighbor 192.0.2.30 {
+#     remote-as 64512;
+#     multihop 2;                 # TTL 2; `multihop;` alone sends 255
+#     local-address 192.0.2.1;    # this host's loopback address
+#     import UPSTREAM-IN;
+#     export UPSTREAM-OUT;
+# }
 ```
 
 Every neighbor must name both an `import` and an `export` policy. A config
 without them is rejected.
+
+### Neighbors more than one hop away
+
+bgpfcd sends to an external neighbor with TTL 1, as BIRD and FRR do: a
+neighbor that is not directly connected, such as one peered between
+loopback addresses as in the commented example above, needs `multihop`
+(TTL 255, or `multihop N;`), and usually `local-address`. Internal
+neighbors keep the system's TTL. A route is used only if its next hop
+resolves in the kernel's main routing table, through a connected, static or
+IGP route, never through a default route or a route of bgpfcd's own, and it
+is installed through the gateway and interface of the route that resolves
+it ([`docs/config.md`](docs/config.md), "Next hops"). `bgpfcctl show
+nexthops` shows what each next hop resolves to.
+
+**Upgrading from an earlier bgpfcd**, which sent with the system's TTL and
+used every route whatever its next hop:
+
+- An external neighbor more than one hop away now needs `multihop`. Without
+  it the session no longer comes up: the log says `connect failed` with
+  `hint="external neighbor: more than one hop away needs multihop"`, and
+  `bgpfcctl show neighbor` shows `ttl 1` and the `last error`.
+- A route whose next hop the kernel's main table reaches only through a
+  default route, or not at all, is now held (`next hop unresolvable` in
+  `bgpfcctl show routes`): add a route to the next hop.
 
 ### FIB dry-run
 
@@ -307,7 +371,14 @@ before and naming the first few, and a line per route at debug
 
 In install mode, bgpfc only touches routes tagged with its own protocol number.
 At startup it flushes stale routes left by a previous run, and it never modifies
-routes it did not create.
+routes it did not create. Its routes have metric 20, as FRR's zebra gives its
+own: where another program's route has the destination and metric of one of
+bgpfc's, as zebra's IGP route to a prefix a neighbor also announces, the
+kernel keeps that route and bgpfc's is not installed, with an error line
+(`another route has this destination and metric`), until that route goes.
+The kernel removes routes through an interface that goes down without
+telling anyone, so bgpfc then checks its routes against the kernel's and
+installs again those it lost (`fib: kernel routes differ, repairing`).
 
 ## Run
 
@@ -370,6 +441,44 @@ The already-open sockets keep working, because Linux checks netlink permissions
 against the credentials of whoever opened the socket. The trade-off is that a
 reload cannot open new listen sockets or a new netlink socket. Changes like that
 need a restart.
+
+### Network namespace
+
+To run bgpfcd in a network namespace, such as the one `ip netns add blue`
+creates, name it with `netns blue;` in the configuration file or with
+`bgpfcd --netns blue`, which overrides the file: `/run/netns/blue`. An
+absolute path, such as `/proc/PID/ns/net`, names a namespace as well.
+bgpfcd joins it itself at startup, before it opens a socket or starts a
+thread, so its sessions, the routes it installs, the HTTP API, its RTR
+connections and Routinator are all in the namespace, as if it had been
+started with `ip netns exec blue`. `bgpfcctl` reaches the control socket
+from any namespace.
+
+Joining takes `CAP_SYS_ADMIN` (`setns(2)`), which bgpfcd gives up right
+after the join. Root has it (Option B); under Option A it is a third
+capability:
+
+```sh
+sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+     --inh-caps=+net_bind_service,+net_admin,+sys_admin \
+     --ambient-caps=+net_bind_service,+net_admin,+sys_admin \
+     ./target/release/bgpfcd -c bgpfc.conf --netns blue
+```
+
+Without it bgpfcd stops with `cannot join network namespace` and
+`setns(2) needs CAP_SYS_ADMIN`; with it, `setns(2) refused although
+CAP_SYS_ADMIN is effective` means the namespace belongs to another user
+namespace, or a seccomp filter, such as systemd's
+`RestrictNamespaces=yes`, blocks the call. A bgpfcd started inside the namespace
+already needs no capability for it. Under systemd,
+`NetworkNamespacePath=/run/netns/blue` has systemd put bgpfcd there
+instead, with no capability at all; `contrib/bgpfcd.service` shows both
+ways. `bgpfcd --check --netns blue` checks that the namespace is there,
+as any user. Unlike `ip netns exec`, bgpfcd does not put
+`/etc/netns/blue/` over `/etc`: the host names of RPKI caches are looked
+up with the host's `/etc/resolv.conf`, from inside the namespace, so give
+caches by address or use a resolver the namespace reaches
+(`docs/config.md`, "Network namespace").
 
 ### Routinator sidecar
 
@@ -441,6 +550,7 @@ bgpfcctl show neighbors
 bgpfcctl show neighbor 198.51.100.1
 bgpfcctl show routes [ipv4|ipv6] [prefix] [held]
 bgpfcctl show fib
+bgpfcctl show nexthops
 bgpfcctl show rpki
 bgpfcctl show rpki transitions
 bgpfcctl clear neighbor 198.51.100.1 [soft]

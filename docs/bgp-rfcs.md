@@ -34,8 +34,8 @@ Of the 154 RFCs below, 21 are `done`, 6 `partial`,
 
 - RFC 4271: §6.3 a) is the one MUST row still `partial`: a received
   `NEXT_HOP` is compared with our address on the session only, as bgpfc
-  tracks no interfaces. Four rows deviate (§6.3 b, §8.2.2, §9.1.2,
-  §9.2.1.1); its row below says how.
+  does not know the host's other addresses. Three rows deviate (§6.3 b,
+  §8.2.2, §9.2.1.1); its row below says how.
 - RFC 2545: bgpfc never sends a link-local next hop (§3, MUST), as it
   cannot tell when it shares a subnet with the next hop and the peer.
 - RFC 8481: §5 (MUST) asks for no policy on the validation state without
@@ -76,7 +76,7 @@ RFC 4271 is the current BGP-4 specification; a revision (rfc4271bis) is a workin
 | [1267](https://datatracker.ietf.org/doc/html/rfc1267) | Border Gateway Protocol 3 (BGP-3) | Historic | `n/a` |  |
 | [1654](https://datatracker.ietf.org/doc/html/rfc1654) | A Border Gateway Protocol 4 (BGP-4) | PS; obsoleted by 1771 | `n/a` |  |
 | [1771](https://datatracker.ietf.org/doc/html/rfc1771) | A Border Gateway Protocol 4 (BGP-4) | DS; obsoleted by 4271 | `n/a` |  |
-| [4271](https://datatracker.ietf.org/doc/html/rfc4271) | A Border Gateway Protocol 4 (BGP-4) | DS; updated by 4724, 6286, 6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774 | `partial` | Open in [COMPLIANCE.md](../COMPLIANCE.md): a received `NEXT_HOP` is checked against our own address on the session, not every address of the host (§6.3 a, MUST, partial). Deviates, as bgpfc tracks no interfaces: next-hop resolvability (§9.1.2) and the one-hop EBGP shared-subnet check (§6.3 b) are left to the kernel, whose verdict is logged. Deviates by choice: a NOTIFICATION in OpenSent goes to Idle as in BIRD and FRR (§8.2.2); the MinRouteAdvertisementInterval paces announcements but never holds back a withdrawal (§9.2.1.1, issue #66). |
+| [4271](https://datatracker.ietf.org/doc/html/rfc4271) | A Border Gateway Protocol 4 (BGP-4) | DS; updated by 4724, 6286, 6608, 6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687, 9774 | `partial` | Open in [COMPLIANCE.md](../COMPLIANCE.md): a received `NEXT_HOP` is checked against our own address on the session, not every address of the host (§6.3 a, MUST, partial). Next hops resolve in the kernel's main table (§9.1.2, §9.1.2.1, done in milestone 15), but the one-hop EBGP shared-subnet check is not made (§6.3 b, deviates). Deviates by choice: a NOTIFICATION in OpenSent goes to Idle as in BIRD and FRR (§8.2.2); the MinRouteAdvertisementInterval paces announcements but never holds back a withdrawal (§9.2.1.1, issue #66). |
 | [1164](https://datatracker.ietf.org/doc/html/rfc1164) | Application of the Border Gateway Protocol in the Internet | Historic; obsoleted by 1268 | `n/a` |  |
 | [1268](https://datatracker.ietf.org/doc/html/rfc1268) | Application of the Border Gateway Protocol in the Internet | Historic; obsoleted by 1655 | `n/a` |  |
 | [1655](https://datatracker.ietf.org/doc/html/rfc1655) | Application of the Border Gateway Protocol in the Internet | PS; obsoleted by 1772 | `n/a` |  |

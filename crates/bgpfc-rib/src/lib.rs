@@ -33,7 +33,11 @@
 //! of the decision process, or Valid ones preferred before anything else,
 //! see [`Rib::set_enforcement`] and [`decision::Step::Validation`]); and,
 //! RFC 6811 §2 again, routes not validated yet left out of it only when
-//! configured to ([`Rib::set_startup`]).
+//! configured to ([`Rib::set_startup`]); RFC 4271 §9.1.2 and §9.1.2.1
+//! (a route whose next hop the kernel's routing table does not resolve is
+//! no candidate, and the FIB installs a route through the immediate hop of
+//! the kernel route that resolves its next hop, see [`nexthop`] and
+//! [`Rib::kernel`]).
 //!
 //! Time is injected: every call that can send takes `now`, and
 //! [`Rib::next_deadline`] and [`Rib::flush`] let the owner release held
@@ -47,6 +51,7 @@
 pub mod attrs;
 pub mod decision;
 pub mod export;
+pub mod nexthop;
 pub mod pacing;
 pub mod peer;
 #[cfg(feature = "profiling")]
@@ -78,6 +83,7 @@ pub use peer::PeerInfo;
 pub use reimport::Reimport;
 pub use validation::{Rejudged, Revalidation, RouteStatus, StartupChange, Transition};
 
+use nexthop::{Hop, KernelChange, KernelUpdate, NextHopReport, NextHops, NextHopsChanged, Shift};
 use pacing::{Clock, Jitter, Now, Offer, Pace, Pacing, Tick};
 use store::{Destination, FamilyMap, PeerId, Route, Table};
 
@@ -110,7 +116,9 @@ pub struct Imported {
 /// the Adj-RIB-In or from consideration in the decision process as a side
 /// effect of its validation state, unless explicitly configured to do
 /// so": the route stays in the Adj-RIB-In, counted as received, and is
-/// used again, with no UPDATE, once its state allows.
+/// used again, with no UPDATE, once its state allows. A route whose next
+/// hop does not resolve is kept the same way, and used again once it does
+/// (RFC 4271 §9.1.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Held {
     /// Import policy rejected it with its validation state and accepts it
@@ -125,17 +133,25 @@ pub enum Held {
     /// holds such routes until validation data judges them (RFC 6811 §2,
     /// "unless explicitly configured to do so").
     Startup,
+    /// Import policy and the validation rules admit it, but its next hop
+    /// does not resolve in the kernel's routing table: RFC 4271 §9.1.2,
+    /// "the BGP route MUST be excluded from the Phase 2 decision function"
+    /// (see [`nexthop`]). It keeps the attributes import policy gave it,
+    /// and is a candidate again, with no UPDATE, once the next hop
+    /// resolves.
+    NextHop,
 }
 
 impl Held {
     /// The name used in logs and control output: `policy`,
-    /// `enforcement` or `startup`.
+    /// `enforcement`, `startup` or `next-hop`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Held::Policy => "policy",
             Held::Enforcement => "enforcement",
             Held::Startup => "startup",
+            Held::NextHop => "next-hop",
         }
     }
 }
@@ -224,17 +240,21 @@ impl Policies for AcceptAll {
     }
 }
 
-/// A Loc-RIB change the FIB must follow (RFC 4271 §9.3).
+/// A Loc-RIB change the FIB must follow (RFC 4271 §9.3): another best
+/// route, or the same one through another hop (its next hop resolves
+/// through another gateway or interface, see [`nexthop`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FibChange {
     /// The family.
     pub family: AddressFamily,
     /// The destination.
     pub prefix: Prefix,
-    /// The new next hop, or `None` when the destination is gone.
-    pub next_hop: Option<IpAddr>,
-    /// The next hop it replaces, or `None` when the destination is new.
-    pub previous: Option<IpAddr>,
+    /// The hop the route goes through now, or `None` when the destination
+    /// is gone.
+    pub next_hop: Option<Hop>,
+    /// The hop it replaces, as the FIB was last given it, or `None` when
+    /// the destination is new.
+    pub previous: Option<Hop>,
 }
 
 /// What the RIB asks its owner to do after an input.
@@ -316,6 +336,11 @@ pub enum Output {
         /// each.
         families: Vec<AddressFamily>,
     },
+    /// A change of the kernel's routing table changed what next hops
+    /// resolve to (see [`Rib::kernel`]): one report, counted, with each
+    /// next hop it moved, followed by the FIB changes and UPDATEs that
+    /// follow. The caller logs it.
+    NextHops(NextHopsChanged),
 }
 
 /// Where the RIB puts what an input produces, in order. A `Vec` collects
@@ -349,7 +374,7 @@ pub struct RouteRef<'a> {
     /// Its ASPA verdict (a placeholder until ASPA lands).
     pub aspa: AspaState,
     /// Why the Adj-RIB-In holds it while it is no candidate, if it is not
-    /// one.
+    /// one: for its validation state, or for its next hop.
     pub held: Option<Held>,
 }
 
@@ -413,8 +438,9 @@ impl PeerState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerStats {
     /// Routes accepted from the peer, per family it may send, with those
-    /// held for their validation state ([`Held`]), which the Adj-RIB-In
-    /// holds too (RFC 6811 §2): what the RFC 4271 §6.7 limit counts.
+    /// held for their validation state or an unresolvable next hop
+    /// ([`Held`]), which the Adj-RIB-In holds too (RFC 6811 §2, RFC 4271
+    /// §9.1.2): what the RFC 4271 §6.7 limit counts.
     pub received: Vec<(AddressFamily, usize)>,
     /// How many of `received` are held and no candidate ([`Held`]), in
     /// the same families and order.
@@ -465,6 +491,9 @@ struct Sessions {
     at: Now,
     /// RFC 4271 §10 jitter for the pacing intervals.
     jitter: Jitter,
+    /// The next hops the routes use, what they resolve to, and the
+    /// destinations of each (RFC 4271 §9.1.2).
+    nexthops: NextHops,
 }
 
 /// What import and export apply to a route.
@@ -618,7 +647,8 @@ impl Rib {
     /// [`Rib::validation_changed`] gives it a source, and nothing acts on
     /// the state beyond policy ([`Enforcement::Off`], [`Startup::Accept`])
     /// until [`Rib::set_enforcement`] and [`Rib::set_startup`] say
-    /// otherwise.
+    /// otherwise. Every next hop resolves to itself until [`Rib::kernel`]
+    /// gives the kernel's routing table.
     #[must_use]
     pub fn with_policies(local_as: Asn, policies: Box<dyn Policies>) -> Rib {
         Rib {
@@ -645,6 +675,7 @@ impl Rib {
                 clock: None,
                 at: Now::default(),
                 jitter: Jitter::new(0),
+                nexthops: NextHops::default(),
             },
             scratch: Scratch::default(),
         }
@@ -734,6 +765,7 @@ impl Rib {
         }
         self.s.emit(&mut batches, out);
         self.s.remove(addr);
+        self.s.nexthops.settle();
     }
 
     /// Change the prefix limits of peer `addr` (RFC 4271 §6.7), as a reload
@@ -780,7 +812,8 @@ impl Rib {
         let addr = self.s.peer(id).info.addr;
         self.s.peer_mut(id).leaving = true;
         for (f, table) in self.tables.iter_mut() {
-            drop_routes(self.s.decide(), table, f, id, scratch);
+            let (decide, nexthops) = self.s.split();
+            drop_routes(decide, nexthops, table, f, id, scratch);
         }
         // The peer goes with its counts: what the removals added up to
         // must not carry over to the next UPDATE's peer.
@@ -1050,7 +1083,12 @@ impl Rib {
         for d in &update.disabled {
             self.disable_family(id, d.family, scratch);
         }
-        let Sessions { cx, peers, .. } = &mut self.s;
+        let Sessions {
+            cx,
+            peers,
+            nexthops,
+            ..
+        } = &mut self.s;
         let decide = Decide {
             peers,
             enforcement: cx.enforcement,
@@ -1073,7 +1111,7 @@ impl Rib {
                 continue;
             }
             if let Some(table) = self.tables.get_mut(family) {
-                withdraw(decide, table, family, prefix, id, scratch);
+                withdraw(decide, nexthops, table, family, prefix, id, scratch);
             }
         }
         scratch.withdrawn = scratch.dirty.len();
@@ -1092,11 +1130,8 @@ impl Rib {
             // keeping it would keep what the peer no longer advertises
             // (RFC 7606 §6 on discarding UPDATEs).
             if info.is_own_address(&next_hop) {
-                if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(decide, table, family, prefix, id, scratch);
-                    }
-                }
+                let table = self.tables.get_mut(family);
+                withdraw_each(decide, nexthops, table, family, prefixes, id, scratch);
                 scratch.ignored.push(Output::InvalidNextHop {
                     peer: info.addr,
                     family,
@@ -1117,11 +1152,8 @@ impl Rib {
             let leftmost_ok = info.kind == PeerKind::Internal
                 || attrs.as_path.first_asn() == Some(info.remote_as);
             if attrs.as_path.contains(cx.local_as) || !leftmost_ok {
-                if let Some(table) = self.tables.get_mut(family) {
-                    for &prefix in prefixes {
-                        withdraw(decide, table, family, prefix, id, scratch);
-                    }
-                }
+                let table = self.tables.get_mut(family);
+                withdraw_each(decide, nexthops, table, family, prefixes, id, scratch);
                 scratch.released.push(attrs);
                 continue;
             }
@@ -1144,7 +1176,7 @@ impl Rib {
                 let judged = judge(
                     &*cx.policies,
                     (cx.enforcement, cx.startup),
-                    &mut cx.interner,
+                    (&mut cx.interner, &mut *nexthops),
                     info,
                     (family, prefix),
                     &attrs,
@@ -1152,7 +1184,7 @@ impl Rib {
                 );
                 if let Some(route) = judged.into_route(&attrs, id, rov, aspa) {
                     let table = self.tables.or_default(family);
-                    announce(decide, table, family, prefix, route, scratch);
+                    announce(decide, nexthops, table, family, prefix, route, scratch);
                 } else {
                     // Not kept, and one the peer sent before for the prefix
                     // goes too: the new announcement replaced it. Noted, so
@@ -1160,7 +1192,7 @@ impl Rib {
                     // peer for it (RFC 2918, `Rib::reimport`).
                     scratch.note_filtered(family);
                     if let Some(table) = self.tables.get_mut(family) {
-                        withdraw(decide, table, family, prefix, id, scratch);
+                        withdraw(decide, nexthops, table, family, prefix, id, scratch);
                     }
                 }
                 // RFC 4271 §6.7: "the number of address prefixes received
@@ -1209,7 +1241,8 @@ impl Rib {
         state.adj_in_count.insert(family, 0);
         state.adj_in_held.insert(family, 0);
         if let Some(table) = self.tables.get_mut(family) {
-            drop_routes(self.s.decide(), table, family, id, scratch);
+            let (decide, nexthops) = self.s.split();
+            drop_routes(decide, nexthops, table, family, id, scratch);
         }
         // The counts are zero now, whatever the removals added up to.
         scratch.delta.insert(family, 0);
@@ -1238,6 +1271,7 @@ impl Rib {
             self.s.cx.interner.release(a);
         }
         scratch.trim();
+        self.s.nexthops.settle();
     }
 
     /// The Loc-RIB of `family`, best routes in prefix order.
@@ -1261,8 +1295,8 @@ impl Rib {
 
     /// The candidate routes to `prefix`, the best first: those import
     /// policy accepted, with the attributes it gave them. The routes the
-    /// Adj-RIB-In holds for their validation state ([`Held`]) are not
-    /// among them.
+    /// Adj-RIB-In holds for their validation state or their next hop
+    /// ([`Held`]) are not among them.
     #[must_use]
     pub fn candidates(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
         self.tables
@@ -1275,8 +1309,8 @@ impl Rib {
     }
 
     /// Every route the Adj-RIBs-In hold for `prefix`: the candidates, the
-    /// best first, then the routes held for their validation state, each
-    /// with why ([`RouteRef::held`]).
+    /// best first, then the routes held for their validation state or
+    /// their next hop, each with why ([`RouteRef::held`]).
     #[must_use]
     pub fn routes(&self, family: AddressFamily, prefix: Prefix) -> Vec<RouteRef<'_>> {
         self.tables
@@ -1289,7 +1323,7 @@ impl Rib {
     }
 
     /// Every route of `family` the Adj-RIBs-In hold for its validation
-    /// state and that is no candidate, in prefix order.
+    /// state or its next hop and that is no candidate, in prefix order.
     pub fn held(&self, family: AddressFamily) -> impl Iterator<Item = (Prefix, RouteRef<'_>)> {
         self.held_after(family, None)
     }
@@ -1324,20 +1358,170 @@ impl Rib {
         self.s.cx.startup
     }
 
-    /// Every destination's next hop, as the FIB wants it: IPv4 unicast,
-    /// then IPv6 unicast, each in prefix order, so in one prefix order
-    /// throughout (what `bgpfc_fib::Routes::merge` takes).
-    pub fn fib_routes(&self) -> impl Iterator<Item = (Prefix, IpAddr)> {
+    /// Every destination's hop, as the FIB wants it: IPv4 unicast, then
+    /// IPv6 unicast, each in prefix order, so in one prefix order
+    /// throughout (what `bgpfc_fib::Routes::merge` takes). A best route's
+    /// next hop always resolves.
+    pub fn fib_routes(&self) -> impl Iterator<Item = (Prefix, Hop)> {
         self.fib_routes_after(None)
     }
 
     /// [`Rib::fib_routes`] after `from`.
-    pub fn fib_routes_after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, IpAddr)> {
+    pub fn fib_routes_after(&self, from: Option<Prefix>) -> impl Iterator<Item = (Prefix, Hop)> {
+        // The routes of one peer share their next hop: one lookup for a
+        // run of them.
+        let mut last: Option<(IpAddr, Option<Hop>)> = None;
         [AddressFamily::IPV4_UNICAST, AddressFamily::IPV6_UNICAST]
             .into_iter()
             .filter_map(|f| self.tables.get(f))
             .flat_map(move |t| t.after(from))
-            .filter_map(|(p, d)| d.best().map(|r| (p, r.attrs.next_hop_addr())))
+            .filter_map(move |(p, d)| {
+                let key = d.best()?.next_hop();
+                let hop = match last {
+                    Some((k, hop)) if k == key => hop,
+                    _ => {
+                        let hop = self.s.nexthops.current_hop(key);
+                        last = Some((key, hop));
+                        hop
+                    }
+                };
+                Some((p, hop?))
+            })
+    }
+
+    /// A change of the kernel's routing table, or the whole table
+    /// (RFC 4271 §9.1.2): apply it to the RIB's copy, resolve again every
+    /// next hop it may change, and decide again the destinations of those
+    /// whose resolution it changed, and only those. A route whose next
+    /// hop no longer resolves is held ([`Held::NextHop`]) and no
+    /// candidate; one whose next hop resolves again is a candidate again,
+    /// with no UPDATE and no policy run. A best route whose next hop
+    /// resolves through another hop stays the best, and goes to the FIB
+    /// again through the new one; no neighbor sees the hop, so nothing is
+    /// sent for it. What follows comes out after one
+    /// [`Output::NextHops`] that counts it, when a next hop changed: FIB
+    /// changes, and UPDATEs sent or held back by the RFC 4271 §9.2.1.1
+    /// pacing, as for an UPDATE. A withdrawal goes at once; the route
+    /// coming back is a change within the advertisement interval like any
+    /// other.
+    ///
+    /// The first table given ends the default of every next hop resolving
+    /// to itself. Give it before any route comes, so that no route is
+    /// judged against no table: it then moves nothing.
+    pub fn kernel(&mut self, update: KernelUpdate, now: Instant, out: &mut impl Sink) {
+        let freed: Vec<Prefix> = match &update {
+            KernelUpdate::Changes(changes) => changes
+                .iter()
+                .filter_map(|c| match c {
+                    KernelChange::Gone { prefix, .. } => Some(*prefix),
+                    _ => None,
+                })
+                .collect(),
+            KernelUpdate::Table { .. } => Vec::new(),
+        };
+        let shifts = self.s.nexthops.update(update);
+        if shifts.is_empty() {
+            self.s.nexthops.settle();
+            self.offer_again(&freed, out);
+            return;
+        }
+        let (v4, v6) = self.s.nexthops.destinations(&shifts);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let tally = self.walk_points(&v4, &v6, &shifts, &mut scratch);
+        let count = |s: Shift| shifts.iter().filter(|(_, x)| *x == s).count();
+        out.put(Output::NextHops(NextHopsChanged {
+            resolved: count(Shift::Resolved),
+            unresolved: count(Shift::Unresolved),
+            moved: count(Shift::Moved),
+            next_hops: shifts
+                .iter()
+                .map(|(a, _)| self.s.nexthops.report(*a))
+                .collect(),
+            held: tally.held,
+            released: tally.released,
+            best_changed: validation::best_changed(&scratch.dirty),
+        }));
+        self.finish(&mut scratch, now, out);
+        self.scratch = scratch;
+        self.offer_again(&freed, out);
+    }
+
+    /// Offer the FIB again the best route to each of `freed`, destinations
+    /// a route of the kernel's table left: the FIB installs a route only
+    /// where no route of another program has its destination and metric,
+    /// and leaves it out while one has (`bgpfc_fib`, `FibError::Occupied`),
+    /// so such a route may be waiting for that place. The change names the
+    /// hop as both new and previous: one the FIB has installed already
+    /// asks for nothing, nor does dry-run, which reports changes of the
+    /// RIB's routes alone.
+    fn offer_again(&mut self, freed: &[Prefix], out: &mut impl Sink) {
+        for &prefix in freed {
+            let family = match prefix {
+                Prefix::V4 { .. } => AddressFamily::IPV4_UNICAST,
+                Prefix::V6 { .. } => AddressFamily::IPV6_UNICAST,
+            };
+            let Some(best) = self
+                .tables
+                .get(family)
+                .and_then(|t| t.get(prefix))
+                .and_then(Destination::best)
+            else {
+                continue;
+            };
+            if let Some(hop) = self.s.nexthops.current_hop(best.next_hop()) {
+                out.put(Output::Fib(FibChange {
+                    family,
+                    prefix,
+                    next_hop: Some(hop),
+                    previous: Some(hop),
+                }));
+            }
+        }
+    }
+
+    /// Every next hop the routes in the Adj-RIBs-In use, in address order:
+    /// what it resolves to, through which interface, and how many routes
+    /// use it.
+    #[must_use]
+    pub fn next_hops(&self) -> Vec<NextHopReport> {
+        self.s.nexthops.reports()
+    }
+
+    /// Routes in the RIB's copy of the kernel's routing table; `None` until
+    /// [`Rib::kernel`] gives one.
+    #[must_use]
+    pub fn kernel_routes(&self) -> Option<usize> {
+        self.s.nexthops.kernel_routes()
+    }
+
+    /// Check the next-hop index against a scan of the tables: every next
+    /// hop a route uses is tracked with exactly its routes and
+    /// destinations, nothing else is, each resolves as the kernel's copy
+    /// says, every candidate's next hop resolves and no route is held for
+    /// a next hop that does.
+    #[cfg(test)]
+    pub(crate) fn check_next_hops(&self) {
+        let mut want: HashMap<IpAddr, nexthop::Uses> = HashMap::new();
+        for (_, table) in self.tables.iter() {
+            for (prefix, dest) in table.iter() {
+                for r in dest.routes() {
+                    let key = r.next_hop();
+                    let uses = want.entry(key).or_default();
+                    uses.0 += 1;
+                    match Ipv4Key::new(prefix) {
+                        Some(k) => uses.1.insert(k),
+                        None => uses.2.insert(prefix),
+                    };
+                    let resolved = self.s.nexthops.resolution(key).is_resolved();
+                    match r.held {
+                        None => assert!(resolved, "{prefix}: candidate through {key}"),
+                        Some(Held::NextHop) => assert!(!resolved, "{prefix}: held for {key}"),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        self.s.nexthops.check(&want);
     }
 
     /// The Adj-RIB-Out for `addr` and `family`, in prefix order: each
@@ -1518,6 +1702,18 @@ impl Sessions {
         }
     }
 
+    /// What Phase 2 needs, and the next-hop index, which removing routes
+    /// keeps up to date.
+    fn split(&mut self) -> (Decide<'_>, &mut NextHops) {
+        (
+            Decide {
+                peers: &self.peers,
+                enforcement: self.cx.enforcement,
+            },
+            &mut self.nexthops,
+        )
+    }
+
     fn route_ref<'a>(&self, r: &'a Route) -> RouteRef<'a> {
         RouteRef {
             peer: self.peer(r.peer).neighbor.addr,
@@ -1545,6 +1741,9 @@ impl Sessions {
         };
         let old = dest.best().cloned();
         let removed = dest.remove(i);
+        let key = removed.next_hop();
+        self.nexthops
+            .unlink(key, prefix, !dest.has_next_hop(key, None));
         self.decide().run(dest);
         self.changed(family, prefix, old.as_ref(), dest.best(), batches, out);
         drop(old);
@@ -1562,9 +1761,11 @@ impl Sessions {
     }
 
     /// Phase 3 and the FIB change when the best route went from `old` to
-    /// `new`: the FIB when another route is chosen; Phase 3 then, and also
+    /// `new`: the FIB when another route is chosen, or the chosen one goes
+    /// through another hop; Phase 3 when another route is chosen, and also
     /// when the chosen one has another validation state, which export
-    /// policy may look at; nothing when it is the same route as it was.
+    /// policy may look at; nothing when it is the same route as it was,
+    /// through the same hop.
     fn changed(
         &mut self,
         family: AddressFamily,
@@ -1579,14 +1780,20 @@ impl Sessions {
             (Some(a), Some(b)) => (!a.same(b), !a.same_state(b)),
             _ => (true, true),
         };
-        // RFC 4271 §9.3: the FIB follows the chosen route; its validation
-        // state alone changes nothing there.
-        if route_changed {
+        // RFC 4271 §9.3: the FIB follows the chosen route and the hop its
+        // next hop resolves through; its validation state alone changes
+        // nothing there. A best route's next hop resolves (`judge`), so
+        // both are `Some` for a route. What the FIB was last given is the
+        // hop before the input being handled changed it: in dry-run it
+        // reports against that.
+        let next_hop = new.and_then(|r| self.nexthops.hop(r.next_hop()));
+        let previous = old.and_then(|r| self.nexthops.hop_before(r.next_hop()));
+        if route_changed || next_hop != previous {
             out.put(Output::Fib(FibChange {
                 family,
                 prefix,
-                next_hop: new.map(|r| r.attrs.next_hop_addr()),
-                previous: old.map(|r| r.attrs.next_hop_addr()),
+                next_hop,
+                previous,
             }));
         }
         if route_changed || state_changed {
@@ -1985,6 +2192,7 @@ impl Decide<'_> {
 /// each destination's best route before and after.
 fn drop_routes(
     decide: Decide<'_>,
+    nexthops: &mut NextHops,
     table: &mut Table,
     family: AddressFamily,
     id: PeerId,
@@ -1994,6 +2202,8 @@ fn drop_routes(
         if let Some(i) = dest.position(id) {
             let old = dest.best().cloned();
             let removed = dest.remove(i);
+            let key = removed.next_hop();
+            nexthops.unlink(key, prefix, !dest.has_next_hop(key, None));
             scratch.note_removed(family, &removed);
             scratch.released.push(removed.attrs);
             scratch.released.extend(removed.received);
@@ -2014,25 +2224,43 @@ fn drop_routes(
 /// destination's best route before and after.
 fn withdraw(
     decide: Decide<'_>,
+    nexthops: &mut NextHops,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     id: PeerId,
     scratch: &mut Scratch,
 ) {
+    let at = (family, prefix, id);
     match Ipv4Key::new(prefix) {
-        Some(k) => withdraw_in(decide, &mut table.v4, k, family, prefix, id, scratch),
-        None => withdraw_in(decide, &mut table.v6, prefix, family, prefix, id, scratch),
+        Some(k) => withdraw_in(decide, nexthops, &mut table.v4, k, at, scratch),
+        None => withdraw_in(decide, nexthops, &mut table.v6, prefix, at, scratch),
+    }
+}
+
+/// [`withdraw`] for each of `prefixes`, if there is a table.
+fn withdraw_each(
+    decide: Decide<'_>,
+    nexthops: &mut NextHops,
+    table: Option<&mut Table>,
+    family: AddressFamily,
+    prefixes: &[Prefix],
+    id: PeerId,
+    scratch: &mut Scratch,
+) {
+    if let Some(table) = table {
+        for &prefix in prefixes {
+            withdraw(decide, nexthops, table, family, prefix, id, scratch);
+        }
     }
 }
 
 fn withdraw_in<K: Ord>(
     decide: Decide<'_>,
+    nexthops: &mut NextHops,
     map: &mut BTreeMap<K, Destination>,
     key: K,
-    family: AddressFamily,
-    prefix: Prefix,
-    id: PeerId,
+    (family, prefix, id): (AddressFamily, Prefix, PeerId),
     scratch: &mut Scratch,
 ) {
     let Slot::Occupied(mut slot) = map.entry(key) else {
@@ -2044,6 +2272,8 @@ fn withdraw_in<K: Ord>(
     };
     let old = dest.best().cloned();
     let removed = dest.remove(i);
+    let key = removed.next_hop();
+    nexthops.unlink(key, prefix, !dest.has_next_hop(key, None));
     scratch.note_removed(family, &removed);
     scratch.released.push(removed.attrs);
     scratch.released.extend(removed.received);
@@ -2065,32 +2295,26 @@ fn withdraw_in<K: Ord>(
 /// destination's best route before and after.
 fn announce(
     decide: Decide<'_>,
+    nexthops: &mut NextHops,
     table: &mut Table,
     family: AddressFamily,
     prefix: Prefix,
     route: Route,
     scratch: &mut Scratch,
 ) {
+    let at = (family, prefix);
     match Ipv4Key::new(prefix) {
-        Some(k) => announce_in(decide, &mut table.v4, k, family, prefix, route, scratch),
-        None => announce_in(
-            decide,
-            &mut table.v6,
-            prefix,
-            family,
-            prefix,
-            route,
-            scratch,
-        ),
+        Some(k) => announce_in(decide, nexthops, &mut table.v4, k, at, route, scratch),
+        None => announce_in(decide, nexthops, &mut table.v6, prefix, at, route, scratch),
     }
 }
 
 fn announce_in<K: Ord>(
     decide: Decide<'_>,
+    nexthops: &mut NextHops,
     map: &mut BTreeMap<K, Destination>,
     key: K,
-    family: AddressFamily,
-    prefix: Prefix,
+    (family, prefix): (AddressFamily, Prefix),
     route: Route,
     scratch: &mut Scratch,
 ) {
@@ -2099,6 +2323,7 @@ fn announce_in<K: Ord>(
             // A new destination: its one route is the best, unless it is
             // held.
             let new = route.held.is_none().then(|| route.clone());
+            nexthops.link(route.next_hop(), prefix, true);
             scratch.note_added(family, &route);
             slot.insert(Destination::One(route));
             (None, new)
@@ -2118,11 +2343,20 @@ fn announce_in<K: Ord>(
                     return;
                 }
                 scratch.note_added(family, &route);
+                let (key, was) = (route.next_hop(), r.next_hop());
+                if key != was {
+                    // The other routes decide whether the destination
+                    // gains the one and keeps the other.
+                    nexthops.link(key, prefix, !dest.has_next_hop(key, Some(i)));
+                    nexthops.unlink(was, prefix, !dest.has_next_hop(was, Some(i)));
+                }
                 let replaced = dest.replace(i, route);
                 scratch.note_removed(family, &replaced);
                 scratch.released.push(replaced.attrs);
                 scratch.released.extend(replaced.received);
             } else {
+                let key = route.next_hop();
+                nexthops.link(key, prefix, !dest.has_next_hop(key, None));
                 scratch.note_added(family, &route);
                 dest.push(route);
             }
@@ -2206,6 +2440,13 @@ enum Judged {
     /// Held in the Adj-RIB-In, and no candidate, for why `by` says;
     /// used with the validation state policy set, if it set one.
     Held { by: Held, rov_set: Option<RovState> },
+    /// Admitted as for `Accepted`, but held for its next hop, which does
+    /// not resolve ([`Held::NextHop`]): it keeps these attributes, so that
+    /// it is a candidate as it is once the next hop resolves.
+    Unresolved {
+        attrs: Arc<PathAttrs>,
+        rov_set: Option<RovState>,
+    },
     /// Rejected whatever the route's validation state: not kept.
     Dropped,
 }
@@ -2224,6 +2465,7 @@ impl Judged {
         let (attrs, rov_set, held) = match self {
             Judged::Accepted { attrs, rov_set } => (attrs, rov_set, None),
             Judged::Held { by, rov_set } => (Arc::clone(received), rov_set, Some(by)),
+            Judged::Unresolved { attrs, rov_set } => (attrs, rov_set, Some(Held::NextHop)),
             Judged::Dropped => return None,
         };
         let received = (!Arc::ptr_eq(&attrs, received)).then(|| Arc::clone(received));
@@ -2278,12 +2520,24 @@ impl Judged {
 /// state, which stays [`Held::Policy`]. Its first lookup with data gives
 /// it a state, and judges it again (RFC 6811 §4).
 ///
+/// A route all of that admits is a candidate if its next hop, as import
+/// policy left it, resolves in the kernel's routing table, and is held
+/// ([`Held::NextHop`]) with the policy's attributes if it does not (RFC
+/// 4271 §9.1.2: "If the `NEXT_HOP` attribute of a BGP route depicts an
+/// address that is not resolvable ... the BGP route MUST be excluded from
+/// the Phase 2 decision function"). The validation rules come first: they
+/// are Phase 1, policy and the operator's configuration, and
+/// resolvability is a Phase 2 exclusion. A next hop not seen before is
+/// resolved here, so the decision never waits for one.
+///
 /// Every route reaches the candidates through here, whatever made it
-/// worth deciding again.
+/// worth deciding again, but for a change of the kernel's table, which
+/// moves routes between the candidates and [`Held::NextHop`] alone
+/// ([`Rib::kernel`]).
 fn judge(
     policies: &dyn Policies,
     (enforcement, startup): (Enforcement, Startup),
-    interner: &mut Interner,
+    (interner, nexthops): (&mut Interner, &mut NextHops),
     info: &PeerInfo,
     (family, prefix): (AddressFamily, Prefix),
     attrs: &Arc<PathAttrs>,
@@ -2319,8 +2573,10 @@ fn judge(
         Held::Startup
     } else if !enforcement.admits(used) {
         Held::Enforcement
-    } else {
+    } else if nexthops.resolved(attrs.next_hop_addr()) {
         return Judged::Accepted { attrs, rov_set };
+    } else {
+        return Judged::Unresolved { attrs, rov_set };
     };
     // Held as received, like any held route: the set policy made of it
     // goes back to the interner.

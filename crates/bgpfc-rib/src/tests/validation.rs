@@ -619,7 +619,7 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
         vec![FibChange {
             family: V4,
             prefix: p("192.0.2.0/24"),
-            next_hop: Some(ip("10.0.0.1")),
+            next_hop: Some(gw("10.0.0.1")),
             previous: None,
         }]
     );
@@ -650,7 +650,7 @@ fn a_route_import_policy_rejected_is_kept_and_taken_once_its_state_allows() {
             family: V4,
             prefix: p("192.0.2.0/24"),
             next_hop: None,
-            previous: Some(ip("10.0.0.1")),
+            previous: Some(gw("10.0.0.1")),
         }]
     );
     let m = decode_sent(sends(&out, e2.addr)[0], &e2);
@@ -1045,8 +1045,8 @@ fn routes_change_places_between_candidates_and_held_routes() {
         vec![FibChange {
             family: V4,
             prefix: p("192.0.2.0/24"),
-            next_hop: Some(ip("10.0.0.2")),
-            previous: Some(ip("10.0.0.1")),
+            next_hop: Some(gw("10.0.0.2")),
+            previous: Some(gw("10.0.0.1")),
         }]
     );
     let r = report(&out).unwrap();

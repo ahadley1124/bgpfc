@@ -44,6 +44,7 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
             statics: vec!["203.0.113.0/24".to_owned()],
             channel: String::new(),
             protocol: String::new(),
+            export: String::new(),
         },
     );
     let socket = lab.dir.join("ctl.sock");
@@ -64,6 +65,7 @@ fn gobgp_session_prefixes_both_ways_withdraw_and_refresh() {
             neighbors: vec![NeighborOpts::new(lab.b_addr, GOBGP_AS), to_bird],
             extra: format!("control {{ socket {}; }}", socket.display()),
             args: Vec::new(),
+            from_host: false,
         },
     );
     let ok = wait_for(ESTABLISH, || {

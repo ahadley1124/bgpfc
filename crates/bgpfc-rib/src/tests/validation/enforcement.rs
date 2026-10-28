@@ -120,7 +120,7 @@ fn invalid_routes_are_held_not_used_under_drop_invalid() {
         vec![FibChange {
             family: V4,
             prefix: p("198.51.100.0/24"),
-            next_hop: Some(ip("10.0.0.1")),
+            next_hop: Some(gw("10.0.0.1")),
             previous: None,
         }]
     );
@@ -223,7 +223,7 @@ fn a_held_invalid_route_returns_when_it_becomes_valid_without_an_update() {
         vec![FibChange {
             family: V4,
             prefix: p("192.0.2.0/24"),
-            next_hop: Some(ip("10.0.0.1")),
+            next_hop: Some(gw("10.0.0.1")),
             previous: None,
         }]
     );
@@ -270,7 +270,7 @@ fn a_used_route_that_turns_invalid_is_withdrawn_from_peers_and_the_fib() {
             family: V4,
             prefix: p("192.0.2.0/24"),
             next_hop: None,
-            previous: Some(ip("10.0.0.1")),
+            previous: Some(gw("10.0.0.1")),
         }]
     );
     assert_eq!(sent(&out, &e2), (vec![], vec![p("192.0.2.0/24")]));
@@ -577,7 +577,7 @@ fn holding_many_destinations_is_one_report_and_a_fib_change_each() {
     assert_eq!((r.released, r.best_changed), (600, 600));
     let changes = fib(&out);
     assert_eq!(changes.len(), 600);
-    assert!(changes.iter().all(|c| c.next_hop == Some(ip("10.0.0.1"))));
+    assert!(changes.iter().all(|c| c.next_hop == Some(gw("10.0.0.1"))));
 }
 
 #[test]
@@ -668,7 +668,7 @@ fn prefer_valid_uses_the_state_import_policy_set() {
     rib.set_policies(Box::new(crate::AcceptAll), &[], now(), &mut Vec::new());
     let out = send(&mut rib, &e1, &["192.0.2.0/24"]);
     assert_eq!(rib.loc_rib(V4).next().unwrap().1.peer, e3.addr);
-    assert_eq!(fib(&out)[0].next_hop, Some(ip("10.0.0.3")));
+    assert_eq!(fib(&out)[0].next_hop, Some(gw("10.0.0.3")));
 }
 
 #[test]
@@ -708,8 +708,8 @@ fn prefer_valid_switch_redecides_without_holding_anything() {
         vec![FibChange {
             family: V4,
             prefix: p("192.0.2.0/24"),
-            next_hop: Some(ip("10.0.0.3")),
-            previous: Some(ip("10.0.0.1")),
+            next_hop: Some(gw("10.0.0.3")),
+            previous: Some(gw("10.0.0.1")),
         }]
     );
     assert_eq!(sent(&out, &e2).0, vec![p("192.0.2.0/24")]);
