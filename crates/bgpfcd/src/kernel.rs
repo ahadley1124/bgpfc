@@ -29,14 +29,19 @@
 //!
 //! The thread reads the whole table again, and hands it on whole
 //! ([`KernelUpdate::Table`]), when the kernel dropped notifications
-//! (`ENOBUFS`), when an interface goes down or away or an address is
+//! (`ENOBUFS`), when an interface goes down or away or an IPv4 address is
 //! removed: IPv4 then removes the routes through it without a
 //! notification of their own; and when a change of routes cannot be
 //! placed for sure, as where a route of bgpfcd's sits among others' at a
-//! destination and metric. The RIB keeps its copy until the new one
-//! arrives whole. Any other error of the socket closes it, and the thread
-//! opens a new one and reads the table, after a pause that doubles up to
-//! a minute while that fails.
+//! destination and metric. Such a read comes [`SETTLE`] after what asked
+//! for it, and [`SPACING`] after the start of the read before at the
+//! earliest, so that what else changes meanwhile, such as the rest of an
+//! interface's going, is read with it, and interfaces that come and go
+//! all the time cost a read a second at most; the changes that come
+//! meanwhile go to the RIB as they come. The RIB keeps its copy until the
+//! new one arrives whole. Any other error of the socket closes it, and the
+//! thread opens a new one and reads the table, after a pause that doubles
+//! up to a minute while that fails.
 //!
 //! # Logging
 //!
@@ -87,6 +92,17 @@ const REOPEN_MAX: Duration = Duration::from_secs(60);
 /// requests back to back, reaches the RIB as no change at all.
 pub(crate) const GATHER: Duration = Duration::from_millis(10);
 
+/// How long after what asks for a read of the whole table the thread
+/// reads it: what else changes meanwhile, such as the rest of an
+/// interface's going down, is read with it.
+pub(crate) const SETTLE: Duration = Duration::from_millis(100);
+
+/// The shortest time between the starts of two reads of the whole table:
+/// each reads bgpfcd's own routes too, about half a second of the
+/// thread's time per million, and interfaces that come and go several
+/// times a second cost a read a second at most.
+pub(crate) const SPACING: Duration = Duration::from_secs(1);
+
 /// Why the thread reads the whole table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -98,7 +114,7 @@ pub(crate) enum Reason {
     LinkDown,
     /// An interface went away.
     LinkGone,
-    /// An address was removed from an interface.
+    /// An IPv4 address was removed from an interface.
     AddressRemoved,
     /// The socket failed and a new one was opened.
     Reopened,
@@ -136,6 +152,50 @@ pub(crate) struct Tracker {
     links: Links,
     /// The routes, as the kernel holds them.
     mirror: Mirror,
+    /// The next read of the whole table.
+    due: Due,
+}
+
+/// A read of the whole table to come.
+#[derive(Debug, Default)]
+pub(crate) struct Due {
+    /// Why, the first reason since the read before, and when; `None`
+    /// while no read is due.
+    next: Option<(Reason, Instant)>,
+    /// When the read before started.
+    last: Option<Instant>,
+}
+
+impl Due {
+    /// A read for `reason`, asked at `now`: [`SETTLE`] later, and
+    /// [`SPACING`] after the start of the read before at the earliest;
+    /// sooner if one is due sooner already, with the reason it has.
+    pub(crate) fn ask(&mut self, reason: Reason, now: Instant) {
+        let mut at = now + SETTLE;
+        if let Some(last) = self.last {
+            at = at.max(last + SPACING);
+        }
+        self.next = Some(match self.next {
+            Some((first, due)) => (first, due.min(at)),
+            None => (reason, at),
+        });
+    }
+
+    /// When the next read is due.
+    pub(crate) fn at(&self) -> Option<Instant> {
+        self.next.map(|(_, at)| at)
+    }
+
+    /// The read due by `now`, if one is, which starts: its reason.
+    pub(crate) fn start(&mut self, now: Instant) -> Option<Reason> {
+        let (reason, at) = self.next?;
+        if at > now {
+            return None;
+        }
+        self.next = None;
+        self.last = Some(now);
+        Some(reason)
+    }
 }
 
 /// What the thread reads notifications from: the monitor's socket, and a
@@ -211,20 +271,15 @@ pub(crate) fn gather(
 /// # Errors
 /// The socket's, or a dump the kernel refuses.
 pub(crate) fn open(protocol: u8) -> Result<(Tracker, KernelUpdate), FibError> {
-    let mut monitor = Monitor::open(protocol)?;
-    let snapshot = monitor.snapshot()?;
-    let (update, links, mirror) = table(snapshot);
-    let line = table_line(&update, Reason::Startup);
-    log_line(line.level, line.msg, &line.fields);
-    Ok((
-        Tracker {
-            monitor,
-            protocol,
-            links,
-            mirror,
-        },
-        update,
-    ))
+    let mut tracker = Tracker {
+        monitor: Monitor::open(protocol)?,
+        protocol,
+        links: Links::new(),
+        mirror: Mirror::new(protocol),
+        due: Due::default(),
+    };
+    let update = tracker.read(Reason::Startup)?;
+    Ok((tracker, update))
 }
 
 /// Start the thread on `tracker`, handing what changes to the RIB
@@ -239,24 +294,36 @@ pub(crate) fn spawn(tracker: Tracker, rib: SyncSender<RibMsg>) {
 fn run(mut t: Tracker, rib: &SyncSender<RibMsg>) {
     let mut lost = Lost::default();
     loop {
-        let update = match gather(&mut t.monitor, None, GATHER) {
-            Ok(batch) => {
-                let (changes, reason) = classify(batch.events, &mut t.links, &mut t.mirror);
-                if batch.lost {
-                    if let Some(times) = lost.note(Instant::now()) {
-                        bgpfc_log::warn!(LOST, times = times);
+        let update = if let Some(reason) = t.due.start(Instant::now()) {
+            bgpfc_log::debug!("kernel: reading the table again", reason = reason.as_str());
+            t.read(reason)
+        } else {
+            // Until the next read of the table is due, if one is.
+            let until = t
+                .due
+                .at()
+                .map(|at| at.saturating_duration_since(Instant::now()));
+            match gather(&mut t.monitor, until, GATHER) {
+                Ok(batch) => {
+                    if batch.lost {
+                        if let Some(times) = lost.note(Instant::now()) {
+                            bgpfc_log::warn!(LOST, times = times);
+                        }
+                        t.due.ask(Reason::LostEvents, Instant::now());
                     }
-                    t.read(Reason::LostEvents)
-                } else if let Some(reason) = reason {
-                    bgpfc_log::debug!("kernel: reading the table again", reason = reason.as_str());
-                    t.read(reason)
-                } else if changes.is_empty() {
-                    continue;
-                } else {
+                    let (changes, reason) = classify(batch.events, &mut t.links, &mut t.mirror);
+                    if let Some(reason) = reason {
+                        t.due.ask(reason, Instant::now());
+                    }
+                    // A read of the whole table to come makes them moot,
+                    // but the RIB is nearer the kernel with them meanwhile.
+                    if changes.is_empty() {
+                        continue;
+                    }
                     Ok(KernelUpdate::Changes(changes))
                 }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
         };
         let update = update.unwrap_or_else(|e| {
             bgpfc_log::error!("kernel: route monitor failed", error = e);
@@ -269,7 +336,7 @@ fn run(mut t: Tracker, rib: &SyncSender<RibMsg>) {
 }
 
 impl Tracker {
-    /// Read the whole table again on the socket, for `reason`.
+    /// Read the whole table on the socket, for `reason`.
     fn read(&mut self, reason: Reason) -> Result<KernelUpdate, FibError> {
         let snapshot = self.monitor.snapshot()?;
         let (update, links, mirror) = table(snapshot);
@@ -354,7 +421,7 @@ pub(crate) fn kernel_route(prefix: Prefix, metric: u32, via: kernel::Via) -> Ker
 /// changes moot. Keeps `links` and `mirror` up to date.
 ///
 /// The table is read again when an interface that was up goes down, when
-/// one goes away, and when an address is removed: IPv4 then removes the
+/// one goes away, and when an IPv4 address is removed: IPv4 then removes the
 /// routes through it without a notification of their own; and when a
 /// change of routes cannot be placed for sure ([`Reason::Unclear`]). An
 /// interface coming up, a change of carrier and an address added need
@@ -886,6 +953,33 @@ mod tests {
             gather(&mut failed, None, GATHER),
             Err(FibError::Kernel(22))
         ));
+    }
+
+    /// A read of the whole table comes a settling pause after what asks
+    /// for it, a second after the start of the one before at the
+    /// earliest, and once for all that ask meanwhile, with the first
+    /// reason.
+    #[test]
+    fn reads_of_the_table_are_settled_and_spaced() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut due = Due::default();
+        assert_eq!(due.at(), None);
+        assert_eq!(due.start(t0), None);
+        due.ask(Reason::LinkDown, t0);
+        due.ask(Reason::AddressRemoved, t0 + ms(50));
+        assert_eq!(due.at(), Some(t0 + SETTLE));
+        assert_eq!(due.start(t0 + ms(99)), None);
+        assert_eq!(due.start(t0 + SETTLE), Some(Reason::LinkDown));
+        assert_eq!(due.at(), None);
+        // The next, asked at once, waits for a second after that start.
+        due.ask(Reason::LinkGone, t0 + ms(500));
+        assert_eq!(due.at(), Some(t0 + SETTLE + SPACING));
+        assert_eq!(due.start(t0 + SETTLE + SPACING), Some(Reason::LinkGone));
+        // Long after the last, the settling pause alone.
+        let later = t0 + ms(5000);
+        due.ask(Reason::LostEvents, later);
+        assert_eq!(due.start(later + SETTLE), Some(Reason::LostEvents));
     }
 
     /// Lost notifications: a line at once, then at most one a minute,

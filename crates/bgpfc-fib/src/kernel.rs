@@ -42,21 +42,19 @@ pub const RTNLGRP_LINK: u32 = 1;
 pub const RTNLGRP_IPV4_IFADDR: u32 = 5;
 /// `RTNLGRP_IPV4_ROUTE`.
 pub const RTNLGRP_IPV4_ROUTE: u32 = 7;
-/// `RTNLGRP_IPV6_IFADDR`.
-pub const RTNLGRP_IPV6_IFADDR: u32 = 9;
 /// `RTNLGRP_IPV6_ROUTE`.
 pub const RTNLGRP_IPV6_ROUTE: u32 = 11;
 
 /// The groups a reader of the kernel's routes joins: the routes of both
-/// families, and the interface and address changes that remove IPv4
+/// families, and the interface and IPv4 address changes that remove IPv4
 /// routes without a notification of their own (an interface going down,
-/// its last address going). Joining the IPv6 groups works with IPv6
-/// disabled.
-pub const GROUPS: [u32; 5] = [
+/// its last address going). IPv6 notifies each route it removes when an
+/// address goes (`fib6_del`), so its address group is not joined.
+/// Joining the IPv6 route group works with IPv6 disabled.
+pub const GROUPS: [u32; 4] = [
     RTNLGRP_LINK,
     RTNLGRP_IPV4_IFADDR,
     RTNLGRP_IPV4_ROUTE,
-    RTNLGRP_IPV6_IFADDR,
     RTNLGRP_IPV6_ROUTE,
 ];
 
@@ -202,8 +200,8 @@ pub enum Event {
     /// An interface went away; IPv4 removes the routes through it without
     /// a notification of their own.
     LinkGone(u32),
-    /// An address was removed from the interface with this index; with
-    /// its last IPv4 address, routes through a gateway on it go without a
+    /// An IPv4 address was removed from the interface with this index;
+    /// with its last one, routes through a gateway on it go without a
     /// notification of their own.
     AddressGone(u32),
 }
@@ -459,13 +457,16 @@ pub fn decode_link(payload: &[u8]) -> Result<Option<Link>, NetlinkError> {
         }))
 }
 
-/// The interface index of an `RTM_NEWADDR` or `RTM_DELADDR` payload.
+/// The family and interface index of an `RTM_NEWADDR` or `RTM_DELADDR`
+/// payload.
 ///
 /// # Errors
 /// [`NetlinkError::ShortAddress`] if shorter than `struct ifaddrmsg`.
-pub fn decode_address_index(payload: &[u8]) -> Result<u32, NetlinkError> {
+pub fn decode_address(payload: &[u8]) -> Result<(u8, u32), NetlinkError> {
     match payload.first_chunk::<IFADDRMSG_LEN>() {
-        Some(&[_, _, _, _, i0, i1, i2, i3]) => Ok(u32::from_ne_bytes([i0, i1, i2, i3])),
+        Some(&[family, _, _, _, i0, i1, i2, i3]) => {
+            Ok((family, u32::from_ne_bytes([i0, i1, i2, i3])))
+        }
         None => Err(NetlinkError::ShortAddress),
     }
 }
@@ -500,7 +501,12 @@ pub fn event(message: &Message<'_>, protocol: u8) -> Result<Option<Event>, Netli
         RTM_DELROUTE => route(true)?,
         RTM_NEWLINK => decode_link(message.payload)?.map(Event::Link),
         RTM_DELLINK => decode_link(message.payload)?.map(|l| Event::LinkGone(l.index)),
-        RTM_DELADDR => Some(Event::AddressGone(decode_address_index(message.payload)?)),
+        // Only IPv4 removes routes through an address without a
+        // notification each.
+        RTM_DELADDR => match decode_address(message.payload)? {
+            (AF_INET, index) => Some(Event::AddressGone(index)),
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -790,6 +796,10 @@ mod tests {
             Some(Event::LinkGone(2))
         );
         assert_eq!(event_of(DELADDR), Some(Event::AddressGone(2)));
+        // An IPv6 address gone: IPv6 notifies the routes it removes.
+        let mut v6 = hex(DELADDR);
+        v6[netlink::HEADER_LEN] = AF_INET6;
+        assert_eq!(event(&message(&v6), 186).unwrap(), None);
         // An RTM_NEWADDR says nothing a reader needs: the routes it adds
         // have notifications of their own.
         let mut new = hex(DELADDR);
@@ -1134,7 +1144,7 @@ mod tests {
         );
         assert_eq!(msg.header.seq, 9);
         assert_eq!(msg.payload, &[0; IFINFOMSG_LEN]);
-        assert_eq!(GROUPS, [1, 5, 7, 9, 11]);
+        assert_eq!(GROUPS, [1, 5, 7, 11]);
     }
 
     /// Every vector above, cut at every length: the message is an error,
@@ -1165,7 +1175,7 @@ mod tests {
                 let cut = &payload[..len];
                 let _ = decode_route(cut);
                 let _ = decode_link(cut);
-                let _ = decode_address_index(cut);
+                let _ = decode_address(cut);
                 // The header says the full length: shorten it with the
                 // payload, so `event` sees each cut.
                 let mut m = bytes[..netlink::HEADER_LEN + len].to_vec();
@@ -1180,9 +1190,6 @@ mod tests {
             assert_eq!(decode_route(&payload[..3]), Err(NetlinkError::ShortRoute));
         }
         assert_eq!(decode_link(&[0; 15]), Err(NetlinkError::ShortLink));
-        assert_eq!(
-            decode_address_index(&[0; 7]),
-            Err(NetlinkError::ShortAddress)
-        );
+        assert_eq!(decode_address(&[0; 7]), Err(NetlinkError::ShortAddress));
     }
 }
